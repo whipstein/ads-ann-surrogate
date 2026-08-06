@@ -4456,6 +4456,37 @@ def metric_text_fixed(value: object, decimals: int = 2) -> str:
     return fixed
 
 
+def cli_metric_label(metric_name: object) -> str:
+    text = str(metric_name or "metric")
+    labels = {
+        "evm_db": "EVMdB",
+        "evm_pct": "EVM%",
+        "evm_rms": "EVM",
+        "max_abs": "maxAbs",
+        "max_abs_db": "maxdB",
+        "passivity.max_singular_value": "sigma",
+        "passivity.violating_points": "pv",
+        "rmse_abs": "RMSE",
+        "rmse_db": "RMSEdB",
+        "weighted_evm_db": "wEVMdB",
+        "weighted_evm_pct": "wEVM%",
+        "weighted_evm_rms": "wEVM",
+        "weighted_max_abs": "wMaxAbs",
+        "weighted_max_abs_db": "wMaxdB",
+        "weighted_rmse_abs": "wRMSE",
+        "weighted_rmse_db": "wRMSEdB",
+    }
+    if text in labels:
+        return labels[text]
+    compact = (
+        text.replace("passivity.", "p.")
+        .replace("weighted_", "w_")
+        .replace("max_singular_value", "sigma")
+        .replace("violating_points", "pv")
+    )
+    return compact if len(compact) <= 14 else compact[:13] + "~"
+
+
 def plot_links_cell(raw_paths: object) -> str:
     if not raw_paths:
         return ""
@@ -5471,6 +5502,18 @@ def run_sweep_command(
         (sweep_arg_values(args), candidate, str(out_dir), trial_index, args.trial_worst_plots)
         for trial_index, candidate in enumerate(candidates, start=1)
     ]
+    trial_width = max(1, len(str(len(candidates))))
+    max_epoch_value = csv_number(getattr(args, "epochs", None))
+    epoch_width = max(
+        len("unknown"),
+        len(str(int(max_epoch_value))) if max_epoch_value is not None else 0,
+    )
+    metric_label = cli_metric_label(args.selection_metric)
+    metric_label_width = max(6, len(metric_label))
+    metric_width = 12
+    passivity_violations_width = 8
+    passivity_sigma_width = 12
+
     def handle_result(result: dict[str, object]) -> None:
         nonlocal best_row, best_metric, live_best_trial, live_promotion_warning
         trial_index = int(result["trial"])
@@ -5508,14 +5551,15 @@ def run_sweep_command(
         epochs_display = training_history_epochs(
             trials_dir / f"trial_{trial_index:04d}" / "training_history.csv"
         )
-        passivity_violations = metric_text(row.get("passivity_violating_points"))
-        passivity_max_sigma = metric_text(row.get("passivity_max_singular_value"))
+        epoch_text = str(epochs_display if epochs_display is not None else "unknown")
+        passivity_violations = metric_text(row.get("passivity_violating_points")) or "n/a"
+        passivity_max_sigma = metric_text(row.get("passivity_max_singular_value")) or "n/a"
         print(
-            f"trial complete {trial_index}/{len(candidates)} "
-            f"epochs={epochs_display if epochs_display is not None else 'unknown'} "
-            f"{args.selection_metric}={metric_display} "
-            f"passivity_violations={passivity_violations} "
-            f"passivity_max_sigma={passivity_max_sigma}",
+            f"trial complete {trial_index:>{trial_width}}/{len(candidates):>{trial_width}} "
+            f"ep={epoch_text:>{epoch_width}} "
+            f"{metric_label:>{metric_label_width}}={metric_display:>{metric_width}} "
+            f"pv={passivity_violations:>{passivity_violations_width}} "
+            f"sigma={passivity_max_sigma:>{passivity_sigma_width}}",
             flush=True,
         )
         cleanup_trial_dir(trials_dir / f"trial_{trial_index:04d}", args.keep_trial_models)

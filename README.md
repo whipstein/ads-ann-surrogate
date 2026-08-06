@@ -37,6 +37,7 @@ Verilog-A n-port export.
 |-- common/
 |   |-- surrogate_common.py      Shared MDIF, metrics, plotting, sweep, and export utilities
 |   `-- README.md                Common support layer notes
+|-- generate_points.py           Geometry/process point-set generator
 |-- dnn/
 |   |-- dnn.py                   Thin CLI wrapper
 |   |-- model.py                 Direct DNN trainer, predictor, sweeper, and ADS exporters
@@ -79,6 +80,10 @@ Verilog-A file generation. The generated ADS ANN training package must be run on
 a licensed ADS machine with the ADS Python environment because it imports
 `keysight.ads.ann`.
 
+`generate_points.py` is pure Python for `maximin-lhs`, `latin-hypercube`, and
+`halton`. Its `sobol` method uses SciPy's Sobol implementation when SciPy is
+available.
+
 ## Input Data
 
 Input data is expected to be MDIF with one block per parameter point. Each block
@@ -107,6 +112,44 @@ trainers can reserve a holdout fraction of blocks for verification. KBNN also
 accepts a separate coarse/prior MDIF; fine and coarse blocks are matched by
 numeric geometry variables and the coarse response is interpolated onto the fine
 frequency grid when needed.
+
+## Point Generation
+
+Use `generate_points.py` to create geometry/process sample CSVs before running
+EM simulations or assembling MDIF. The default method is `maximin-lhs`, a
+maximin Latin hypercube. For finite surrogate-training campaigns, this is often
+more appropriate than a raw Sobol prefix because every parameter is stratified
+and the script chooses the candidate design with the largest minimum point
+spacing. Sobol remains useful when you want a low-discrepancy sequence that can
+grow naturally in power-of-two batches.
+
+```bash
+python3 generate_points.py \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 80 \
+  --verification-count 16 \
+  --method maximin-lhs \
+  --out geometries.csv
+```
+
+To compare the current Sobol-style workflow with the recommended space-filling
+design, ask for both methods. The `{method}` placeholder is replaced in the
+output path:
+
+```bash
+python3 generate_points.py \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 64 \
+  --method sobol \
+  --method maximin-lhs \
+  --out geometries_{method}.csv
+```
+
+Each CSV contains `point_index`, `dataset`, `method`, and one column per
+parameter. Add `--include-normalized` when you also want the underlying
+unit-cube coordinates.
 
 ## Quick Start
 
