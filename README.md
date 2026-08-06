@@ -140,6 +140,26 @@ unit-cube coordinates. Add `--write-split-files` to also write separate
 `*_train.csv` and `*_verification.csv` files for tools that consume the two
 simulation queues independently.
 
+For expensive EM campaigns, treat each point as one geometry/process setting
+with a full frequency sweep. A practical initial design size is:
+
+| Geometry parameters | Training points | Verification points |
+| ---: | ---: | ---: |
+| 2 | 20-35 | 8-12 |
+| 3 | 35-60 | 12-18 |
+| 4 | 60-100 | 16-25 |
+| 5 | 100-160 | 25-40 |
+| 6 | 160-250 | 35-55 |
+| 7-8 | 250-450 | 50-90 |
+
+For residual KBNN fits with a useful coarse model, start near the low-to-middle
+end of each range because the neural network is learning `fine - coarse`
+instead of the full response. A good staged workflow is to start with roughly
+`15*d` training points, with a minimum of about 30, and `4*d` to `6*d`
+verification points, with a minimum of about 12. Keep the verification set
+fixed across model comparisons, then grow the training set in targeted batches
+of about `3*d` to `5*d` points using the current worst-fit regions.
+
 To compare the current Sobol-style workflow with the recommended space-filling
 design, ask for both methods. The `{method}` placeholder is replaced in the
 output path:
