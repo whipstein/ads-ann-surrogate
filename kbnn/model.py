@@ -52,6 +52,7 @@ from common.surrogate_common import (  # noqa: E402
     make_training_progress_callback,
     metadata_csv,
     metadata_hidden_layers,
+    model_settings_title,
     normalize_name,
     normalize_sparam_weights,
     output_weights_from_sparam_weights,
@@ -654,6 +655,8 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         include_coarse_input = True
     if mode == "prior-input" and not args.coarse_mdif:
         raise ValueError("--mode prior-input requires --coarse-mdif")
+    if include_coarse_input and not args.coarse_mdif:
+        raise ValueError("--include-coarse-input requires --coarse-mdif")
 
     train_fine, verify_fine, all_fine = split_fine_blocks(args)
     if not train_fine:
@@ -771,7 +774,6 @@ def command_train(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     assert metadata is not None
     model.save(out_dir, metadata=metadata)
-    write_history(out_dir / "training_history.csv", history)
     training_config = {
         "training_blocks": metadata["training_blocks"],
         "verification_blocks": metadata["verification_blocks"],
@@ -796,6 +798,16 @@ def command_train(args: argparse.Namespace) -> int:
         "output_scaler_floor": metadata["output_scaler_floor"],
         "floored_output_columns": metadata["floored_output_columns"],
     }
+    plot_context = model_settings_title(
+        "KBNN",
+        training_config,
+        getattr(args, "progress_label", "KBNN fit"),
+    )
+    write_history(
+        out_dir / "training_history.csv",
+        history,
+        plot_title=f"Model performance vs epoch | {plot_context}",
+    )
 
     if verify_fine:
         pred_blocks = model.predict_blocks(verify_fine, verify_coarse)
@@ -808,6 +820,7 @@ def command_train(args: argparse.Namespace) -> int:
             max_worst_plots=getattr(args, "worst_plots", 6),
             sparam_weights=parse_sparam_weights(labels, getattr(args, "sparam_weights", None)),
             y_z0=50.0,
+            title_context=plot_context,
         )
     else:
         summary = {"warning": "No verification blocks were available"}
@@ -1250,13 +1263,36 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
     }
     candidates = []
     keys = list(axes)
+    skipped_without_coarse = 0
     for values in itertools.product(*(axes[key] for key in keys)):
         candidate = dict(zip(keys, values))
         if candidate["mode"] == "plain" and candidate["include_coarse_input"]:
             continue
         if candidate["mode"] == "prior-input" and not candidate["include_coarse_input"]:
             continue
+        if not args.coarse_mdif and (
+            candidate["mode"] == "prior-input" or bool(candidate["include_coarse_input"])
+        ):
+            skipped_without_coarse += 1
+            continue
         candidates.append(candidate)
+    if skipped_without_coarse:
+        print(
+            "warning: skipped "
+            f"{skipped_without_coarse} KBNN candidate(s) that require --coarse-mdif",
+            file=sys.stderr,
+        )
+    if candidates and not args.coarse_mdif and any(candidate["mode"] == "residual" for candidate in candidates):
+        print(
+            "warning: --coarse-mdif was not supplied; residual KBNN candidates "
+            "will use a zero coarse response",
+            file=sys.stderr,
+        )
+    if not candidates:
+        raise ValueError(
+            "No valid KBNN sweep candidates. prior-input mode and coarse-input "
+            "residual candidates require --coarse-mdif."
+        )
     if args.mode == "random" and args.max_trials and args.max_trials < len(candidates):
         rng = np.random.default_rng(args.seed)
         chosen = rng.choice(len(candidates), size=args.max_trials, replace=False)

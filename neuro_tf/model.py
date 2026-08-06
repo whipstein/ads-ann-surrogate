@@ -406,7 +406,6 @@ def command_train(args: argparse.Namespace) -> int:
         out_dir,
         metadata=metadata,
     )
-    write_history(out_dir / "training_history.csv", history)
     training_config = {
         "training_blocks": len(train_blocks),
         "verification_blocks": len(verify_blocks),
@@ -428,6 +427,16 @@ def command_train(args: argparse.Namespace) -> int:
         "progress_interval": progress_interval_from_args(args),
         "seed": args.seed,
     }
+    plot_context = model_settings_title(
+        "Neuro-TF",
+        training_config,
+        getattr(args, "progress_label", "Neuro-TF fit"),
+    )
+    write_history(
+        out_dir / "training_history.csv",
+        history,
+        plot_title=f"Model performance vs epoch | {plot_context}",
+    )
 
     if verify_blocks:
         pred_blocks = model.predict_blocks(verify_blocks)
@@ -439,6 +448,7 @@ def command_train(args: argparse.Namespace) -> int:
             parameter_names,
             max_worst_plots=getattr(args, "worst_plots", 6),
             y_z0=50.0,
+            title_context=plot_context,
         )
     else:
         summary = {"warning": "No verification blocks were available"}

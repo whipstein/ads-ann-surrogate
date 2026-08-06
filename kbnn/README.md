@@ -111,7 +111,9 @@ during large experiments.
 
 For `plain` models, `--coarse-mdif` is not needed. For `prior-input` models, it
 is required. For `residual` models, omitting `--coarse-mdif` uses a zero coarse
-model, which reduces the method to a plain correction model.
+model, which reduces the method to a plain correction model. Residual models
+with `--include-coarse-input` also require `--coarse-mdif` because there is no
+coarse response to append as an input otherwise.
 
 ### Options
 
@@ -172,7 +174,8 @@ try for the single-model `--include-coarse-input` switch. `false` trains
 residual candidates from geometry and frequency only; `true` also feeds the
 coarse real/imaginary S-parameters into the residual network. Impossible mode
 combinations are skipped: `plain` forces this off and `prior-input` forces it
-on.
+on. If `--coarse-mdif` is omitted, `prior-input` and coarse-input residual
+candidates are skipped before the sweep starts.
 
 Use `--sparam-weights` to make some S-parameters matter less during training
 and sweep selection. In residual KBNN mode, the weights apply to the residual

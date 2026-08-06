@@ -51,6 +51,7 @@ from common.surrogate_common import (  # noqa: E402
     make_training_progress_callback,
     metadata_csv,
     metadata_hidden_layers,
+    model_settings_title,
     normalize_name,
     normalize_sparam_weights,
     output_weights_from_sparam_weights,
@@ -541,7 +542,6 @@ def command_train(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save(out_dir, metadata=metadata)
-    write_history(out_dir / "training_history.csv", history)
     training_config = {
         "training_blocks": metadata["training_blocks"],
         "verification_blocks": metadata["verification_blocks"],
@@ -566,6 +566,16 @@ def command_train(args: argparse.Namespace) -> int:
         "output_scaler_floor": metadata["output_scaler_floor"],
         "floored_output_columns": metadata["floored_output_columns"],
     }
+    plot_context = model_settings_title(
+        "DNN",
+        training_config,
+        getattr(args, "progress_label", "DNN fit"),
+    )
+    write_history(
+        out_dir / "training_history.csv",
+        history,
+        plot_title=f"Model performance vs epoch | {plot_context}",
+    )
 
     if verify_blocks:
         pred_blocks = model.predict_blocks(verify_blocks)
@@ -578,6 +588,7 @@ def command_train(args: argparse.Namespace) -> int:
             max_worst_plots=getattr(args, "worst_plots", 6),
             sparam_weights=parse_sparam_weights(labels, getattr(args, "sparam_weights", None)),
             y_z0=model.target_z0,
+            title_context=plot_context,
         )
     else:
         summary = {"warning": "No verification blocks were available"}

@@ -3759,6 +3759,50 @@ def matplotlib_header(title: str, case_name: str, metrics: dict[str, object], pa
     return "\n".join(lines)
 
 
+def compact_plot_value(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, (list, tuple)):
+        return ",".join(compact_plot_value(item) for item in value)
+    return str(value)
+
+
+def model_settings_title(
+    model_kind: str,
+    config: dict[str, object],
+    label: object | None = None,
+) -> str:
+    display_label = str(label or model_kind).strip() or model_kind
+    parts = [display_label]
+    fields = [
+        ("freq_transform", "ft"),
+        ("output_domain", "out"),
+        ("target_z0", "z0"),
+        ("mode", "mode"),
+        ("include_coarse_input", "coarse_in"),
+        ("order", "order"),
+        ("pole_damping", "damp"),
+        ("ridge", "ridge"),
+        ("hidden_layers", "layers"),
+        ("activation", "act"),
+        ("learning_rate", "lr"),
+        ("batch_size", "bs"),
+        ("epochs", "ep"),
+        ("patience", "pat"),
+        ("seed", "seed"),
+    ]
+    for key, short_name in fields:
+        if key not in config:
+            continue
+        value = config.get(key)
+        if value is None or value == "":
+            continue
+        parts.append(f"{short_name}={compact_plot_value(value)}")
+    return " | ".join(parts)
+
+
 def matplotlib_grid_page(
     plt: object,
     truth: MDIFBlock,
@@ -4195,6 +4239,7 @@ def plot_worst_case_y_fits(
     out_dir: Path,
     max_plots: int,
     z0: float = 50.0,
+    title_context: str | None = None,
 ) -> tuple[list[Path], str | None]:
     if max_plots <= 0:
         return [], None
@@ -4213,7 +4258,11 @@ def plot_worst_case_y_fits(
             max_plots=max_plots,
             plot_subdir="worst_case_y_plots",
             csv_name="worst_case_y_plots.csv",
-            title_prefix="Worst verification Y-parameter case",
+            title_prefix=(
+                f"{title_context} | Worst verification Y-parameter case"
+                if title_context
+                else "Worst verification Y-parameter case"
+            ),
             response_kind="Y",
             include_passivity=False,
         ),
@@ -4230,6 +4279,7 @@ def write_training_verification_artifacts(
     max_worst_plots: int,
     sparam_weights: dict[str, float] | None = None,
     y_z0: float = 50.0,
+    title_context: str | None = None,
 ) -> dict[str, object]:
     write_mdif(out_dir / "predicted_verification.mdif", pred_blocks, labels)
     metric_rows, summary = verification_metrics(
@@ -4247,6 +4297,11 @@ def write_training_verification_artifacts(
         parameter_names,
         out_dir,
         max_plots=max_worst_plots,
+        title_prefix=(
+            f"{title_context} | Worst verification case"
+            if title_context
+            else "Worst verification case"
+        ),
     )
     summary["worst_case_plots"] = [str(path.relative_to(out_dir)) for path in plot_paths]
     y_plot_paths, y_plot_warning = plot_worst_case_y_fits(
@@ -4257,6 +4312,7 @@ def write_training_verification_artifacts(
         out_dir,
         max_plots=max_worst_plots,
         z0=y_z0,
+        title_context=title_context,
     )
     if y_plot_paths:
         summary["worst_case_y_plots"] = [str(path.relative_to(out_dir)) for path in y_plot_paths]
@@ -4284,12 +4340,16 @@ def write_csv(path: Path, rows: Sequence[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def write_history(path: Path, history: Sequence[dict[str, float]]) -> None:
+def write_history(
+    path: Path,
+    history: Sequence[dict[str, float]],
+    plot_title: str = "Model performance vs epoch",
+) -> None:
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss"])
         writer.writeheader()
         writer.writerows(history)
-    write_training_history_plot(path.with_suffix(".pdf"), history)
+    write_training_history_plot(path.with_suffix(".pdf"), history, title=plot_title)
 
 
 def history_series(
@@ -4317,6 +4377,7 @@ def history_series(
 def write_training_history_plot_matplotlib(
     path: Path,
     history: Sequence[dict[str, float]],
+    title: str = "Model performance vs epoch",
 ) -> bool:
     modules = load_matplotlib_modules()
     if modules is None:
@@ -4331,7 +4392,7 @@ def write_training_history_plot_matplotlib(
     finite_losses = np.concatenate([train_loss[np.isfinite(train_loss)], val_loss[np.isfinite(val_loss)]])
     if finite_losses.size and np.all(finite_losses > 0.0):
         ax.set_yscale("log")
-    ax.set_title("Model performance vs epoch")
+    ax.set_title("\n".join(wrapped_text_lines(title, 92)), fontsize=11)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.grid(True, which="both", alpha=0.28)
@@ -4357,13 +4418,24 @@ def draw_training_history_legend(canvas: PdfCanvas, rect: tuple[float, float, fl
 def write_training_history_plot_fallback(
     path: Path,
     history: Sequence[dict[str, float]],
+    title: str = "Model performance vs epoch",
 ) -> bool:
     epochs, train_loss, val_loss = history_series(history)
     if epochs.size == 0:
         return False
     canvas = PdfCanvas(width=900.0, height=520.0)
-    canvas.text(canvas.width / 2, 30, "Model performance vs epoch", size=18, font="F2", align="center")
-    rect = (86.0, 82.0, 742.0, 338.0)
+    title_lines = wrapped_text_lines(title, 96)
+    header_bottom = draw_wrapped_centered_text(
+        canvas,
+        title_lines,
+        canvas.width / 2,
+        24,
+        16,
+        18,
+        font="F2",
+    )
+    title_offset = max(0.0, header_bottom - 42.0)
+    rect = (86.0, 82.0 + title_offset, 742.0, max(260.0, 338.0 - title_offset))
     finite_losses = np.concatenate([train_loss[np.isfinite(train_loss)], val_loss[np.isfinite(val_loss)]])
     use_log = bool(finite_losses.size and np.all(finite_losses > 0.0))
     if use_log:
@@ -4393,14 +4465,18 @@ def write_training_history_plot_fallback(
     return True
 
 
-def write_training_history_plot(path: Path, history: Sequence[dict[str, float]]) -> Path | None:
+def write_training_history_plot(
+    path: Path,
+    history: Sequence[dict[str, float]],
+    title: str = "Model performance vs epoch",
+) -> Path | None:
     if not history:
         if path.exists():
             path.unlink()
         return None
-    if write_training_history_plot_matplotlib(path, history):
+    if write_training_history_plot_matplotlib(path, history, title=title):
         return path
-    if write_training_history_plot_fallback(path, history):
+    if write_training_history_plot_fallback(path, history, title=title):
         return path
     if path.exists():
         path.unlink()
@@ -4511,6 +4587,15 @@ def cli_color_text(text: str, color: str, stream: object | None = None) -> str:
     if not prefix:
         return text
     return f"{prefix}{text}\033[0m"
+
+
+def compact_cli_text(text: object, max_chars: int) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "").strip())
+    if max_chars <= 0 or len(compact) <= max_chars:
+        return compact
+    if max_chars <= 1:
+        return "~"
+    return compact[: max_chars - 1] + "~"
 
 
 def plot_links_cell(raw_paths: object) -> str:
@@ -5601,14 +5686,20 @@ def run_sweep_command(
             f"pv={passivity_violations:>{passivity_violations_width}} "
             f"sigma={passivity_max_sigma:>{passivity_sigma_width}}"
         )
-        failed = bool(str(row.get("error") or "").strip()) or bool(
-            sweep_row_exclusion_reasons(
-                row,
-                selection_metric=args.selection_metric,
-                max_passivity_violations=max_passivity_violations,
-                max_passivity_sigma=max_passivity_sigma,
-            )
+        trial_error = str(row.get("error") or "").strip()
+        exclusion_reasons = sweep_row_exclusion_reasons(
+            row,
+            selection_metric=args.selection_metric,
+            max_passivity_violations=max_passivity_violations,
+            max_passivity_sigma=max_passivity_sigma,
         )
+        failed = bool(trial_error) or bool(exclusion_reasons)
+        if failed:
+            reason = trial_error or "; ".join(exclusion_reasons)
+            suffix = f"err={compact_cli_text(reason, 36)}"
+            available = max(0, 116 - len(line) - 1)
+            if available >= 5:
+                line = f"{line} {compact_cli_text(suffix, available)}"
         print(
             cli_color_text(line, "red" if failed else "green"),
             flush=True,
