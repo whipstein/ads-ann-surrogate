@@ -114,6 +114,7 @@ and links to the generated S- and Y-parameter worst-case plots.
 | ------------------------------- | --- | ------------------------------------------------ |
 | <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden-layer activation. `tanh` is smoother for small microwave datasets; `relu` can help larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
 | <nobr><code>--batch-size INT</code></nobr> | Number of frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
+| <nobr><code>--debug</code></nobr> | Print common diagnostics and show Python tracebacks for failed commands. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | Frequency input transform. `log` uses `log10(freq_hz)`, `linear` uses raw Hz, and `log-linear` uses both. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes. More entries create a deeper model. Default: `128,128,64`. | <nobr><code>--hidden-layers 128,128,64</code></nobr> |
@@ -238,6 +239,7 @@ transform do not rebuild the same training arrays.
 | ------------------------------- | --- | ------------------------------------------------ |
 | <nobr><code>--activation-options LIST</code></nobr> | Comma-separated activation functions to try. Available values are `tanh` and `relu`. Default: `tanh,relu`. | <nobr><code>--activation-options tanh,relu</code></nobr> |
 | <nobr><code>--batch-size INT</code></nobr> | Batch size per trial. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
+| <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, and include tracebacks in failed trial summaries. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum epochs per trial and for the final best-model retrain. Default: `2000`. | <nobr><code>--epochs 1200</code></nobr> |
 | <nobr><code>--freq-transform-options LIST</code></nobr> | Comma-separated frequency transforms to try. Available values are `log`, `linear`, and `log-linear`. Default: `log,log-linear`. | <nobr><code>--freq-transform-options log,log-linear</code></nobr> |
 | <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated DNN layouts to try. Use commas inside one layout and semicolons between layouts. Default: `64,64;128,128,64;128,128,128;256,128,64`. | <nobr><code>--hidden-layer-options '64,64;128,128,64'</code></nobr> |

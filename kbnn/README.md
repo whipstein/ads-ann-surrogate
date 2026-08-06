@@ -123,6 +123,7 @@ coarse response to append as an input otherwise.
 | <nobr><code>--batch-size INT</code></nobr> | Frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
 | <nobr><code>--coarse-mdif PATH</code></nobr> | Optional coarse/prior S-parameter MDIF. Required for `prior-input`, strongly recommended for `residual`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
 | <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--debug</code></nobr> | Print common diagnostics plus KBNN data/loss diagnostics, show Python tracebacks for failed commands, and write `kbnn_training_debug.json`. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform. `log` uses `log10(freq_hz)` and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes. Default: `64,64`. | <nobr><code>--hidden-layers 64,64</code></nobr> |
@@ -178,10 +179,11 @@ on. If `--coarse-mdif` is omitted, `prior-input` and coarse-input residual
 candidates are skipped before the sweep starts.
 
 For fitting failures that do not produce an obvious Python error, rerun a small
-or representative sweep with `--debug --jobs 1`. Debug mode prints the selected
-candidate list, per-trial block/sample counts, feature and target scaling
-statistics, constant columns, and initial-to-final scaled losses. Each trial
-also writes `kbnn_training_debug.json` in its trial directory.
+or representative sweep with `--debug --jobs 1`. The shared sweep debug mode
+prints the selected candidate list and failed-trial tracebacks. KBNN also prints
+per-trial block/sample counts, feature and target scaling statistics, constant
+columns, and initial-to-final scaled losses, and each trial writes
+`kbnn_training_debug.json` in its trial directory.
 
 Use `--sparam-weights` to make some S-parameters matter less during training
 and sweep selection. In residual KBNN mode, the weights apply to the residual
@@ -257,6 +259,7 @@ of rebuilding them.
 | <nobr><code>--batch-size INT</code></nobr> | Frequency-sample rows per Adam update in each candidate. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
 | <nobr><code>--coarse-mdif PATH</code></nobr> | Optional coarse/prior S-parameter MDIF. Required for `prior-input` candidates and strongly recommended for `residual` candidates. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
 | <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, include tracebacks in failed trial summaries, and write KBNN per-trial debug diagnostics. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs for each candidate and the final retrain. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform applied in every trial. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
 | <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated layer layouts. Use commas inside one layout and semicolons between layouts. Default: `32;64;64,64`. | <nobr><code>--hidden-layer-options '32;64,64;128,64'</code></nobr> |

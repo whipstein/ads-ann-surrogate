@@ -20,7 +20,6 @@ import json
 import math
 import shutil
 import sys
-import traceback
 from pathlib import Path
 from typing import Sequence
 
@@ -36,6 +35,7 @@ from common.surrogate_common import (  # noqa: E402
     MDIFBlock,
     MLP,
     Standardizer,
+    add_debug_argument,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
@@ -46,10 +46,13 @@ from common.surrogate_common import (  # noqa: E402
     configure_parallel_numeric_threads,
     copy_trial_model,
     csv_number,
+    debug_print,
+    debug_traceback,
     frequency_feature_columns,
     infer_parameter_names,
     load_sweep_rows,
     infer_uniform_hidden_layout,
+    load_or_write_trial_summary,
     make_training_progress_callback,
     metadata_csv,
     metadata_hidden_layers,
@@ -66,6 +69,7 @@ from common.surrogate_common import (  # noqa: E402
     plot_sweep_diagnostics,
     plot_worst_case_fits,
     plot_worst_case_y_fits,
+    print_cli_error,
     read_mdif,
     read_model_metadata,
     rerank_sweep_rows,
@@ -347,12 +351,6 @@ def compact_list(values: Sequence[object], limit: int = 12) -> list[object]:
     if len(items) <= limit:
         return items
     return [*items[:limit], f"... ({len(items) - limit} more)"]
-
-
-def debug_print(args: argparse.Namespace, message: str) -> None:
-    if getattr(args, "debug", False):
-        label = str(getattr(args, "progress_label", "KBNN debug"))
-        print(f"debug: {label}: {message}", file=sys.stderr, flush=True)
 
 
 def build_training_debug_info(
@@ -1657,18 +1655,15 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
     except Exception as exc:
         status = 2
         error_message = str(exc)
-        error_traceback = traceback.format_exc()
-        if getattr(args, "debug", False):
-            print(error_traceback, file=sys.stderr, flush=True)
+        error_traceback = debug_traceback(args)
     summary_path = trial_dir / "verification_summary.json"
-    if status != 0 or not summary_path.exists():
-        summary: dict[str, object] = {"error": error_message or "trial failed"}
-        if error_traceback:
-            summary["traceback"] = error_traceback
-        metric_value = None
-    else:
-        summary = json.loads(summary_path.read_text())
-        metric_value = summary_metric(summary, args.selection_metric)
+    summary = load_or_write_trial_summary(
+        summary_path,
+        status=status,
+        error_message=error_message,
+        traceback_text=error_traceback,
+    )
+    metric_value = summary_metric(summary, args.selection_metric) if status == 0 else None
     return {
         "trial": trial_index,
         "candidate": candidate,
@@ -1680,26 +1675,9 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
 
 
 def command_sweep(args: argparse.Namespace) -> int:
-    candidates = sweep_candidate_grid(args)
-    if getattr(args, "debug", False):
-        print(
-            f"debug: KBNN sweep: candidates={len(candidates)} jobs={args.jobs} "
-            f"out_dir={args.out_dir}",
-            file=sys.stderr,
-            flush=True,
-        )
-        if args.jobs != 1:
-            print(
-                "debug: KBNN sweep: parallel trial debug output may interleave; "
-                "use --jobs 1 for the cleanest trace",
-                file=sys.stderr,
-                flush=True,
-            )
-        for idx, candidate in enumerate(candidates, start=1):
-            print(f"debug: KBNN sweep: candidate {idx}: {candidate}", file=sys.stderr, flush=True)
     return run_sweep_command(
         args,
-        candidates,
+        sweep_candidate_grid(args),
         worker_func=kbnn_sweep_trial_worker,
         namespace_for_trial_func=namespace_for_trial,
         train_func=command_train,
@@ -1850,14 +1828,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--patience", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help=(
-            "Print KBNN data/loss diagnostics and write kbnn_training_debug.json "
-            "in each training output directory."
+    add_debug_argument(
+        parser,
+        (
+            "Print common sweep diagnostics plus KBNN data/loss diagnostics, "
+            "and write kbnn_training_debug.json in each training output directory."
         ),
     )
+    parser.set_defaults(debug_label="KBNN debug")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2137,7 +2115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print_cli_error(args, exc)
         return 2
 
 

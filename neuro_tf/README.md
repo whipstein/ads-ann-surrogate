@@ -108,6 +108,7 @@ and links to the generated S- and Y-parameter worst-case plots.
 | ------------------------------- | --- | ------------------------------------------------ |
 | <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden-layer activation. `tanh` is usually smoother for microwave response fitting; `relu` can be useful for larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
 | <nobr><code>--batch-size INT</code></nobr> | Number of training geometries per Adam update. The implementation clamps this to the number of available training blocks. Default: `64`. | <nobr><code>--batch-size 64</code></nobr> |
+| <nobr><code>--debug</code></nobr> | Print common diagnostics and show Python tracebacks for failed commands. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes for the coefficient neural network. Default: `64,64`. | <nobr><code>--hidden-layers 64,64</code></nobr> |
 | <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks to reserve for verification when no split values are found in a combined MDIF. Default: `0.2`. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
@@ -189,6 +190,7 @@ CSV/PDF; the CSV records how many samples were excluded for each setting.
 | ------------------------------- | --- | ------------------------------------------------ |
 | <nobr><code>--activation-options LIST</code></nobr> | Comma-separated activation functions to try. Available values are `tanh` and `relu`. Default: `tanh,relu`. | <nobr><code>--activation-options tanh,relu</code></nobr> |
 | <nobr><code>--batch-size INT</code></nobr> | Batch size per trial. Default: `64`. | <nobr><code>--batch-size 64</code></nobr> |
+| <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, and include tracebacks in failed trial summaries. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum epochs per trial and for the final best-model retrain. Default: `1200`. | <nobr><code>--epochs 1200</code></nobr> |
 | <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated neural-network layouts to try. Use commas inside one layout and semicolons between layouts. Default: `32;64;64,64`. | <nobr><code>--hidden-layer-options '32;64,64;128,64'</code></nobr> |
 | <nobr><code>--holdout-fraction FLOAT</code></nobr> | Verification holdout fraction if split values are absent. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import difflib
 import itertools
 import json
 import math
@@ -25,6 +26,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import traceback
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -2052,24 +2054,74 @@ def infer_parameter_names(
     requested: str | None,
     split_var: str,
 ) -> list[str]:
-    if requested:
-        return [normalize_name(part) for part in requested.split(",") if part.strip()]
+    if not blocks:
+        raise ValueError("No MDIF blocks were available for parameter inference")
 
     excluded = {normalize_name(split_var).lower(), "dataset", "set", "split"}
     common = set(blocks[0].params)
     for block in blocks[1:]:
         common &= set(block.params)
-    names = []
+
+    numeric_common = []
     for name in sorted(common):
         if name.lower() in excluded:
             continue
         if all(parse_number(block.params[name]) is not None for block in blocks):
-            names.append(name)
-    if not names:
+            numeric_common.append(name)
+
+    if requested:
+        raw_names = [part.strip() for part in requested.split(",") if part.strip()]
+        if not raw_names:
+            raise ValueError("--parameter-names did not contain any parameter names")
+
+        lookup: dict[str, str] = {}
+        for name in sorted(common):
+            for key in {name, name.lower(), normalize_name(name), normalize_name(name).lower()}:
+                lookup.setdefault(key, name)
+
+        resolved = []
+        for raw_name in raw_names:
+            normalized = normalize_name(raw_name)
+            target = (
+                lookup.get(normalized)
+                or lookup.get(normalized.lower())
+                or lookup.get(raw_name)
+                or lookup.get(raw_name.lower())
+            )
+            if target is None:
+                candidates = numeric_common or sorted(common)
+                suggestion = difflib.get_close_matches(normalized, candidates, n=1)
+                suggestion_text = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+                available = ", ".join(numeric_common) if numeric_common else "none"
+                raise ValueError(
+                    f"Requested parameter {raw_name!r} was not found as a common MDIF VAR. "
+                    f"Common numeric VARs: {available}.{suggestion_text}"
+                )
+            bad_blocks = [
+                block.source_index
+                for block in blocks
+                if parse_number(block.params[target]) is None
+            ]
+            if bad_blocks:
+                sample_value = next(
+                    block.params[target]
+                    for block in blocks
+                    if parse_number(block.params[target]) is None
+                )
+                available = ", ".join(numeric_common) if numeric_common else "none"
+                raise ValueError(
+                    f"Requested parameter {raw_name!r} matched MDIF VAR {target!r}, "
+                    f"but it is not numeric in block(s) {bad_blocks[:8]} "
+                    f"(example value {sample_value!r}). Common numeric VARs: {available}."
+                )
+            resolved.append(target)
+        return resolved
+
+    if not numeric_common:
         raise ValueError(
             "Could not infer numeric geometry parameters. Pass --parameter-names w,l,..."
         )
-    return names
+    return numeric_common
 
 
 def parameter_matrix(blocks: Sequence[MDIFBlock], parameter_names: Sequence[str]) -> np.ndarray:
@@ -5348,6 +5400,68 @@ def summary_metric(summary: dict[str, object], metric_name: str) -> float | None
     return numeric
 
 
+def add_debug_argument(
+    parser: argparse.ArgumentParser,
+    help_text: str | None = None,
+) -> None:
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=help_text
+        or "Print common sweep diagnostics and show tracebacks for failed commands/trials.",
+    )
+
+
+def debug_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "debug", False))
+
+
+def debug_print(
+    args: argparse.Namespace,
+    message: str,
+    label: str | None = None,
+) -> None:
+    if not debug_enabled(args):
+        return
+    resolved_label = (
+        label
+        or getattr(args, "progress_label", None)
+        or getattr(args, "debug_label", None)
+        or "surrogate"
+    )
+    print(f"debug: {resolved_label}: {message}", file=sys.stderr, flush=True)
+
+
+def debug_traceback(args: argparse.Namespace) -> str | None:
+    traceback_text = traceback.format_exc()
+    if debug_enabled(args):
+        print(traceback_text, file=sys.stderr, flush=True)
+        return traceback_text
+    return None
+
+
+def print_cli_error(args: argparse.Namespace, exc: Exception) -> None:
+    print(f"error: {exc}", file=sys.stderr)
+    debug_traceback(args)
+
+
+def load_or_write_trial_summary(
+    summary_path: Path,
+    status: int,
+    error_message: str | None = None,
+    traceback_text: str | None = None,
+) -> dict[str, object]:
+    if status == 0 and summary_path.exists():
+        return json.loads(summary_path.read_text())
+
+    summary: dict[str, object] = {"error": error_message or "trial failed"}
+    if traceback_text:
+        summary["traceback"] = traceback_text
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2))
+    return summary
+
+
 def csv_number(value: object) -> float | None:
     if value is None or value == "":
         return None
@@ -5625,6 +5739,21 @@ def run_sweep_command(
     live_best_trial: int | None = None
     live_promotion_warning: str | None = None
     jobs = configure_parallel_numeric_threads(getattr(args, "jobs", 1))
+    if debug_enabled(args):
+        debug_label = f"{diagnostics_prefix} sweep"
+        debug_print(
+            args,
+            f"candidates={len(candidates)} jobs={jobs} out_dir={out_dir}",
+            label=debug_label,
+        )
+        if jobs != 1:
+            debug_print(
+                args,
+                "parallel trial debug output may interleave; use --jobs 1 for the cleanest trace",
+                label=debug_label,
+            )
+        for idx, candidate in enumerate(candidates, start=1):
+            debug_print(args, f"candidate {idx}: {candidate}", label=debug_label)
     payloads = [
         (sweep_arg_values(args), candidate, str(out_dir), trial_index, args.trial_worst_plots)
         for trial_index, candidate in enumerate(candidates, start=1)
@@ -5723,10 +5852,14 @@ def run_sweep_command(
                     try:
                         result = future.result()
                     except Exception as exc:
+                        summary: dict[str, object] = {"error": str(exc)}
+                        traceback_text = debug_traceback(args)
+                        if traceback_text:
+                            summary["traceback"] = traceback_text
                         result = {
                             "trial": payload[3],
                             "candidate": payload[1],
-                            "summary": {"error": str(exc)},
+                            "summary": summary,
                             "metric": None,
                             "plot_paths": [],
                         }

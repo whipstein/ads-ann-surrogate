@@ -33,6 +33,7 @@ from common.surrogate_common import (  # noqa: E402
     MDIFBlock,
     MLP,
     Standardizer,
+    add_debug_argument,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
@@ -48,6 +49,7 @@ from common.surrogate_common import (  # noqa: E402
     infer_parameter_names,
     load_sweep_rows,
     infer_uniform_hidden_layout,
+    load_or_write_trial_summary,
     make_training_progress_callback,
     metadata_csv,
     metadata_hidden_layers,
@@ -56,6 +58,7 @@ from common.surrogate_common import (  # noqa: E402
     normalize_sparam_weights,
     output_weights_from_sparam_weights,
     parse_csv_set,
+    debug_traceback,
     parse_float_options,
     parse_hidden_layer_options,
     parse_hidden_layers,
@@ -67,6 +70,7 @@ from common.surrogate_common import (  # noqa: E402
     plot_sweep_diagnostics,
     plot_worst_case_fits,
     plot_worst_case_y_fits,
+    print_cli_error,
     read_mdif,
     read_model_metadata,
     rerank_sweep_rows,
@@ -952,6 +956,7 @@ def namespace_for_trial(
         target_z0=args.target_z0,
         worst_plots=plots,
         sparam_weights=args.sparam_weights,
+        debug=bool(getattr(args, "debug", False)),
         quiet=True,
     )
 
@@ -962,6 +967,7 @@ def dnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object], 
     out_dir = Path(out_dir_text)
     trial_dir = out_dir / "trials" / f"trial_{trial_index:04d}"
     error_message = None
+    error_traceback = None
     trial_seed = sweep_trial_seed(args.seed, trial_index, getattr(args, "trial_seed_mode", "fixed"))
     try:
         trial_args = namespace_for_trial(args, candidate, trial_dir, trial_index, plots=plots)
@@ -969,13 +975,15 @@ def dnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object], 
     except Exception as exc:
         status = 2
         error_message = str(exc)
+        error_traceback = debug_traceback(args)
     summary_path = trial_dir / "verification_summary.json"
-    if status != 0 or not summary_path.exists():
-        summary: dict[str, object] = {"error": error_message or "trial failed"}
-        metric_value = None
-    else:
-        summary = json.loads(summary_path.read_text())
-        metric_value = summary_metric(summary, args.selection_metric)
+    summary = load_or_write_trial_summary(
+        summary_path,
+        status=status,
+        error_message=error_message,
+        traceback_text=error_traceback,
+    )
+    metric_value = summary_metric(summary, args.selection_metric) if status == 0 else None
     return {
         "trial": trial_index,
         "candidate": candidate,
@@ -1168,6 +1176,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="S-parameter loss weights. Examples: 'diag=1;offdiag=0.2' or 'S11,S22=1;S12,S21=0.1'. Later rules override earlier ones.",
     )
     train.add_argument("--worst-plots", type=int, default=6)
+    add_debug_argument(train)
     train.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
     train.set_defaults(func=command_train)
 
@@ -1234,6 +1243,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--worst-plots", type=int, default=6)
     sweep.add_argument("--trial-worst-plots", type=int, default=1)
     sweep.add_argument("--keep-trial-models", action="store_true")
+    add_debug_argument(sweep)
     sweep.add_argument(
         "--retrain-best",
         action="store_true",
@@ -1416,7 +1426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print_cli_error(args, exc)
         return 2
 
 
