@@ -102,10 +102,11 @@ built-in renderer, but those plots are intended as a fallback rather than an
 exact visual match to the example.
 
 Training writes multi-page PDF plots for the worst verification cases by
-default. The S-parameter plots show the direct fit quality; the matching
-Y-parameter plots under `worst_case_y_plots/` show the admittance response that
-the Verilog-A implementation stamps after S-to-Y conversion. Use
-`--worst-plots 0` to skip both plot sets during large experiments.
+default. The S-parameter plots include Smith/complex response grids along with
+magnitude, phase, and error-focus pages. The matching Y-parameter plots under
+`worst_case_y_plots/` show the admittance response as modeled-vs-measured
+real/imaginary frequency plots. Use `--worst-plots 0` to skip both plot sets
+during large experiments.
 
 For `plain` models, `--coarse-mdif` is not needed. For `prior-input` models, it
 is required. For `residual` models, omitting `--coarse-mdif` uses a zero coarse

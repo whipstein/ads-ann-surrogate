@@ -97,12 +97,12 @@ built-in renderer, but those plots are intended as a fallback rather than an
 exact visual match to the example.
 
 Training writes multi-page PDF plots for the worst verification cases by
-default. Each plot contains a magnitude grid for all S-parameters, an unwrapped
-phase grid, and an error-focus page with a max magnitude-error heatmap plus the
-worst S-parameter overlay. The same cases are also converted to Y-parameters
-with `--target-z0` and written under `worst_case_y_plots/`, which shows the
-admittance response used by the direct Verilog-A implementation. Use
-`--worst-plots 0` to skip both plot sets during large experiments.
+default. Each S-parameter plot contains a Smith/complex response grid, a
+magnitude grid, an unwrapped phase grid, and an error-focus page. The same cases
+are also converted to Y-parameters with `--target-z0` and written under
+`worst_case_y_plots/`, where modeled and measured admittance are shown as
+real/imaginary frequency plots. Use `--worst-plots 0` to skip both plot sets
+during large experiments.
 Each single `train` run also writes `training_summary.md`, which collects the
 chosen settings, final loss values, verification metrics, passivity summary,
 and links to the generated S- and Y-parameter worst-case plots.

@@ -222,8 +222,9 @@ A normal `train` run writes:
 - `verification_summary.json` with global errors and passivity summary data.
 - `training_history.csv` with train/verification loss history.
 - `training_summary.md` with a human-readable run summary.
-- `worst_case_plots/*.pdf` with S-parameter magnitude, phase, and error views.
-- `worst_case_y_plots/*.pdf` with Y-parameter implementation-view diagnostics.
+- `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
+  and error views.
+- `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
 
 Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
 diagnostic plots, and a promoted `best_model/` directory. DNN and KBNN sweep

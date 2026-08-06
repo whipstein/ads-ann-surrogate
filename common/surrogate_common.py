@@ -3188,6 +3188,98 @@ def response_magnitude_axis_label(response_kind: str) -> str:
     return f"|{str(response_kind or 'S').strip().upper()}ij| (dB)"
 
 
+def response_component_axis_label(response_kind: str, component: str) -> str:
+    kind = str(response_kind or "S").strip().upper()
+    component_name = "Real" if component == "real" else "Imaginary"
+    if kind == "Y":
+        return f"{component_name}({kind}ij) (siemens)"
+    return f"{component_name}({kind}ij)"
+
+
+def square_plot_rect(rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    left, top, width, height = rect
+    size = min(width, height)
+    return (left + (width - size) / 2.0, top + (height - size) / 2.0, size, size)
+
+
+def complex_points_to_rect(
+    values: np.ndarray,
+    rect: tuple[float, float, float, float],
+    limit: float = 1.08,
+) -> list[tuple[float, float]]:
+    left, top, width, height = rect
+    points: list[tuple[float, float]] = []
+    for value in values:
+        if not np.isfinite(value.real) or not np.isfinite(value.imag):
+            continue
+        px = left + width * (float(value.real) + limit) / (2.0 * limit)
+        py = top + height * (1.0 - (float(value.imag) + limit) / (2.0 * limit))
+        points.append((px, py))
+    return points
+
+
+def smith_chart_curves() -> list[tuple[np.ndarray, tuple[float, float, float], float, str | None]]:
+    curves: list[tuple[np.ndarray, tuple[float, float, float], float, str | None]] = []
+    grid_color = (0.78, 0.80, 0.82)
+    axis_color = (0.58, 0.60, 0.62)
+    boundary_color = (0.34, 0.36, 0.38)
+    theta = np.linspace(0.0, 2.0 * math.pi, 361)
+    curves.append((np.exp(1j * theta), boundary_color, 1.0, None))
+
+    reactance_values = np.linspace(-20.0, 20.0, 600)
+    for resistance in [0.2, 0.5, 1.0, 2.0, 5.0]:
+        z_norm = resistance + 1j * reactance_values
+        gamma = (z_norm - 1.0) / (z_norm + 1.0)
+        curves.append((gamma, grid_color, 0.55, None))
+
+    resistance_values = np.linspace(0.0, 20.0, 600)
+    for reactance in [0.2, 0.5, 1.0, 2.0, 5.0]:
+        for sign in [-1.0, 1.0]:
+            z_norm = resistance_values + 1j * sign * reactance
+            gamma = (z_norm - 1.0) / (z_norm + 1.0)
+            curves.append((gamma, grid_color, 0.55, None))
+
+    curves.append((np.linspace(-1.0, 1.0, 241).astype(complex), axis_color, 0.7, "[2 3] 0"))
+    curves.append((1j * np.linspace(-1.0, 1.0, 241), axis_color, 0.7, "[2 3] 0"))
+    return curves
+
+
+def draw_smith_chart_axes(
+    canvas: PdfCanvas,
+    rect: tuple[float, float, float, float],
+) -> None:
+    canvas.rect(rect[0], rect[1], rect[2], rect[3], stroke=(0.88, 0.88, 0.88), fill=(1.0, 1.0, 1.0))
+    for curve, color, width, dash in smith_chart_curves():
+        canvas.polyline(complex_points_to_rect(curve, rect), color=color, width=width, dash=dash)
+
+
+def draw_smith_subplot(
+    canvas: PdfCanvas,
+    rect: tuple[float, float, float, float],
+    truth_values: np.ndarray,
+    pred_values: np.ndarray,
+    label: str,
+    show_legend: bool,
+) -> None:
+    left, top, width, _height = rect
+    chart_rect = square_plot_rect((rect[0], rect[1] + 4.0, rect[2], max(rect[3] - 10.0, 20.0)))
+    canvas.text(left + width / 2, top - 12, label, size=13, font="F2", align="center")
+    draw_smith_chart_axes(canvas, chart_rect)
+    canvas.polyline(
+        complex_points_to_rect(pred_values, chart_rect),
+        color=(0.1216, 0.4667, 0.7059),
+        width=1.8,
+    )
+    canvas.polyline(
+        complex_points_to_rect(truth_values, chart_rect),
+        color=(1.0, 0.498, 0.0549),
+        width=1.8,
+        dash="[5 3] 0",
+    )
+    if show_legend:
+        draw_legend(canvas, chart_rect, location="upper_left")
+
+
 def case_metrics(
     truth: MDIFBlock,
     pred: MDIFBlock,
@@ -3268,6 +3360,23 @@ def draw_legend(canvas: PdfCanvas, rect: tuple[float, float, float, float], loca
     canvas.text(legend_left + 30, legend_top + 23, "measured", size=10)
 
 
+def draw_component_legend(canvas: PdfCanvas, rect: tuple[float, float, float, float]) -> None:
+    left, top, _width, _height = rect
+    legend_left = left + 10
+    legend_top = top + 12
+    entries = [
+        ("modeled real", (0.1216, 0.4667, 0.7059), None),
+        ("measured real", (1.0, 0.498, 0.0549), "[5 3] 0"),
+        ("modeled imag", (0.1725, 0.6275, 0.1725), None),
+        ("measured imag", (0.8392, 0.1529, 0.1569), "[5 3] 0"),
+    ]
+    canvas.rect(legend_left - 8, legend_top - 10, 136, 82, stroke=(0.82, 0.82, 0.82), fill=(1.0, 1.0, 1.0))
+    for idx, (label, color, dash) in enumerate(entries):
+        y = legend_top + 19 * idx
+        canvas.line(legend_left, y, legend_left + 24, y, color=color, width=1.8, dash=dash)
+        canvas.text(legend_left + 30, y + 4, label, size=9)
+
+
 def draw_series_subplot(
     canvas: PdfCanvas,
     rect: tuple[float, float, float, float],
@@ -3341,10 +3450,20 @@ def draw_grid_page(
             truth_y = mag_db(truth.sparams[label])
             pred_y = mag_db(pred.sparams[label])
             y_label = response_magnitude_axis_label(response_kind)
-        else:
+        elif quantity == "phase":
             truth_y = unwrapped_phase_deg(truth.sparams[label])
             pred_y = unwrapped_phase_deg(pred.sparams[label])
             y_label = "Phase (deg)"
+        elif quantity == "real":
+            truth_y = np.real(truth.sparams[label])
+            pred_y = np.real(pred.sparams[label])
+            y_label = response_component_axis_label(response_kind, "real")
+        elif quantity == "imag":
+            truth_y = np.imag(truth.sparams[label])
+            pred_y = np.imag(pred.sparams[label])
+            y_label = response_component_axis_label(response_kind, "imag")
+        else:
+            raise ValueError(f"Unsupported plot quantity {quantity!r}")
         draw_series_subplot(
             canvas,
             rect,
@@ -3353,6 +3472,53 @@ def draw_grid_page(
             pred_y,
             response_plot_label(label, response_kind),
             y_label,
+            show_legend=idx == 0,
+        )
+    return canvas
+
+
+def draw_smith_grid_page(
+    truth: MDIFBlock,
+    pred: MDIFBlock,
+    labels: Sequence[str],
+    case_name: str,
+    metrics: dict[str, object],
+    title: str,
+    response_kind: str = "S",
+) -> PdfCanvas:
+    rows, cols, ordered = subplot_grid(labels)
+    canvas = PdfCanvas(width=1133.0, height=830.0)
+    header_bottom = draw_page_header(canvas, title, case_name, metrics, "Smith / complex plane")
+    margin_x = 70.0 if cols >= 4 else 86.0
+    margin_bottom = 58.0
+    grid_top = max(142.0, header_bottom + 48.0)
+    gap_x = 52.0 if cols <= 2 else 84.0 if cols >= 4 else 65.0
+    if rows <= 2:
+        gap_y = 82.0
+    elif rows == 3:
+        gap_y = 62.0
+    else:
+        gap_y = 50.0
+    plot_w = (canvas.width - 2 * margin_x - gap_x * (cols - 1)) / cols
+    plot_h = (canvas.height - grid_top - margin_bottom - gap_y * (rows - 1)) / rows
+
+    for idx, label in enumerate(ordered):
+        if label not in truth.sparams or label not in pred.sparams:
+            continue
+        row = idx // cols
+        col = idx % cols
+        rect = (
+            margin_x + col * (plot_w + gap_x),
+            grid_top + row * (plot_h + gap_y),
+            plot_w,
+            plot_h,
+        )
+        draw_smith_subplot(
+            canvas,
+            rect,
+            truth.sparams[label],
+            pred.sparams[label],
+            response_plot_label(label, response_kind),
             show_legend=idx == 0,
         )
     return canvas
@@ -3482,26 +3648,51 @@ def draw_focus_page(
     worst_label = str(metrics["worst_sparam"])
     worst_display = response_plot_label(worst_label, response_kind)
     freq_ghz = truth.freq_hz / 1e9
-    truth_mag = mag_db(truth.sparams[worst_label])
-    pred_mag = mag_db(pred.sparams[worst_label])
+    is_y_response = str(response_kind or "S").strip().upper() == "Y"
     x_range = expanded_range([freq_ghz])
-    y_range = expanded_range([truth_mag, pred_mag])
     canvas.text(focus_rect[0] + focus_rect[2] / 2, focus_rect[1] - 18, f"Worst {worst_display}", size=14, font="F2", align="center")
-    pdf_ticks(
-        canvas,
-        focus_rect,
-        x_range,
-        y_range,
-        response_magnitude_axis_label(response_kind),
-        "Frequency (GHz)",
-        tick_size=9.0,
-        label_size=10.0,
-        x_label_offset=27.0,
-        y_label_offset=42.0,
-    )
-    canvas.polyline(plot_points(freq_ghz, pred_mag, x_range, y_range, focus_rect), color=(0.1216, 0.4667, 0.7059), width=2.0)
-    canvas.polyline(plot_points(freq_ghz, truth_mag, x_range, y_range, focus_rect), color=(1.0, 0.498, 0.0549), width=2.0, dash="[5 3] 0")
-    draw_legend(canvas, focus_rect, location="upper_left")
+    if is_y_response:
+        truth_real = np.real(truth.sparams[worst_label])
+        pred_real = np.real(pred.sparams[worst_label])
+        truth_imag = np.imag(truth.sparams[worst_label])
+        pred_imag = np.imag(pred.sparams[worst_label])
+        y_range = expanded_range([truth_real, pred_real, truth_imag, pred_imag])
+        pdf_ticks(
+            canvas,
+            focus_rect,
+            x_range,
+            y_range,
+            "Admittance (siemens)",
+            "Frequency (GHz)",
+            tick_size=9.0,
+            label_size=10.0,
+            x_label_offset=27.0,
+            y_label_offset=42.0,
+        )
+        canvas.polyline(plot_points(freq_ghz, pred_real, x_range, y_range, focus_rect), color=(0.1216, 0.4667, 0.7059), width=2.0)
+        canvas.polyline(plot_points(freq_ghz, truth_real, x_range, y_range, focus_rect), color=(1.0, 0.498, 0.0549), width=2.0, dash="[5 3] 0")
+        canvas.polyline(plot_points(freq_ghz, pred_imag, x_range, y_range, focus_rect), color=(0.1725, 0.6275, 0.1725), width=2.0)
+        canvas.polyline(plot_points(freq_ghz, truth_imag, x_range, y_range, focus_rect), color=(0.8392, 0.1529, 0.1569), width=2.0, dash="[5 3] 0")
+        draw_component_legend(canvas, focus_rect)
+    else:
+        truth_mag = mag_db(truth.sparams[worst_label])
+        pred_mag = mag_db(pred.sparams[worst_label])
+        y_range = expanded_range([truth_mag, pred_mag])
+        pdf_ticks(
+            canvas,
+            focus_rect,
+            x_range,
+            y_range,
+            response_magnitude_axis_label(response_kind),
+            "Frequency (GHz)",
+            tick_size=9.0,
+            label_size=10.0,
+            x_label_offset=27.0,
+            y_label_offset=42.0,
+        )
+        canvas.polyline(plot_points(freq_ghz, pred_mag, x_range, y_range, focus_rect), color=(0.1216, 0.4667, 0.7059), width=2.0)
+        canvas.polyline(plot_points(freq_ghz, truth_mag, x_range, y_range, focus_rect), color=(1.0, 0.498, 0.0549), width=2.0, dash="[5 3] 0")
+        draw_legend(canvas, focus_rect, location="upper_left")
     passivity = metrics.get("passivity")
     max_sigma = None
     if isinstance(passivity, dict):
@@ -3592,10 +3783,20 @@ def matplotlib_grid_page(
             truth_y = mag_db(truth.sparams[label])
             pred_y = mag_db(pred.sparams[label])
             y_label = response_magnitude_axis_label(response_kind)
-        else:
+        elif quantity == "phase":
             truth_y = unwrapped_phase_deg(truth.sparams[label])
             pred_y = unwrapped_phase_deg(pred.sparams[label])
             y_label = "Phase (deg)"
+        elif quantity == "real":
+            truth_y = np.real(truth.sparams[label])
+            pred_y = np.real(pred.sparams[label])
+            y_label = response_component_axis_label(response_kind, "real")
+        elif quantity == "imag":
+            truth_y = np.imag(truth.sparams[label])
+            pred_y = np.imag(pred.sparams[label])
+            y_label = response_component_axis_label(response_kind, "imag")
+        else:
+            raise ValueError(f"Unsupported plot quantity {quantity!r}")
         ax.plot(freq_ghz, pred_y, color="#1f77b4", linewidth=1.5, label="modeled")
         ax.plot(freq_ghz, truth_y, color="#ff7f0e", linestyle="--", linewidth=1.25, label="measured")
         ax.set_title(response_plot_label(label, response_kind), fontsize=12)
@@ -3604,6 +3805,66 @@ def matplotlib_grid_page(
         ax.grid(True, alpha=0.28)
         if idx == 0:
             ax.legend(loc="upper right", fontsize=9, frameon=True)
+    return fig
+
+
+def matplotlib_draw_smith_axes(ax: object) -> None:
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-1.08, 1.08)
+    ax.set_ylim(-1.08, 1.08)
+    ax.axis("off")
+    for curve, color, width, dash in smith_chart_curves():
+        linestyle = ":" if dash else "-"
+        ax.plot(np.real(curve), np.imag(curve), color=color, linewidth=width, linestyle=linestyle, zorder=1)
+
+
+def matplotlib_smith_grid_page(
+    plt: object,
+    truth: MDIFBlock,
+    pred: MDIFBlock,
+    labels: Sequence[str],
+    case_name: str,
+    metrics: dict[str, object],
+    title: str,
+    response_kind: str = "S",
+) -> object:
+    rows, cols, ordered = subplot_grid(labels)
+    fig, axes = plt.subplots(rows, cols, figsize=(15.74, 11.53), squeeze=False)
+    header = matplotlib_header(title, case_name, metrics, "Smith / complex plane")
+    header_lines = header.count("\n") + 1
+    top = max(0.58, 0.82 - 0.028 * max(header_lines - 3, 0))
+    fig.subplots_adjust(left=0.055, right=0.985, bottom=0.055, top=top, wspace=0.18, hspace=0.42)
+    fig.suptitle(header, fontsize=12, y=0.985)
+
+    for idx, ax in enumerate(axes.ravel()):
+        if idx >= len(ordered):
+            ax.axis("off")
+            continue
+        label = ordered[idx]
+        if label not in truth.sparams or label not in pred.sparams:
+            ax.axis("off")
+            continue
+        matplotlib_draw_smith_axes(ax)
+        ax.plot(
+            np.real(pred.sparams[label]),
+            np.imag(pred.sparams[label]),
+            color="#1f77b4",
+            linewidth=1.5,
+            label="modeled",
+            zorder=3,
+        )
+        ax.plot(
+            np.real(truth.sparams[label]),
+            np.imag(truth.sparams[label]),
+            color="#ff7f0e",
+            linestyle="--",
+            linewidth=1.25,
+            label="measured",
+            zorder=4,
+        )
+        ax.set_title(response_plot_label(label, response_kind), fontsize=12)
+        if idx == 0:
+            ax.legend(loc="upper left", fontsize=9, frameon=True)
     return fig
 
 
@@ -3667,13 +3928,47 @@ def matplotlib_focus_page(
     worst_label = str(metrics["worst_sparam"])
     worst_display = response_plot_label(worst_label, response_kind)
     freq_ghz = truth.freq_hz / 1e9
-    truth_mag = mag_db(truth.sparams[worst_label])
-    pred_mag = mag_db(pred.sparams[worst_label])
-    focus_ax.plot(freq_ghz, pred_mag, color="#1f77b4", linewidth=1.5, label="modeled")
-    focus_ax.plot(freq_ghz, truth_mag, color="#ff7f0e", linestyle="--", linewidth=1.25, label="measured")
+    is_y_response = str(response_kind or "S").strip().upper() == "Y"
+    if is_y_response:
+        focus_ax.plot(
+            freq_ghz,
+            np.real(pred.sparams[worst_label]),
+            color="#1f77b4",
+            linewidth=1.5,
+            label="modeled real",
+        )
+        focus_ax.plot(
+            freq_ghz,
+            np.real(truth.sparams[worst_label]),
+            color="#ff7f0e",
+            linestyle="--",
+            linewidth=1.25,
+            label="measured real",
+        )
+        focus_ax.plot(
+            freq_ghz,
+            np.imag(pred.sparams[worst_label]),
+            color="#2ca02c",
+            linewidth=1.5,
+            label="modeled imag",
+        )
+        focus_ax.plot(
+            freq_ghz,
+            np.imag(truth.sparams[worst_label]),
+            color="#d62728",
+            linestyle="--",
+            linewidth=1.25,
+            label="measured imag",
+        )
+        focus_ax.set_ylabel("Admittance (siemens)")
+    else:
+        truth_mag = mag_db(truth.sparams[worst_label])
+        pred_mag = mag_db(pred.sparams[worst_label])
+        focus_ax.plot(freq_ghz, pred_mag, color="#1f77b4", linewidth=1.5, label="modeled")
+        focus_ax.plot(freq_ghz, truth_mag, color="#ff7f0e", linestyle="--", linewidth=1.25, label="measured")
+        focus_ax.set_ylabel(response_magnitude_axis_label(response_kind))
     focus_ax.set_title(f"Worst {worst_display}", fontsize=12)
     focus_ax.set_xlabel("Frequency (GHz)")
-    focus_ax.set_ylabel(response_magnitude_axis_label(response_kind))
     focus_ax.grid(True, alpha=0.28)
     focus_ax.legend(loc="upper left", fontsize=9, frameon=True)
 
@@ -3708,17 +4003,41 @@ def write_case_pdf_matplotlib(
     title: str,
     metrics: dict[str, object],
     response_kind: str = "S",
+    plot_quantities: Sequence[str] | None = None,
+    include_smith: bool = False,
 ) -> bool:
     modules = load_matplotlib_modules()
     if modules is None:
         return False
     plt, PdfPages = modules
+    quantities = list(plot_quantities or ["magnitude", "phase"])
+    figures = []
+    if include_smith:
+        figures.append(matplotlib_smith_grid_page(plt, truth, pred, labels, case_name, metrics, title, response_kind))
+    page_labels = {
+        "magnitude": "Magnitude",
+        "phase": "Unwrapped phase",
+        "real": "Real",
+        "imag": "Imaginary",
+    }
+    for quantity in quantities:
+        figures.append(
+            matplotlib_grid_page(
+                plt,
+                truth,
+                pred,
+                labels,
+                case_name,
+                metrics,
+                title,
+                page_labels.get(quantity, quantity.title()),
+                quantity,
+                response_kind,
+            )
+        )
+    figures.append(matplotlib_focus_page(plt, truth, pred, labels, case_name, metrics, title, response_kind))
     with PdfPages(path) as pdf:
-        for figure in [
-            matplotlib_grid_page(plt, truth, pred, labels, case_name, metrics, title, "Magnitude", "magnitude", response_kind),
-            matplotlib_grid_page(plt, truth, pred, labels, case_name, metrics, title, "Unwrapped phase", "phase", response_kind),
-            matplotlib_focus_page(plt, truth, pred, labels, case_name, metrics, title, response_kind),
-        ]:
+        for figure in figures:
             pdf.savefig(figure)
             plt.close(figure)
     return True
@@ -3734,17 +4053,52 @@ def write_case_pdf(
     metrics: dict[str, object],
     title: str | None = None,
     response_kind: str = "S",
+    plot_quantities: Sequence[str] | None = None,
+    include_smith: bool | None = None,
 ) -> None:
     param_text = ", ".join(f"{name}={truth.params.get(name, '')}" for name in parameter_names)
     case_name = f"block_{truth.source_index}" + (f" | {param_text}" if param_text else "")
     plot_title = title or f"Worst verification case {rank}"
-    if write_case_pdf_matplotlib(path, truth, pred, labels, case_name, plot_title, metrics, response_kind):
+    kind = str(response_kind or "S").strip().upper()
+    quantities = list(plot_quantities or (["real", "imag"] if kind == "Y" else ["magnitude", "phase"]))
+    add_smith = bool(kind == "S" if include_smith is None else include_smith)
+    if write_case_pdf_matplotlib(
+        path,
+        truth,
+        pred,
+        labels,
+        case_name,
+        plot_title,
+        metrics,
+        response_kind,
+        plot_quantities=quantities,
+        include_smith=add_smith,
+    ):
         return
-    pages = [
-        draw_grid_page(truth, pred, labels, case_name, metrics, plot_title, "Magnitude", "magnitude", response_kind),
-        draw_grid_page(truth, pred, labels, case_name, metrics, plot_title, "Unwrapped phase", "phase", response_kind),
-        draw_focus_page(truth, pred, labels, case_name, metrics, plot_title, response_kind),
-    ]
+    pages = []
+    if add_smith:
+        pages.append(draw_smith_grid_page(truth, pred, labels, case_name, metrics, plot_title, response_kind))
+    page_labels = {
+        "magnitude": "Magnitude",
+        "phase": "Unwrapped phase",
+        "real": "Real",
+        "imag": "Imaginary",
+    }
+    for quantity in quantities:
+        pages.append(
+            draw_grid_page(
+                truth,
+                pred,
+                labels,
+                case_name,
+                metrics,
+                plot_title,
+                page_labels.get(quantity, quantity.title()),
+                quantity,
+                response_kind,
+            )
+        )
+    pages.append(draw_focus_page(truth, pred, labels, case_name, metrics, plot_title, response_kind))
     save_pdf_pages(path, pages)
 
 
@@ -4920,7 +5274,6 @@ def run_sweep_command(
         (sweep_arg_values(args), candidate, str(out_dir), trial_index, args.trial_worst_plots)
         for trial_index, candidate in enumerate(candidates, start=1)
     ]
-    sweep_start_time = time.monotonic()
     print(
         f"sweep start: {len(candidates)} trials, jobs={jobs}, "
         f"selection_metric={args.selection_metric}",
@@ -4966,17 +5319,14 @@ def run_sweep_command(
                     else:
                         live_promotion_warning = warning
                         print(f"warning: {warning}", file=sys.stderr, flush=True)
-        elapsed = format_duration(time.monotonic() - sweep_start_time)
         metric_display = metric_text(metric_value) if metric_value is not None else "failed"
-        best_display = (
-            f" current_best=trial {live_best_trial} {args.selection_metric}={metric_text(best_metric)}"
-            if live_best_trial is not None and best_metric is not None
-            else ""
-        )
+        passivity_violations = metric_text(row.get("passivity_violating_points"))
+        passivity_max_sigma = metric_text(row.get("passivity_max_singular_value"))
         print(
-            f"trial complete {len(rows)}/{len(candidates)} "
-            f"(trial {trial_index}, elapsed {elapsed}) "
-            f"{args.selection_metric}={metric_display}{best_display} config={candidate}",
+            f"trial complete {trial_index}/{len(candidates)} "
+            f"{args.selection_metric}={metric_display} "
+            f"passivity_violations={passivity_violations} "
+            f"passivity_max_sigma={passivity_max_sigma}",
             flush=True,
         )
         cleanup_trial_dir(trials_dir / f"trial_{trial_index:04d}", args.keep_trial_models)
