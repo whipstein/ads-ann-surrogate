@@ -177,6 +177,12 @@ combinations are skipped: `plain` forces this off and `prior-input` forces it
 on. If `--coarse-mdif` is omitted, `prior-input` and coarse-input residual
 candidates are skipped before the sweep starts.
 
+For fitting failures that do not produce an obvious Python error, rerun a small
+or representative sweep with `--debug --jobs 1`. Debug mode prints the selected
+candidate list, per-trial block/sample counts, feature and target scaling
+statistics, constant columns, and initial-to-final scaled losses. Each trial
+also writes `kbnn_training_debug.json` in its trial directory.
+
 Use `--sparam-weights` to make some S-parameters matter less during training
 and sweep selection. In residual KBNN mode, the weights apply to the residual
 target for each S-parameter. Rules are applied left to right, so later rules

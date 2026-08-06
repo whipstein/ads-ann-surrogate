@@ -4749,6 +4749,8 @@ def write_training_markdown(
     ]
     if (path.parent / "training_history.pdf").exists():
         artifacts.insert(3, ("Training loss plot", "training_history.pdf"))
+    if (path.parent / "kbnn_training_debug.json").exists():
+        artifacts.append(("KBNN debug diagnostics", "kbnn_training_debug.json"))
     if not warning:
         artifacts.extend(
             [

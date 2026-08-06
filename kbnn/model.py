@@ -20,6 +20,7 @@ import json
 import math
 import shutil
 import sys
+import traceback
 from pathlib import Path
 from typing import Sequence
 
@@ -53,6 +54,7 @@ from common.surrogate_common import (  # noqa: E402
     metadata_csv,
     metadata_hidden_layers,
     model_settings_title,
+    mse,
     normalize_name,
     normalize_sparam_weights,
     output_weights_from_sparam_weights,
@@ -279,6 +281,262 @@ def fit_output_standardizer(
         if bool(is_floored)
     ]
     return scaler, floored_columns, floor
+
+
+def kbnn_feature_columns(
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    mode: str,
+    include_coarse_input: bool,
+    freq_transform: str,
+) -> list[str]:
+    columns = [*parameter_names, *frequency_feature_columns(freq_transform)]
+    include_coarse = bool(include_coarse_input or normalize_mode(mode) == "prior-input")
+    if normalize_mode(mode) == "plain":
+        include_coarse = False
+    if include_coarse:
+        columns.extend(f"coarse_{label}_real" for label in labels)
+        columns.extend(f"coarse_{label}_imag" for label in labels)
+    return list(columns)
+
+
+def finite_array_stats(values: np.ndarray) -> dict[str, object]:
+    array = np.asarray(values, dtype=float)
+    finite = array[np.isfinite(array)]
+    stats: dict[str, object] = {
+        "shape": [int(size) for size in array.shape],
+        "finite_values": int(finite.size),
+        "nonfinite_values": int(array.size - finite.size),
+    }
+    if finite.size:
+        stats.update(
+            {
+                "min": float(np.min(finite)),
+                "max": float(np.max(finite)),
+                "mean": float(np.mean(finite)),
+                "std": float(np.std(finite)),
+                "rms": float(np.sqrt(np.mean(finite * finite))),
+            }
+        )
+    return stats
+
+
+def vector_stats(values: np.ndarray) -> dict[str, object]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return {"finite_values": 0}
+    return {
+        "finite_values": int(finite.size),
+        "min": float(np.min(finite)),
+        "median": float(np.median(finite)),
+        "max": float(np.max(finite)),
+    }
+
+
+def finite_loss(value: object) -> float | None:
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def compact_list(values: Sequence[object], limit: int = 12) -> list[object]:
+    items = list(values)
+    if len(items) <= limit:
+        return items
+    return [*items[:limit], f"... ({len(items) - limit} more)"]
+
+
+def debug_print(args: argparse.Namespace, message: str) -> None:
+    if getattr(args, "debug", False):
+        label = str(getattr(args, "progress_label", "KBNN debug"))
+        print(f"debug: {label}: {message}", file=sys.stderr, flush=True)
+
+
+def build_training_debug_info(
+    args: argparse.Namespace,
+    mode: str,
+    include_coarse_input: bool,
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    train_fine: Sequence[MDIFBlock],
+    verify_fine: Sequence[MDIFBlock],
+    train_coarse: Sequence[MDIFBlock],
+    verify_coarse: Sequence[MDIFBlock],
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_verify: np.ndarray | None,
+    y_verify: np.ndarray | None,
+    x_scaler: Standardizer,
+    y_scaler: Standardizer,
+    floored_output_columns: Sequence[str],
+    output_std_floor: float,
+    initial_train_loss: float,
+    initial_verify_loss: float | None,
+    final_train_loss: float,
+    final_verify_loss: float | None,
+    history: Sequence[dict[str, float]],
+) -> dict[str, object]:
+    feature_columns = kbnn_feature_columns(
+        parameter_names,
+        labels,
+        mode,
+        include_coarse_input,
+        args.freq_transform,
+    )
+    target_columns = sparameter_real_imag_columns(labels)
+    raw_x_std = np.std(x_train, axis=0)
+    raw_y_std = np.std(y_train, axis=0)
+    constant_features = [
+        name
+        for name, std in zip(feature_columns, raw_x_std)
+        if math.isfinite(float(std)) and float(std) < EPS
+    ]
+    constant_targets = [
+        name
+        for name, std in zip(target_columns, raw_y_std)
+        if math.isfinite(float(std)) and float(std) < EPS
+    ]
+    best_history = None
+    if history:
+        def history_val_loss(row: dict[str, float]) -> float:
+            value = finite_loss(row.get("val_loss"))
+            return value if value is not None else float("inf")
+
+        best_history = min(
+            history,
+            key=history_val_loss,
+        )
+    coarse_train_keys = [block_key(block, parameter_names) for block in train_coarse] if train_coarse else []
+    fine_train_keys = [block_key(block, parameter_names) for block in train_fine]
+    alignment_mismatches = 0
+    if train_coarse:
+        alignment_mismatches += sum(
+            int(fine_key != coarse_key)
+            for fine_key, coarse_key in zip(fine_train_keys, coarse_train_keys)
+        )
+    if verify_fine and verify_coarse:
+        alignment_mismatches += sum(
+            int(block_key(fine, parameter_names) != block_key(coarse, parameter_names))
+            for fine, coarse in zip(verify_fine, verify_coarse)
+        )
+    return {
+        "mode": mode,
+        "include_coarse_input": bool(include_coarse_input),
+        "coarse_mdif_supplied": bool(args.coarse_mdif),
+        "coarse_verification_mdif_supplied": bool(args.coarse_verification_mdif),
+        "freq_transform": args.freq_transform,
+        "parameter_names": list(parameter_names),
+        "sparam_labels": list(labels),
+        "blocks": {
+            "train_fine": len(train_fine),
+            "verify_fine": len(verify_fine),
+            "train_coarse": len(train_coarse),
+            "verify_coarse": len(verify_coarse),
+            "coarse_alignment_mismatches": int(alignment_mismatches),
+        },
+        "samples": {
+            "x_train": finite_array_stats(x_train),
+            "y_train": finite_array_stats(y_train),
+            "x_verify": finite_array_stats(x_verify) if x_verify is not None else None,
+            "y_verify": finite_array_stats(y_verify) if y_verify is not None else None,
+        },
+        "feature_scaling": {
+            "columns": feature_columns,
+            "raw_std": vector_stats(raw_x_std),
+            "scaler_std": vector_stats(x_scaler.std if x_scaler.std is not None else np.asarray([])),
+            "constant_columns": constant_features,
+        },
+        "target_scaling": {
+            "columns": target_columns,
+            "raw_std": vector_stats(raw_y_std),
+            "scaler_std": vector_stats(y_scaler.std if y_scaler.std is not None else np.asarray([])),
+            "constant_columns": constant_targets,
+            "floored_output_columns": list(floored_output_columns),
+            "output_std_floor": float(output_std_floor),
+        },
+        "loss_scaled": {
+            "initial_train": float(initial_train_loss),
+            "initial_verify": finite_loss(initial_verify_loss),
+            "final_best_train": float(final_train_loss),
+            "final_best_verify": finite_loss(final_verify_loss),
+            "improvement_train": (
+                float(initial_train_loss / final_train_loss)
+                if final_train_loss > 0.0
+                else None
+            ),
+            "improvement_verify": (
+                float(initial_verify_loss / final_verify_loss)
+                if initial_verify_loss is not None and final_verify_loss is not None and final_verify_loss > 0.0
+                else None
+            ),
+        },
+        "history": {
+            "rows": len(history),
+            "first": dict(history[0]) if history else None,
+            "last_recorded": dict(history[-1]) if history else None,
+            "best_recorded": dict(best_history) if best_history is not None else None,
+        },
+    }
+
+
+def emit_training_debug(args: argparse.Namespace, info: dict[str, object]) -> None:
+    if not getattr(args, "debug", False):
+        return
+    blocks = info["blocks"] if isinstance(info.get("blocks"), dict) else {}
+    samples = info["samples"] if isinstance(info.get("samples"), dict) else {}
+    feature_scaling = info["feature_scaling"] if isinstance(info.get("feature_scaling"), dict) else {}
+    target_scaling = info["target_scaling"] if isinstance(info.get("target_scaling"), dict) else {}
+    loss_scaled = info["loss_scaled"] if isinstance(info.get("loss_scaled"), dict) else {}
+    debug_print(
+        args,
+        (
+            f"mode={info.get('mode')} coarse_input={info.get('include_coarse_input')} "
+            f"coarse_mdif={info.get('coarse_mdif_supplied')}"
+        ),
+    )
+    debug_print(
+        args,
+        (
+            "blocks "
+            f"train_fine={blocks.get('train_fine')} verify_fine={blocks.get('verify_fine')} "
+            f"train_coarse={blocks.get('train_coarse')} verify_coarse={blocks.get('verify_coarse')} "
+            f"align_mismatch={blocks.get('coarse_alignment_mismatches')}"
+        ),
+    )
+    x_train_stats = samples.get("x_train") if isinstance(samples.get("x_train"), dict) else {}
+    y_train_stats = samples.get("y_train") if isinstance(samples.get("y_train"), dict) else {}
+    debug_print(
+        args,
+        (
+            f"x_train shape={x_train_stats.get('shape')} nonfinite={x_train_stats.get('nonfinite_values')} "
+            f"y_train shape={y_train_stats.get('shape')} nonfinite={y_train_stats.get('nonfinite_values')}"
+        ),
+    )
+    debug_print(
+        args,
+        (
+            f"feature std={feature_scaling.get('raw_std')} "
+            f"constant_features={compact_list(feature_scaling.get('constant_columns', []))}"
+        ),
+    )
+    debug_print(
+        args,
+        (
+            f"target std={target_scaling.get('raw_std')} "
+            f"floored_targets={compact_list(target_scaling.get('floored_output_columns', []))}"
+        ),
+    )
+    debug_print(
+        args,
+        (
+            "scaled loss "
+            f"train {loss_scaled.get('initial_train')} -> {loss_scaled.get('final_best_train')} "
+            f"verify {loss_scaled.get('initial_verify')} -> {loss_scaled.get('final_best_verify')}"
+        ),
+    )
 
 
 def interpolate_coarse_to_fine(
@@ -718,6 +976,12 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
     normalized_sparam_weights = normalize_sparam_weights(labels, sparam_weights)
     output_weights = output_weights_from_sparam_weights(labels, sparam_weights)
     progress_interval = progress_interval_from_args(args)
+    initial_train_loss = mse(mlp.predict(x_train_scaled), y_train_scaled, output_weights=output_weights)
+    initial_verify_loss = (
+        mse(mlp.predict(x_verify_scaled), y_verify_scaled, output_weights=output_weights)
+        if x_verify_scaled is not None and y_verify_scaled is not None
+        else None
+    )
     history = mlp.train(
         x_train_scaled,
         y_train_scaled,
@@ -736,6 +1000,12 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
             progress_interval,
         ),
         progress_interval=progress_interval,
+    )
+    final_train_loss = mse(mlp.predict(x_train_scaled), y_train_scaled, output_weights=output_weights)
+    final_verify_loss = (
+        mse(mlp.predict(x_verify_scaled), y_verify_scaled, output_weights=output_weights)
+        if x_verify_scaled is not None and y_verify_scaled is not None
+        else None
     )
     model = KBNN(
         mlp=mlp,
@@ -765,6 +1035,33 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
     }
+    if getattr(args, "debug", False):
+        debug_info = build_training_debug_info(
+            args,
+            mode,
+            include_coarse_input,
+            parameter_names,
+            labels,
+            train_fine,
+            verify_fine,
+            train_coarse,
+            verify_coarse,
+            x_train,
+            y_train,
+            x_verify,
+            y_verify,
+            x_scaler,
+            y_scaler,
+            floored_output_columns,
+            output_std_floor,
+            initial_train_loss,
+            initial_verify_loss,
+            final_train_loss,
+            final_verify_loss,
+            history,
+        )
+        metadata["training_debug"] = debug_info
+        emit_training_debug(args, debug_info)
     return model, verify_fine, verify_coarse, parameter_names, labels, history, metadata
 
 
@@ -774,6 +1071,11 @@ def command_train(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     assert metadata is not None
     model.save(out_dir, metadata=metadata)
+    debug_info = metadata.get("training_debug")
+    if getattr(args, "debug", False) and isinstance(debug_info, dict):
+        debug_path = out_dir / "kbnn_training_debug.json"
+        debug_path.write_text(json.dumps(debug_info, indent=2))
+        debug_print(args, f"wrote {debug_path}")
     training_config = {
         "training_blocks": metadata["training_blocks"],
         "verification_blocks": metadata["verification_blocks"],
@@ -1336,6 +1638,7 @@ def namespace_for_trial(
         seed=trial_seed,
         worst_plots=plots,
         sparam_weights=args.sparam_weights,
+        debug=bool(getattr(args, "debug", False)),
         quiet=True,
     )
 
@@ -1346,6 +1649,7 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
     out_dir = Path(out_dir_text)
     trial_dir = out_dir / "trials" / f"trial_{trial_index:04d}"
     error_message = None
+    error_traceback = None
     trial_seed = sweep_trial_seed(args.seed, trial_index, getattr(args, "trial_seed_mode", "fixed"))
     try:
         trial_args = namespace_for_trial(args, candidate, trial_dir, trial_index, plots=plots)
@@ -1353,9 +1657,14 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
     except Exception as exc:
         status = 2
         error_message = str(exc)
+        error_traceback = traceback.format_exc()
+        if getattr(args, "debug", False):
+            print(error_traceback, file=sys.stderr, flush=True)
     summary_path = trial_dir / "verification_summary.json"
     if status != 0 or not summary_path.exists():
         summary: dict[str, object] = {"error": error_message or "trial failed"}
+        if error_traceback:
+            summary["traceback"] = error_traceback
         metric_value = None
     else:
         summary = json.loads(summary_path.read_text())
@@ -1371,9 +1680,26 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
 
 
 def command_sweep(args: argparse.Namespace) -> int:
+    candidates = sweep_candidate_grid(args)
+    if getattr(args, "debug", False):
+        print(
+            f"debug: KBNN sweep: candidates={len(candidates)} jobs={args.jobs} "
+            f"out_dir={args.out_dir}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if args.jobs != 1:
+            print(
+                "debug: KBNN sweep: parallel trial debug output may interleave; "
+                "use --jobs 1 for the cleanest trace",
+                file=sys.stderr,
+                flush=True,
+            )
+        for idx, candidate in enumerate(candidates, start=1):
+            print(f"debug: KBNN sweep: candidate {idx}: {candidate}", file=sys.stderr, flush=True)
     return run_sweep_command(
         args,
-        sweep_candidate_grid(args),
+        candidates,
         worker_func=kbnn_sweep_trial_worker,
         namespace_for_trial_func=namespace_for_trial,
         train_func=command_train,
@@ -1524,6 +1850,14 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--patience", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Print KBNN data/loss diagnostics and write kbnn_training_debug.json "
+            "in each training output directory."
+        ),
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
