@@ -95,7 +95,14 @@ from common.surrogate_common import (  # noqa: E402
 
 
 VERSION = "0.2.0-rc2"
-KBNN_SWEEP_RESULT_COLUMNS = ["mode", "include_coarse_input", "hidden_layers", "activation", "learning_rate"]
+KBNN_SWEEP_RESULT_COLUMNS = [
+    "mode",
+    "include_coarse_input",
+    "freq_transform",
+    "hidden_layers",
+    "activation",
+    "learning_rate",
+]
 _MDIF_BLOCK_CACHE: dict[tuple[str, int, int], list[MDIFBlock]] = {}
 _BLOCK_PARAMETER_CACHE: dict[tuple[int, tuple[str, ...]], np.ndarray] = {}
 _ALIGN_COARSE_CACHE: dict[tuple[object, ...], list[MDIFBlock]] = {}
@@ -1554,9 +1561,18 @@ def summary_metric(summary: dict[str, object], metric_name: str) -> float | None
 
 
 def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
+    freq_transform_options = (
+        parse_text_options(args.freq_transform_options)
+        if getattr(args, "freq_transform_options", None)
+        else [args.freq_transform]
+    )
+    for freq_transform in freq_transform_options:
+        if freq_transform not in {"log", "linear"}:
+            raise ValueError(f"Unsupported frequency transform {freq_transform!r}")
     axes = {
         "mode": [normalize_mode(value) for value in parse_text_options(args.mode_options)],
         "include_coarse_input": [parse_bool_option(value) for value in parse_text_options(args.include_coarse_input_options)],
+        "freq_transform": freq_transform_options,
         "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options),
         "activation": parse_text_options(args.activation_options),
         "learning_rate": parse_float_options(args.learning_rates),
@@ -1623,7 +1639,7 @@ def namespace_for_trial(
         holdout_fraction=args.holdout_fraction,
         mode=str(candidate["mode"]),
         include_coarse_input=bool(candidate["include_coarse_input"]),
-        freq_transform=args.freq_transform,
+        freq_transform=str(candidate["freq_transform"]),
         hidden_layers=str(candidate["hidden_layers"]),
         activation=str(candidate["activation"]),
         epochs=args.epochs,
@@ -1867,6 +1883,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_common_train_args(sweep)
     sweep.add_argument("--mode-options", default="residual,prior-input")
     sweep.add_argument("--include-coarse-input-options", default="false,true")
+    sweep.add_argument(
+        "--freq-transform-options",
+        help=(
+            "Comma-separated frequency transforms to try. Available values are log and linear. "
+            "If omitted, the sweep uses --freq-transform."
+        ),
+    )
     sweep.add_argument("--hidden-layer-options", default="32;64;64,64")
     sweep.add_argument("--activation-options", default="tanh,relu")
     sweep.add_argument("--learning-rates", default="0.001,0.002,0.005")

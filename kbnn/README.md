@@ -161,6 +161,7 @@ python3 kbnn.py optimize \
   --parameter-names W,L \
   --mode-options residual,prior-input \
   --include-coarse-input-options false,true \
+  --freq-transform-options log,linear \
   --hidden-layer-options '32;64;64,64' \
   --activation-options tanh,relu \
   --learning-rates 0.001,0.002,0.005 \
@@ -261,7 +262,8 @@ of rebuilding them.
 | <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
 | <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, include tracebacks in failed trial summaries, and write KBNN per-trial debug diagnostics. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs for each candidate and the final retrain. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform applied in every trial. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
+| <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform used when `--freq-transform-options` is omitted. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
+| <nobr><code>--freq-transform-options LIST</code></nobr> | Comma-separated frequency transforms to try in the sweep. Available values are `log` and `linear`. If omitted, the sweep uses the single `--freq-transform` value. | <nobr><code>--freq-transform-options log,linear</code></nobr> |
 | <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated layer layouts. Use commas inside one layout and semicolons between layouts. Default: `32;64;64,64`. | <nobr><code>--hidden-layer-options '32;64,64;128,64'</code></nobr> |
 | <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks reserved for verification when no split values are found. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
 | <nobr><code>--include-coarse-input-options LIST</code></nobr> | Comma-separated boolean candidate values to try for the single-model `--include-coarse-input` switch. In residual mode, `false` uses geometry/frequency only and `true` appends coarse real/imaginary S-parameters to the NN input. `plain` forces this off; `prior-input` forces it on. Default: `false,true`. | <nobr><code>--include-coarse-input-options false,true</code></nobr> |
