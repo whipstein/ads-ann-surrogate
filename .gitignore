@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*.so
+.DS_Store
+
+# Local environments
+.env
+.venv/
+venv/
+
+# Generated training/sweep artifacts
+work/
+runs/
+trials/
+best_model/
+best_model_reranked/
+sweep_diagnostics/
+*_model/
+*_sweep/
+*_export/
+*_veriloga/
+*_ads_ann/
+
+# Generated model outputs
+*.npz
+predicted_*.mdif
+training_history.csv
+training_summary.md
+verification_metrics.csv
+verification_summary.json
+*_sweep_results.csv
+*_sweep_summary.md
+*_best_config.json
+*_reranked_*.csv
+*_reranked_*.md
+*_reranked_*.json
