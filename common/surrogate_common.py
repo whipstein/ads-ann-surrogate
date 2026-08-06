@@ -4440,7 +4440,7 @@ def metric_text(value: object) -> str:
     return f"{numeric:.6g}"
 
 
-def metric_text_sig(value: object, digits: int = 2) -> str:
+def metric_text_fixed(value: object, decimals: int = 2) -> str:
     if value is None or value == "":
         return ""
     try:
@@ -4449,7 +4449,11 @@ def metric_text_sig(value: object, digits: int = 2) -> str:
         return markdown_escape(value)
     if not math.isfinite(numeric):
         return ""
-    return f"{numeric:.{max(1, int(digits))}g}"
+    places = max(0, int(decimals))
+    fixed = f"{numeric:.{places}f}"
+    if numeric != 0.0 and csv_number(fixed) == 0.0:
+        return f"{numeric:.{places}e}"
+    return fixed
 
 
 def plot_links_cell(raw_paths: object) -> str:
@@ -5500,7 +5504,7 @@ def run_sweep_command(
                     else:
                         live_promotion_warning = warning
                         print(f"warning: {warning}", file=sys.stderr, flush=True)
-        metric_display = metric_text_sig(metric_value, 2) if metric_value is not None else "failed"
+        metric_display = metric_text_fixed(metric_value, 2) if metric_value is not None else "failed"
         epochs_display = training_history_epochs(
             trials_dir / f"trial_{trial_index:04d}" / "training_history.csv"
         )
