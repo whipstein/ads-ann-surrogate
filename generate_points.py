@@ -57,8 +57,28 @@ class ParameterSpec:
     scale: str = "linear"
 
 
-def parse_value_token(token: str) -> tuple[float, str]:
-    text = token.strip()
+@dataclass
+class ErrorRegion:
+    source_index: str
+    unit_point: list[float]
+    score: float
+    worst_sparam: str
+    worst_sparam_score: float
+    row_count: int
+
+
+@dataclass
+class SuggestedPoint:
+    unit_point: list[float]
+    acquisition_score: float
+    distance_to_existing: float
+    nearest_error_source_index: str
+    nearest_error_score: float
+    nearest_error_distance: float
+
+
+def split_value_token(token: object) -> tuple[float, str]:
+    text = str(token).strip()
     match = re.fullmatch(
         r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)",
         text,
@@ -69,7 +89,25 @@ def parse_value_token(token: str) -> tuple[float, str]:
     unit = match.group(2).lower()
     if unit not in UNIT_SCALES:
         raise ValueError(f"Unsupported unit suffix {unit!r} in {token!r}")
+    return value, unit
+
+
+def parse_value_token(token: object) -> tuple[float, str]:
+    value, unit = split_value_token(token)
     return value * UNIT_SCALES[unit], unit
+
+
+def parse_observed_value(
+    token: object,
+    spec: ParameterSpec,
+    bare_values: str = "parameter-units",
+) -> float:
+    value, unit = split_value_token(token)
+    if unit:
+        return value * UNIT_SCALES[unit]
+    if bare_values == "parameter-units" and spec.unit:
+        return value * UNIT_SCALES[spec.unit]
+    return value
 
 
 def parse_parameter_spec(raw: str) -> ParameterSpec:
@@ -111,6 +149,12 @@ def map_unit_point(value: float, spec: ParameterSpec) -> float:
         log_hi = math.log(spec.upper)
         return math.exp(log_lo + value * (log_hi - log_lo))
     return spec.lower + value * (spec.upper - spec.lower)
+
+
+def unit_coordinate_for_value(value: float, spec: ParameterSpec) -> float:
+    if spec.scale == "log":
+        return (math.log(value) - math.log(spec.lower)) / (math.log(spec.upper) - math.log(spec.lower))
+    return (value - spec.lower) / (spec.upper - spec.lower)
 
 
 def latin_hypercube_points(count: int, dimensions: int, rng: random.Random) -> list[list[float]]:
@@ -253,6 +297,60 @@ def output_path_for_method(path: Path, method: str, multiple_methods: bool) -> P
     return path.with_name(f"{path.stem}_{safe}{path.suffix or '.csv'}")
 
 
+def write_rows_csv(path: Path, rows: Sequence[dict[str, object]], fields: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(fields))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def generated_point_rows(
+    method: str,
+    unit_points: Sequence[Sequence[float]],
+    parameters: Sequence[ParameterSpec],
+    verification_count: int,
+    split_var: str,
+    include_normalized: bool,
+) -> tuple[list[dict[str, object]], list[str]]:
+    fields = [
+        "point_index",
+        split_var,
+        "split_sequence",
+        "train_sequence",
+        "verification_sequence",
+        "method",
+    ]
+    if include_normalized:
+        fields.extend(f"u_{parameter.name}" for parameter in parameters)
+    fields.extend(parameter.name for parameter in parameters)
+
+    train_count = len(unit_points) - verification_count
+    rows: list[dict[str, object]] = []
+    for idx, point in enumerate(unit_points, start=1):
+        is_train = idx <= train_count
+        split_sequence = idx if is_train else idx - train_count
+        row: dict[str, object] = {
+            "point_index": idx,
+            split_var: "train" if is_train else "verification",
+            "split_sequence": split_sequence,
+            "train_sequence": split_sequence if is_train else "",
+            "verification_sequence": "" if is_train else split_sequence,
+            "method": method,
+        }
+        if include_normalized:
+            for parameter, unit_value in zip(parameters, point):
+                row[f"u_{parameter.name}"] = f"{unit_value:.16g}"
+        for parameter, unit_value in zip(parameters, point):
+            row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
+        rows.append(row)
+    return rows, fields
+
+
+def split_output_path(path: Path, split_name: str) -> Path:
+    return path.with_name(f"{path.stem}_{safe_method_name(split_name)}{path.suffix or '.csv'}")
+
+
 def write_points_csv(
     path: Path,
     method: str,
@@ -261,29 +359,424 @@ def write_points_csv(
     verification_count: int,
     split_var: str,
     include_normalized: bool,
+    write_split_files: bool,
+) -> list[Path]:
+    rows, fields = generated_point_rows(
+        method,
+        unit_points,
+        parameters,
+        verification_count,
+        split_var,
+        include_normalized,
+    )
+    write_rows_csv(path, rows, fields)
+    written = [path]
+    if write_split_files:
+        split_values = ["train", "verification"] if verification_count else ["train"]
+        for split_value in split_values:
+            split_rows = [row for row in rows if row.get(split_var) == split_value]
+            split_path = split_output_path(path, split_value)
+            write_rows_csv(split_path, split_rows, fields)
+            written.append(split_path)
+    return written
+
+
+def normalize_key(name: object) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(name).strip()).strip("_").lower()
+
+
+def lookup_row_value(row: dict[str, object], name: str) -> object | None:
+    if name in row:
+        return row[name]
+    wanted = normalize_key(name)
+    for key, value in row.items():
+        if normalize_key(key) == wanted:
+            return value
+    return None
+
+
+def csv_number(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def read_csv_rows(path: Path) -> list[dict[str, object]]:
+    with path.open(newline="") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
+def row_unit_point(
+    row: dict[str, object],
+    parameters: Sequence[ParameterSpec],
+    bare_values: str,
+) -> list[float] | None:
+    point: list[float] = []
+    for parameter in parameters:
+        raw = lookup_row_value(row, parameter.name)
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            value = parse_observed_value(raw, parameter, bare_values=bare_values)
+            unit_value = unit_coordinate_for_value(value, parameter)
+        except (ValueError, OverflowError):
+            return None
+        if not math.isfinite(unit_value):
+            return None
+        point.append(unit_value)
+    return point
+
+
+def in_unit_cube(point: Sequence[float], tolerance: float = 1e-9) -> bool:
+    return all(-tolerance <= value <= 1.0 + tolerance for value in point)
+
+
+def clamp_unit_point(point: Sequence[float]) -> list[float]:
+    return [min(1.0, max(0.0, float(value))) for value in point]
+
+
+def squared_distance(lhs: Sequence[float], rhs: Sequence[float]) -> float:
+    return sum((float(a) - float(b)) ** 2 for a, b in zip(lhs, rhs))
+
+
+def point_distance(lhs: Sequence[float], rhs: Sequence[float]) -> float:
+    return math.sqrt(squared_distance(lhs, rhs))
+
+
+def nearest_distance(point: Sequence[float], others: Sequence[Sequence[float]]) -> float:
+    if not others:
+        return math.sqrt(len(point))
+    return min(point_distance(point, other) for other in others)
+
+
+def dedupe_points(points: Sequence[Sequence[float]], tolerance: float = 1e-10) -> list[list[float]]:
+    seen: set[tuple[int, ...]] = set()
+    unique: list[list[float]] = []
+    scale = 1.0 / tolerance
+    for point in points:
+        key = tuple(int(round(value * scale)) for value in point)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append([float(value) for value in point])
+    return unique
+
+
+def parse_var_assignment(line: str) -> tuple[str, str] | None:
+    text = line.strip()
+    if not text.upper().startswith("VAR"):
+        return None
+    body = text[3:].strip()
+    if not body:
+        return None
+    if "=" in body:
+        name, value = body.split("=", 1)
+    else:
+        parts = body.split(None, 1)
+        if len(parts) != 2:
+            return None
+        name, value = parts
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return name.strip(), value
+
+
+def read_mdif_parameter_rows(path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    pending: dict[str, object] = {}
+    current: dict[str, object] | None = None
+    in_block = False
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = raw.split("!", 1)[0].strip()
+        if not line:
+            continue
+        parsed = parse_var_assignment(line)
+        if parsed:
+            name, value = parsed
+            target = current if in_block and current is not None else pending
+            target[name] = value
+            continue
+        upper = line.upper()
+        if upper.startswith("BEGIN"):
+            in_block = True
+            current = dict(pending)
+            continue
+        if upper.startswith("END") and in_block:
+            if current is not None:
+                rows.append(current)
+            current = None
+            in_block = False
+    return rows
+
+
+def load_existing_points(
+    csv_paths: Sequence[str],
+    mdif_paths: Sequence[str],
+    parameters: Sequence[ParameterSpec],
+    bare_values: str,
+) -> list[list[float]]:
+    points: list[list[float]] = []
+    for raw_path in csv_paths:
+        path = Path(raw_path)
+        for row in read_csv_rows(path):
+            point = row_unit_point(row, parameters, bare_values=bare_values)
+            if point is not None and in_unit_cube(point):
+                points.append(clamp_unit_point(point))
+    for raw_path in mdif_paths:
+        path = Path(raw_path)
+        for row in read_mdif_parameter_rows(path):
+            point = row_unit_point(row, parameters, bare_values=bare_values)
+            if point is not None and in_unit_cube(point):
+                points.append(clamp_unit_point(point))
+    return dedupe_points(points)
+
+
+def metric_score_value(metric_name: str, value: float) -> float:
+    lowered = metric_name.lower()
+    if lowered in {"evm_db", "weighted_evm_db"}:
+        return 10.0 ** (value / 20.0)
+    return abs(value)
+
+
+def load_error_regions(
+    metrics_path: Path,
+    parameters: Sequence[ParameterSpec],
+    metric_name: str,
+    bare_values: str,
+) -> tuple[list[ErrorRegion], str]:
+    rows = read_csv_rows(metrics_path)
+    if not rows:
+        raise ValueError(f"{metrics_path} is empty")
+    if metric_name == "auto":
+        for candidate in ["evm_pct", "rmse_abs", "max_abs", "rmse_db", "max_abs_db"]:
+            if any(str(row.get(candidate) or "").strip() for row in rows):
+                metric_name = candidate
+                break
+        else:
+            raise ValueError(f"{metrics_path} does not contain a usable error metric")
+
+    groups: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in rows:
+        point = row_unit_point(row, parameters, bare_values=bare_values)
+        value = csv_number(row.get(metric_name))
+        if point is None or value is None or not in_unit_cube(point):
+            continue
+        point = clamp_unit_point(point)
+        source_index = str(row.get("source_index") or "")
+        key = (source_index, *(round(coord, 12) for coord in point))
+        bucket = groups.setdefault(
+            key,
+            {
+                "source_index": source_index,
+                "point": point,
+                "weighted_sum": 0.0,
+                "weight_sum": 0.0,
+                "worst_sparam": "",
+                "worst_score": -1.0,
+                "row_count": 0,
+            },
+        )
+        score = metric_score_value(metric_name, value)
+        weight = csv_number(row.get("normalized_sparam_weight"))
+        if weight is None or weight <= 0.0:
+            weight = csv_number(row.get("sparam_weight")) or 1.0
+        bucket["weighted_sum"] = float(bucket["weighted_sum"]) + weight * score * score
+        bucket["weight_sum"] = float(bucket["weight_sum"]) + weight
+        bucket["row_count"] = int(bucket["row_count"]) + 1
+        if score > float(bucket["worst_score"]):
+            bucket["worst_score"] = score
+            bucket["worst_sparam"] = str(row.get("sparam") or "")
+
+    regions: list[ErrorRegion] = []
+    for bucket in groups.values():
+        weight_sum = float(bucket["weight_sum"])
+        if weight_sum <= 0.0:
+            continue
+        regions.append(
+            ErrorRegion(
+                source_index=str(bucket["source_index"]),
+                unit_point=list(bucket["point"]),  # type: ignore[arg-type]
+                score=math.sqrt(float(bucket["weighted_sum"]) / weight_sum),
+                worst_sparam=str(bucket["worst_sparam"]),
+                worst_sparam_score=float(bucket["worst_score"]),
+                row_count=int(bucket["row_count"]),
+            )
+        )
+    regions.sort(key=lambda region: region.score, reverse=True)
+    if not regions:
+        raise ValueError(
+            f"No rows in {metrics_path} had {metric_name!r} and all requested parameters"
+        )
+    return regions, metric_name
+
+
+def error_region_fields(parameters: Sequence[ParameterSpec]) -> list[str]:
+    return [
+        "rank",
+        "source_index",
+        "error_score",
+        "worst_sparam",
+        "worst_sparam_score",
+        "metric_rows",
+        *[parameter.name for parameter in parameters],
+    ]
+
+
+def write_error_regions_csv(
+    path: Path,
+    regions: Sequence[ErrorRegion],
+    parameters: Sequence[ParameterSpec],
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["point_index", split_var, "method"]
+    rows: list[dict[str, object]] = []
+    for rank, region in enumerate(regions, start=1):
+        row: dict[str, object] = {
+            "rank": rank,
+            "source_index": region.source_index,
+            "error_score": f"{region.score:.12g}",
+            "worst_sparam": region.worst_sparam,
+            "worst_sparam_score": f"{region.worst_sparam_score:.12g}",
+            "metric_rows": region.row_count,
+        }
+        for parameter, unit_value in zip(parameters, region.unit_point):
+            row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
+        rows.append(row)
+    write_rows_csv(path, rows, error_region_fields(parameters))
+
+
+def analysis_output_path(out_path: Path) -> Path:
+    return out_path.with_name(f"{out_path.stem}_fit_error_regions{out_path.suffix or '.csv'}")
+
+
+def candidate_focus(
+    point: Sequence[float],
+    regions: Sequence[ErrorRegion],
+    focus_radius: float,
+    focus_power: float,
+) -> tuple[float, ErrorRegion | None, float]:
+    if not regions:
+        return 1.0, None, math.sqrt(len(point))
+    sigma2 = max(focus_radius, 1e-12) ** 2
+    total = 0.0
+    best_contribution = -1.0
+    best_region: ErrorRegion | None = None
+    best_distance = math.sqrt(len(point))
+    for region in regions:
+        distance2 = squared_distance(point, region.unit_point)
+        weight = max(region.score, 0.0) ** focus_power
+        contribution = weight * math.exp(-0.5 * distance2 / sigma2)
+        total += contribution
+        if contribution > best_contribution:
+            best_contribution = contribution
+            best_region = region
+            best_distance = math.sqrt(distance2)
+    return total, best_region, best_distance
+
+
+def select_targeted_points(
+    candidate_points: Sequence[Sequence[float]],
+    regions: Sequence[ErrorRegion],
+    existing_points: Sequence[Sequence[float]],
+    count: int,
+    focus_radius: float,
+    focus_power: float,
+    novelty_power: float,
+    min_distance: float,
+) -> list[SuggestedPoint]:
+    selected: list[SuggestedPoint] = []
+    occupied = [list(point) for point in existing_points]
+    unused = [list(point) for point in candidate_points]
+    diag = max(math.sqrt(len(candidate_points[0])) if candidate_points else 1.0, 1e-12)
+
+    while len(selected) < count and unused:
+        best_idx: int | None = None
+        best_point: SuggestedPoint | None = None
+        for idx, point in enumerate(unused):
+            distance_existing = nearest_distance(point, occupied)
+            if distance_existing < min_distance:
+                continue
+            focus, region, region_distance = candidate_focus(
+                point,
+                regions,
+                focus_radius=focus_radius,
+                focus_power=focus_power,
+            )
+            novelty = min(1.0, distance_existing / diag)
+            acquisition = focus * (max(novelty, 1e-12) ** novelty_power)
+            source_index = region.source_index if region is not None else ""
+            source_score = region.score if region is not None else 0.0
+            candidate = SuggestedPoint(
+                unit_point=point,
+                acquisition_score=acquisition,
+                distance_to_existing=distance_existing,
+                nearest_error_source_index=source_index,
+                nearest_error_score=source_score,
+                nearest_error_distance=region_distance,
+            )
+            if best_point is None or candidate.acquisition_score > best_point.acquisition_score:
+                best_idx = idx
+                best_point = candidate
+        if best_idx is None or best_point is None:
+            break
+        selected.append(best_point)
+        occupied.append(best_point.unit_point)
+        unused.pop(best_idx)
+    return selected
+
+
+def write_suggested_points_csv(
+    path: Path,
+    suggestions: Sequence[SuggestedPoint],
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    target_dataset: str,
+    method: str,
+    metric_name: str,
+    include_normalized: bool,
+) -> None:
+    fields = [
+        "point_index",
+        split_var,
+        "additional_sequence",
+        "method",
+        "analysis_metric",
+        "fit_error_score",
+        "nearest_error_source_index",
+        "nearest_error_distance",
+        "distance_to_existing",
+        "acquisition_score",
+    ]
     if include_normalized:
         fields.extend(f"u_{parameter.name}" for parameter in parameters)
     fields.extend(parameter.name for parameter in parameters)
 
-    train_count = len(unit_points) - verification_count
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for idx, point in enumerate(unit_points, start=1):
-            row: dict[str, object] = {
-                "point_index": idx,
-                split_var: "train" if idx <= train_count else "verification",
-                "method": method,
-            }
-            if include_normalized:
-                for parameter, unit_value in zip(parameters, point):
-                    row[f"u_{parameter.name}"] = f"{unit_value:.16g}"
-            for parameter, unit_value in zip(parameters, point):
-                row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
-            writer.writerow(row)
+    rows: list[dict[str, object]] = []
+    for idx, suggestion in enumerate(suggestions, start=1):
+        row: dict[str, object] = {
+            "point_index": idx,
+            split_var: target_dataset,
+            "additional_sequence": idx,
+            "method": f"targeted-{method}",
+            "analysis_metric": metric_name,
+            "fit_error_score": f"{suggestion.nearest_error_score:.12g}",
+            "nearest_error_source_index": suggestion.nearest_error_source_index,
+            "nearest_error_distance": f"{suggestion.nearest_error_distance:.12g}",
+            "distance_to_existing": f"{suggestion.distance_to_existing:.12g}",
+            "acquisition_score": f"{suggestion.acquisition_score:.12g}",
+        }
+        if include_normalized:
+            for parameter, unit_value in zip(parameters, suggestion.unit_point):
+                row[f"u_{parameter.name}"] = f"{unit_value:.16g}"
+        for parameter, unit_value in zip(parameters, suggestion.unit_point):
+            row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
+        rows.append(row)
+    write_rows_csv(path, rows, fields)
 
 
 def parse_methods(raw_methods: Sequence[str]) -> list[str]:
@@ -296,10 +789,10 @@ def parse_methods(raw_methods: Sequence[str]) -> list[str]:
     return methods
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Generate geometry/process sample points for ADS surrogate extraction.",
-    )
+VALID_METHODS = {"maximin-lhs", "latin-hypercube", "sobol", "halton"}
+
+
+def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--parameter",
         action="append",
@@ -307,6 +800,36 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME=LOW:HIGH[:linear|log]",
         help="Repeat once per geometry/process variable, e.g. W=0.40mm:0.80mm or R=1:100:log.",
     )
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed for randomized methods.")
+    parser.add_argument(
+        "--lhs-candidates",
+        type=int,
+        default=64,
+        help="Number of Latin-hypercube candidate designs tried by maximin-lhs. Default: 64.",
+    )
+    parser.add_argument("--skip", type=int, default=0, help="Skip this many leading Sobol/Halton points.")
+    parser.add_argument(
+        "--no-scramble",
+        action="store_true",
+        help="Disable Sobol scrambling. Scrambling is enabled by default.",
+    )
+    parser.add_argument(
+        "--split-var",
+        default="dataset",
+        help="CSV column used to label point groups. Default: dataset.",
+    )
+    parser.add_argument(
+        "--include-normalized",
+        action="store_true",
+        help="Include u_<name> columns with the underlying [0, 1] coordinates.",
+    )
+
+
+def build_generate_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate geometry/process sample points for ADS surrogate extraction.",
+    )
+    add_parameter_arguments(parser)
     parser.add_argument("--count", type=int, required=True, help="Total number of points to write.")
     parser.add_argument(
         "--verification-count",
@@ -324,57 +847,141 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--out", default="generated_points.csv", help="Output CSV path. Use {method} for multiple methods.")
-    parser.add_argument("--seed", type=int, default=1234, help="Random seed for randomized methods.")
     parser.add_argument(
-        "--lhs-candidates",
-        type=int,
-        default=64,
-        help="Number of Latin-hypercube candidate designs tried by maximin-lhs. Default: 64.",
-    )
-    parser.add_argument("--skip", type=int, default=0, help="Skip this many leading Sobol/Halton points.")
-    parser.add_argument(
-        "--no-scramble",
+        "--write-split-files",
         action="store_true",
-        help="Disable Sobol scrambling. Scrambling is enabled by default.",
-    )
-    parser.add_argument(
-        "--split-var",
-        default="dataset",
-        help="CSV column used to label train vs verification points. Default: dataset.",
-    )
-    parser.add_argument(
-        "--include-normalized",
-        action="store_true",
-        help="Include u_<name> columns with the underlying [0, 1] coordinates.",
+        help="Also write *_train.csv and *_verification.csv files beside the combined CSV.",
     )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def build_suggest_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyze current verification error and suggest targeted additional "
+            "geometry/process points for the next EM batch."
+        ),
+    )
+    add_parameter_arguments(parser)
+    parser.add_argument("--count", type=int, required=True, help="Number of additional points to suggest.")
+    parser.add_argument(
+        "--fit-dir",
+        help="Training or sweep trial directory containing verification_metrics.csv.",
+    )
+    parser.add_argument(
+        "--verification-metrics",
+        help="Path to verification_metrics.csv. Overrides --fit-dir.",
+    )
+    parser.add_argument(
+        "--existing-points",
+        action="append",
+        default=[],
+        help="CSV containing already simulated points. Repeat for multiple files.",
+    )
+    parser.add_argument(
+        "--existing-mdif",
+        action="append",
+        default=[],
+        help="MDIF containing already simulated training/verification blocks. Repeat for multiple files.",
+    )
+    parser.add_argument(
+        "--metric",
+        default="evm_pct",
+        help="Column in verification_metrics.csv used to target errors. Use 'auto' to pick a known metric.",
+    )
+    parser.add_argument(
+        "--candidate-method",
+        default="latin-hypercube",
+        choices=sorted(VALID_METHODS),
+        help="Method used to create the candidate pool before targeted selection. Default: latin-hypercube.",
+    )
+    parser.add_argument(
+        "--candidate-count",
+        type=int,
+        help="Number of candidate points to score. Default: max(1000, count * candidate-factor).",
+    )
+    parser.add_argument(
+        "--candidate-factor",
+        type=int,
+        default=200,
+        help="Candidate multiplier used when --candidate-count is omitted. Default: 200.",
+    )
+    parser.add_argument(
+        "--focus-radius",
+        type=float,
+        default=0.25,
+        help="Normalized unit-cube radius around high-error verification points. Default: 0.25.",
+    )
+    parser.add_argument(
+        "--focus-power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to verification error scores. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--novelty-power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to distance from existing/suggested points. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--min-distance",
+        type=float,
+        default=0.0,
+        help="Reject candidates closer than this normalized distance to existing/suggested points.",
+    )
+    parser.add_argument(
+        "--bare-values",
+        choices=["parameter-units", "base-units"],
+        default="parameter-units",
+        help=(
+            "How to interpret unitless values in metrics/MDIF/CSV rows. "
+            "Default: parameter-units."
+        ),
+    )
+    parser.add_argument(
+        "--target-dataset",
+        default="targeted",
+        help="Dataset label assigned to suggested points. Default: targeted.",
+    )
+    parser.add_argument("--out", default="targeted_additional_points.csv", help="Suggested-point CSV path.")
+    parser.add_argument(
+        "--analysis-out",
+        help="Ranked current-fit error-region CSV path. Default: <out>_fit_error_regions.csv.",
+    )
+    return parser
 
-    if args.count <= 0:
-        parser.error("--count must be positive")
-    if args.verification_count < 0 or args.verification_count >= args.count:
-        parser.error("--verification-count must be non-negative and smaller than --count")
+
+def parse_parameters_or_error(parser: argparse.ArgumentParser, args: argparse.Namespace) -> list[ParameterSpec]:
+    try:
+        return [parse_parameter_spec(raw) for raw in args.parameter]
+    except ValueError as exc:
+        parser.error(str(exc))
+    raise AssertionError("unreachable")
+
+
+def validate_shared_sampling_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.lhs_candidates <= 0:
         parser.error("--lhs-candidates must be positive")
     if args.skip < 0:
         parser.error("--skip must be non-negative")
 
-    try:
-        parameters = [parse_parameter_spec(raw) for raw in args.parameter]
-    except ValueError as exc:
-        parser.error(str(exc))
+
+def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.count <= 0:
+        parser.error("--count must be positive")
+    if args.verification_count < 0 or args.verification_count >= args.count:
+        parser.error("--verification-count must be non-negative and smaller than --count")
+    validate_shared_sampling_args(parser, args)
+    parameters = parse_parameters_or_error(parser, args)
 
     methods = parse_methods(args.method) or ["maximin-lhs"]
-    valid_methods = {"maximin-lhs", "latin-hypercube", "sobol", "halton"}
-    unknown = [method for method in methods if method not in valid_methods]
+    unknown = [method for method in methods if method not in VALID_METHODS]
     if unknown:
         parser.error("Unknown method(s): " + ", ".join(unknown))
 
     multiple_methods = len(methods) > 1
+    written_paths: list[Path] = []
     for offset, method in enumerate(methods):
         try:
             unit_points = generate_unit_points(
@@ -391,7 +998,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
         out_path = output_path_for_method(Path(args.out), method, multiple_methods)
-        write_points_csv(
+        written_paths.extend(write_points_csv(
             out_path,
             method,
             unit_points,
@@ -399,9 +1006,131 @@ def main(argv: Sequence[str] | None = None) -> int:
             verification_count=args.verification_count,
             split_var=args.split_var,
             include_normalized=args.include_normalized,
-        )
-        print(f"wrote {out_path}")
+            write_split_files=args.write_split_files,
+        ))
+    for path in written_paths:
+        print(f"wrote {path}")
     return 0
+
+
+def verification_metrics_path(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Path:
+    if args.verification_metrics:
+        path = Path(args.verification_metrics)
+    elif args.fit_dir:
+        path = Path(args.fit_dir) / "verification_metrics.csv"
+    else:
+        parser.error("Either --fit-dir or --verification-metrics is required")
+    if not path.exists():
+        parser.error(f"Verification metrics file does not exist: {path}")
+    return path
+
+
+def command_suggest_additional(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.count <= 0:
+        parser.error("--count must be positive")
+    if args.candidate_factor <= 0:
+        parser.error("--candidate-factor must be positive")
+    if args.candidate_count is not None and args.candidate_count <= 0:
+        parser.error("--candidate-count must be positive")
+    if args.focus_radius <= 0.0:
+        parser.error("--focus-radius must be positive")
+    if args.focus_power < 0.0:
+        parser.error("--focus-power must be non-negative")
+    if args.novelty_power < 0.0:
+        parser.error("--novelty-power must be non-negative")
+    if args.min_distance < 0.0:
+        parser.error("--min-distance must be non-negative")
+    validate_shared_sampling_args(parser, args)
+    parameters = parse_parameters_or_error(parser, args)
+
+    metrics_path = verification_metrics_path(args, parser)
+    try:
+        regions, metric_name = load_error_regions(
+            metrics_path,
+            parameters,
+            metric_name=args.metric,
+            bare_values=args.bare_values,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    existing_points = [region.unit_point for region in regions]
+    existing_points.extend(
+        load_existing_points(
+            args.existing_points,
+            args.existing_mdif,
+            parameters,
+            bare_values=args.bare_values,
+        )
+    )
+    existing_points = dedupe_points(existing_points)
+
+    candidate_count = args.candidate_count or max(1000, args.count * args.candidate_factor)
+    try:
+        candidates = generate_unit_points(
+            args.candidate_method,
+            count=candidate_count,
+            dimensions=len(parameters),
+            seed=args.seed,
+            lhs_candidates=args.lhs_candidates,
+            scramble=not args.no_scramble,
+            skip=args.skip,
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    suggestions = select_targeted_points(
+        candidates,
+        regions,
+        existing_points,
+        count=args.count,
+        focus_radius=args.focus_radius,
+        focus_power=args.focus_power,
+        novelty_power=args.novelty_power,
+        min_distance=args.min_distance,
+    )
+    if len(suggestions) < args.count:
+        print(
+            f"warning: selected {len(suggestions)} of {args.count} requested points; "
+            "increase --candidate-count or lower --min-distance",
+            file=sys.stderr,
+        )
+
+    out_path = Path(args.out)
+    analysis_path = Path(args.analysis_out) if args.analysis_out else analysis_output_path(out_path)
+    write_error_regions_csv(analysis_path, regions, parameters)
+    write_suggested_points_csv(
+        out_path,
+        suggestions,
+        parameters,
+        split_var=args.split_var,
+        target_dataset=args.target_dataset,
+        method=args.candidate_method,
+        metric_name=metric_name,
+        include_normalized=args.include_normalized,
+    )
+    print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
+    print(f"considered {len(existing_points)} existing point(s) and {candidate_count} candidate point(s)")
+    print(f"wrote {out_path}")
+    print(f"wrote {analysis_path}")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    command = "generate"
+    if raw_args and raw_args[0] in {"generate", "suggest-additional"}:
+        command = raw_args.pop(0)
+
+    if command == "suggest-additional":
+        parser = build_suggest_parser()
+        args = parser.parse_args(raw_args)
+        return command_suggest_additional(args, parser)
+
+    parser = build_generate_parser()
+    args = parser.parse_args(raw_args)
+    return command_generate(args, parser)
 
 
 if __name__ == "__main__":

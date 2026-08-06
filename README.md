@@ -133,6 +133,13 @@ python3 generate_points.py \
   --out geometries.csv
 ```
 
+Each generated CSV contains `point_index`, `dataset`, `split_sequence`,
+`train_sequence`, `verification_sequence`, `method`, and one column per
+parameter. Add `--include-normalized` when you also want the underlying
+unit-cube coordinates. Add `--write-split-files` to also write separate
+`*_train.csv` and `*_verification.csv` files for tools that consume the two
+simulation queues independently.
+
 To compare the current Sobol-style workflow with the recommended space-filling
 design, ask for both methods. The `{method}` placeholder is replaced in the
 output path:
@@ -147,9 +154,26 @@ python3 generate_points.py \
   --out geometries_{method}.csv
 ```
 
-Each CSV contains `point_index`, `dataset`, `method`, and one column per
-parameter. Add `--include-normalized` when you also want the underlying
-unit-cube coordinates.
+After a first model fit, use the `suggest-additional` command to target the
+next expensive EM simulations toward the current worst-fit regions. The command
+reads `verification_metrics.csv`, ranks verification points by error, scores a
+candidate pool by proximity to high-error regions and distance from existing
+points, then writes a new CSV for the next training batch:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 12 \
+  --fit-dir outputs/dnn_model \
+  --existing-points geometries.csv \
+  --out targeted_additional_points.csv
+```
+
+The suggested-point CSV uses `dataset=targeted` by default and includes the
+nearest high-error verification source, distance from existing points, and
+acquisition score. A companion `*_fit_error_regions.csv` file ranks the current
+verification points by the selected metric, which defaults to `evm_pct`.
 
 ## Quick Start
 

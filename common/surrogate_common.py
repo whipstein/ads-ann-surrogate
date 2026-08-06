@@ -4487,6 +4487,32 @@ def cli_metric_label(metric_name: object) -> str:
     return compact if len(compact) <= 14 else compact[:13] + "~"
 
 
+def cli_color_enabled(stream: object) -> bool:
+    if os.environ.get("CLICOLOR_FORCE", "0") != "0":
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("CLICOLOR") == "0":
+        return False
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty and isatty())
+
+
+def cli_color_text(text: str, color: str, stream: object | None = None) -> str:
+    if stream is None:
+        stream = sys.stdout
+    if not cli_color_enabled(stream):
+        return text
+    codes = {
+        "green": "\033[32m",
+        "red": "\033[31m",
+    }
+    prefix = codes.get(color)
+    if not prefix:
+        return text
+    return f"{prefix}{text}\033[0m"
+
+
 def plot_links_cell(raw_paths: object) -> str:
     if not raw_paths:
         return ""
@@ -5277,6 +5303,27 @@ def sweep_row_metric(row: dict[str, object], metric_name: str) -> float | None:
     return csv_number(row.get(metric_name))
 
 
+def sweep_row_exclusion_reasons(
+    row: dict[str, object],
+    selection_metric: str,
+    max_passivity_violations: int | None = None,
+    max_passivity_sigma: float | None = None,
+) -> list[str]:
+    reasons: list[str] = []
+    metric = sweep_row_metric(row, selection_metric)
+    if metric is None:
+        reasons.append(f"missing {selection_metric}")
+    if max_passivity_violations is not None:
+        violations = sweep_row_metric(row, "passivity.violating_points")
+        if violations is None or violations > max_passivity_violations:
+            reasons.append(f"passivity violations > {max_passivity_violations}")
+    if max_passivity_sigma is not None:
+        sigma = sweep_row_metric(row, "passivity.max_singular_value")
+        if sigma is None or sigma > max_passivity_sigma:
+            reasons.append(f"max sigma > {max_passivity_sigma:g}")
+    return reasons
+
+
 def update_sweep_row_from_summary(
     row: dict[str, object],
     summary: dict[str, object],
@@ -5344,19 +5391,12 @@ def rerank_sweep_rows(
         metric = sweep_row_metric(row, selection_metric)
         row["metric"] = metric
         row["selection_metric"] = selection_metric
-        excluded_reasons: list[str] = []
-        if metric is None:
-            excluded_reasons.append(f"missing {selection_metric}")
-        if max_passivity_violations is not None:
-            violations = sweep_row_metric(row, "passivity.violating_points")
-            if violations is None or violations > max_passivity_violations:
-                excluded_reasons.append(
-                    f"passivity violations > {max_passivity_violations}"
-                )
-        if max_passivity_sigma is not None:
-            sigma = sweep_row_metric(row, "passivity.max_singular_value")
-            if sigma is None or sigma > max_passivity_sigma:
-                excluded_reasons.append(f"max sigma > {max_passivity_sigma:g}")
+        excluded_reasons = sweep_row_exclusion_reasons(
+            row,
+            selection_metric=selection_metric,
+            max_passivity_violations=max_passivity_violations,
+            max_passivity_sigma=max_passivity_sigma,
+        )
         if excluded_reasons:
             existing_error = str(row.get("error") or "").strip()
             row["error"] = "; ".join(
@@ -5554,12 +5594,23 @@ def run_sweep_command(
         epoch_text = str(epochs_display if epochs_display is not None else "unknown")
         passivity_violations = metric_text(row.get("passivity_violating_points")) or "n/a"
         passivity_max_sigma = metric_text(row.get("passivity_max_singular_value")) or "n/a"
-        print(
+        line = (
             f"trial complete {trial_index:>{trial_width}}/{len(candidates):>{trial_width}} "
             f"ep={epoch_text:>{epoch_width}} "
             f"{metric_label:>{metric_label_width}}={metric_display:>{metric_width}} "
             f"pv={passivity_violations:>{passivity_violations_width}} "
-            f"sigma={passivity_max_sigma:>{passivity_sigma_width}}",
+            f"sigma={passivity_max_sigma:>{passivity_sigma_width}}"
+        )
+        failed = bool(str(row.get("error") or "").strip()) or bool(
+            sweep_row_exclusion_reasons(
+                row,
+                selection_metric=args.selection_metric,
+                max_passivity_violations=max_passivity_violations,
+                max_passivity_sigma=max_passivity_sigma,
+            )
+        )
+        print(
+            cli_color_text(line, "red" if failed else "green"),
             flush=True,
         )
         cleanup_trial_dir(trials_dir / f"trial_{trial_index:04d}", args.keep_trial_models)
