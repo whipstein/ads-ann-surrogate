@@ -82,6 +82,7 @@ Outputs:
 - `verification_metrics.csv`: per-block and per-S-parameter errors, including EVM
 - `verification_summary.json`: global error, passivity summary, and plot paths
 - `training_history.csv`: neural training loss history
+- `training_history.pdf`: train/verification loss versus epoch convergence plot
 - `worst_case_plots/*.pdf`: multi-page worst verification case plots
 - `worst_case_y_plots/*.pdf`: matching Y-parameter implementation-view plots
 

@@ -220,16 +220,18 @@ A normal `train` run writes:
 - `verification_metrics.csv` with per-block and per-S-parameter errors,
   including EVM.
 - `verification_summary.json` with global errors and passivity summary data.
-- `training_history.csv` with train/verification loss history.
+- `training_history.csv` and `training_history.pdf` with train/verification
+  loss history and convergence plots.
 - `training_summary.md` with a human-readable run summary.
 - `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
   and error views.
 - `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
 
 Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
-diagnostic plots, and a promoted `best_model/` directory. DNN and KBNN sweep
-results can also be reranked after the fact to choose a different passive or
-weighted-error winner without repeating every trial.
+per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
+directory. DNN and KBNN sweep results can also be reranked after the fact to
+choose a different passive or weighted-error winner without repeating every
+trial.
 
 ## ADS Integration Paths
 

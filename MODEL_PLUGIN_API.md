@@ -458,6 +458,7 @@ A successful `train` command should write:
 model.npz
 metadata.json
 training_history.csv
+training_history.pdf
 training_summary.md
 verification_summary.json
 predicted_verification.mdif

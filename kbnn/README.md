@@ -87,6 +87,7 @@ Outputs:
 - `training_summary.md`: settings, final loss values, verification metrics,
   passivity summary, and links to S- and Y-parameter worst-case plots
 - `training_history.csv`: neural training loss history
+- `training_history.pdf`: train/verification loss versus epoch convergence plot
 - `worst_case_plots/*.pdf`: multi-page worst verification case plots
 - `worst_case_y_plots/*.pdf`: matching Y-parameter implementation-view plots
 

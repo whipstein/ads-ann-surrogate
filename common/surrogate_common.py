@@ -3280,6 +3280,10 @@ def draw_smith_subplot(
         draw_legend(canvas, chart_rect, location="upper_left")
 
 
+def chunks(values: Sequence[str], size: int) -> list[list[str]]:
+    return [list(values[idx : idx + size]) for idx in range(0, len(values), size)]
+
+
 def case_metrics(
     truth: MDIFBlock,
     pred: MDIFBlock,
@@ -3477,7 +3481,7 @@ def draw_grid_page(
     return canvas
 
 
-def draw_smith_grid_page(
+def draw_smith_grid_pages(
     truth: MDIFBlock,
     pred: MDIFBlock,
     labels: Sequence[str],
@@ -3485,43 +3489,48 @@ def draw_smith_grid_page(
     metrics: dict[str, object],
     title: str,
     response_kind: str = "S",
-) -> PdfCanvas:
-    rows, cols, ordered = subplot_grid(labels)
-    canvas = PdfCanvas(width=1133.0, height=830.0)
-    header_bottom = draw_page_header(canvas, title, case_name, metrics, "Smith / complex plane")
-    margin_x = 70.0 if cols >= 4 else 86.0
-    margin_bottom = 58.0
-    grid_top = max(142.0, header_bottom + 48.0)
-    gap_x = 52.0 if cols <= 2 else 84.0 if cols >= 4 else 65.0
-    if rows <= 2:
-        gap_y = 82.0
-    elif rows == 3:
-        gap_y = 62.0
-    else:
-        gap_y = 50.0
-    plot_w = (canvas.width - 2 * margin_x - gap_x * (cols - 1)) / cols
-    plot_h = (canvas.height - grid_top - margin_bottom - gap_y * (rows - 1)) / rows
-
-    for idx, label in enumerate(ordered):
-        if label not in truth.sparams or label not in pred.sparams:
-            continue
-        row = idx // cols
-        col = idx % cols
-        rect = (
-            margin_x + col * (plot_w + gap_x),
-            grid_top + row * (plot_h + gap_y),
-            plot_w,
-            plot_h,
-        )
-        draw_smith_subplot(
+) -> list[PdfCanvas]:
+    _rows, _cols, ordered = subplot_grid(labels)
+    present = [label for label in ordered if label in truth.sparams and label in pred.sparams]
+    pages: list[PdfCanvas] = []
+    groups = chunks(present, 4)
+    for page_index, group in enumerate(groups, start=1):
+        canvas = PdfCanvas(width=1133.0, height=830.0)
+        page_suffix = f" page {page_index}/{len(groups)}" if len(groups) > 1 else ""
+        header_bottom = draw_page_header(
             canvas,
-            rect,
-            truth.sparams[label],
-            pred.sparams[label],
-            response_plot_label(label, response_kind),
-            show_legend=idx == 0,
+            title,
+            case_name,
+            metrics,
+            f"Smith / complex plane{page_suffix}",
         )
-    return canvas
+        margin_x = 92.0
+        margin_bottom = 58.0
+        grid_top = max(142.0, header_bottom + 42.0)
+        gap_x = 86.0
+        gap_y = 74.0
+        plot_w = (canvas.width - 2 * margin_x - gap_x) / 2.0
+        plot_h = (canvas.height - grid_top - margin_bottom - gap_y) / 2.0
+
+        for idx, label in enumerate(group):
+            row = idx // 2
+            col = idx % 2
+            rect = (
+                margin_x + col * (plot_w + gap_x),
+                grid_top + row * (plot_h + gap_y),
+                plot_w,
+                plot_h,
+            )
+            draw_smith_subplot(
+                canvas,
+                rect,
+                truth.sparams[label],
+                pred.sparams[label],
+                response_plot_label(label, response_kind),
+                show_legend=page_index == 1 and idx == 0,
+            )
+        pages.append(canvas)
+    return pages
 
 
 def heat_color(value: float, vmin: float, vmax: float) -> tuple[float, float, float]:
@@ -3818,7 +3827,7 @@ def matplotlib_draw_smith_axes(ax: object) -> None:
         ax.plot(np.real(curve), np.imag(curve), color=color, linewidth=width, linestyle=linestyle, zorder=1)
 
 
-def matplotlib_smith_grid_page(
+def matplotlib_smith_grid_pages(
     plt: object,
     truth: MDIFBlock,
     pred: MDIFBlock,
@@ -3827,45 +3836,53 @@ def matplotlib_smith_grid_page(
     metrics: dict[str, object],
     title: str,
     response_kind: str = "S",
-) -> object:
-    rows, cols, ordered = subplot_grid(labels)
-    fig, axes = plt.subplots(rows, cols, figsize=(15.74, 11.53), squeeze=False)
-    header = matplotlib_header(title, case_name, metrics, "Smith / complex plane")
-    header_lines = header.count("\n") + 1
-    top = max(0.58, 0.82 - 0.028 * max(header_lines - 3, 0))
-    fig.subplots_adjust(left=0.055, right=0.985, bottom=0.055, top=top, wspace=0.18, hspace=0.42)
-    fig.suptitle(header, fontsize=12, y=0.985)
+) -> list[object]:
+    _rows, _cols, ordered = subplot_grid(labels)
+    present = [label for label in ordered if label in truth.sparams and label in pred.sparams]
+    figures = []
+    groups = chunks(present, 4)
+    for page_index, group in enumerate(groups, start=1):
+        fig, axes = plt.subplots(2, 2, figsize=(15.74, 11.53), squeeze=False)
+        page_suffix = f" page {page_index}/{len(groups)}" if len(groups) > 1 else ""
+        header = matplotlib_header(title, case_name, metrics, f"Smith / complex plane{page_suffix}")
+        header_lines = header.count("\n") + 1
+        top = max(0.58, 0.82 - 0.028 * max(header_lines - 3, 0))
+        fig.subplots_adjust(left=0.055, right=0.985, bottom=0.055, top=top, wspace=0.18, hspace=0.34)
+        fig.suptitle(header, fontsize=12, y=0.985)
 
-    for idx, ax in enumerate(axes.ravel()):
-        if idx >= len(ordered):
-            ax.axis("off")
-            continue
-        label = ordered[idx]
-        if label not in truth.sparams or label not in pred.sparams:
-            ax.axis("off")
-            continue
-        matplotlib_draw_smith_axes(ax)
-        ax.plot(
-            np.real(pred.sparams[label]),
-            np.imag(pred.sparams[label]),
-            color="#1f77b4",
-            linewidth=1.5,
-            label="modeled",
-            zorder=3,
-        )
-        ax.plot(
-            np.real(truth.sparams[label]),
-            np.imag(truth.sparams[label]),
-            color="#ff7f0e",
-            linestyle="--",
-            linewidth=1.25,
-            label="measured",
-            zorder=4,
-        )
-        ax.set_title(response_plot_label(label, response_kind), fontsize=12)
-        if idx == 0:
-            ax.legend(loc="upper left", fontsize=9, frameon=True)
-    return fig
+        for idx, ax in enumerate(axes.ravel()):
+            if idx >= len(group):
+                ax.axis("off")
+                continue
+            label = group[idx]
+            matplotlib_draw_smith_axes(ax)
+            ax.plot(
+                np.real(pred.sparams[label]),
+                np.imag(pred.sparams[label]),
+                color="#1f77b4",
+                linewidth=1.8,
+                label="modeled",
+                zorder=3,
+            )
+            ax.plot(
+                np.real(truth.sparams[label]),
+                np.imag(truth.sparams[label]),
+                color="#ff7f0e",
+                linestyle="--",
+                linewidth=1.45,
+                label="measured",
+                zorder=4,
+            )
+            ax.set_title(response_plot_label(label, response_kind), fontsize=13)
+            if page_index == 1 and idx == 0:
+                ax.legend(loc="upper left", fontsize=10, frameon=True)
+        figures.append(fig)
+    if not figures:
+        fig, ax = plt.subplots(figsize=(15.74, 11.53))
+        ax.axis("off")
+        fig.suptitle(matplotlib_header(title, case_name, metrics, "Smith / complex plane"), fontsize=12, y=0.985)
+        figures.append(fig)
+    return figures
 
 
 def matplotlib_focus_page(
@@ -4013,7 +4030,7 @@ def write_case_pdf_matplotlib(
     quantities = list(plot_quantities or ["magnitude", "phase"])
     figures = []
     if include_smith:
-        figures.append(matplotlib_smith_grid_page(plt, truth, pred, labels, case_name, metrics, title, response_kind))
+        figures.extend(matplotlib_smith_grid_pages(plt, truth, pred, labels, case_name, metrics, title, response_kind))
     page_labels = {
         "magnitude": "Magnitude",
         "phase": "Unwrapped phase",
@@ -4077,7 +4094,7 @@ def write_case_pdf(
         return
     pages = []
     if add_smith:
-        pages.append(draw_smith_grid_page(truth, pred, labels, case_name, metrics, plot_title, response_kind))
+        pages.extend(draw_smith_grid_pages(truth, pred, labels, case_name, metrics, plot_title, response_kind))
     page_labels = {
         "magnitude": "Magnitude",
         "phase": "Unwrapped phase",
@@ -4272,6 +4289,122 @@ def write_history(path: Path, history: Sequence[dict[str, float]]) -> None:
         writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss"])
         writer.writeheader()
         writer.writerows(history)
+    write_training_history_plot(path.with_suffix(".pdf"), history)
+
+
+def history_series(
+    history: Sequence[dict[str, float]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    epochs: list[float] = []
+    train_loss: list[float] = []
+    val_loss: list[float] = []
+    for row in history:
+        epoch = csv_number(row.get("epoch"))
+        train = csv_number(row.get("train_loss"))
+        val = csv_number(row.get("val_loss"))
+        if epoch is None or train is None or val is None:
+            continue
+        epochs.append(epoch)
+        train_loss.append(train)
+        val_loss.append(val)
+    return (
+        np.asarray(epochs, dtype=float),
+        np.asarray(train_loss, dtype=float),
+        np.asarray(val_loss, dtype=float),
+    )
+
+
+def write_training_history_plot_matplotlib(
+    path: Path,
+    history: Sequence[dict[str, float]],
+) -> bool:
+    modules = load_matplotlib_modules()
+    if modules is None:
+        return False
+    epochs, train_loss, val_loss = history_series(history)
+    if epochs.size == 0:
+        return False
+    plt, PdfPages = modules
+    fig, ax = plt.subplots(figsize=(9.4, 5.2))
+    ax.plot(epochs, train_loss, color="#1f77b4", linewidth=1.6, label="train loss")
+    ax.plot(epochs, val_loss, color="#ff7f0e", linestyle="--", linewidth=1.4, label="validation loss")
+    finite_losses = np.concatenate([train_loss[np.isfinite(train_loss)], val_loss[np.isfinite(val_loss)]])
+    if finite_losses.size and np.all(finite_losses > 0.0):
+        ax.set_yscale("log")
+    ax.set_title("Model performance vs epoch")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.grid(True, which="both", alpha=0.28)
+    ax.legend(loc="best", frameon=True)
+    fig.tight_layout()
+    with PdfPages(path) as pdf:
+        pdf.savefig(fig)
+    plt.close(fig)
+    return True
+
+
+def draw_training_history_legend(canvas: PdfCanvas, rect: tuple[float, float, float, float]) -> None:
+    left, top, width, _height = rect
+    legend_left = left + width - 148
+    legend_top = top + 12
+    canvas.rect(legend_left - 8, legend_top - 10, 140, 42, stroke=(0.82, 0.82, 0.82), fill=(1.0, 1.0, 1.0))
+    canvas.line(legend_left, legend_top, legend_left + 24, legend_top, color=(0.1216, 0.4667, 0.7059), width=1.8)
+    canvas.text(legend_left + 30, legend_top + 4, "train loss", size=10)
+    canvas.line(legend_left, legend_top + 19, legend_left + 24, legend_top + 19, color=(1.0, 0.498, 0.0549), width=1.8, dash="[5 3] 0")
+    canvas.text(legend_left + 30, legend_top + 23, "validation loss", size=10)
+
+
+def write_training_history_plot_fallback(
+    path: Path,
+    history: Sequence[dict[str, float]],
+) -> bool:
+    epochs, train_loss, val_loss = history_series(history)
+    if epochs.size == 0:
+        return False
+    canvas = PdfCanvas(width=900.0, height=520.0)
+    canvas.text(canvas.width / 2, 30, "Model performance vs epoch", size=18, font="F2", align="center")
+    rect = (86.0, 82.0, 742.0, 338.0)
+    finite_losses = np.concatenate([train_loss[np.isfinite(train_loss)], val_loss[np.isfinite(val_loss)]])
+    use_log = bool(finite_losses.size and np.all(finite_losses > 0.0))
+    if use_log:
+        train_y = np.log10(train_loss)
+        val_y = np.log10(val_loss)
+        y_label = "log10(loss)"
+    else:
+        train_y = train_loss
+        val_y = val_loss
+        y_label = "Loss"
+    x_range = expanded_range([epochs])
+    y_range = expanded_range([train_y, val_y])
+    pdf_ticks(canvas, rect, x_range, y_range, y_label, "Epoch")
+    canvas.polyline(
+        plot_points(epochs, train_y, x_range, y_range, rect),
+        color=(0.1216, 0.4667, 0.7059),
+        width=2.0,
+    )
+    canvas.polyline(
+        plot_points(epochs, val_y, x_range, y_range, rect),
+        color=(1.0, 0.498, 0.0549),
+        width=2.0,
+        dash="[5 3] 0",
+    )
+    draw_training_history_legend(canvas, rect)
+    save_pdf_pages(path, [canvas])
+    return True
+
+
+def write_training_history_plot(path: Path, history: Sequence[dict[str, float]]) -> Path | None:
+    if not history:
+        if path.exists():
+            path.unlink()
+        return None
+    if write_training_history_plot_matplotlib(path, history):
+        return path
+    if write_training_history_plot_fallback(path, history):
+        return path
+    if path.exists():
+        path.unlink()
+    return None
 
 
 def cleanup_trial_dir(trial_dir: Path, keep_trial_models: bool) -> None:
@@ -4307,20 +4440,61 @@ def metric_text(value: object) -> str:
     return f"{numeric:.6g}"
 
 
+def metric_text_sig(value: object, digits: int = 2) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return markdown_escape(value)
+    if not math.isfinite(numeric):
+        return ""
+    return f"{numeric:.{max(1, int(digits))}g}"
+
+
 def plot_links_cell(raw_paths: object) -> str:
     if not raw_paths:
         return ""
     paths = [part.strip() for part in str(raw_paths).split(";") if part.strip()]
+    return plot_links_for_paths(paths)
+
+
+def plot_links_for_paths(paths: Sequence[str]) -> str:
     links = []
-    for idx, path in enumerate(paths, start=1):
+    s_count = 0
+    y_count = 0
+    for path in paths:
         lower = path.lower()
-        prefix = "Y plot" if "worst_case_y_plots" in lower else "S plot"
-        links.append(f"[{prefix} {idx}]({path})")
+        if lower.endswith("training_history.pdf"):
+            label = "Loss vs epoch"
+        elif "worst_case_y_plots" in lower:
+            y_count += 1
+            label = f"Y plot {y_count}"
+        else:
+            s_count += 1
+            label = f"S plot {s_count}"
+        links.append(f"[{label}]({path})")
     return "<br>".join(links)
+
+
+def sweep_plot_links_cell(raw_paths: object, trial_value: object, sweep_dir: Path) -> str:
+    paths = [part.strip() for part in str(raw_paths or "").split(";") if part.strip()]
+    trial_number = csv_number(trial_value)
+    if trial_number is not None:
+        history_rel = f"trials/trial_{int(trial_number):04d}/training_history.pdf"
+        if (sweep_dir / history_rel).exists() and history_rel not in paths:
+            paths.insert(0, history_rel)
+    return plot_links_for_paths(paths)
 
 
 def trial_plot_paths(summary: dict[str, object], trial_dir: Path, out_dir: Path) -> list[str]:
     paths = []
+    history_plot = trial_dir / "training_history.pdf"
+    if history_plot.exists():
+        try:
+            paths.append(str(history_plot.relative_to(out_dir)))
+        except ValueError:
+            paths.append(str(history_plot))
     for key in ["worst_case_plots", "worst_case_y_plots"]:
         raw = summary.get(key)
         if not isinstance(raw, list):
@@ -4427,6 +4601,8 @@ def write_training_markdown(
         ("Training history", "training_history.csv"),
         ("Verification summary JSON", "verification_summary.json"),
     ]
+    if (path.parent / "training_history.pdf").exists():
+        artifacts.insert(3, ("Training loss plot", "training_history.pdf"))
     if not warning:
         artifacts.extend(
             [
@@ -4511,7 +4687,7 @@ def write_sweep_markdown(
         lines.append("")
     lines.extend(
         [
-            "| Rank | Trial | Metric | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Worst-case plots | Error |",
+            "| Rank | Trial | Metric | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Trial plots | Error |",
             "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
@@ -4566,7 +4742,7 @@ def write_sweep_markdown(
                     metric_text(row.get("passivity_max_singular_value")),
                     metric_text(row.get("passivity_violating_points")),
                     config,
-                    plot_links_cell(row.get("worst_case_plots")),
+                    sweep_plot_links_cell(row.get("worst_case_plots"), row.get("trial"), path.parent),
                     markdown_escape(row.get("error", "")),
                 ]
             )
@@ -5041,6 +5217,23 @@ def read_csv_rows(path: Path) -> list[dict[str, object]]:
         return [dict(row) for row in csv.DictReader(f)]
 
 
+def training_history_epochs(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    last_epoch: float | None = None
+    try:
+        with path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                epoch = csv_number(row.get("epoch"))
+                if epoch is not None:
+                    last_epoch = epoch
+    except OSError:
+        return None
+    if last_epoch is None:
+        return None
+    return int(round(last_epoch))
+
+
 def sweep_row_metric(row: dict[str, object], metric_name: str) -> float | None:
     if metric_name == "passivity.max_singular_value":
         return csv_number(row.get("passivity_max_singular_value"))
@@ -5274,12 +5467,6 @@ def run_sweep_command(
         (sweep_arg_values(args), candidate, str(out_dir), trial_index, args.trial_worst_plots)
         for trial_index, candidate in enumerate(candidates, start=1)
     ]
-    print(
-        f"sweep start: {len(candidates)} trials, jobs={jobs}, "
-        f"selection_metric={args.selection_metric}",
-        flush=True,
-    )
-
     def handle_result(result: dict[str, object]) -> None:
         nonlocal best_row, best_metric, live_best_trial, live_promotion_warning
         trial_index = int(result["trial"])
@@ -5310,20 +5497,18 @@ def run_sweep_command(
                     if promoted:
                         live_best_trial = current_best_trial
                         live_promotion_warning = None
-                        print(
-                            f"current best -> trial {current_best_trial} "
-                            f"{args.selection_metric}={metric_text(current_best_metric)} "
-                            f"(copied to {best_dir})",
-                            flush=True,
-                        )
                     else:
                         live_promotion_warning = warning
                         print(f"warning: {warning}", file=sys.stderr, flush=True)
-        metric_display = metric_text(metric_value) if metric_value is not None else "failed"
+        metric_display = metric_text_sig(metric_value, 2) if metric_value is not None else "failed"
+        epochs_display = training_history_epochs(
+            trials_dir / f"trial_{trial_index:04d}" / "training_history.csv"
+        )
         passivity_violations = metric_text(row.get("passivity_violating_points"))
         passivity_max_sigma = metric_text(row.get("passivity_max_singular_value"))
         print(
             f"trial complete {trial_index}/{len(candidates)} "
+            f"epochs={epochs_display if epochs_display is not None else 'unknown'} "
             f"{args.selection_metric}={metric_display} "
             f"passivity_violations={passivity_violations} "
             f"passivity_max_sigma={passivity_max_sigma}",
@@ -5333,10 +5518,6 @@ def run_sweep_command(
 
     if jobs == 1:
         for payload in payloads:
-            print(
-                f"trial start {payload[3]}/{len(candidates)} config={payload[1]}",
-                flush=True,
-            )
             handle_result(worker_func(payload))
     else:
         try:
@@ -5365,10 +5546,6 @@ def run_sweep_command(
             best_metric = float("inf")
             jobs = 1
             for payload in payloads:
-                print(
-                    f"trial start {payload[3]}/{len(candidates)} config={payload[1]}",
-                    flush=True,
-                )
                 handle_result(worker_func(payload))
 
     rows.sort(key=lambda row: int(row["trial"]))
@@ -5404,11 +5581,6 @@ def run_sweep_command(
     if retrain_best:
         if best_dir.exists():
             shutil.rmtree(best_dir)
-        print(
-            f"retraining best_model from trial {best_row['trial']} "
-            f"with {args.selection_metric}={metric_text(best_metric)}",
-            flush=True,
-        )
         train_func(best_args)
         best_model_source = "retrained"
         live_promotion_warning = None
@@ -5417,11 +5589,6 @@ def run_sweep_command(
         if promoted:
             live_best_trial = final_best_trial
             live_promotion_warning = None
-            print(
-                f"using promoted best_model from trial {final_best_trial} "
-                f"with {args.selection_metric}={metric_text(best_metric)}",
-                flush=True,
-            )
         else:
             live_promotion_warning = warning
             if best_dir.exists():
@@ -5433,12 +5600,6 @@ def run_sweep_command(
             )
             train_func(best_args)
             best_model_source = "retrained_after_promotion_failure"
-    else:
-        print(
-            f"using promoted best_model from trial {final_best_trial} "
-            f"with {args.selection_metric}={metric_text(best_metric)}",
-            flush=True,
-        )
     (out_dir / best_config_filename).write_text(
         json.dumps(
             {
@@ -5476,22 +5637,4 @@ def run_sweep_command(
         best_metric=best_metric,
         diagnostic_artifacts=diagnostic_artifacts,
     )
-    print(json.dumps({
-        "out_dir": str(out_dir),
-        "best_model_dir": str(best_dir),
-        "sweep_summary": str(out_dir / summary_filename),
-        "diagnostic_artifacts": diagnostic_artifacts,
-        "jobs": jobs,
-        "selection_metric": args.selection_metric,
-        "require_passive": require_passive,
-        "max_passivity_violations": max_passivity_violations,
-        "max_passivity_sigma": max_passivity_sigma,
-        "best_metric": best_metric,
-        "best_trial": best_row["trial"],
-        "best_trial_seed": best_args.seed,
-        "trial_seed_mode": getattr(args, "trial_seed_mode", "fixed"),
-        "best_model_source": best_model_source,
-        "promotion_warning": live_promotion_warning,
-        "best_config": best_candidate,
-    }, indent=2))
     return 0
