@@ -1,4 +1,5 @@
 ! Minimal synthetic DNN training/verification MDIF.
+! File: dnn_sample_training_verification.mdif.
 ! Two geometry variables: W and L. One split variable: dataset.
 
 VAR dataset=train

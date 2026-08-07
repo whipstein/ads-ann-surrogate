@@ -24,11 +24,7 @@ from typing import Sequence
 
 import numpy as np
 
-RC2_ROOT = Path(__file__).resolve().parents[1]
-if str(RC2_ROOT) not in sys.path:
-    sys.path.insert(0, str(RC2_ROOT))
-
-from common.surrogate_common import (  # noqa: E402
+from surrogate_common import (  # noqa: E402
     EPS,
     MDIFBlock,
     MLP,
@@ -1006,6 +1002,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="dnn_best_config.json",
         summary_filename="dnn_sweep_summary.md",
         diagnostics_prefix="dnn",
+        train_command_prefix=[sys.executable, "dnn.py", "train"],
     )
 
 

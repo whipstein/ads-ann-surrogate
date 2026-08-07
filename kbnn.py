@@ -25,11 +25,7 @@ from typing import Sequence
 
 import numpy as np
 
-RC2_ROOT = Path(__file__).resolve().parents[1]
-if str(RC2_ROOT) not in sys.path:
-    sys.path.insert(0, str(RC2_ROOT))
-
-from common.surrogate_common import (  # noqa: E402
+from surrogate_common import (  # noqa: E402
     DB_MAG_FLOOR,
     EPS,
     MDIFBlock,
@@ -92,6 +88,7 @@ from common.surrogate_common import (  # noqa: E402
     write_training_markdown,
     write_veriloga_package,
 )
+from dnn import DNN  # noqa: E402
 
 
 VERSION = "0.2.0-rc2"
@@ -1482,22 +1479,77 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     )
     uses_coarse_inputs = bool(model.include_coarse_input or model.mode == "prior-input")
     adds_coarse_to_output = model.mode == "residual"
+    needs_coarse_response = bool(uses_coarse_inputs or adds_coarse_to_output)
+    coarse_model = DNN.load(Path(args.coarse_model_dir)) if args.coarse_model_dir else None
+    if coarse_model is not None and not needs_coarse_response:
+        raise ValueError(
+            "--coarse-model-dir is only valid for residual or prior-input KBNN models"
+        )
+    if coarse_model is not None:
+        if coarse_model.output_domain != "s":
+            raise ValueError(
+                "The embedded coarse DNN must be trained with --output-domain s because the "
+                "KBNN coarse response is an S-parameter matrix"
+            )
+        if coarse_model.parameter_names != model.parameter_names:
+            raise ValueError(
+                "The coarse DNN parameter names/order must match the KBNN: "
+                f"expected {model.parameter_names}, got {coarse_model.parameter_names}"
+            )
+        if coarse_model.sparam_labels != model.sparam_labels:
+            raise ValueError(
+                "The coarse DNN S-parameter labels/order must match the KBNN: "
+                f"expected {model.sparam_labels}, got {coarse_model.sparam_labels}"
+            )
+    allow_coarse_hooks = bool(getattr(args, "allow_coarse_hooks", False))
+    if needs_coarse_response and coarse_model is None and not allow_coarse_hooks:
+        raise ValueError(
+            "This KBNN requires a coarse response. For a self-contained Verilog-A package, "
+            "train an S-domain DNN on the coarse MDIF and pass --coarse-model-dir. "
+            "Use --allow-coarse-hooks only to intentionally generate the legacy incomplete "
+            "hook model."
+        )
+    embedded_coarse_model = None
+    if coarse_model is not None:
+        embedded_coarse_model = {
+            "source_model_dir": str(Path(args.coarse_model_dir)),
+            "parameter_names": coarse_model.parameter_names,
+            "sparam_labels": coarse_model.sparam_labels,
+            "freq_transform": coarse_model.freq_transform,
+            "activation": coarse_model.mlp.activation,
+            "layer_sizes": coarse_model.mlp.layer_sizes,
+            "weights": coarse_model.mlp.weights,
+            "biases": coarse_model.mlp.biases,
+            "x_mean": np.asarray(coarse_model.x_scaler.mean, dtype=float),
+            "x_std": np.asarray(coarse_model.x_scaler.std, dtype=float),
+            "y_mean": np.asarray(coarse_model.y_scaler.mean, dtype=float),
+            "y_std": np.asarray(coarse_model.y_scaler.std, dtype=float),
+            "output_domain": coarse_model.output_domain,
+        }
     notes = [
         "This direct Verilog-A export embeds the saved local model.npz weights; it does not retrain in ADS ANN.",
         "The generated N-port is intended for S-parameter and small-signal AC simulation. It is not a causal transient model.",
         "The default frequency expression is $freq. If your ADS Verilog-A environment uses a different frequency variable, regenerate with --frequency-expression.",
     ]
-    if uses_coarse_inputs or adds_coarse_to_output:
+    if coarse_model is not None:
         notes.append(
-            "This KBNN formulation requires a coarse response at runtime. The generated Verilog-A file includes coarse response assignment hooks with zero defaults inside the analog block; replace those assignment right hand sides with the actual coarse circuit/surrogate response before relying on the model."
+            "This package embeds the supplied coarse S-domain DNN and is fully self-contained; ADS only supplies geometry/process parameters and simulator frequency."
+        )
+    elif needs_coarse_response:
+        notes.append(
+            "Legacy coarse-response hooks were explicitly requested. This package is not self-contained and the zero defaults are only suitable for a fixed-point diagnostic."
         )
     if model.mode == "residual":
         notes.append(
-            "Residual KBNN output is delta S internally; the generated N-port adds the coarse hook response before converting final S to Y."
+            "Residual KBNN output is delta S internally; the generated N-port adds the embedded coarse response before converting final S to Y."
+            if coarse_model is not None
+            else "Residual KBNN output is delta S internally; the generated N-port adds the coarse hook response before converting final S to Y."
         )
     elif model.mode == "prior-input":
         notes.append(
-            "Prior-input KBNN output is final fine S, but the ANN inputs still require the coarse hook response."
+            "Prior-input KBNN output is final fine S; the generated model feeds the embedded coarse response into the KBNN."
+            if coarse_model is not None
+            else "Prior-input KBNN output is final fine S, but the ANN inputs still require the coarse hook response."
         )
 
     manifest = write_veriloga_package(
@@ -1520,12 +1572,15 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         uses_coarse_inputs=uses_coarse_inputs,
         adds_coarse_to_output=adds_coarse_to_output,
         parameter_input_scales=parameter_input_scales,
+        embedded_coarse_model=embedded_coarse_model,
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "knowledge_based_neural_network",
             "mode": model.mode,
             "include_coarse_input": model.include_coarse_input,
-            "requires_coarse_hooks": bool(uses_coarse_inputs or adds_coarse_to_output),
+            "coarse_model_dir": str(Path(args.coarse_model_dir)) if args.coarse_model_dir else None,
+            "fully_self_contained": bool(not needs_coarse_response or coarse_model is not None),
+            "requires_coarse_hooks": bool(needs_coarse_response and coarse_model is None),
         },
         extra_notes=notes,
     )
@@ -1538,6 +1593,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "nports": manifest["nports"],
         "parameters": manifest["parameter_identifiers"],
         "parameter_input_scales": manifest["parameter_input_scales"],
+        "coarse_model_dir": manifest["coarse_model_dir"],
+        "fully_self_contained": manifest["fully_self_contained"],
         "requires_coarse_hooks": manifest["requires_coarse_hooks"],
     }, indent=2))
     return 0
@@ -1702,6 +1759,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="kbnn_best_config.json",
         summary_filename="kbnn_sweep_summary.md",
         diagnostics_prefix="kbnn",
+        train_command_prefix=[sys.executable, "kbnn.py", "train"],
     )
 
 
@@ -2108,6 +2166,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Export a trained KBNN directly as a Verilog-A N-port using saved model.npz weights",
     )
     export_va.add_argument("--model-dir", required=True, help="Directory containing trained model.npz and metadata.json")
+    export_va.add_argument(
+        "--coarse-model-dir",
+        help=(
+            "Directory containing an S-domain DNN trained on the KBNN coarse MDIF. "
+            "Required for a self-contained residual or prior-input export."
+        ),
+    )
     export_va.add_argument("--out-dir", required=True, help="Output directory for the Verilog-A package")
     export_va.add_argument("--module-name", help="Verilog-A module name. Defaults to the model directory name plus _va")
     export_va.add_argument("--z0", type=float, default=50.0, help="Reference impedance for S-to-Y conversion")
@@ -2121,6 +2186,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Optional NAME=SCALE mappings converting ADS/base-unit instance parameters "
             "to model-training units. Example: W=1um,L=1um or all=1um"
+        ),
+    )
+    export_va.add_argument(
+        "--allow-coarse-hooks",
+        action="store_true",
+        help=(
+            "Allow the legacy non-self-contained residual/prior-input export with "
+            "zero-default coarse response hooks when --coarse-model-dir is omitted"
         ),
     )
     export_va.set_defaults(func=command_export_veriloga)

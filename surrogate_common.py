@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Neuro-TF surrogate trainer for parameterized S-parameter MDIF data.
+"""Shared training, reporting, and ADS export utilities for all surrogate models.
 
-This implementation is intentionally dependency-light: it uses only NumPy from
-the bundled Codex/ADS-capable Python runtime.  The model structure is:
-
-    geometry parameters -> neural network -> rational transfer-function coeffs
-
-The rational transfer functions use a fixed stable pole basis, so fitting the
-coefficients for each training geometry is a linear least-squares problem.  A
-small MLP then learns the smooth map from geometry to those coefficients.
+The implementation is intentionally dependency-light and uses only NumPy for
+model calculations. DNN, KBNN, and Neuro-TF entry points import this module
+directly from the repository root.
 """
 
 from __future__ import annotations
@@ -22,6 +17,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -1362,6 +1358,7 @@ def _veriloga_readme(
     folded_output_scaler: bool,
     uses_coarse_inputs: bool,
     adds_coarse_to_output: bool,
+    embedded_coarse_model: bool,
     extra_notes: Sequence[str] | None,
 ) -> str:
     params = ", ".join(
@@ -1407,7 +1404,19 @@ def _veriloga_readme(
         f"- Output scaling folded into final layer: `{str(folded_output_scaler).lower()}`"
     )
     coarse = ""
-    if uses_coarse_inputs or adds_coarse_to_output:
+    if embedded_coarse_model:
+        coarse = """
+
+## Embedded Coarse-Response Model
+
+This KBNN package is self-contained. A second S-domain DNN evaluates the
+coarse response from the same geometry/process parameters and simulator
+frequency. The generated module feeds that response into the KBNN and/or adds
+it to the residual before converting the final S-matrix to Y. No coarse-response
+pins, instance parameters, MDIF files, or schematic subcircuits are required at
+runtime.
+"""
+    elif uses_coarse_inputs or adds_coarse_to_output:
         coarse = """
 
 ## Coarse-Response Hooks
@@ -1506,6 +1515,7 @@ def veriloga_module_text(
     output_domain: str = "s",
     fold_input_scaler: bool = False,
     fold_output_scaler: bool = False,
+    embedded_coarse_model: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
     output_domain = output_domain.lower().strip()
     if output_domain not in {"s", "y"}:
@@ -1560,6 +1570,119 @@ def veriloga_module_text(
     if np.any(np.asarray(x_std, dtype=float) == 0.0):
         raise ValueError("Input scaler standard deviations must be non-zero for Verilog-A export")
 
+    coarse_embedded = embedded_coarse_model is not None
+    needs_coarse_response = bool(uses_coarse_inputs or adds_coarse_to_output)
+    if coarse_embedded and not needs_coarse_response:
+        raise ValueError(
+            "An embedded coarse model is only valid when the primary model uses a coarse response"
+        )
+
+    coarse_feature_columns: list[str] = []
+    coarse_freq_transform = ""
+    coarse_activation = ""
+    coarse_layer_sizes: list[int] = []
+    coarse_weights: list[np.ndarray] = []
+    coarse_biases: list[np.ndarray] = []
+    coarse_x_mean = np.asarray([], dtype=float)
+    coarse_x_std = np.asarray([], dtype=float)
+    coarse_y_mean = np.asarray([], dtype=float)
+    coarse_y_std = np.asarray([], dtype=float)
+    coarse_source_model_dir: str | None = None
+    if embedded_coarse_model is not None:
+        coarse_parameter_names = [
+            str(value) for value in embedded_coarse_model["parameter_names"]  # type: ignore[index]
+        ]
+        coarse_sparam_labels = [
+            str(value) for value in embedded_coarse_model["sparam_labels"]  # type: ignore[index]
+        ]
+        if coarse_parameter_names != list(parameter_names):
+            raise ValueError(
+                "Embedded coarse DNN parameter_names must exactly match the KBNN parameter order: "
+                f"expected {list(parameter_names)}, got {coarse_parameter_names}"
+            )
+        if coarse_sparam_labels != list(sparam_labels):
+            raise ValueError(
+                "Embedded coarse DNN sparam_labels must exactly match the KBNN output order: "
+                f"expected {list(sparam_labels)}, got {coarse_sparam_labels}"
+            )
+        coarse_output_domain = str(
+            embedded_coarse_model.get("output_domain", "s")
+        ).lower().strip()
+        if coarse_output_domain != "s":
+            raise ValueError("Embedded coarse DNN must be trained with --output-domain s")
+        coarse_freq_transform = str(embedded_coarse_model["freq_transform"])
+        coarse_activation = str(embedded_coarse_model["activation"])
+        coarse_layer_sizes = [
+            int(value) for value in embedded_coarse_model["layer_sizes"]  # type: ignore[index]
+        ]
+        coarse_weights = [
+            np.asarray(value, dtype=float).copy()
+            for value in embedded_coarse_model["weights"]  # type: ignore[index]
+        ]
+        coarse_biases = [
+            np.asarray(value, dtype=float).copy()
+            for value in embedded_coarse_model["biases"]  # type: ignore[index]
+        ]
+        coarse_x_mean = np.asarray(embedded_coarse_model["x_mean"], dtype=float)
+        coarse_x_std = np.asarray(embedded_coarse_model["x_std"], dtype=float)
+        coarse_y_mean = np.asarray(embedded_coarse_model["y_mean"], dtype=float)
+        coarse_y_std = np.asarray(embedded_coarse_model["y_std"], dtype=float)
+        coarse_source_model_dir = (
+            str(embedded_coarse_model.get("source_model_dir") or "") or None
+        )
+        coarse_feature_columns = [
+            *parameter_names,
+            *frequency_feature_columns(coarse_freq_transform),
+        ]
+        if len(coarse_layer_sizes) < 2:
+            raise ValueError(
+                "Embedded coarse DNN layer sizes must include input and output dimensions"
+            )
+        if coarse_layer_sizes[0] != len(coarse_feature_columns):
+            raise ValueError(
+                "Embedded coarse DNN input dimension does not match its parameter/frequency features"
+            )
+        if coarse_layer_sizes[-1] != n_outputs:
+            raise ValueError(
+                f"Embedded coarse DNN output dimension must be {n_outputs}, "
+                f"got {coarse_layer_sizes[-1]}"
+            )
+        if (
+            len(coarse_weights) != len(coarse_biases)
+            or len(coarse_weights) != len(coarse_layer_sizes) - 1
+        ):
+            raise ValueError(
+                "Embedded coarse DNN weights, biases, and layer sizes are inconsistent"
+            )
+        for layer_idx, (coarse_weight, coarse_bias) in enumerate(
+            zip(coarse_weights, coarse_biases)
+        ):
+            expected_weight_shape = (
+                coarse_layer_sizes[layer_idx],
+                coarse_layer_sizes[layer_idx + 1],
+            )
+            if coarse_weight.shape != expected_weight_shape:
+                raise ValueError(
+                    f"Embedded coarse DNN W{layer_idx} has shape {coarse_weight.shape}; "
+                    f"expected {expected_weight_shape}"
+                )
+            if coarse_bias.shape != (coarse_layer_sizes[layer_idx + 1],):
+                raise ValueError(
+                    f"Embedded coarse DNN b{layer_idx} has shape {coarse_bias.shape}; "
+                    f"expected {(coarse_layer_sizes[layer_idx + 1],)}"
+                )
+        if (
+            coarse_x_mean.shape != (coarse_layer_sizes[0],)
+            or coarse_x_std.shape != (coarse_layer_sizes[0],)
+        ):
+            raise ValueError("Embedded coarse DNN input scaler dimensions are inconsistent")
+        if coarse_y_mean.shape != (n_outputs,) or coarse_y_std.shape != (n_outputs,):
+            raise ValueError("Embedded coarse DNN output scaler dimensions are inconsistent")
+        if np.any(coarse_x_std == 0.0):
+            raise ValueError(
+                "Embedded coarse DNN input scaler standard deviations must be non-zero"
+            )
+
     va_weights = [np.asarray(weight, dtype=float).copy() for weight in weights]
     va_biases = [np.asarray(bias, dtype=float).copy() for bias in biases]
     folded_input_scaler = bool(fold_input_scaler)
@@ -1612,7 +1735,7 @@ def veriloga_module_text(
                 f"// model VAR {name} = {ident}/{scale_ident}"
             )
 
-    if uses_coarse_inputs or adds_coarse_to_output:
+    if needs_coarse_response and not coarse_embedded:
         lines.append("")
         lines.append("  // Default coarse S-parameter values. Replace analog assignments for a live coarse model.")
         for label in sparam_labels:
@@ -1666,6 +1789,10 @@ def veriloga_module_text(
                 f"  real ci [0:{n_sparams - 1}];",
             ]
         )
+    if coarse_embedded:
+        lines.append(f"  real coarse_y [0:{n_outputs - 1}];")
+        for layer_idx, size in enumerate(coarse_layer_sizes):
+            lines.append(f"  real c{layer_idx} [0:{size - 1}];")
     if not folded_output_scaler:
         lines.append(f"  real y [0:{n_outputs - 1}];")
     if output_domain == "s":
@@ -1684,7 +1811,62 @@ def veriloga_module_text(
     lines.append("    freq_log10_hz = log(freq_hz)/log(10.0);")
     lines.append("")
 
-    if uses_coarse_inputs or adds_coarse_to_output:
+    if coarse_embedded:
+        lines.append("    // Self-contained coarse S-parameter DNN.")
+        coarse_feature_exprs: list[str] = [
+            f"({ident})/({scale_ident})"
+            for ident, scale_ident in zip(param_ids, scale_ids)
+        ]
+        if coarse_freq_transform == "log":
+            coarse_feature_exprs.append("freq_log10_hz")
+        elif coarse_freq_transform == "linear":
+            coarse_feature_exprs.append("freq_hz")
+        elif coarse_freq_transform == "log-linear":
+            coarse_feature_exprs.extend(["freq_log10_hz", "freq_hz"])
+        else:
+            raise ValueError(
+                f"Unsupported embedded coarse frequency transform {coarse_freq_transform!r}"
+            )
+        for idx, expr in enumerate(coarse_feature_exprs):
+            lines.append(
+                f"    c0[{idx}] = (({expr}) - "
+                f"({veriloga_float(float(coarse_x_mean[idx]))}))"
+                f"/({veriloga_float(float(coarse_x_std[idx]))}); "
+                f"// {coarse_feature_columns[idx]}"
+            )
+        lines.append("")
+        for layer_idx, (coarse_weight, coarse_bias) in enumerate(
+            zip(coarse_weights, coarse_biases)
+        ):
+            coarse_hidden_activation = (
+                coarse_activation if layer_idx < len(coarse_weights) - 1 else None
+            )
+            _veriloga_layer_assignments(
+                lines,
+                source=f"c{layer_idx}",
+                dest=f"c{layer_idx + 1}",
+                weight=coarse_weight,
+                bias=coarse_bias,
+                activation=coarse_hidden_activation,
+            )
+        coarse_final_layer = f"c{len(coarse_layer_sizes) - 1}"
+        for idx in range(n_outputs):
+            lines.append(
+                f"    coarse_y[{idx}] = {coarse_final_layer}[{idx}]"
+                f"*({veriloga_float(float(coarse_y_std[idx]))}) "
+                f"+ ({veriloga_float(float(coarse_y_mean[idx]))});"
+            )
+        lines.append("")
+        for idx, label in enumerate(sparam_labels):
+            lines.append(
+                f"    cr[{idx}] = coarse_y[{idx}]; // embedded coarse {label} real"
+            )
+            lines.append(
+                f"    ci[{idx}] = coarse_y[{idx + n_sparams}]; "
+                f"// embedded coarse {label} imag"
+            )
+        lines.append("")
+    elif needs_coarse_response:
         lines.append("    // Coarse response values. Replace these assignments for a live coarse model.")
         for idx, label in enumerate(sparam_labels):
             base = veriloga_identifier(label, "sparam")
@@ -1872,15 +2054,22 @@ def veriloga_module_text(
         if output_domain == "y"
         else sparameter_real_imag_columns(sparam_labels, prefix="fine")
     )
-    implementation_note = (
-        "Direct Verilog-A embeds the trained NumPy MLP weights and stamps the predicted "
-        "Y-parameter matrix directly. Intended for AC/SP analyses."
-        if output_domain == "y"
-        else (
+    if coarse_embedded:
+        implementation_note = (
+            "Direct Verilog-A embeds an S-domain coarse-response DNN and the trained "
+            "KBNN, combines them internally, and converts the final S-parameters to a "
+            "small-signal Y-matrix. Intended for AC/SP analyses."
+        )
+    elif output_domain == "y":
+        implementation_note = (
+            "Direct Verilog-A embeds the trained NumPy MLP weights and stamps the predicted "
+            "Y-parameter matrix directly. Intended for AC/SP analyses."
+        )
+    else:
+        implementation_note = (
             "Direct Verilog-A embeds the trained NumPy MLP weights and converts predicted "
             "S-parameters to a small-signal Y-matrix. Intended for AC/SP analyses."
         )
-    )
     manifest = {
         "module_name": module_id,
         "model_kind": model_kind,
@@ -1907,6 +2096,24 @@ def veriloga_module_text(
         "folded_output_scaler": folded_output_scaler,
         "uses_coarse_inputs": bool(uses_coarse_inputs),
         "adds_coarse_to_output": bool(adds_coarse_to_output),
+        "embedded_coarse_model": bool(coarse_embedded),
+        "coarse_model": (
+            {
+                "source_model_dir": coarse_source_model_dir,
+                "parameter_names": list(parameter_names),
+                "sparam_labels": list(sparam_labels),
+                "input_columns": coarse_feature_columns,
+                "output_columns": sparameter_real_imag_columns(
+                    sparam_labels, prefix="coarse"
+                ),
+                "output_domain": "s",
+                "freq_transform": coarse_freq_transform,
+                "activation": coarse_activation,
+                "layer_sizes": coarse_layer_sizes,
+            }
+            if coarse_embedded
+            else None
+        ),
         "implementation_note": implementation_note,
     }
     return "\n".join(lines), manifest
@@ -1935,6 +2142,7 @@ def write_veriloga_package(
     output_domain: str = "s",
     fold_input_scaler: bool = False,
     fold_output_scaler: bool = False,
+    embedded_coarse_model: dict[str, object] | None = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -1963,6 +2171,7 @@ def write_veriloga_package(
         output_domain=output_domain,
         fold_input_scaler=fold_input_scaler,
         fold_output_scaler=fold_output_scaler,
+        embedded_coarse_model=embedded_coarse_model,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -2005,6 +2214,7 @@ def write_veriloga_package(
             folded_output_scaler=bool(manifest["folded_output_scaler"]),
             uses_coarse_inputs=uses_coarse_inputs,
             adds_coarse_to_output=adds_coarse_to_output,
+            embedded_coarse_model=bool(manifest["embedded_coarse_model"]),
             extra_notes=extra_notes,
         )
     )
@@ -4714,6 +4924,36 @@ def markdown_value(value: object) -> str:
     return metric_text(value)
 
 
+def single_model_train_command(
+    command_prefix: Sequence[str],
+    train_args: argparse.Namespace,
+    out_dir: Path,
+) -> str:
+    """Build a shell-copyable train command from a selected sweep trial."""
+
+    argv = [str(part) for part in command_prefix]
+    internal_names = {
+        "command",
+        "func",
+        "progress_label",
+        "debug_label",
+        "quiet",
+    }
+    for name, raw_value in vars(train_args).items():
+        if name in internal_names or raw_value is None:
+            continue
+        value = str(out_dir) if name == "out_dir" else raw_value
+        flag = f"--{name.replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+            continue
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(item) for item in value)
+        argv.extend([flag, str(value)])
+    return " ".join(shlex.quote(part) for part in argv)
+
+
 def write_training_markdown(
     path: Path,
     model_kind: str,
@@ -4860,6 +5100,7 @@ def write_sweep_markdown(
     selection_metric: str,
     best_config: dict[str, object] | None,
     best_metric: float | None,
+    reproduction_command: str | None = None,
     diagnostic_artifacts: Sequence[str] | None = None,
 ) -> None:
     sorted_rows = sorted(
@@ -4879,6 +5120,19 @@ def write_sweep_markdown(
     if best_config is not None and best_metric is not None:
         config_text = ", ".join(f"`{key}={value}`" for key, value in best_config.items())
         lines.extend([f"Best metric: `{best_metric:.6g}`", f"Best configuration: {config_text}", ""])
+    if reproduction_command:
+        lines.extend(
+            [
+                "## Reproduce the Best Model",
+                "",
+                "Run this command from the repository root to train the selected configuration by itself:",
+                "",
+                "```bash",
+                reproduction_command,
+                "```",
+                "",
+            ]
+        )
     if diagnostic_artifacts:
         lines.extend(["Diagnostic artifacts:", ""])
         for artifact in diagnostic_artifacts:
@@ -5717,6 +5971,7 @@ def run_sweep_command(
     best_config_filename: str,
     summary_filename: str,
     diagnostics_prefix: str,
+    train_command_prefix: Sequence[str] | None = None,
 ) -> int:
     out_dir = Path(args.out_dir)
     trials_dir = out_dir / "trials"
@@ -5925,6 +6180,15 @@ def run_sweep_command(
             )
             train_func(best_args)
             best_model_source = "retrained_after_promotion_failure"
+    reproduction_command = (
+        single_model_train_command(
+            train_command_prefix,
+            best_args,
+            out_dir / "reproduced_model",
+        )
+        if train_command_prefix
+        else None
+    )
     (out_dir / best_config_filename).write_text(
         json.dumps(
             {
@@ -5940,6 +6204,7 @@ def run_sweep_command(
                 "best_model_dir": str(best_dir),
                 "best_model_source": best_model_source,
                 "promotion_warning": live_promotion_warning,
+                "reproduction_command": reproduction_command,
             },
             indent=2,
         )
@@ -5960,6 +6225,10 @@ def run_sweep_command(
         selection_metric=args.selection_metric,
         best_config=best_candidate,
         best_metric=best_metric,
+        reproduction_command=reproduction_command,
         diagnostic_artifacts=diagnostic_artifacts,
     )
+    if reproduction_command:
+        print("reproduce best model:", flush=True)
+        print(reproduction_command, flush=True)
     return 0

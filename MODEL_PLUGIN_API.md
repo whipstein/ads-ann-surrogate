@@ -1,59 +1,38 @@
 # Model Extraction Plugin API
 
-This document describes the rc2 module API for adding a new model extraction
-plugin. In rc2, a plugin is a model package that uses the shared infrastructure
-in `common/surrogate_common.py` while keeping model-specific fitting and
-prediction logic in its own module.
+This document describes the flat module API for adding a new model extraction
+front end. A model script imports shared infrastructure from
+`surrogate_common.py` while keeping its fitting, prediction, and CLI logic in
+one root-level file.
 
-There is no dynamic plugin discovery layer yet. A new plugin is added by
-creating a new directory beside `dnn/`, `kbnn/`, and `neuro_tf/`, then wiring a
-thin entry-point script to that directory's `model.py`.
+There is no dynamic plugin discovery layer. Add a uniquely named Python script
+beside `dnn.py`, `kbnn.py`, and `neuro_tf.py`, then add its workflow and command
+reference to the integrated `README.md`.
 
-## Directory Layout
+## Flat Layout
 
-Use this shape for a new plugin named `my_model`:
+For a new model named `my_model`, add:
 
 ```text
-outputs/rc2/
-  common/
-    surrogate_common.py
-  my_model/
-    my_model.py
-    model.py
-    README.md
-    sample_training_verification.mdif
+.
+|-- surrogate_common.py
+|-- my_model.py
+|-- my_model_sample_training_verification.mdif
+`-- README.md
 ```
 
-`my_model.py` should be a thin wrapper:
+`my_model.py` is both the implementation and command entry point. Import the
+shared APIs directly:
 
 ```python
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import sys
+import argparse
 from pathlib import Path
+from typing import Sequence
 
-MODULE_DIR = Path(__file__).resolve().parent
-if str(MODULE_DIR) not in sys.path:
-    sys.path.insert(0, str(MODULE_DIR))
-
-from model import main  # noqa: E402
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
-
-`model.py` should add the rc2 root to `sys.path` and import shared APIs:
-
-```python
-from pathlib import Path
-import sys
-
-RC2_ROOT = Path(__file__).resolve().parents[1]
-if str(RC2_ROOT) not in sys.path:
-    sys.path.insert(0, str(RC2_ROOT))
-
-from common.surrogate_common import (
+from surrogate_common import (
     MDIFBlock,
     MLP,
     Standardizer,
@@ -66,12 +45,22 @@ from common.surrogate_common import (
     run_sweep_command,
     split_blocks,
     summary_metric,
-    trial_plot_paths,
     sweep_trial_seed,
+    trial_plot_paths,
     write_history,
     write_training_markdown,
     write_training_verification_artifacts,
 )
+
+# Define the model, command handlers, and build_arg_parser() here.
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 ## Shared Data Types
@@ -348,6 +337,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="my_model_best_config.json",
         summary_filename="my_model_sweep_summary.md",
         diagnostics_prefix="my_model",
+        train_command_prefix=[sys.executable, "my_model.py", "train"],
     )
 ```
 
@@ -360,6 +350,8 @@ The common sweep runner handles:
 - sweep results CSV
 - best config JSON
 - sweep summary Markdown
+- a shell-copyable standalone training command in the terminal, best config
+  JSON, and Markdown summary when `train_command_prefix` is supplied
 - error-vs-swept-parameter PDF/CSV diagnostics
 
 ## Required CLI Surface
@@ -450,6 +442,41 @@ Export helpers:
 - `write_ads_ann_package(...)`
 - `write_veriloga_package(...)`
 
+### Composite Verilog-A Models
+
+`write_veriloga_package(...)` accepts an optional `embedded_coarse_model`
+mapping for a model whose runtime calculation depends on a coarse response.
+The common exporter evaluates that DNN first, maps its outputs to complex
+coarse S-parameters, evaluates the primary model, and emits one Verilog-A
+N-port. The mapping contains:
+
+```python
+embedded_coarse_model = {
+    "source_model_dir": str(coarse_model_dir),
+    "parameter_names": coarse_model.parameter_names,
+    "sparam_labels": coarse_model.sparam_labels,
+    "freq_transform": coarse_model.freq_transform,
+    "activation": coarse_model.mlp.activation,
+    "layer_sizes": coarse_model.mlp.layer_sizes,
+    "weights": coarse_model.mlp.weights,
+    "biases": coarse_model.mlp.biases,
+    "x_mean": coarse_model.x_scaler.mean,
+    "x_std": coarse_model.x_scaler.std,
+    "y_mean": coarse_model.y_scaler.mean,
+    "y_std": coarse_model.y_scaler.std,
+    "output_domain": "s",
+}
+```
+
+The coarse model must be S-domain and must use exactly the same parameter-name
+order and S-parameter-label order as the primary model. Its inputs are geometry
+or process parameters plus its own frequency features; it cannot itself require
+a coarse response. Set `uses_coarse_inputs=True` when the primary model consumes
+the coarse S-parameters and `adds_coarse_to_output=True` when it predicts a
+residual that must be added to them. A plugin should reject a missing embedded
+model by default whenever either flag is true, unless it deliberately exposes a
+legacy hook-based export mode.
+
 ## Artifact Expectations
 
 A successful `train` command should write:
@@ -478,6 +505,10 @@ best_model/
 sweep_diagnostics/
 ```
 
+The best-config JSON and Markdown summary include a standalone `train` command
+that uses the selected trial seed and effective training arguments. The command
+targets `<sweep-dir>/reproduced_model` so it does not overwrite `best_model/`.
+
 If `--keep-trial-models` is false, the common sweep runner removes large
 per-trial model artifacts after each trial while keeping lightweight summaries
 and plots.
@@ -493,9 +524,9 @@ configuration is trained again after all trials finish.
 
 ## Implementation Checklist
 
-1. Create `outputs/rc2/<plugin>/`.
-2. Add a thin `<plugin>.py` wrapper.
-3. Implement `model.py` with `train_model`, `command_train`, `predict_blocks`,
+1. Add a unique root-level `<plugin>.py` model script.
+2. Import reusable infrastructure directly from `surrogate_common.py`.
+3. Implement the script with `train_model`, `command_train`, `predict_blocks`,
    `save`, and `load`.
 4. Add `sweep_candidate_grid`, `namespace_for_trial`, a sweep worker, and
    `command_sweep` using `run_sweep_command`.
@@ -503,6 +534,6 @@ configuration is trained again after all trials finish.
 6. Add `--loss-interval` and `--progress-interval` to neural training/sweep
    parsers, and add `--retrain-best` to sweep parsers.
 7. Reuse `write_training_verification_artifacts` for verification outputs.
-8. Add a plugin README and one small sample MDIF.
+8. Add the plugin workflow to `README.md` and add one uniquely named sample MDIF.
 9. Verify with `python3 -m py_compile` and a short `train` run.
 10. Verify `sweep --max-trials 2 --worst-plots 0 --trial-worst-plots 0`.

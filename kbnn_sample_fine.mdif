@@ -1,4 +1,5 @@
 ! Synthetic fine/target data for KBNN smoke tests.
+! File: kbnn_sample_fine.mdif.
 
 VAR dataset=train
 VAR W=0.40mm

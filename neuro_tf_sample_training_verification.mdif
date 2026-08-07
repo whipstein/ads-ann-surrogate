@@ -1,4 +1,5 @@
 ! Minimal synthetic Neuro-TF training/verification MDIF.
+! File: neuro_tf_sample_training_verification.mdif.
 ! Two geometry variables: W and L. One split variable: dataset.
 
 VAR dataset=train

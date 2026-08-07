@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neuro-TF model-specific calculations and CLI for rc2."""
+"""Neuro-TF trainer, predictor, and sweep CLI for parameterized MDIF data."""
 
 from __future__ import annotations
 
@@ -16,11 +16,7 @@ from typing import Sequence
 
 import numpy as np
 
-RC2_ROOT = Path(__file__).resolve().parents[1]
-if str(RC2_ROOT) not in sys.path:
-    sys.path.insert(0, str(RC2_ROOT))
-
-from common.surrogate_common import *  # noqa: F401,F403,E402
+from surrogate_common import *  # noqa: F401,F403,E402
 
 VERSION = "0.2.0-rc2"
 
@@ -315,6 +311,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="neurotf_best_config.json",
         summary_filename="neurotf_sweep_summary.md",
         diagnostics_prefix="neurotf",
+        train_command_prefix=[sys.executable, "neuro_tf.py", "train"],
     )
 
 
