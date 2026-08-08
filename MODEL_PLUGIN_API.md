@@ -269,6 +269,20 @@ parallel execution, passivity-aware ranking, live best-model promotion,
 optional best-model retraining, CSV/Markdown summaries, and post-sweep
 diagnostics.
 
+Sweep CLI candidate axes must use the same naming contract as the built-in
+models:
+
+- The train option selects one value, such as `--activation relu` or
+  `--learning-rate 0.002`.
+- The standardized plural selects several values, such as
+  `--activations tanh,relu` or `--learning-rates 0.001,0.002`.
+- The sweep parser must also accept the singular train option for a one-value
+  candidate set.
+- Use `--search-mode grid|random` for the sweep strategy. Do not overload a
+  model's train-time `--mode`; legacy aliases may be retained separately.
+- Existing `*-options` names may remain compatibility aliases, but should not
+  be the primary documented spelling.
+
 Required constants:
 
 ```python

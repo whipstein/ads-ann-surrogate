@@ -1312,10 +1312,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Try multiple DNN configurations and retrain the best one",
     )
     add_data_args(sweep)
-    sweep.add_argument("--freq-transform-options", default="log,log-linear")
-    sweep.add_argument("--hidden-layer-options", default="64,64;128,128,64;128,128,128;256,128,64")
-    sweep.add_argument("--activation-options", default="tanh,relu")
-    sweep.add_argument("--learning-rates", default="0.001,0.002,0.005")
+    sweep.add_argument(
+        "--freq-transforms",
+        "--freq-transform-options",
+        "--freq-transform",
+        dest="freq_transform_options",
+        default="log,log-linear",
+        help="Comma-separated frequency transforms; --freq-transform is the single-value train-compatible form.",
+    )
+    sweep.add_argument(
+        "--hidden-layers",
+        "--hidden-layer-layouts",
+        "--hidden-layer-options",
+        dest="hidden_layer_options",
+        default="64,64;128,128,64;128,128,128;256,128,64",
+        help="One train-style layout or semicolon-separated hidden-layer layouts.",
+    )
+    sweep.add_argument(
+        "--activations",
+        "--activation-options",
+        "--activation",
+        dest="activation_options",
+        default="tanh,relu",
+        help="Comma-separated activations; --activation is the single-value train-compatible form.",
+    )
+    sweep.add_argument(
+        "--learning-rates",
+        "--learning-rate",
+        dest="learning_rates",
+        default="0.001,0.002,0.005",
+        help="Comma-separated learning rates; --learning-rate accepts one value as in train.",
+    )
     sweep.add_argument("--jobs", type=int, default=1, help="Number of sweep trials to train in parallel")
     sweep.add_argument(
         "--sparam-weights",
@@ -1325,7 +1352,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--frequency-weights",
         help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
     )
-    sweep.add_argument("--mode", choices=["grid", "random"], default="random")
+    sweep.add_argument(
+        "--search-mode",
+        "--mode",
+        dest="mode",
+        choices=["grid", "random"],
+        default="random",
+        help="Sweep search strategy. --mode remains a backward-compatible alias.",
+    )
     sweep.add_argument("--max-trials", type=int, default=24)
     sweep.add_argument(
         "--trial-seed-mode",

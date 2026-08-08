@@ -2114,7 +2114,12 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
         if freq_transform not in {"log", "linear"}:
             raise ValueError(f"Unsupported frequency transform {freq_transform!r}")
     axes = {
-        "mode": [normalize_mode(value) for value in parse_text_options(args.mode_options)],
+        "mode": [
+            normalize_mode(value)
+            for value in parse_text_options(
+                getattr(args, "mode_options", None) or "residual,prior-input"
+            )
+        ],
         "include_coarse_input": [parse_bool_option(value) for value in parse_text_options(args.include_coarse_input_options)],
         "freq_transform": freq_transform_options,
         "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options),
@@ -2229,6 +2234,18 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
 
 
 def command_sweep(args: argparse.Namespace) -> int:
+    compatibility_mode = getattr(args, "mode", None)
+    model_modes = getattr(args, "mode_options", None)
+    search_mode = getattr(args, "search_mode", "random")
+    if compatibility_mode in {"grid", "random"}:
+        search_mode = compatibility_mode
+    elif compatibility_mode is not None:
+        if model_modes is not None:
+            raise ValueError("Use either --mode for one KBNN mode or --modes for several, not both")
+        model_modes = compatibility_mode
+    args = argparse.Namespace(**vars(args))
+    args.mode = search_mode
+    args.mode_options = model_modes or "residual,prior-input"
     integrated_coarse_fit = bool(getattr(args, "coarse_mdif", None))
     prepared_args = prepare_fitted_coarse_model(args, Path(args.out_dir))
     # Trial directories are transient, so package the shared coarse model only
@@ -2558,18 +2575,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Try multiple KBNN configurations and retrain the best one",
     )
     add_common_train_args(sweep)
-    sweep.add_argument("--mode-options", default="residual,prior-input")
-    sweep.add_argument("--include-coarse-input-options", default="false,true")
     sweep.add_argument(
+        "--modes",
+        "--mode-options",
+        dest="mode_options",
+        help="Comma-separated KBNN model modes. Use train-compatible --mode for one value.",
+    )
+    sweep.add_argument(
+        "--mode",
+        choices=["plain", "residual", "prior-input", "grid", "random"],
+        help="One train-compatible KBNN model mode; grid/random remain accepted for legacy search-mode commands.",
+    )
+    sweep.add_argument(
+        "--include-coarse-inputs",
+        "--include-coarse-input-options",
+        dest="include_coarse_input_options",
+        default="false,true",
+        help="Comma-separated false/true candidate values.",
+    )
+    sweep.add_argument(
+        "--include-coarse-input",
+        dest="include_coarse_input_options",
+        action="store_const",
+        const="true",
+        default=argparse.SUPPRESS,
+        help="Train-compatible single true value for the optimize candidate set.",
+    )
+    sweep.add_argument(
+        "--freq-transforms",
         "--freq-transform-options",
+        dest="freq_transform_options",
         help=(
             "Comma-separated frequency transforms to try. Available values are log and linear. "
             "If omitted, the sweep uses --freq-transform."
         ),
     )
-    sweep.add_argument("--hidden-layer-options", default="32;64;64,64")
-    sweep.add_argument("--activation-options", default="tanh,relu")
-    sweep.add_argument("--learning-rates", default="0.001,0.002,0.005")
+    sweep.add_argument(
+        "--hidden-layers",
+        "--hidden-layer-layouts",
+        "--hidden-layer-options",
+        dest="hidden_layer_options",
+        default="32;64;64,64",
+        help="One train-style layout or semicolon-separated hidden-layer layouts.",
+    )
+    sweep.add_argument(
+        "--activations",
+        "--activation-options",
+        "--activation",
+        dest="activation_options",
+        default="tanh,relu",
+        help="Comma-separated activations; --activation accepts one value as in train.",
+    )
+    sweep.add_argument(
+        "--learning-rates",
+        "--learning-rate",
+        dest="learning_rates",
+        default="0.001,0.002,0.005",
+        help="Comma-separated learning rates; --learning-rate accepts one value as in train.",
+    )
     sweep.add_argument("--jobs", type=int, default=1, help="Number of sweep trials to train in parallel")
     sweep.add_argument(
         "--sparam-weights",
@@ -2579,7 +2642,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--frequency-weights",
         help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
     )
-    sweep.add_argument("--mode", choices=["grid", "random"], default="random")
+    sweep.add_argument(
+        "--search-mode",
+        choices=["grid", "random"],
+        default="random",
+        help="Sweep search strategy. Legacy --mode grid/random is still accepted.",
+    )
     sweep.add_argument("--max-trials", type=int, default=24)
     sweep.add_argument(
         "--trial-seed-mode",

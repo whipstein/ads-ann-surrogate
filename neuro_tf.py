@@ -795,22 +795,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--verify-values", default="verify,verification,test,validation")
     sweep.add_argument("--parameter-names", help="Comma-separated geometry parameter VAR names")
     sweep.add_argument("--holdout-fraction", type=float, default=0.2)
-    sweep.add_argument("--orders", default="6,10,14", help="Comma-separated rational pole counts")
-    sweep.add_argument("--pole-dampings", default="0.12,0.18,0.28")
-    sweep.add_argument("--ridge-values", default="1e-10,1e-8,1e-6")
     sweep.add_argument(
-        "--hidden-layer-options",
-        default="32;64;64,64",
-        help="Semicolon-separated hidden-layer layouts, e.g. '32;64,64;128,64'",
+        "--orders",
+        "--order",
+        dest="orders",
+        default="6,10,14",
+        help="Comma-separated rational pole counts; --order accepts one value as in train.",
     )
-    sweep.add_argument("--activation-options", default="tanh,relu")
-    sweep.add_argument("--learning-rates", default="0.001,0.002,0.005")
+    sweep.add_argument(
+        "--pole-dampings",
+        "--pole-damping",
+        dest="pole_dampings",
+        default="0.12,0.18,0.28",
+        help="Comma-separated damping values; --pole-damping accepts one value as in train.",
+    )
+    sweep.add_argument(
+        "--ridges",
+        "--ridge-values",
+        "--ridge",
+        dest="ridge_values",
+        default="1e-10,1e-8,1e-6",
+        help="Comma-separated ridge values; --ridge accepts one value as in train.",
+    )
+    sweep.add_argument(
+        "--hidden-layers",
+        "--hidden-layer-layouts",
+        "--hidden-layer-options",
+        dest="hidden_layer_options",
+        default="32;64;64,64",
+        help="One train-style layout or semicolon-separated hidden-layer layouts, e.g. '32;64,64;128,64'.",
+    )
+    sweep.add_argument(
+        "--activations",
+        "--activation-options",
+        "--activation",
+        dest="activation_options",
+        default="tanh,relu",
+        help="Comma-separated activations; --activation accepts one value as in train.",
+    )
+    sweep.add_argument(
+        "--learning-rates",
+        "--learning-rate",
+        dest="learning_rates",
+        default="0.001,0.002,0.005",
+        help="Comma-separated learning rates; --learning-rate accepts one value as in train.",
+    )
     sweep.add_argument(
         "--frequency-weights",
         help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
     )
     sweep.add_argument("--jobs", type=int, default=1, help="Number of sweep trials to train in parallel")
-    sweep.add_argument("--mode", choices=["grid", "random"], default="random")
+    sweep.add_argument(
+        "--search-mode",
+        "--mode",
+        dest="mode",
+        choices=["grid", "random"],
+        default="random",
+        help="Sweep search strategy. --mode remains a backward-compatible alias.",
+    )
     sweep.add_argument("--max-trials", type=int, default=24)
     sweep.add_argument(
         "--trial-seed-mode",

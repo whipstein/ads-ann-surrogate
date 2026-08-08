@@ -231,6 +231,30 @@ Complete DNN, KBNN, and Neuro-TF command references are integrated below.
 
 ## Common Workflows
 
+### Train and optimize option naming
+
+Optimize/sweep commands use plural names for candidate lists and accept the
+matching train option for a single candidate. This makes a train command easy
+to reuse: change `train` to `optimize`, keep singular options when their value
+should stay fixed, and pluralize only the settings that should be swept.
+Existing `*-options` spellings remain supported as compatibility aliases.
+
+| Train or one optimize value | Multiple optimize values |
+| --- | --- |
+| `--activation relu` | `--activations tanh,relu` |
+| `--learning-rate 0.002` | `--learning-rates 0.001,0.002,0.005` |
+| `--freq-transform log` | `--freq-transforms log,linear` |
+| `--hidden-layers 64,64` | `--hidden-layers '32;64;64,64'` |
+| `--order 10` | `--orders 6,10,14` |
+| `--pole-damping 0.18` | `--pole-dampings 0.12,0.18,0.28` |
+| `--ridge 1e-8` | `--ridges 1e-10,1e-8,1e-6` |
+| KBNN `--mode residual` | KBNN `--modes residual,prior-input` |
+
+Use `--search-mode grid|random` for the optimize search strategy. Legacy
+`--mode grid|random` commands remain valid; on KBNN optimize commands,
+`--mode plain|residual|prior-input` now has the same model meaning as it does
+for `train`.
+
 Run a hyperparameter sweep and keep the best completed model:
 
 ```bash
@@ -238,7 +262,7 @@ python3 dnn.py optimize \
   --mdif train_verify.mdif \
   --out-dir outputs/dnn_sweep \
   --parameter-names W,L,H \
-  --mode random \
+  --search-mode random \
   --max-trials 40 \
   --selection-metric weighted_evm_pct \
   --require-passive
@@ -456,13 +480,6 @@ python3 dnn.py inspect-mdif \
   --mdif train_verify.mdif
 ```
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--mdif PATH</code></nobr> | Required. MDIF file to inspect. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Split variable name to count in the summary. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-
 ### Usage
 
 Train one DNN model with `train`:
@@ -509,35 +526,6 @@ chosen settings, final loss values, verification metrics, passivity summary,
 links to the generated S- and Y-parameter worst-case plots, and copyable
 self-contained Verilog-A and sampled ADS MDIF export commands.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden-layer activation. `tanh` is smoother for small microwave datasets; `relu` can help larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
-| <nobr><code>--batch-size INT</code></nobr> | Number of frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
-| <nobr><code>--debug</code></nobr> | Print common diagnostics and show Python tracebacks for failed commands. | <nobr><code>--debug</code></nobr> |
-| <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | Frequency input transform. `log` uses `log10(freq_hz)`, `linear` uses raw Hz, and `log-linear` uses both. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
-| <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes. More entries create a deeper model. Default: `128,128,64`. | <nobr><code>--hidden-layers 128,128,64</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks to reserve for verification when no split values are found in a combined MDIF. Default: `0.2`. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
-| <nobr><code>--learning-rate FLOAT</code></nobr> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
-| <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Input MDIF. If `--verification-mdif` is not supplied, this file should contain both training and verification blocks, typically separated by a `VAR` such as `dataset=train` or `dataset=verification`. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `model.npz`, `metadata.json`, `training_summary.md`, `predicted_verification.mdif`, metrics CSV/JSON files, training history, and S/Y worst-case plot PDFs. | <nobr><code>--out-dir dnn_model</code></nobr> |
-| <nobr><code>--output-domain {s,y}</code></nobr> | Training target domain. `s` predicts S-parameters and is compatible with every export path. `y` converts the MDIF S-data to admittance targets using `--target-z0`; this is the fastest formulation for direct Verilog-A solve speed. Default: `s`. | <nobr><code>--output-domain y</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variable names to use as DNN inputs. If omitted, the trainer infers numeric `VAR`s common to all blocks, excluding the split variable. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
-| <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | Random seed for holdout splitting and neural-network initialization. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss weights. Supports grouped selectors such as `diag`, `offdiag`, `row1`, `col2`, wildcards, and comma-separated explicit labels. Later rules override earlier rules. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
-| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional per-frequency loss weights. Select exact frequencies or inclusive ranges; later rules override earlier rules and weights are normalized to mean 1. | <nobr><code>--frequency-weights 'default=1;1GHz=5;2GHz:4GHz=3'</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Name of the `VAR` used to split a combined MDIF. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--target-z0 FLOAT</code></nobr> | Reference impedance used only when `--output-domain y` converts S-parameters into Y-parameter training targets. Use the same value as the MDIF option line reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated values of `--split-var` that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-| <nobr><code>--worst-plots INT</code></nobr> | Number of worst verification fits to render as PDFs. Each selected case gets an S-parameter plot and a Y-parameter implementation-view plot. Use `0` to skip plot generation. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
-
 ### Sweeping / Optimizing
 
 Use `sweep` or its alias `optimize` to try multiple DNN configurations. The
@@ -553,14 +541,14 @@ python3 dnn.py optimize \
   --mdif train_verify.mdif \
   --out-dir dnn_sweep \
   --parameter-names W,L,H \
-  --freq-transform-options log,log-linear \
-  --hidden-layer-options '64,64;128,128,64;256,128,64' \
-  --activation-options tanh,relu \
+  --freq-transforms log,log-linear \
+  --hidden-layers '64,64;128,128,64;256,128,64' \
+  --activations tanh,relu \
   --learning-rates 0.001,0.002,0.005 \
   --sparam-weights 'diag=1;offdiag=0.2' \
   --output-domain y \
   --target-z0 50 \
-  --mode random \
+  --search-mode random \
   --max-trials 40 \
   --selection-metric weighted_evm_pct \
   --require-passive
@@ -645,8 +633,8 @@ Useful selection metrics:
 - `weighted_evm_rms`: S-parameter-weighted EVM ratio
 - `weighted_rmse_abs`: S-parameter-weighted complex RMSE
 
-Set `--mode grid` to exhaustively test all combinations, or keep the default
-`--mode random --max-trials N` for direct hyperparameter optimization over a
+Set `--search-mode grid` to exhaustively test all combinations, or keep the default
+`--search-mode random --max-trials N` for direct hyperparameter optimization over a
 larger search space.
 
 Use `--require-passive` when passivity is a hard acceptance criterion. The
@@ -670,46 +658,6 @@ winning model can be exported as a direct admittance-stamping n-port. During a
 DNN sweep, parsed MDIF blocks and prepared feature/target matrices are cached
 inside each process, so repeated trials with the same data and frequency
 transform do not rebuild the same training arrays.
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--activation-options LIST</code></nobr> | Comma-separated activation functions to try. Available values are `tanh` and `relu`. Default: `tanh,relu`. | <nobr><code>--activation-options tanh,relu</code></nobr> |
-| <nobr><code>--batch-size INT</code></nobr> | Batch size per trial. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
-| <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, and include tracebacks in failed trial summaries. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
-| <nobr><code>--epochs INT</code></nobr> | Maximum epochs per trial and for the final best-model retrain. Default: `2000`. | <nobr><code>--epochs 1200</code></nobr> |
-| <nobr><code>--freq-transform-options LIST</code></nobr> | Comma-separated frequency transforms to try. Available values are `log`, `linear`, and `log-linear`. Default: `log,log-linear`. | <nobr><code>--freq-transform-options log,log-linear</code></nobr> |
-| <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated DNN layouts to try. Use commas inside one layout and semicolons between layouts. Default: `64,64;128,128,64;128,128,128;256,128,64`. | <nobr><code>--hidden-layer-options '64,64;128,128,64'</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Verification holdout fraction if split values are absent. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
-| <nobr><code>--jobs INT</code></nobr> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
-| <nobr><code>--keep-trial-models</code></nobr> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
-| <nobr><code>--learning-rates LIST</code></nobr> | Comma-separated Adam learning rates to try. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
-| <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs for each trial. Higher values can speed large sweeps because validation is scored less often. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
-| <nobr><code>--max-passivity-violations INT</code></nobr> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--max-trials INT</code></nobr> | Maximum number of candidate configurations to evaluate. In `random` mode this limits the random sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Input MDIF. Same meaning as in `train`. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--mode {grid,random}</code></nobr> | Search strategy. `grid` evaluates combinations in deterministic product order; `random` samples combinations from the full grid. Default: `random`. | <nobr><code>--mode random</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Sweep output directory. Contains `dnn_sweep_results.csv`, `dnn_best_config.json`, and `best_model/`. | <nobr><code>--out-dir dnn_sweep</code></nobr> |
-| <nobr><code>--output-domain {s,y}</code></nobr> | Fixed training target domain for every trial. Use `y` when the sweep is intended to produce a faster direct Verilog-A model. Default: `s`. | <nobr><code>--output-domain y</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated model input variable names. Same meaning as in `train`. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | Early-stopping patience per trial. Default: `200`. | <nobr><code>--patience 150</code></nobr> |
-| <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs for each trial and for the optional final best-model retrain. Updates redraw one terminal status line. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
-| <nobr><code>--require-passive</code></nobr> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
-| <nobr><code>--retrain-best</code></nobr> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | Base random seed for holdout splitting, random candidate selection, initialization, and minibatch order. With the default `--trial-seed-mode fixed`, every trial uses this exact seed for apples-to-apples comparisons. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized when choosing the best trial. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
-| <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss and ranking weights used by every sweep trial. Use this with weighted selection metrics to rank by the same priorities used during training. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'all=0.2;S21=1;S12=0.8'</code></nobr> |
-| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency loss and weighted-ranking priorities used by every trial. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Split `VAR` name for combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--target-z0 FLOAT</code></nobr> | Reference impedance used when `--output-domain y` converts S-parameter MDIF data to Y targets. Use the MDIF reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated training split values. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
-| <nobr><code>--trial-worst-plots INT</code></nobr> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate verification MDIF. Same meaning as in `train`. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated verification split values. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-| <nobr><code>--worst-plots INT</code></nobr> | Number of worst-case S/Y PDF pairs generated for the final `best_model/` only when `--retrain-best` is used. Without `--retrain-best`, `best_model/` is copied from a completed trial and uses `--trial-worst-plots`. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
 
 ### Post-Run Sweep Reranking
 
@@ -746,20 +694,6 @@ configuration, but the script cannot copy deleted `model.npz` files. In that
 case, retrain only the selected configuration rather than rerunning the full
 sweep.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--best-model-dir PATH</code></nobr> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir dnn_sweep/best_model_passive</code></nobr> |
-| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | Only consider trials whose worst predicted S-matrix singular value is at or below this value. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
-| <nobr><code>--max-passivity-violations INT</code></nobr> | Only consider trials with this many or fewer passivity-violating frequency points. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--overwrite</code></nobr> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
-| <nobr><code>--promote-best</code></nobr> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
-| <nobr><code>--replace-current-best</code></nobr> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
-| <nobr><code>--require-passive</code></nobr> | Only consider trials with zero passivity-violating frequency points. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
-| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized after filtering. Use this to choose the lowest-error passive model, such as `weighted_evm_pct` with `--require-passive`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
-| <nobr><code>--sweep-dir PATH</code></nobr> | Required. Existing DNN sweep or optimize output directory. | <nobr><code>--sweep-dir dnn_sweep</code></nobr> |
-
 ### Predict
 
 Predict new parameter blocks after training:
@@ -773,14 +707,6 @@ python3 dnn.py predict \
 
 For prediction, the input MDIF must provide the geometry `VAR`s and frequency
 grid. Placeholder S-parameter columns are acceptable; their values are ignored.
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--mdif PATH</code></nobr> | Required. MDIF containing geometry/process `VAR`s and frequency grids for prediction. S-parameter values in this file are ignored except for parsing the frequency table shape. | <nobr><code>--mdif new_parameter_blocks.mdif</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir dnn_model</code></nobr> |
-| <nobr><code>--out-mdif PATH</code></nobr> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 
 ### ADS MDIF Export
 
@@ -819,17 +745,6 @@ Copy the MDIF into the ADS workspace data area, point the data-based component
 at that file, and drive the same schematic variable names as the MDIF `VAR`s`.
 For optimization, constrain ADS variables inside the exported grid; ADS will
 interpolate between sampled points rather than evaluate the neural network.
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--freqs SPEC</code></nobr> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir dnn_model</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `surrogate_ads.mdif`, `ads_model_manifest.json`, and `ADS_README.md`. | <nobr><code>--out-dir ads_export</code></nobr> |
-| <nobr><code>--output-name NAME</code></nobr> | Output MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name dnn_ads.mdif</code></nobr> |
-| <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--template-mdif PATH</code></nobr> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. S-parameter values are ignored. Use this when you already know the ADS optimization grid. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
 
 ### ADS ANN Export
 
@@ -899,33 +814,6 @@ Schematic use:
 5. Validate the wrapper in an S-parameter or AC simulation before circuit
    optimization.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden-layer activation requested for ADS ANN. `tanh` maps to `HYPERBOLIC_TANGENT`; `relu` maps to `RELU`. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
-| <nobr><code>--ads-hidden-layers INT</code></nobr> | Override ADS `AnnSetup.num_hidden_layers`. If omitted, this is derived from `--hidden-layers`. | <nobr><code>--ads-hidden-layers 3</code></nobr> |
-| <nobr><code>--ads-iterations INT</code></nobr> | ADS ANN maximum training iterations. Default: `500`. | <nobr><code>--ads-iterations 1000</code></nobr> |
-| <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
-| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | Override ADS `AnnSetup.num_neurons_per_layer`. If omitted, this is derived from the average of `--hidden-layers`. | <nobr><code>--ads-neurons-per-layer 128</code></nobr> |
-| <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
-| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
-| <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
-| <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | Frequency input transform used in the ADS ANN training CSV. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
-| <nobr><code>--hidden-layers LIST</code></nobr> | Local layout used to derive ADS's uniform hidden-layer count and width when ADS-specific overrides are omitted. | <nobr><code>--hidden-layers 128,128,64</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks reserved for verification when split values are absent. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Input MDIF. If `--verification-mdif` is not supplied, this file should contain both training and verification blocks. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Optional trained model directory, or an optimize run's `best_model/` directory. The exporter uses `metadata.json` for parameter names, S-parameter labels, frequency transform, activation, and hidden-layer layout. Weights are not imported into ADS ANN. | <nobr><code>--model-dir dnn_sweep/best_model</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the ADS ANN package files. | <nobr><code>--out-dir dnn_ads_ann</code></nobr> |
-| <nobr><code>--output-prefix NAME</code></nobr> | Prefix for native ADS ANN outputs such as `.inc`, `.c`, `.equation`, `.scale`, and `.struc`. Default: `dnn_ads_ann`. | <nobr><code>--output-prefix dnn_filter_ann</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variables used as ADS ANN inputs. If omitted, common numeric `VAR`s are inferred. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | ADS ANN seed plus local holdout split seed. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter weights to record in the ADS ANN manifest. Defaults to `metadata.json` values when `--model-dir` is supplied. The generated ADS ANN script records but does not apply per-output weights because the documented ADS ANN API does not expose them. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | `VAR` used to split combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate verification MDIF. When supplied, every block in `--mdif` is treated as training data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated split values that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-
 ### Direct Verilog-A Export
 
 Use `export-veriloga` when you want to embed the trained local DNN weights
@@ -987,18 +875,6 @@ use `--parameter-input-scales 1um`. The generated Verilog-A divides every
 fitted parameter by its generated input-scale parameter before evaluating the
 network.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--frequency-expression EXPR</code></nobr> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir dnn_sweep/best_model</code></nobr> |
-| <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
-| <nobr><code>--no-fold-scalers</code></nobr> | Debug option. Keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the first and final neural layers. Leaving this unset is faster. | <nobr><code>--no-fold-scalers</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `<module>.va`, `veriloga_manifest.json`, and `VERILOGA_README.md`. | <nobr><code>--out-dir dnn_veriloga</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained model. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
-| <nobr><code>--z0 FLOAT</code></nobr> | Reference impedance used when exporting an S-output model and converting predicted S-parameters to admittance. Direct-Y models use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
-
 ### ADS Note
 
 The `export-ads-mdif` command is the lowest-risk direct ADS handoff. It exports
@@ -1009,6 +885,98 @@ local DNN weights into a Verilog-A n-port, which avoids ADS ANN retraining but
 should be validated in the target ADS Verilog-A compiler. The `export-ads-ann`
 command is the native ADS ANN handoff for generating ADS ANN
 Verilog-A/C/equation artifacts on an ADS machine.
+
+### Options Reference
+
+Options are grouped by purpose below. Rows are alphabetical within each table;
+the **Subcommands** column includes accepted command aliases.
+
+#### Files, data, and outputs
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-ann</code> | Input MDIF to inspect, fit, predict, or use as an ADS ANN retraining source, depending on the subcommand. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
+| <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir dnn_model</code></nobr> |
+| <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir dnn_model</code></nobr> |
+| <nobr><code>--out-mdif PATH</code></nobr> | <code>predict</code> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
+| <nobr><code>--output-name NAME</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Output MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name dnn_ads.mdif</code></nobr> |
+| <nobr><code>--output-prefix NAME</code></nobr> | <code>export-ads-ann</code> | Prefix for native ADS ANN outputs such as `.inc`, `.c`, `.equation`, `.scale`, and `.struc`. Default: `dnn_ads_ann`. | <nobr><code>--output-prefix dnn_filter_ann</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. S-parameter values are ignored. Use this when you already know the ADS optimization grid. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
+
+#### Data selection and loss weighting
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional per-frequency fitting and sweep-selection weights. Select exact frequencies or inclusive ranges; later rules override earlier rules and weights are normalized to mean 1. | <nobr><code>--frequency-weights 'default=1;1GHz=5;2GHz:4GHz=3'</code></nobr> |
+| <nobr><code>--holdout-fraction FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Fraction of blocks to reserve for verification when no split values are found in a combined MDIF. Default: `0.2`. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
+| <nobr><code>--parameter-names LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated geometry/process variable names to use as DNN inputs. If omitted, the trainer infers numeric `VAR`s common to all blocks, excluding the split variable. | <nobr><code>--parameter-names W,L,H</code></nobr> |
+| <nobr><code>--sparam-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional S-parameter fitting and sweep-selection weights. ADS ANN export records the stored or overridden weights in its manifest, but the generated ADS script cannot apply per-output weights because the documented ADS ANN API does not expose them. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
+| <nobr><code>--split-var NAME</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Name of the <code>VAR</code> used to split or summarize a combined MDIF. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
+| <nobr><code>--train-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
+| <nobr><code>--verify-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated values of `--split-var` that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
+
+#### Model architecture and fitting
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--activation {tanh,relu}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Hidden-layer activation. `tanh` is smoother for small microwave datasets; `relu` can help larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
+| <nobr><code>--activations LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated activation functions to try. `--activation` accepts one train-compatible value; `--activation-options` remains an alias. Default: `tanh,relu`. | <nobr><code>--activations tanh,relu</code></nobr> |
+| <nobr><code>--batch-size INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
+| <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable diagnostic output and command tracebacks. Sweeps also print the candidate list and retain failed-trial tracebacks; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
+| <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
+| <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses `log10(freq_hz)`, `linear` uses raw Hz, and `log-linear` uses both. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
+| <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. Default: `log,log-linear`. | <nobr><code>--freq-transforms log,log-linear</code></nobr> |
+| <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `128,128,64`; sweep default: `64,64;128,128,64;128,128,128;256,128,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 128,128,64</code></nobr> |
+| <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
+| <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates to try. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
+| <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
+| <nobr><code>--output-domain {s,y}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Training target domain. `s` predicts S-parameters and is compatible with every export path. `y` converts the MDIF S-data to admittance targets using `--target-z0`; this is the fastest formulation for direct Verilog-A solve speed. Default: `s`. | <nobr><code>--output-domain y</code></nobr> |
+| <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
+| <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
+| <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Random seed for data splitting, model initialization, minibatch order, ADS ANN data preparation, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
+| <nobr><code>--target-z0 FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Reference impedance used only when `--output-domain y` converts S-parameters into Y-parameter training targets. Use the same value as the MDIF option line reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
+| <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification S/Y plot pairs to generate. In a sweep it applies to a final `--retrain-best`; otherwise the promoted trial retains its `--trial-worst-plots` output. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
+
+#### Sweep and model selection
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir dnn_sweep/best_model_passive</code></nobr> |
+| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
+| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
+| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
+| <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
+| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum number of candidate configurations to evaluate. In `random` mode this limits the random sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
+| <nobr><code>--overwrite</code></nobr> | <code>rerank-sweep</code> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
+| <nobr><code>--promote-best</code></nobr> | <code>rerank-sweep</code> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
+| <nobr><code>--replace-current-best</code></nobr> | <code>rerank-sweep</code> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
+| <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
+| <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
+| <nobr><code>--search-mode {grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. `grid` evaluates combinations in deterministic product order; `random` samples combinations from the full grid. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode random</code></nobr> |
+| <nobr><code>--selection-metric NAME</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Metric minimized when choosing the best trial. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
+| <nobr><code>--sweep-dir PATH</code></nobr> | <code>rerank-sweep</code> | Required. Existing DNN sweep or optimize output directory. | <nobr><code>--sweep-dir dnn_sweep</code></nobr> |
+| <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
+| <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
+
+#### Export and ADS integration
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--ads-hidden-layers INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_hidden_layers`. If omitted, this is derived from `--hidden-layers`. | <nobr><code>--ads-hidden-layers 3</code></nobr> |
+| <nobr><code>--ads-iterations INT</code></nobr> | <code>export-ads-ann</code> | ADS ANN maximum training iterations. Default: `500`. | <nobr><code>--ads-iterations 1000</code></nobr> |
+| <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | <code>export-ads-ann</code> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
+| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. If omitted, this is derived from the average of `--hidden-layers`. | <nobr><code>--ads-neurons-per-layer 128</code></nobr> |
+| <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
+| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
+| <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
+| <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
+| <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
+| <nobr><code>--module-name NAME</code></nobr> | <code>export-veriloga</code> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
+| <nobr><code>--no-fold-scalers</code></nobr> | <code>export-veriloga</code> | Debug option. Keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the first and final neural layers. Leaving this unset is faster. | <nobr><code>--no-fold-scalers</code></nobr> |
+| <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-veriloga</code> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained model. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-veriloga</code> | Reference impedance used when exporting an S-output model and converting predicted S-parameters to admittance. Direct-Y models use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
 
@@ -1067,13 +1035,6 @@ labels, inferred numeric variables, split values, and frequency span.
 python3 kbnn.py inspect-mdif \
   --mdif fine_train_verify.mdif
 ```
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--mdif PATH</code></nobr> | Required. MDIF file to inspect. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Split variable name to count in the summary. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
 
 ### Usage
 
@@ -1135,51 +1096,6 @@ predictions are appended to the input. Prior-input mode always uses the
 predictions as inputs. The KBNN metadata records relative and absolute coarse
 model paths plus file hashes for later prediction and export.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden activation. `tanh` is smoother; `relu` can help larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
-| <nobr><code>--batch-size INT</code></nobr> | Frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Recommended coarse source for `residual` and `prior-input`. Fits an S-domain DNN first and saves its complete outputs under `<out-dir>/coarse_model/`. Mutually exclusive with `--coarse-model-dir`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
-| <nobr><code>--coarse-model-dir PATH</code></nobr> | Reuse an existing frozen S-domain DNN instead of fitting `--coarse-mdif`. Parameter order and S-parameter labels must match. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
-| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate verification MDIF used while fitting `--coarse-mdif`. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
-| <nobr><code>--coarse-hidden-layers LIST</code></nobr> | Coarse-DNN hidden layout. Default: `64,64`. | <nobr><code>--coarse-hidden-layers 64,64</code></nobr> |
-| <nobr><code>--coarse-activation {tanh,relu}</code></nobr> | Coarse-DNN hidden activation. Default: `tanh`. | <nobr><code>--coarse-activation tanh</code></nobr> |
-| <nobr><code>--coarse-freq-transform {log,linear,log-linear}</code></nobr> | Coarse-DNN frequency transform. Defaults to the fine KBNN `--freq-transform`. | <nobr><code>--coarse-freq-transform log-linear</code></nobr> |
-| <nobr><code>--coarse-learning-rate FLOAT</code></nobr> | Coarse-DNN Adam step size. Default: `0.002`. | <nobr><code>--coarse-learning-rate 0.002</code></nobr> |
-| <nobr><code>--coarse-epochs INT</code></nobr> | Coarse-DNN maximum epochs. Defaults to `--epochs`. | <nobr><code>--coarse-epochs 2000</code></nobr> |
-| <nobr><code>--coarse-batch-size INT</code></nobr> | Coarse-DNN batch size. Defaults to `--batch-size`. | <nobr><code>--coarse-batch-size 256</code></nobr> |
-| <nobr><code>--coarse-patience INT</code></nobr> | Coarse-DNN early-stopping patience. Defaults to `--patience`. | <nobr><code>--coarse-patience 200</code></nobr> |
-| <nobr><code>--coarse-loss-interval INT</code></nobr> | Coarse-DNN full-loss check interval. Defaults to `--loss-interval`. | <nobr><code>--coarse-loss-interval 5</code></nobr> |
-| <nobr><code>--coarse-progress-interval INT</code></nobr> | Coarse-DNN console progress interval. Uses the same terminal-width-aware stderr redraw as the fine KBNN and other fits, so updates do not wrap into retained lines; completed fit metrics replace the status line. Defaults to `--progress-interval`. | <nobr><code>--coarse-progress-interval 25</code></nobr> |
-| <nobr><code>--coarse-seed INT</code></nobr> | Coarse-DNN random seed. Defaults to `--seed`. | <nobr><code>--coarse-seed 1234</code></nobr> |
-| <nobr><code>--coarse-worst-plots INT</code></nobr> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
-| <nobr><code>--coarse-sparam-weights SPEC</code></nobr> | Optional coarse-DNN loss weights. Defaults to the fine `--sparam-weights`. | <nobr><code>--coarse-sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
-| <nobr><code>--coarse-frequency-weights SPEC</code></nobr> | Optional coarse-DNN frequency loss weights. Defaults to the fine `--frequency-weights`. | <nobr><code>--coarse-frequency-weights 'default=1;1GHz=4'</code></nobr> |
-| <nobr><code>--debug</code></nobr> | Print common diagnostics plus KBNN data/loss diagnostics, show Python tracebacks for failed commands, and write `kbnn_training_debug.json`. | <nobr><code>--debug</code></nobr> |
-| <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform. `log` uses `log10(freq_hz)` and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
-| <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes. Default: `64,64`. | <nobr><code>--hidden-layers 64,64</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks reserved for verification when no split values are found. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
-| <nobr><code>--include-coarse-input</code></nobr> | In `residual` mode, append coarse real/imaginary S-parameters to the NN input vector. This can improve accuracy if the correction depends strongly on the coarse response. Forced on for `prior-input` and off for `plain`. | <nobr><code>--include-coarse-input</code></nobr> |
-| <nobr><code>--learning-rate FLOAT</code></nobr> | Adam step size. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
-| <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Fine/target S-parameter MDIF. If `--verification-mdif` is omitted, this file should contain both training and verification blocks. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
-| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | KBNN formulation. `residual` learns `fine - fitted_coarse_dnn`; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the trained model, `training_summary.md`, metrics, predictions, and S/Y worst-case PDF plots. | <nobr><code>--out-dir kbnn_model</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variables used as model inputs. If omitted, common numeric `VAR`s are inferred. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | Early-stopping patience in epochs. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
-| <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | Random seed for holdout splitting and network initialization. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss weights. Supports grouped selectors such as `diag`, `offdiag`, `row1`, `col2`, wildcards, and comma-separated explicit labels. Later rules override earlier rules. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
-| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional per-frequency loss weights. Exact frequencies and inclusive ranges are supported. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | `VAR` used to split combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated split values that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-| <nobr><code>--worst-plots INT</code></nobr> | Number of worst verification fits to render as PDFs. Each selected case gets an S-parameter plot and a Y-parameter implementation-view plot. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
-
 ### Sweeping / Optimizing
 
 Use `sweep` or its alias `optimize` to try multiple KBNN configurations. The
@@ -1196,11 +1112,11 @@ python3 kbnn.py optimize \
   --coarse-mdif coarse_train_verify.mdif \
   --out-dir kbnn_sweep \
   --parameter-names W,L \
-  --mode-options residual,prior-input \
-  --include-coarse-input-options false,true \
-  --freq-transform-options log,linear \
-  --hidden-layer-options '32;64;64,64' \
-  --activation-options tanh,relu \
+  --modes residual,prior-input \
+  --include-coarse-inputs false,true \
+  --freq-transforms log,linear \
+  --hidden-layers '32;64;64,64' \
+  --activations tanh,relu \
   --learning-rates 0.001,0.002,0.005 \
   --sparam-weights 'diag=1;offdiag=0.2' \
   --max-trials 24 \
@@ -1208,7 +1124,7 @@ python3 kbnn.py optimize \
   --require-passive
 ```
 
-In a sweep, `--include-coarse-input-options` is the list of boolean values to
+In a sweep, `--include-coarse-inputs` is the list of boolean values to
 try for the single-model `--include-coarse-input` switch. `false` trains
 residual candidates from geometry and frequency only; `true` also feeds the
 coarse real/imaginary S-parameters into the residual network. Impossible mode
@@ -1299,50 +1215,6 @@ matrices are cached inside each process. Repeated trials with the same data,
 mode, coarse-input setting, and frequency transform reuse those arrays instead
 of rebuilding them.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--activation-options LIST</code></nobr> | Comma-separated activations to try. Default: `tanh,relu`. | <nobr><code>--activation-options tanh,relu</code></nobr> |
-| <nobr><code>--batch-size INT</code></nobr> | Frequency-sample rows per Adam update in each candidate. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Fit one shared coarse S-domain DNN under `<out-dir>/coarse_model/` before running non-plain candidates. Mutually exclusive with `--coarse-model-dir`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
-| <nobr><code>--coarse-model-dir PATH</code></nobr> | Reuse an existing frozen coarse DNN for every non-plain candidate and include it in the winning reproduction command. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
-| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate verification MDIF for the integrated coarse-DNN fit. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
-| <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, include tracebacks in failed trial summaries, and write KBNN per-trial debug diagnostics. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
-| <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs for each candidate and the final retrain. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform used when `--freq-transform-options` is omitted. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
-| <nobr><code>--freq-transform-options LIST</code></nobr> | Comma-separated frequency transforms to try in the sweep. Available values are `log` and `linear`. If omitted, the sweep uses the single `--freq-transform` value. | <nobr><code>--freq-transform-options log,linear</code></nobr> |
-| <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated layer layouts. Use commas inside one layout and semicolons between layouts. Default: `32;64;64,64`. | <nobr><code>--hidden-layer-options '32;64,64;128,64'</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks reserved for verification when no split values are found. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
-| <nobr><code>--include-coarse-input-options LIST</code></nobr> | Comma-separated boolean candidate values to try for the single-model `--include-coarse-input` switch. In residual mode, `false` uses geometry/frequency only and `true` appends coarse real/imaginary S-parameters to the NN input. `plain` forces this off; `prior-input` forces it on. Default: `false,true`. | <nobr><code>--include-coarse-input-options false,true</code></nobr> |
-| <nobr><code>--jobs INT</code></nobr> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
-| <nobr><code>--keep-trial-models</code></nobr> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
-| <nobr><code>--learning-rates LIST</code></nobr> | Comma-separated Adam learning rates. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
-| <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs for each trial. Higher values can speed large sweeps because validation is scored less often. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
-| <nobr><code>--max-passivity-violations INT</code></nobr> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--max-trials INT</code></nobr> | Maximum candidate configurations to evaluate. Default: `24`. | <nobr><code>--max-trials 24</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Fine/target S-parameter MDIF. If `--verification-mdif` is omitted, this file should contain both training and verification blocks. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
-| <nobr><code>--mode {grid,random}</code></nobr> | Search strategy. `grid` tries the product in order; `random` samples from it. Default: `random`. | <nobr><code>--mode random</code></nobr> |
-| <nobr><code>--mode-options LIST</code></nobr> | Comma-separated KBNN modes to try. Default: `residual,prior-input`. | <nobr><code>--mode-options residual,prior-input</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `kbnn_sweep_results.csv`, `kbnn_best_config.json`, and the final `best_model/` artifacts. | <nobr><code>--out-dir kbnn_sweep</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variables used as model inputs. If omitted, common numeric `VAR`s are inferred. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | Early-stopping patience in epochs for each candidate. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
-| <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs for each trial and for the optional final best-model retrain. Updates redraw one terminal status line. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
-| <nobr><code>--require-passive</code></nobr> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
-| <nobr><code>--retrain-best</code></nobr> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | Base random seed for holdout splitting, random candidate selection, initialization, and minibatch order. With the default `--trial-seed-mode fixed`, every trial uses this exact seed for apples-to-apples comparisons. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized to choose the best model. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | `VAR` used to split combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss and ranking weights used by every sweep trial. Use this with weighted selection metrics to rank by the same priorities used during training. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'all=0.2;S21=1;S12=0.8'</code></nobr> |
-| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency loss and weighted-ranking priorities used by every trial. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
-| <nobr><code>--trial-worst-plots INT</code></nobr> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated split values that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-| <nobr><code>--worst-plots INT</code></nobr> | Number of worst-case S/Y PDF pairs generated for the final `best_model/` only when `--retrain-best` is used. Without `--retrain-best`, `best_model/` is copied from a completed trial and uses `--trial-worst-plots`. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
-
 ### Post-Run Sweep Reranking
 
 Passivity is computed and saved for every sweep trial, regardless of the
@@ -1379,20 +1251,6 @@ configuration, but the script cannot copy deleted `model.npz` files. In that
 case, retrain only the selected configuration rather than rerunning the full
 sweep.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--best-model-dir PATH</code></nobr> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir kbnn_sweep/best_model_passive</code></nobr> |
-| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | Only consider trials whose worst predicted S-matrix singular value is at or below this value. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
-| <nobr><code>--max-passivity-violations INT</code></nobr> | Only consider trials with this many or fewer passivity-violating frequency points. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--overwrite</code></nobr> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
-| <nobr><code>--promote-best</code></nobr> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
-| <nobr><code>--replace-current-best</code></nobr> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
-| <nobr><code>--require-passive</code></nobr> | Only consider trials with zero passivity-violating frequency points. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
-| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized after filtering. Use this to choose the lowest-error passive model, such as `weighted_evm_pct` with `--require-passive`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
-| <nobr><code>--sweep-dir PATH</code></nobr> | Required. Existing KBNN sweep or optimize output directory. | <nobr><code>--sweep-dir kbnn_sweep</code></nobr> |
-
 ### Predict
 
 Predict new parameter blocks after training:
@@ -1409,15 +1267,6 @@ coarse DNN used during KBNN training. The packaged relative path is used first,
 then the recorded absolute path. If the coarse model was moved separately, pass
 its new path with
 `--coarse-model-dir`; the saved model and metadata hashes must still match.
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--coarse-model-dir PATH</code></nobr> | Optional relocated path to the exact frozen coarse DNN. If omitted, the packaged relative path and then the recorded source path are tried. | <nobr><code>--coarse-model-dir kbnn_model/coarse_model</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. MDIF providing geometry variables and frequency grids. | <nobr><code>--mdif new_fine_shape.mdif</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_model</code></nobr> |
-| <nobr><code>--out-mdif PATH</code></nobr> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 
 ### ADS MDIF Export
 
@@ -1460,18 +1309,6 @@ Copy the MDIF into the ADS workspace data area, point the data-based component
 at that file, and drive the same schematic variable names as the MDIF `VAR`s`.
 For optimization, constrain ADS variables inside the exported grid; ADS will
 interpolate between sampled points rather than evaluate the neural network.
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--coarse-model-dir PATH</code></nobr> | Optional relocated path to the exact frozen coarse DNN. If omitted, the packaged relative path and then the recorded source path are tried. | <nobr><code>--coarse-model-dir kbnn_model/coarse_model</code></nobr> |
-| <nobr><code>--freqs SPEC</code></nobr> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_model</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `surrogate_ads.mdif`, `ads_model_manifest.json`, and `ADS_README.md`. | <nobr><code>--out-dir ads_export</code></nobr> |
-| <nobr><code>--output-name NAME</code></nobr> | Output MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name kbnn_ads.mdif</code></nobr> |
-| <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--template-mdif PATH</code></nobr> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. Fine S-parameter values are ignored. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
 
 ### ADS ANN Export
 
@@ -1556,38 +1393,6 @@ Schematic use:
 5. Validate the wrapper in an S-parameter or AC simulation before circuit
    optimization.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden-layer activation requested for ADS ANN. `tanh` maps to `HYPERBOLIC_TANGENT`; `relu` maps to `RELU`. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
-| <nobr><code>--ads-ann-target {native,fine}</code></nobr> | ADS ANN target definition. `native` preserves the KBNN target, so residual mode outputs `delta_S*`; `fine` trains ADS ANN to output final fine S-parameters directly. Default: `native`. | <nobr><code>--ads-ann-target native</code></nobr> |
-| <nobr><code>--ads-hidden-layers INT</code></nobr> | Override ADS `AnnSetup.num_hidden_layers`. If omitted, this is derived from `--hidden-layers`. | <nobr><code>--ads-hidden-layers 2</code></nobr> |
-| <nobr><code>--ads-iterations INT</code></nobr> | ADS ANN maximum training iterations. Default: `500`. | <nobr><code>--ads-iterations 1000</code></nobr> |
-| <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
-| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | Override ADS `AnnSetup.num_neurons_per_layer`. If omitted, this is derived from the average of `--hidden-layers`. | <nobr><code>--ads-neurons-per-layer 64</code></nobr> |
-| <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
-| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
-| <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Optional coarse/prior S-parameter MDIF. Required for `prior-input` and recommended for residual KBNN exports. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
-| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
-| <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform used in the ADS ANN training CSV. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
-| <nobr><code>--hidden-layers LIST</code></nobr> | Local layout used to derive ADS's uniform hidden-layer count and width when ADS-specific overrides are omitted. | <nobr><code>--hidden-layers 64,64</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks reserved for verification when split values are absent. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
-| <nobr><code>--include-coarse-input</code></nobr> | In residual mode, append coarse real/imaginary S-parameters to the ADS ANN input table. Forced on for `prior-input` and off for `plain`. | <nobr><code>--include-coarse-input</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Fine/target S-parameter MDIF. If `--verification-mdif` is omitted, this file should contain both training and verification blocks. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Optional trained model directory, or an optimize run's `best_model/` directory. The exporter uses `metadata.json` for parameter names, S-parameter labels, frequency transform, KBNN mode, coarse-input flag, activation, and hidden-layer layout. Weights are not imported into ADS ANN. | <nobr><code>--model-dir kbnn_sweep/best_model</code></nobr> |
-| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | KBNN formulation used to build the ADS ANN feature/target table. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the ADS ANN package files. | <nobr><code>--out-dir kbnn_ads_ann</code></nobr> |
-| <nobr><code>--output-prefix NAME</code></nobr> | Prefix for native ADS ANN outputs such as `.inc`, `.c`, `.equation`, `.scale`, and `.struc`. Default: `kbnn_ads_ann`. | <nobr><code>--output-prefix kbnn_filter_ann</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variables used as ADS ANN inputs. If omitted, common numeric `VAR`s are inferred. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | ADS ANN seed plus local holdout split seed. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter weights to record in the ADS ANN manifest. Defaults to `metadata.json` values when `--model-dir` is supplied. The generated ADS ANN script records but does not apply per-output weights because the documented ADS ANN API does not expose them. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | `VAR` used to split combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated split values that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-
 ### Direct Verilog-A Export
 
 Use `export-veriloga` when you want a self-contained Verilog-A n-port instead
@@ -1607,7 +1412,7 @@ python3 kbnn.py optimize \
   --out-dir kbnn_sweep \
   --parameter-names W,L \
   --coarse-hidden-layers 64,64 \
-  --mode-options residual,prior-input
+  --modes residual,prior-input
 ```
 
 This writes the coarse DNN and all of its verification outputs under
@@ -1672,19 +1477,6 @@ use `--parameter-input-scales 1um`. The generated Verilog-A divides every
 fitted parameter by its generated input-scale parameter before evaluating both
 the fine and embedded coarse networks.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--allow-coarse-hooks</code></nobr> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
-| <nobr><code>--coarse-model-dir PATH</code></nobr> | Optional relocated path to the exact frozen S-domain DNN used during KBNN training. If omitted, the packaged relative path and then recorded source path are tried. Parameter order, S-parameter labels, and saved file hashes must match. | <nobr><code>--coarse-model-dir kbnn_model/coarse_model</code></nobr> |
-| <nobr><code>--frequency-expression EXPR</code></nobr> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_sweep/best_model</code></nobr> |
-| <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `<module>.va`, `veriloga_manifest.json`, and `VERILOGA_README.md`. | <nobr><code>--out-dir kbnn_veriloga</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained fine and coarse networks. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
-| <nobr><code>--z0 FLOAT</code></nobr> | Reference impedance used when converting predicted S-parameters to admittance. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
-
 ### ADS Note
 
 The `export-ads-mdif` command is the lowest-risk direct ADS handoff. It exports
@@ -1695,6 +1487,117 @@ command embeds the KBNN and, for residual or prior-input mode, the supplied
 coarse S-domain DNN into one Verilog-A n-port. The `export-ads-ann` command is
 the native ADS ANN handoff for generating ADS ANN Verilog-A/C/equation
 artifacts on an ADS machine.
+
+### Options Reference
+
+Options are grouped by purpose below. Rows are alphabetical within each table;
+the **Subcommands** column includes accepted command aliases.
+
+#### Files, data, and outputs
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--coarse-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Recommended coarse source for `residual` and `prior-input`. Fits an S-domain DNN first and saves its complete outputs under `<out-dir>/coarse_model/`. Mutually exclusive with `--coarse-model-dir`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-model-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Directory containing the frozen coarse DNN used by the KBNN. Training may create it from coarse MDIF data; prediction and export can use the packaged model or a validated relocated copy. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
+| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-ann</code> | Fine/target MDIF to inspect, fit, predict, or use as an ADS ANN retraining source, depending on the subcommand. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
+| <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir kbnn_model</code></nobr> |
+| <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir kbnn_model</code></nobr> |
+| <nobr><code>--out-mdif PATH</code></nobr> | <code>predict</code> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
+| <nobr><code>--output-name NAME</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Output MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name kbnn_ads.mdif</code></nobr> |
+| <nobr><code>--output-prefix NAME</code></nobr> | <code>export-ads-ann</code> | Prefix for native ADS ANN outputs such as `.inc`, `.c`, `.equation`, `.scale`, and `.struc`. Default: `kbnn_ads_ann`. | <nobr><code>--output-prefix kbnn_filter_ann</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. Fine S-parameter values are ignored. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
+
+#### Data selection and loss weighting
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--coarse-frequency-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional coarse-DNN frequency loss weights. Defaults to the fine `--frequency-weights`. | <nobr><code>--coarse-frequency-weights 'default=1;1GHz=4'</code></nobr> |
+| <nobr><code>--coarse-sparam-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional coarse-DNN loss weights. Defaults to the fine `--sparam-weights`. | <nobr><code>--coarse-sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional per-frequency fitting and sweep-selection weights. Exact frequencies and inclusive ranges are supported. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
+| <nobr><code>--holdout-fraction FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Fraction of blocks reserved for verification when no split values are found. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
+| <nobr><code>--parameter-names LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated geometry/process variables used as KBNN and ADS ANN inputs. If omitted, common numeric `VAR`s are inferred. | <nobr><code>--parameter-names W,L,H</code></nobr> |
+| <nobr><code>--sparam-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional S-parameter fitting and sweep-selection weights. ADS ANN export records the stored or overridden weights in its manifest, but the generated ADS script cannot apply per-output weights because the documented ADS ANN API does not expose them. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
+| <nobr><code>--split-var NAME</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Name of the <code>VAR</code> used to split or summarize a combined MDIF. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
+| <nobr><code>--train-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
+| <nobr><code>--verify-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated split values that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
+
+#### Model architecture and fitting
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--activation {tanh,relu}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Hidden-layer activation for one KBNN or ADS ANN configuration. In ADS, `tanh` maps to `HYPERBOLIC_TANGENT` and `relu` maps to `RELU`. Train default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
+| <nobr><code>--activations LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated activations to try. `--activation` accepts one train-compatible value; `--activation-options` remains an alias. Default: `tanh,relu`. | <nobr><code>--activations tanh,relu</code></nobr> |
+| <nobr><code>--batch-size INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Frequency-sample rows per Adam update in each candidate. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
+| <nobr><code>--coarse-activation {tanh,relu}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN hidden activation. Default: `tanh`. | <nobr><code>--coarse-activation tanh</code></nobr> |
+| <nobr><code>--coarse-batch-size INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN batch size. Defaults to `--batch-size`. | <nobr><code>--coarse-batch-size 256</code></nobr> |
+| <nobr><code>--coarse-epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN maximum epochs. Defaults to `--epochs`. | <nobr><code>--coarse-epochs 2000</code></nobr> |
+| <nobr><code>--coarse-freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN frequency transform. Defaults to the fine KBNN `--freq-transform`. | <nobr><code>--coarse-freq-transform log-linear</code></nobr> |
+| <nobr><code>--coarse-hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN hidden layout. Default: `64,64`. | <nobr><code>--coarse-hidden-layers 64,64</code></nobr> |
+| <nobr><code>--coarse-learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN Adam step size. Default: `0.002`. | <nobr><code>--coarse-learning-rate 0.002</code></nobr> |
+| <nobr><code>--coarse-loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN full-loss check interval. Defaults to `--loss-interval`. | <nobr><code>--coarse-loss-interval 5</code></nobr> |
+| <nobr><code>--coarse-patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN early-stopping patience. Defaults to `--patience`. | <nobr><code>--coarse-patience 200</code></nobr> |
+| <nobr><code>--coarse-progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN console progress interval. Uses the same terminal-width-aware stderr redraw as the fine KBNN and other fits, so updates do not wrap into retained lines; completed fit metrics replace the status line. Defaults to `--progress-interval`. | <nobr><code>--coarse-progress-interval 25</code></nobr> |
+| <nobr><code>--coarse-seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN random seed. Defaults to `--seed`. | <nobr><code>--coarse-seed 1234</code></nobr> |
+| <nobr><code>--coarse-worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
+| <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable KBNN data/loss diagnostics and tracebacks. Sweeps also print the candidate list and retain per-trial debug output; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
+| <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs for one fit or each sweep candidate. Early stopping may finish sooner. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
+| <nobr><code>--freq-transform {log,linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses `log10(freq_hz)` and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
+| <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. | <nobr><code>--freq-transforms log,linear</code></nobr> |
+| <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `64,64`; sweep default: `32;64;64,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 64,64</code></nobr> |
+| <nobr><code>--include-coarse-input</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | In `residual` mode, append coarse real/imaginary S-parameters to the NN input vector. This can improve accuracy if the correction depends strongly on the coarse response. Forced on for `prior-input` and off for `plain`. | <nobr><code>--include-coarse-input</code></nobr> |
+| <nobr><code>--include-coarse-inputs LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated boolean candidates for `--include-coarse-input`. Supplying the singular flag selects only `true`; `--include-coarse-input-options` remains an alias. Default: `false,true`. | <nobr><code>--include-coarse-inputs false,true</code></nobr> |
+| <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam step size. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
+| <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
+| <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
+| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | KBNN formulation. `residual` learns `fine - fitted_coarse_dnn`; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
+| <nobr><code>--modes LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated KBNN model modes. The singular `--mode` accepts one train-compatible value; `--mode-options` remains an alias. Default: `plain,residual,prior-input`. | <nobr><code>--modes residual,prior-input</code></nobr> |
+| <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience in epochs for each candidate. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
+| <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
+| <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Random seed for data splitting, model initialization, minibatch order, ADS ANN data preparation, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
+| <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification S/Y plot pairs to generate. In a sweep it applies to a final `--retrain-best`; otherwise the promoted trial retains its `--trial-worst-plots` output. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
+
+#### Sweep and model selection
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir kbnn_sweep/best_model_passive</code></nobr> |
+| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
+| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
+| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
+| <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
+| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum candidate configurations to evaluate. Default: `24`. | <nobr><code>--max-trials 24</code></nobr> |
+| <nobr><code>--overwrite</code></nobr> | <code>rerank-sweep</code> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
+| <nobr><code>--promote-best</code></nobr> | <code>rerank-sweep</code> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
+| <nobr><code>--replace-current-best</code></nobr> | <code>rerank-sweep</code> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
+| <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
+| <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
+| <nobr><code>--search-mode {grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. Legacy `--mode grid` and `--mode random` remain valid. Default: `random`. | <nobr><code>--search-mode random</code></nobr> |
+| <nobr><code>--selection-metric NAME</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Metric minimized to choose the best model. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
+| <nobr><code>--sweep-dir PATH</code></nobr> | <code>rerank-sweep</code> | Required. Existing KBNN sweep or optimize output directory. | <nobr><code>--sweep-dir kbnn_sweep</code></nobr> |
+| <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
+| <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
+
+#### Export and ADS integration
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--ads-ann-target {native,fine}</code></nobr> | <code>export-ads-ann</code> | ADS ANN target definition. `native` preserves the KBNN target, so residual mode outputs `delta_S*`; `fine` trains ADS ANN to output final fine S-parameters directly. Default: `native`. | <nobr><code>--ads-ann-target native</code></nobr> |
+| <nobr><code>--ads-hidden-layers INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_hidden_layers`. If omitted, this is derived from `--hidden-layers`. | <nobr><code>--ads-hidden-layers 2</code></nobr> |
+| <nobr><code>--ads-iterations INT</code></nobr> | <code>export-ads-ann</code> | ADS ANN maximum training iterations. Default: `500`. | <nobr><code>--ads-iterations 1000</code></nobr> |
+| <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | <code>export-ads-ann</code> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
+| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. If omitted, this is derived from the average of `--hidden-layers`. | <nobr><code>--ads-neurons-per-layer 64</code></nobr> |
+| <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
+| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
+| <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
+| <nobr><code>--allow-coarse-hooks</code></nobr> | <code>export-veriloga</code> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
+| <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
+| <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
+| <nobr><code>--module-name NAME</code></nobr> | <code>export-veriloga</code> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
+| <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-veriloga</code> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained fine and coarse networks. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-veriloga</code> | Reference impedance used when converting predicted S-parameters to admittance. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
 
@@ -1744,13 +1647,6 @@ python3 neuro_tf.py inspect-mdif \
   --mdif train_verify.mdif
 ```
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--mdif PATH</code></nobr> | Required. MDIF file to inspect. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Split variable name to count in the summary. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-
 ### Usage
 
 Train one Neuro-TF model with `train`:
@@ -1799,34 +1695,6 @@ chosen settings, final loss values, verification metrics, passivity summary,
 links to the generated S- and Y-parameter worst-case plots, and copyable
 self-contained Verilog-A and sampled ADS MDIF export commands.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden-layer activation. `tanh` is usually smoother for microwave response fitting; `relu` can be useful for larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
-| <nobr><code>--batch-size INT</code></nobr> | Number of training geometries per Adam update. The implementation clamps this to the number of available training blocks. Default: `64`. | <nobr><code>--batch-size 64</code></nobr> |
-| <nobr><code>--debug</code></nobr> | Print common diagnostics and show Python tracebacks for failed commands. | <nobr><code>--debug</code></nobr> |
-| <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency weights used by the rational least-squares coefficient fit. Exact frequencies and inclusive ranges are supported. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
-| <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes for the coefficient neural network. Default: `64,64`. | <nobr><code>--hidden-layers 64,64</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks to reserve for verification when no split values are found in a combined MDIF. Default: `0.2`. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
-| <nobr><code>--learning-rate FLOAT</code></nobr> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
-| <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Input MDIF. If `--verification-mdif` is not supplied, this file should contain both training and verification blocks, typically separated by a `VAR` such as `dataset=train` or `dataset=verification`. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--order INT</code></nobr> | Number of fixed stable rational poles used for each S-parameter transfer function. Higher values can fit sharper frequency behavior but increase coefficient count and NN output dimension. Default: `10`. | <nobr><code>--order 12</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `model.npz`, `metadata.json`, `training_summary.md`, `predicted_verification.mdif`, metrics CSV/JSON files, training history, and S/Y worst-case plot PDFs. | <nobr><code>--out-dir neuro_tf_model</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variable names to use as neural-network inputs. If omitted, the trainer infers numeric `VAR`s common to all blocks, excluding the split variable. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
-| <nobr><code>--pole-damping FLOAT</code></nobr> | Real-part damping factor for the fixed pole grid. Larger values make poles more damped and smoother; smaller values can follow sharper resonances but may be more sensitive. Default: `0.18`. | <nobr><code>--pole-damping 0.18</code></nobr> |
-| <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
-| <nobr><code>--ridge FLOAT</code></nobr> | Ridge regularization used during linear least-squares TF coefficient fitting. Increase this if coefficient fits become noisy or ill-conditioned. Default: `1e-8`. | <nobr><code>--ridge 1e-8</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | Random seed for holdout splitting and neural-network initialization. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Name of the `VAR` used to split a combined MDIF. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated values of `--split-var` that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-| <nobr><code>--worst-plots INT</code></nobr> | Number of worst verification fits to render as PDFs. Each selected case gets an S-parameter plot and a Y-parameter implementation-view plot. Ranking uses max absolute complex response error, with RMSE also reported in the title and plot index CSV. Use `0` to skip plot generation. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
-
 ### Sweeping / Optimizing
 
 Use `sweep` or its alias `optimize` to try multiple rational orders and neural
@@ -1844,10 +1712,10 @@ python3 neuro_tf.py optimize \
   --out-dir neuro_tf_sweep \
   --parameter-names W,L,H \
   --orders 8,10,12,16 \
-  --hidden-layer-options '32;64;64,64;128,64' \
-  --activation-options tanh,relu \
+  --hidden-layers '32;64;64,64;128,64' \
+  --activations tanh,relu \
   --learning-rates 0.001,0.002,0.005 \
-  --mode random \
+  --search-mode random \
   --max-trials 40 \
   --selection-metric rmse_abs \
   --require-passive
@@ -1867,8 +1735,8 @@ Useful selection metrics:
 - `weighted_rmse_abs`, `weighted_evm_pct`, and the other `weighted_*`
   variants: the same metrics using `--frequency-weights`
 
-Set `--mode grid` to exhaustively test all combinations, or keep the default
-`--mode random --max-trials N` for direct hyperparameter optimization over a
+Set `--search-mode grid` to exhaustively test all combinations, or keep the default
+`--search-mode random --max-trials N` for direct hyperparameter optimization over a
 larger search space.
 
 Use `--require-passive` when passivity is a hard acceptance criterion. The
@@ -1887,45 +1755,6 @@ metrics against each swept option. Passivity-failing trials are shown in red on
 those plots and are excluded from the grouped mean values in the diagnostic
 CSV/PDF; the CSV records how many samples were excluded for each setting.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--activation-options LIST</code></nobr> | Comma-separated activation functions to try. Available values are `tanh` and `relu`. Default: `tanh,relu`. | <nobr><code>--activation-options tanh,relu</code></nobr> |
-| <nobr><code>--batch-size INT</code></nobr> | Batch size per trial. Default: `64`. | <nobr><code>--batch-size 64</code></nobr> |
-| <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, and include tracebacks in failed trial summaries. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
-| <nobr><code>--epochs INT</code></nobr> | Maximum epochs per trial and for the final best-model retrain. Default: `1200`. | <nobr><code>--epochs 1200</code></nobr> |
-| <nobr><code>--hidden-layer-options LIST</code></nobr> | Semicolon-separated neural-network layouts to try. Use commas inside one layout and semicolons between layouts. Default: `32;64;64,64`. | <nobr><code>--hidden-layer-options '32;64,64;128,64'</code></nobr> |
-| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Verification holdout fraction if split values are absent. Default: `0.2`. | <nobr><code>--holdout-fraction 0.2</code></nobr> |
-| <nobr><code>--jobs INT</code></nobr> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
-| <nobr><code>--keep-trial-models</code></nobr> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
-| <nobr><code>--learning-rates LIST</code></nobr> | Comma-separated Adam learning rates to try. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
-| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency priorities used by every rational/NN sweep trial and weighted verification metric. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
-| <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs for each trial. Higher values can speed large sweeps because validation is scored less often. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
-| <nobr><code>--max-passivity-violations INT</code></nobr> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--max-trials INT</code></nobr> | Maximum number of candidate configurations to evaluate. In `random` mode this limits the random sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
-| <nobr><code>--mdif PATH</code></nobr> | Required. Input MDIF. Same meaning as in `train`. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
-| <nobr><code>--mode {grid,random}</code></nobr> | Search strategy. `grid` evaluates combinations in deterministic product order; `random` samples combinations from the full grid. Default: `random`. | <nobr><code>--mode random</code></nobr> |
-| <nobr><code>--orders LIST</code></nobr> | Comma-separated rational pole counts to try. Default: `6,10,14`. | <nobr><code>--orders 8,10,12,16</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Sweep output directory. Contains `neurotf_sweep_results.csv`, `neurotf_best_config.json`, and `best_model/`. | <nobr><code>--out-dir neuro_tf_sweep</code></nobr> |
-| <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated model input variable names. Same meaning as in `train`. | <nobr><code>--parameter-names W,L,H</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | Early-stopping patience per trial. Default: `150`. | <nobr><code>--patience 150</code></nobr> |
-| <nobr><code>--pole-dampings LIST</code></nobr> | Comma-separated pole damping values to try. Default: `0.12,0.18,0.28`. | <nobr><code>--pole-dampings 0.12,0.18,0.28</code></nobr> |
-| <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs for each trial and for the optional final best-model retrain. Updates redraw one terminal status line. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
-| <nobr><code>--ridge-values LIST</code></nobr> | Comma-separated coefficient-fit ridge values to try. Default: `1e-10,1e-8,1e-6`. | <nobr><code>--ridge-values 1e-10,1e-8,1e-6</code></nobr> |
-| <nobr><code>--require-passive</code></nobr> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
-| <nobr><code>--retrain-best</code></nobr> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
-| <nobr><code>--seed INT</code></nobr> | Base random seed for holdout splitting, random candidate selection, initialization, and minibatch order. With the default `--trial-seed-mode fixed`, every trial uses this exact seed for apples-to-apples comparisons. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized when choosing the best trial. Includes unweighted error, passivity, and `weighted_*` metrics that apply `--frequency-weights`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_rmse_abs</code></nobr> |
-| <nobr><code>--split-var NAME</code></nobr> | Split `VAR` name for combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--train-values LIST</code></nobr> | Comma-separated training split values. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
-| <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
-| <nobr><code>--trial-worst-plots INT</code></nobr> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
-| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate verification MDIF. Same meaning as in `train`. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
-| <nobr><code>--verify-values LIST</code></nobr> | Comma-separated verification split values. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
-| <nobr><code>--worst-plots INT</code></nobr> | Number of worst-case S/Y PDF pairs generated for the final `best_model/` only when `--retrain-best` is used. Without `--retrain-best`, `best_model/` is copied from a completed trial and uses `--trial-worst-plots`. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
-
 ### Predict
 
 Predict new parameter blocks after training:
@@ -1936,14 +1765,6 @@ python3 neuro_tf.py predict \
   --mdif new_parameter_blocks.mdif \
   --out-mdif predicted.mdif
 ```
-
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--mdif PATH</code></nobr> | Required. MDIF containing geometry/process `VAR`s and frequency grids for prediction. S-parameter values in this file are ignored except for parsing the frequency table shape. | <nobr><code>--mdif new_parameter_blocks.mdif</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
-| <nobr><code>--out-mdif PATH</code></nobr> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 
 ### Direct Verilog-A Export
 
@@ -1968,17 +1789,6 @@ This export is intended for S-parameter and small-signal AC analysis. Validate
 it against `predicted_verification.mdif` with the target ADS Verilog-A compiler
 before using it in optimization.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--frequency-expression EXPR</code></nobr> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained Neuro-TF `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
-| <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the self-contained Verilog-A package. | <nobr><code>--out-dir neuro_tf_veriloga</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained coefficient network. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
-| <nobr><code>--z0 FLOAT</code></nobr> | Reference impedance used when converting predicted S-parameters to admittance. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
-
 ### Export Sampled ADS MDIF
 
 Export the fitted fixed-pole Neuro-TF response on either the exact geometry and
@@ -1996,17 +1806,6 @@ The command writes `surrogate_ads.mdif`, `ads_model_manifest.json`, and
 parameter blocks and frequency grids are used. Instead of `--template-mdif`,
 repeat `--parameter-grid` once for each model parameter and supply `--freqs`.
 
-#### Options
-
-| Option Name | Description | Example |
-| ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained Neuro-TF `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
-| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the ADS MDIF package. | <nobr><code>--out-dir neuro_tf_ads_export</code></nobr> |
-| <nobr><code>--template-mdif PATH</code></nobr> | MDIF whose parameter/frequency blocks define the export sampling grid. Mutually exclusive in practice with the explicit-grid form. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
-| <nobr><code>--parameter-grid SPEC</code></nobr> | Explicit grid for one model parameter. Repeat once per parameter; requires `--freqs`. | <nobr><code>--parameter-grid W=0.4mm:0.8mm:9</code></nobr> |
-| <nobr><code>--freqs SPEC</code></nobr> | Frequency grid used with `--parameter-grid`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
-| <nobr><code>--output-name NAME</code></nobr> | Exported MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name neuro_tf_ads.mdif</code></nobr> |
-
 ### ADS Note
 
 Use `export-ads-mdif` for the lowest-risk interpolation-based handoff, or
@@ -2014,3 +1813,82 @@ Use `export-ads-mdif` for the lowest-risk interpolation-based handoff, or
 fixed-pole rational response directly. The Verilog-A package is self-contained;
 the sampled MDIF remains useful as a simulator-independent reference for
 cross-checking the exported component.
+
+### Options Reference
+
+Options are grouped by purpose below. Rows are alphabetical within each table;
+the **Subcommands** column includes accepted command aliases.
+
+#### Files, data, and outputs
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code> | Input MDIF to inspect, fit, or predict, depending on the subcommand. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
+| <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
+| <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir neuro_tf_model</code></nobr> |
+| <nobr><code>--out-mdif PATH</code></nobr> | <code>predict</code> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
+| <nobr><code>--output-name NAME</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Exported MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name neuro_tf_ads.mdif</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | MDIF whose parameter/frequency blocks define the export sampling grid. Mutually exclusive in practice with the explicit-grid form. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
+
+#### Data selection and loss weighting
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional weights for the rational least-squares coefficient fit and weighted sweep-selection metrics. Exact frequencies and inclusive ranges are supported. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
+| <nobr><code>--holdout-fraction FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Fraction of blocks to reserve for verification when no split values are found in a combined MDIF. Default: `0.2`. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
+| <nobr><code>--parameter-names LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Comma-separated geometry/process variable names to use as neural-network inputs. If omitted, the trainer infers numeric `VAR`s common to all blocks, excluding the split variable. | <nobr><code>--parameter-names W,L,H</code></nobr> |
+| <nobr><code>--split-var NAME</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code> | Name of the <code>VAR</code> used to split or summarize a combined MDIF. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
+| <nobr><code>--train-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
+| <nobr><code>--verify-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Comma-separated values of `--split-var` that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
+
+#### Model architecture and fitting
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--activation {tanh,relu}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Hidden-layer activation. `tanh` is usually smoother for microwave response fitting; `relu` can be useful for larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
+| <nobr><code>--activations LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated activation functions. `--activation` accepts one train-compatible value; `--activation-options` remains an alias. Default: `tanh,relu`. | <nobr><code>--activations tanh,relu</code></nobr> |
+| <nobr><code>--batch-size INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of training geometries per Adam update. The implementation clamps this to the number of available training blocks. Default: `64`. | <nobr><code>--batch-size 64</code></nobr> |
+| <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable diagnostic output and command tracebacks. Sweeps also print the candidate list and retain failed-trial tracebacks; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
+| <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
+| <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `64,64`; sweep default: `32;64;64,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 64,64</code></nobr> |
+| <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
+| <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
+| <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
+| <nobr><code>--order INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of fixed stable rational poles used for each S-parameter transfer function. Higher values can fit sharper frequency behavior but increase coefficient count and NN output dimension. Default: `10`. | <nobr><code>--order 12</code></nobr> |
+| <nobr><code>--orders LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated rational pole counts. `--order` accepts one train-compatible value. Default: `6,10,14`. | <nobr><code>--orders 8,10,12,16</code></nobr> |
+| <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
+| <nobr><code>--pole-damping FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Real-part damping factor for the fixed pole grid. Larger values make poles more damped and smoother; smaller values can follow sharper resonances but may be more sensitive. Default: `0.18`. | <nobr><code>--pole-damping 0.18</code></nobr> |
+| <nobr><code>--pole-dampings LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated pole damping values. `--pole-damping` accepts one train-compatible value. Default: `0.12,0.18,0.28`. | <nobr><code>--pole-dampings 0.12,0.18,0.28</code></nobr> |
+| <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
+| <nobr><code>--ridge FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Ridge regularization used during linear least-squares TF coefficient fitting. Increase this if coefficient fits become noisy or ill-conditioned. Default: `1e-8`. | <nobr><code>--ridge 1e-8</code></nobr> |
+| <nobr><code>--ridges LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated coefficient-fit ridge values. `--ridge` accepts one train-compatible value; `--ridge-values` remains an alias. Default: `1e-10,1e-8,1e-6`. | <nobr><code>--ridges 1e-10,1e-8,1e-6</code></nobr> |
+| <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Random seed for data splitting, model initialization, minibatch order, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
+| <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification fits to render as PDFs. Each selected case gets an S-parameter plot and a Y-parameter implementation-view plot. Ranking uses max absolute complex response error, with RMSE also reported in the title and plot index CSV. Use `0` to skip plot generation. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
+
+#### Sweep and model selection
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
+| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
+| <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
+| <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
+| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum number of candidate configurations to evaluate. In `random` mode this limits the random sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
+| <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
+| <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
+| <nobr><code>--search-mode {grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode random</code></nobr> |
+| <nobr><code>--selection-metric NAME</code></nobr> | <code>sweep</code>, <code>optimize</code> | Metric minimized when choosing the best trial. Includes unweighted error, passivity, and `weighted_*` metrics that apply `--frequency-weights`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_rmse_abs</code></nobr> |
+| <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
+| <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
+
+#### Export and ADS integration
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
+| <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
+| <nobr><code>--module-name NAME</code></nobr> | <code>export-veriloga</code> | Optional Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |
+| <nobr><code>--parameter-grid SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Explicit grid for one model parameter. Repeat once per parameter; requires `--freqs`. | <nobr><code>--parameter-grid W=0.4mm:0.8mm:9</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-veriloga</code> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained coefficient network. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-veriloga</code> | Reference impedance used when converting predicted S-parameters to admittance. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
