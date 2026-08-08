@@ -1437,9 +1437,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     export_va.add_argument(
         "--parameter-input-scales",
+        metavar="SCALE",
         help=(
-            "Optional NAME=SCALE mappings converting ADS/base-unit instance parameters "
-            "to model-training units. Example: W=1um,L=1um or all=1um"
+            "Optional positive scale applied to every ADS/base-unit instance parameter "
+            "before conversion to model-training units. Example: 1um"
         ),
     )
     export_va.add_argument(

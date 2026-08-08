@@ -26,9 +26,9 @@ The repository provides three surrogate-model front ends:
 | Neuro-TF | `neuro_tf.py` | Smooth frequency responses where a rational transfer-function structure is useful. | Fixed stable poles define rational transfer functions; a neural network maps geometry/process variables to the fitted coefficients. |
 
 All three tools read MDIF, train models, run sweeps, write verification
-artifacts, predict new response blocks, and export sampled ADS MDIF packages.
-DNN and KBNN additionally support native ADS ANN package generation and direct
-Verilog-A n-port export.
+artifacts, predict new response blocks, and export sampled ADS MDIF packages or
+self-contained Verilog-A n-ports. DNN and KBNN additionally support native ADS
+ANN package generation.
 
 ## Repository Layout
 
@@ -262,13 +262,14 @@ python3 dnn.py export-ads-mdif \
   --template-mdif ads_sweep_template.mdif
 ```
 
-Export a trained DNN or KBNN as a direct Verilog-A n-port:
+Export any trained model family as a direct Verilog-A n-port:
 
 ```bash
 python3 dnn.py export-veriloga \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_veriloga \
-  --module-name my_dnn_4port
+  --module-name my_dnn_4port \
+  --parameter-input-scales 1.0
 ```
 
 Residual and prior-input KBNNs use a frozen coarse DNN during fitting and at
@@ -329,6 +330,9 @@ A normal `train` run writes:
 An integrated residual or prior-input KBNN run also writes a complete coarse
 DNN package under `coarse_model/` and a `composite_model_manifest.json` that
 identifies and hashes both saved networks for later Verilog-A extraction.
+The reported Verilog-A commands include an explicit default module name and a
+single `--parameter-input-scales 1.0` value applied to every fitted parameter,
+making either value easy to edit before export.
 
 Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
 per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
@@ -908,12 +912,12 @@ you intentionally change the ADS unit convention. The `freq_hz` and
 `VERILOGA_README.md` are computed inside the Verilog-A module from simulator
 frequency; do not add external pins or parameters for them.
 
-If the MDIF training parameters were scaled dimensionless values but the ADS
-schematic uses base units, export with `--parameter-input-scales`. For example,
-if the MDIF used `W=0.4` to mean 0.4 microns and ADS will pass `W=0.4e-6`
-meters, use `--parameter-input-scales W=1um`. The generated Verilog-A then
-feeds `W / W_input_scale` to the neural network, so the ADS-facing parameter can
-remain in meters.
+If all MDIF training parameters were scaled dimensionless values but the ADS
+schematic uses base units, export with one common scale. For example, if the
+MDIF parameter values are expressed in microns and ADS passes them in meters,
+use `--parameter-input-scales 1um`. The generated Verilog-A divides every
+fitted parameter by its generated input-scale parameter before evaluating the
+network.
 
 #### Options
 
@@ -924,7 +928,7 @@ remain in meters.
 | <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
 | <nobr><code>--no-fold-scalers</code></nobr> | Debug option. Keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the first and final neural layers. Leaving this unset is faster. | <nobr><code>--no-fold-scalers</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `<module>.va`, `veriloga_manifest.json`, and `VERILOGA_README.md`. | <nobr><code>--out-dir dnn_veriloga</code></nobr> |
-| <nobr><code>--parameter-input-scales SPEC</code></nobr> | Optional ADS/base-unit scale for each geometry/process parameter before the value is fed to the trained model. Use `NAME=SCALE` entries separated by commas or semicolons, `all=SCALE` for every parameter, or a bare scale such as `1um` for every parameter. Default: `1.0` for all parameters. | <nobr><code>--parameter-input-scales W=1um,L=1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained model. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | Reference impedance used when exporting an S-output model and converting predicted S-parameters to admittance. Direct-Y models use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ### ADS Note
@@ -1590,12 +1594,12 @@ you intentionally change the ADS unit convention. The `freq_hz` and
 `VERILOGA_README.md` are computed inside the Verilog-A module from simulator
 frequency; do not add external pins or parameters for them.
 
-If the MDIF training parameters were scaled dimensionless values but the ADS
-schematic uses base units, export with `--parameter-input-scales`. For example,
-if the MDIF used `W=0.4` to mean 0.4 microns and ADS will pass `W=0.4e-6`
-meters, use `--parameter-input-scales W=1um`. The generated Verilog-A then
-feeds `W / W_input_scale` to the neural network, so the ADS-facing parameter can
-remain in meters.
+If all MDIF training parameters were scaled dimensionless values but the ADS
+schematic uses base units, export with one common scale. For example, if the
+MDIF parameter values are expressed in microns and ADS passes them in meters,
+use `--parameter-input-scales 1um`. The generated Verilog-A divides every
+fitted parameter by its generated input-scale parameter before evaluating both
+the fine and embedded coarse networks.
 
 #### Options
 
@@ -1607,7 +1611,7 @@ remain in meters.
 | <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_sweep/best_model</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `<module>.va`, `veriloga_manifest.json`, and `VERILOGA_README.md`. | <nobr><code>--out-dir kbnn_veriloga</code></nobr> |
-| <nobr><code>--parameter-input-scales SPEC</code></nobr> | Optional ADS/base-unit scale for each geometry/process parameter before the value is fed to the trained model. Use `NAME=SCALE` entries separated by commas or semicolons, `all=SCALE` for every parameter, or a bare scale such as `1um` for every parameter. Default: `1.0` for all parameters. | <nobr><code>--parameter-input-scales W=1um,L=1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained fine and coarse networks. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | Reference impedance used when converting predicted S-parameters to admittance. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ### ADS Note
@@ -1692,8 +1696,8 @@ python3 neuro_tf.py train \
 Outputs:
 
 - `model.npz` and `metadata.json`: trained Neuro-TF model
-- `training_summary.md`: settings, metrics, plot links, and a copyable sampled
-  ADS MDIF export command
+- `training_summary.md`: settings, metrics, plot links, and copyable
+  self-contained Verilog-A and sampled ADS MDIF export commands
 - `predicted_verification.mdif`: model predictions at verification points
 - `verification_metrics.csv`: per-block and per-S-parameter errors, including EVM
 - `verification_summary.json`: global error, passivity summary, and plot paths
@@ -1721,8 +1725,8 @@ where modeled and measured admittance are shown as real/imaginary frequency
 plots. Use `--worst-plots 0` to skip both plot sets during large experiments.
 Each single `train` run also writes `training_summary.md`, which collects the
 chosen settings, final loss values, verification metrics, passivity summary,
-links to the generated S- and Y-parameter worst-case plots, and a copyable
-sampled ADS MDIF export command.
+links to the generated S- and Y-parameter worst-case plots, and copyable
+self-contained Verilog-A and sampled ADS MDIF export commands.
 
 #### Options
 
@@ -1866,6 +1870,40 @@ python3 neuro_tf.py predict \
 | <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
 | <nobr><code>--out-mdif PATH</code></nobr> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 
+### Direct Verilog-A Export
+
+Export the saved geometry-to-coefficient network and its fixed rational poles
+as one self-contained Verilog-A n-port:
+
+```bash
+python3 neuro_tf.py export-veriloga \
+  --model-dir neuro_tf_model \
+  --out-dir neuro_tf_veriloga \
+  --module-name my_neuro_tf_4port \
+  --parameter-input-scales 1.0
+```
+
+The generated module evaluates the neural coefficient map, constructs each
+S-parameter from `c0 + sum(c_k / (j*f/f_scale - pole_k))`, converts the complete
+S-matrix to Y, and stamps the small-signal port currents. It requires no Python
+runtime or MDIF table in ADS. The package contains `<module>.va`,
+`veriloga_manifest.json`, and `VERILOGA_README.md`.
+
+This export is intended for S-parameter and small-signal AC analysis. Validate
+it against `predicted_verification.mdif` with the target ADS Verilog-A compiler
+before using it in optimization.
+
+#### Options
+
+| Option Name | Description | Example |
+| ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
+| <nobr><code>--frequency-expression EXPR</code></nobr> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
+| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained Neuro-TF `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
+| <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |
+| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the self-contained Verilog-A package. | <nobr><code>--out-dir neuro_tf_veriloga</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained coefficient network. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--z0 FLOAT</code></nobr> | Reference impedance used when converting predicted S-parameters to admittance. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
+
 ### Export Sampled ADS MDIF
 
 Export the fitted fixed-pole Neuro-TF response on either the exact geometry and
@@ -1896,6 +1934,8 @@ repeat `--parameter-grid` once for each model parameter and supply `--freqs`.
 
 ### ADS Note
 
-Neuro-TF currently exports a sampled MDIF table for ADS interpolation. A direct
-equation/SDD or Verilog-A wrapper that evaluates the neural coefficient map and
-rational transfer functions inside the simulator is not currently generated.
+Use `export-ads-mdif` for the lowest-risk interpolation-based handoff, or
+`export-veriloga` when ADS should evaluate the trained coefficient network and
+fixed-pole rational response directly. The Verilog-A package is self-contained;
+the sampled MDIF remains useful as a simulator-independent reference for
+cross-checking the exported component.

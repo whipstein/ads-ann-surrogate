@@ -133,75 +133,31 @@ def parse_parameter_scale_spec(
     parameter_names: Sequence[str],
     spec: str | None,
 ) -> dict[str, float]:
-    """Parse ADS/base-unit-to-model-unit parameter scales.
+    """Apply one ADS/base-unit-to-model-unit scale to every parameter.
 
     The returned scale is the ADS-facing parameter value per training-model
     unit. During Verilog-A export the model feature is computed as:
 
         model_value = ads_instance_parameter / scale
 
-    For example, if the MDIF used W=0.4 to mean 0.4 um but ADS will pass W in
-    meters, use W=1um.
+    For example, if every MDIF parameter uses dimensionless micron values but
+    ADS passes parameters in meters, use 1um.
     """
 
     names = list(parameter_names)
-    scales = {name: 1.0 for name in names}
     if not spec:
-        return scales
+        return {name: 1.0 for name in names}
 
     text = spec.strip()
     if not text:
-        return scales
-    if "=" not in text:
-        scale = parse_scale_number(text)
-        return {name: scale for name in names}
-
-    lookup: dict[str, str] = {}
-    for name in names:
-        keys = {
-            name,
-            name.lower(),
-            normalize_name(name),
-            normalize_name(name).lower(),
-        }
-        for key in keys:
-            lookup.setdefault(key, name)
-
-    assigned: set[str] = set()
-    for raw_part in re.split(r"[;,]", text):
-        part = raw_part.strip()
-        if not part:
-            continue
-        if "=" not in part:
-            raise ValueError(
-                "Parameter scale mappings must use NAME=SCALE entries, "
-                f"got {part!r}"
-            )
-        raw_name, raw_value = part.split("=", 1)
-        key = raw_name.strip()
-        if not key:
-            raise ValueError(f"Parameter scale mapping is missing a parameter name: {part!r}")
-        scale = parse_scale_number(raw_value)
-        if key.strip().lower() in {"*", "all"}:
-            for name in names:
-                scales[name] = scale
-            continue
-        target = (
-            lookup.get(key)
-            or lookup.get(key.lower())
-            or lookup.get(normalize_name(key))
-            or lookup.get(normalize_name(key).lower())
+        return {name: 1.0 for name in names}
+    if "=" in text or "," in text or ";" in text:
+        raise ValueError(
+            "--parameter-input-scales accepts one positive scale applied to every "
+            "model parameter, for example 1.0 or 1um"
         )
-        if target is None:
-            raise ValueError(
-                f"Unknown parameter {key!r} in scale spec. Available parameters: "
-                + ", ".join(names)
-            )
-        if target in assigned:
-            raise ValueError(f"Duplicate scale mapping for parameter {target!r}")
-        scales[target] = scale
-        assigned.add(target)
-    return scales
+    scale = parse_scale_number(text)
+    return {name: scale for name in names}
 
 
 def parse_data_number(token: str) -> float:
@@ -1337,6 +1293,127 @@ def _veriloga_layer_assignments(
         lines.append("")
 
 
+def _append_veriloga_s_to_y_conversion(
+    lines: list[str],
+    nports: int,
+) -> None:
+    """Append the shared complex Y = (I-S) * inverse(I+S) / Z0 solve."""
+
+    matrix_size = nports * nports
+    lines.append(f"    for (i = 0; i < {matrix_size}; i = i + 1) begin")
+    lines.append("      ar[i] = sr[i];")
+    lines.append("      ai[i] = si[i];")
+    lines.append("      mr[i] = -sr[i];")
+    lines.append("      mi[i] = -si[i];")
+    lines.append("      invr[i] = 0.0;")
+    lines.append("      invi[i] = 0.0;")
+    lines.append("    end")
+    lines.append(f"    for (i = 0; i < {nports}; i = i + 1) begin")
+    lines.append(f"      idx = i*{nports} + i;")
+    lines.append("      ar[idx] = ar[idx] + 1.0;")
+    lines.append("      mr[idx] = mr[idx] + 1.0;")
+    lines.append("      invr[idx] = 1.0;")
+    lines.append("    end")
+    lines.append("")
+
+    lines.append(f"    for (piv = 0; piv < {nports}; piv = piv + 1) begin")
+    lines.append("      pivrow = piv;")
+    lines.append(f"      idx = piv*{nports} + piv;")
+    lines.append("      best_mag = ar[idx]*ar[idx] + ai[idx]*ai[idx];")
+    lines.append(f"      for (row = piv + 1; row < {nports}; row = row + 1) begin")
+    lines.append(f"        idx = row*{nports} + piv;")
+    lines.append("        mag = ar[idx]*ar[idx] + ai[idx]*ai[idx];")
+    lines.append("        if (mag > best_mag) begin")
+    lines.append("          best_mag = mag;")
+    lines.append("          pivrow = row;")
+    lines.append("        end")
+    lines.append("      end")
+    lines.append("      if (pivrow != piv) begin")
+    lines.append(f"        for (col = 0; col < {nports}; col = col + 1) begin")
+    lines.append(f"          idx = piv*{nports} + col;")
+    lines.append(f"          k = pivrow*{nports} + col;")
+    lines.append(
+        "          tr = ar[idx]; ti = ai[idx]; ar[idx] = ar[k]; "
+        "ai[idx] = ai[k]; ar[k] = tr; ai[k] = ti;"
+    )
+    lines.append(
+        "          tr = invr[idx]; ti = invi[idx]; invr[idx] = invr[k]; "
+        "invi[idx] = invi[k]; invr[k] = tr; invi[k] = ti;"
+    )
+    lines.append("        end")
+    lines.append("      end")
+    lines.append(f"      idx = piv*{nports} + piv;")
+    lines.append("      pr = ar[idx];")
+    lines.append("      pi = ai[idx];")
+    lines.append("      den = pr*pr + pi*pi;")
+    lines.append("      if (den < pivot_floor) den = pivot_floor;")
+    lines.append(f"      for (col = 0; col < {nports}; col = col + 1) begin")
+    lines.append(f"        idx = piv*{nports} + col;")
+    lines.append("        tr = (ar[idx]*pr + ai[idx]*pi)/den;")
+    lines.append("        ti = (ai[idx]*pr - ar[idx]*pi)/den;")
+    lines.append("        ar[idx] = tr; ai[idx] = ti;")
+    lines.append("        tr = (invr[idx]*pr + invi[idx]*pi)/den;")
+    lines.append("        ti = (invi[idx]*pr - invr[idx]*pi)/den;")
+    lines.append("        invr[idx] = tr; invi[idx] = ti;")
+    lines.append("      end")
+    lines.append(f"      for (row = 0; row < {nports}; row = row + 1) begin")
+    lines.append("        if (row != piv) begin")
+    lines.append(f"          idx = row*{nports} + piv;")
+    lines.append("          fr = ar[idx];")
+    lines.append("          fi = ai[idx];")
+    lines.append(f"          for (col = 0; col < {nports}; col = col + 1) begin")
+    lines.append(f"            idx = row*{nports} + col;")
+    lines.append(f"            k = piv*{nports} + col;")
+    lines.append("            ar[idx] = ar[idx] - (fr*ar[k] - fi*ai[k]);")
+    lines.append("            ai[idx] = ai[idx] - (fr*ai[k] + fi*ar[k]);")
+    lines.append("            invr[idx] = invr[idx] - (fr*invr[k] - fi*invi[k]);")
+    lines.append("            invi[idx] = invi[idx] - (fr*invi[k] + fi*invr[k]);")
+    lines.append("          end")
+    lines.append("        end")
+    lines.append("      end")
+    lines.append("    end")
+    lines.append("")
+
+    lines.append(f"    for (row = 0; row < {nports}; row = row + 1) begin")
+    lines.append(f"      for (col = 0; col < {nports}; col = col + 1) begin")
+    lines.append(f"        idx = row*{nports} + col;")
+    lines.append(f"        i = row*{nports};")
+    lines.append("        j = col;")
+    lines.append("        yr[idx] = mr[i]*invr[j] - mi[i]*invi[j];")
+    lines.append("        yi[idx] = mr[i]*invi[j] + mi[i]*invr[j];")
+    lines.append(f"        for (k = 1; k < {nports}; k = k + 1) begin")
+    lines.append(f"          i = row*{nports} + k;")
+    lines.append(f"          j = k*{nports} + col;")
+    lines.append("          yr[idx] = yr[idx] + (mr[i]*invr[j] - mi[i]*invi[j]);")
+    lines.append("          yi[idx] = yi[idx] + (mr[i]*invi[j] + mi[i]*invr[j]);")
+    lines.append("        end")
+    lines.append("        yr[idx] = yr[idx]/z0;")
+    lines.append("        yi[idx] = yi[idx]/z0;")
+    lines.append("      end")
+    lines.append("    end")
+    lines.append("")
+
+
+def _append_veriloga_port_stamps(
+    lines: list[str],
+    port_ids: Sequence[str],
+    real_by_flat: Sequence[str],
+    imag_by_flat: Sequence[str],
+) -> None:
+    """Append common small-signal complex-admittance port contributions."""
+
+    lines.append("    omega = 6.2831853071795864769*freq_hz;")
+    lines.append("    if (omega < 1.0e-30) omega = 1.0e-30;")
+    nports = len(port_ids)
+    for row, port_i in enumerate(port_ids):
+        for col, port_j in enumerate(port_ids):
+            flat = row * nports + col
+            lines.append(
+                f"    I({port_i}) <+ ({real_by_flat[flat]})*V({port_j}) + "
+                f"(({imag_by_flat[flat]})/omega)*ddt(V({port_j}));"
+            )
+
+
 def _veriloga_readme(
     model_kind: str,
     module_name: str,
@@ -1360,6 +1437,7 @@ def _veriloga_readme(
     adds_coarse_to_output: bool,
     embedded_coarse_model: bool,
     extra_notes: Sequence[str] | None,
+    response_relation_override: str | None = None,
 ) -> str:
     params = ", ".join(
         f"`{identifier}` from `{name}`"
@@ -1386,7 +1464,9 @@ def _veriloga_readme(
     notes = "\n".join(f"- {note}" for note in (extra_notes or []))
     if notes:
         notes = "\n\nNotes:\n\n" + notes + "\n"
-    if output_domain == "y":
+    if response_relation_override is not None:
+        response_relation = response_relation_override
+    elif output_domain == "y":
         response_relation = (
             "- Neural output domain: direct Y-parameters in Siemens\n"
             f"- Reference impedance used when generating Y training targets: `{z0:g} ohm`\n"
@@ -1470,9 +1550,10 @@ during training before applying the neural-network standardization:
 {scale_rows}
 
 If the MDIF training values were already in the same units you use in ADS, keep
-the scale at `1.0`. If the MDIF used dimensionless micron values and ADS uses
-meters, export with a scale such as `--parameter-input-scales W=1um,L=1um`.
-The scale means "ADS/base-unit value per one model-training unit".
+the scale at `1.0`. If all MDIF parameters used dimensionless micron values and
+ADS uses meters, export with `--parameter-input-scales 1um`. The one scale is
+applied to every fitted parameter and means "ADS/base-unit value per one
+model-training unit".
 
 ## Implementation
 
@@ -1940,113 +2021,17 @@ def veriloga_module_text(
             lines.append(f"    si[{flat}] = {network_output(idx + n_sparams)}{add_im}; // {label} imag")
         lines.append("")
 
-        lines.append(f"    for (i = 0; i < {matrix_size}; i = i + 1) begin")
-        lines.append("      ar[i] = sr[i];")
-        lines.append("      ai[i] = si[i];")
-        lines.append("      mr[i] = -sr[i];")
-        lines.append("      mi[i] = -si[i];")
-        lines.append("      invr[i] = 0.0;")
-        lines.append("      invi[i] = 0.0;")
-        lines.append("    end")
-        lines.append(f"    for (i = 0; i < {nports}; i = i + 1) begin")
-        lines.append(f"      idx = i*{nports} + i;")
-        lines.append("      ar[idx] = ar[idx] + 1.0;")
-        lines.append("      mr[idx] = mr[idx] + 1.0;")
-        lines.append("      invr[idx] = 1.0;")
-        lines.append("    end")
-        lines.append("")
+        _append_veriloga_s_to_y_conversion(lines, nports)
 
-        lines.append(f"    for (piv = 0; piv < {nports}; piv = piv + 1) begin")
-        lines.append("      pivrow = piv;")
-        lines.append(f"      idx = piv*{nports} + piv;")
-        lines.append("      best_mag = ar[idx]*ar[idx] + ai[idx]*ai[idx];")
-        lines.append(f"      for (row = piv + 1; row < {nports}; row = row + 1) begin")
-        lines.append(f"        idx = row*{nports} + piv;")
-        lines.append("        mag = ar[idx]*ar[idx] + ai[idx]*ai[idx];")
-        lines.append("        if (mag > best_mag) begin")
-        lines.append("          best_mag = mag;")
-        lines.append("          pivrow = row;")
-        lines.append("        end")
-        lines.append("      end")
-        lines.append("      if (pivrow != piv) begin")
-        lines.append(f"        for (col = 0; col < {nports}; col = col + 1) begin")
-        lines.append(f"          idx = piv*{nports} + col;")
-        lines.append(f"          k = pivrow*{nports} + col;")
-        lines.append("          tr = ar[idx]; ti = ai[idx]; ar[idx] = ar[k]; ai[idx] = ai[k]; ar[k] = tr; ai[k] = ti;")
-        lines.append("          tr = invr[idx]; ti = invi[idx]; invr[idx] = invr[k]; invi[idx] = invi[k]; invr[k] = tr; invi[k] = ti;")
-        lines.append("        end")
-        lines.append("      end")
-        lines.append(f"      idx = piv*{nports} + piv;")
-        lines.append("      pr = ar[idx];")
-        lines.append("      pi = ai[idx];")
-        lines.append("      den = pr*pr + pi*pi;")
-        lines.append("      if (den < pivot_floor) den = pivot_floor;")
-        lines.append(f"      for (col = 0; col < {nports}; col = col + 1) begin")
-        lines.append(f"        idx = piv*{nports} + col;")
-        lines.append("        tr = (ar[idx]*pr + ai[idx]*pi)/den;")
-        lines.append("        ti = (ai[idx]*pr - ar[idx]*pi)/den;")
-        lines.append("        ar[idx] = tr; ai[idx] = ti;")
-        lines.append("        tr = (invr[idx]*pr + invi[idx]*pi)/den;")
-        lines.append("        ti = (invi[idx]*pr - invr[idx]*pi)/den;")
-        lines.append("        invr[idx] = tr; invi[idx] = ti;")
-        lines.append("      end")
-        lines.append(f"      for (row = 0; row < {nports}; row = row + 1) begin")
-        lines.append("        if (row != piv) begin")
-        lines.append(f"          idx = row*{nports} + piv;")
-        lines.append("          fr = ar[idx];")
-        lines.append("          fi = ai[idx];")
-        lines.append(f"          for (col = 0; col < {nports}; col = col + 1) begin")
-        lines.append(f"            idx = row*{nports} + col;")
-        lines.append(f"            k = piv*{nports} + col;")
-        lines.append("            ar[idx] = ar[idx] - (fr*ar[k] - fi*ai[k]);")
-        lines.append("            ai[idx] = ai[idx] - (fr*ai[k] + fi*ar[k]);")
-        lines.append("            invr[idx] = invr[idx] - (fr*invr[k] - fi*invi[k]);")
-        lines.append("            invi[idx] = invi[idx] - (fr*invi[k] + fi*invr[k]);")
-        lines.append("          end")
-        lines.append("        end")
-        lines.append("      end")
-        lines.append("    end")
-        lines.append("")
-
-        lines.append(f"    for (row = 0; row < {nports}; row = row + 1) begin")
-        lines.append(f"      for (col = 0; col < {nports}; col = col + 1) begin")
-        lines.append(f"        idx = row*{nports} + col;")
-        lines.append(f"        i = row*{nports};")
-        lines.append("        j = col;")
-        lines.append("        yr[idx] = mr[i]*invr[j] - mi[i]*invi[j];")
-        lines.append("        yi[idx] = mr[i]*invi[j] + mi[i]*invr[j];")
-        lines.append(f"        for (k = 1; k < {nports}; k = k + 1) begin")
-        lines.append(f"          i = row*{nports} + k;")
-        lines.append(f"          j = k*{nports} + col;")
-        lines.append("          yr[idx] = yr[idx] + (mr[i]*invr[j] - mi[i]*invi[j]);")
-        lines.append("          yi[idx] = yi[idx] + (mr[i]*invi[j] + mi[i]*invr[j]);")
-        lines.append("        end")
-        lines.append("        yr[idx] = yr[idx]/z0;")
-        lines.append("        yi[idx] = yi[idx]/z0;")
-        lines.append("      end")
-        lines.append("    end")
-        lines.append("")
-    lines.append("    omega = 6.2831853071795864769*freq_hz;")
-    lines.append("    if (omega < 1.0e-30) omega = 1.0e-30;")
-    for row, port_i in enumerate(port_ids):
-        for col, port_j in enumerate(port_ids):
-            flat = row * nports + col
-            real_expr = (
-                direct_y_real_by_flat[flat]
-                if output_domain == "y"
-                else f"yr[{flat}]"
-            )
-            imag_expr = (
-                direct_y_imag_by_flat[flat]
-                if output_domain == "y"
-                else f"yi[{flat}]"
-            )
-            if real_expr is None or imag_expr is None:
-                raise ValueError("Internal error: direct-Y output mapping is incomplete")
-            lines.append(
-                f"    I({port_i}) <+ ({real_expr})*V({port_j}) + "
-                f"(({imag_expr})/omega)*ddt(V({port_j}));"
-            )
+    if output_domain == "y":
+        if any(value is None for value in direct_y_real_by_flat + direct_y_imag_by_flat):
+            raise ValueError("Internal error: direct-Y output mapping is incomplete")
+        stamp_real = [str(value) for value in direct_y_real_by_flat]
+        stamp_imag = [str(value) for value in direct_y_imag_by_flat]
+    else:
+        stamp_real = [f"yr[{flat}]" for flat in range(matrix_size)]
+        stamp_imag = [f"yi[{flat}]" for flat in range(matrix_size)]
+    _append_veriloga_port_stamps(lines, port_ids, stamp_real, stamp_imag)
     lines.extend(["  end", "endmodule", ""])
 
     output_columns = (
@@ -2216,6 +2201,418 @@ def write_veriloga_package(
             adds_coarse_to_output=adds_coarse_to_output,
             embedded_coarse_model=bool(manifest["embedded_coarse_model"]),
             extra_notes=extra_notes,
+        )
+    )
+    return manifest
+
+
+def neurotf_veriloga_module_text(
+    module_name: str,
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+    activation: str,
+    layer_sizes: Sequence[int],
+    weights: Sequence[np.ndarray],
+    biases: Sequence[np.ndarray],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+    poles: np.ndarray,
+    f_scale: float,
+    z0: float,
+    frequency_expression: str,
+    parameter_input_scales: dict[str, float] | None = None,
+) -> tuple[str, dict[str, object]]:
+    """Generate a direct Neuro-TF Verilog-A implementation."""
+
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    n_sparams = len(sparam_labels)
+    poles_array = np.asarray(poles, dtype=complex).reshape(-1)
+    n_coeffs = len(poles_array) + 1
+    n_network_outputs = 2 * n_sparams * n_coeffs
+    matrix_size = nports * nports
+    if not parameter_names:
+        raise ValueError("Neuro-TF Verilog-A export requires at least one model parameter")
+    if len(layer_sizes) < 2:
+        raise ValueError("Layer sizes must include input and output dimensions")
+    if layer_sizes[0] != len(parameter_names):
+        raise ValueError(
+            f"Neuro-TF input dimension {layer_sizes[0]} does not match its "
+            f"{len(parameter_names)} model parameters"
+        )
+    if layer_sizes[-1] != n_network_outputs:
+        raise ValueError(
+            f"Neuro-TF output dimension {layer_sizes[-1]} does not match "
+            f"2 * {n_sparams} S-parameters * {n_coeffs} coefficients "
+            f"({n_network_outputs})"
+        )
+    if len(weights) != len(biases) or len(weights) != len(layer_sizes) - 1:
+        raise ValueError("Weights, biases, and layer sizes are inconsistent")
+    numeric_weights = [np.asarray(value, dtype=float) for value in weights]
+    numeric_biases = [np.asarray(value, dtype=float) for value in biases]
+    for layer_idx, (weight, bias) in enumerate(zip(numeric_weights, numeric_biases)):
+        expected_weight_shape = (layer_sizes[layer_idx], layer_sizes[layer_idx + 1])
+        if weight.shape != expected_weight_shape:
+            raise ValueError(
+                f"Neuro-TF W{layer_idx} has shape {weight.shape}; "
+                f"expected {expected_weight_shape}"
+            )
+        if bias.shape != (layer_sizes[layer_idx + 1],):
+            raise ValueError(
+                f"Neuro-TF b{layer_idx} has shape {bias.shape}; "
+                f"expected {(layer_sizes[layer_idx + 1],)}"
+            )
+    x_mean_array = np.asarray(x_mean, dtype=float).reshape(-1)
+    x_std_array = np.asarray(x_std, dtype=float).reshape(-1)
+    y_mean_array = np.asarray(y_mean, dtype=float).reshape(-1)
+    y_std_array = np.asarray(y_std, dtype=float).reshape(-1)
+    if x_mean_array.shape != (layer_sizes[0],) or x_std_array.shape != (layer_sizes[0],):
+        raise ValueError("Neuro-TF input scaler dimensions do not match its input layer")
+    if y_mean_array.shape != (n_network_outputs,) or y_std_array.shape != (n_network_outputs,):
+        raise ValueError("Neuro-TF output scaler dimensions do not match its coefficient rows")
+    if np.any(x_std_array == 0.0):
+        raise ValueError("Neuro-TF input scaler standard deviations must be non-zero")
+    if not np.all(np.isfinite(poles_array.real)) or not np.all(np.isfinite(poles_array.imag)):
+        raise ValueError("Neuro-TF poles must be finite")
+    if not math.isfinite(float(f_scale)) or float(f_scale) <= 0.0:
+        raise ValueError("Neuro-TF f_scale must be positive and finite")
+    if not math.isfinite(float(z0)) or float(z0) <= 0.0:
+        raise ValueError("Reference impedance z0 must be positive and finite")
+
+    scale_map = {
+        str(key): float(value) for key, value in (parameter_input_scales or {}).items()
+    }
+    unknown_scales = sorted(set(scale_map) - set(parameter_names))
+    if unknown_scales:
+        raise ValueError(
+            "Parameter input scales include names that are not model parameters: "
+            + ", ".join(unknown_scales)
+        )
+    param_ids = unique_veriloga_identifiers(parameter_names, "param")
+    scale_ids = unique_veriloga_identifiers(
+        [f"{ident}_input_scale" for ident in param_ids],
+        "param_input_scale",
+        used_names=set(param_ids),
+    )
+    param_scales: list[float] = []
+    param_defaults: list[float] = []
+    param_model_defaults: list[float] = []
+    for idx, name in enumerate(parameter_names):
+        scale = float(scale_map.get(name, 1.0))
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"Parameter input scale for {name!r} must be positive and finite")
+        model_default = float(x_mean_array[idx])
+        param_scales.append(scale)
+        param_model_defaults.append(model_default)
+        param_defaults.append(model_default * scale)
+
+    module_id = veriloga_identifier(module_name, "neuro_tf_va")
+    port_ids = [f"p{idx}" for idx in range(1, nports + 1)]
+    lines: list[str] = [
+        "`include \"constants.vams\"",
+        "`include \"disciplines.vams\"",
+        "",
+        f"module {module_id}({', '.join(port_ids)});",
+        f"  inout {', '.join(port_ids)};",
+        f"  electrical {', '.join(port_ids)};",
+        "",
+        "  parameter integer clamp_frequency = 1;",
+        "  parameter real min_frequency_hz = 1.0;",
+        f"  parameter real z0 = {veriloga_float(z0)};",
+        "  parameter real pivot_floor = 1.0e-24;",
+    ]
+    for name, ident, default in zip(parameter_names, param_ids, param_defaults):
+        lines.append(
+            f"  parameter real {ident} = {veriloga_float(default)}; "
+            f"// source VAR {name}, ADS/base units"
+        )
+    lines.extend(
+        [
+            "",
+            "  // ADS/base-unit parameter divided by input_scale equals the model training VAR.",
+        ]
+    )
+    for name, ident, scale_ident, scale in zip(
+        parameter_names, param_ids, scale_ids, param_scales
+    ):
+        lines.append(
+            f"  parameter real {scale_ident} = {veriloga_float(scale)}; "
+            f"// model VAR {name} = {ident}/{scale_ident}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "  integer i;",
+            "  integer j;",
+            "  integer k;",
+            "  integer row;",
+            "  integer col;",
+            "  integer idx;",
+            "  integer piv;",
+            "  integer pivrow;",
+            "  real freq_hz;",
+            "  real normalized_frequency;",
+            "  real omega;",
+            "  real mag;",
+            "  real best_mag;",
+            "  real den;",
+            "  real pr;",
+            "  real pi;",
+            "  real fr;",
+            "  real fi;",
+            "  real tr;",
+            "  real ti;",
+            f"  real basis_r [0:{n_coeffs - 1}];",
+            f"  real basis_i [0:{n_coeffs - 1}];",
+            f"  real coeff [0:{n_network_outputs - 1}];",
+            f"  real sr [0:{matrix_size - 1}];",
+            f"  real si [0:{matrix_size - 1}];",
+            f"  real mr [0:{matrix_size - 1}];",
+            f"  real mi [0:{matrix_size - 1}];",
+            f"  real ar [0:{matrix_size - 1}];",
+            f"  real ai [0:{matrix_size - 1}];",
+            f"  real invr [0:{matrix_size - 1}];",
+            f"  real invi [0:{matrix_size - 1}];",
+            f"  real yr [0:{matrix_size - 1}];",
+            f"  real yi [0:{matrix_size - 1}];",
+        ]
+    )
+    for layer_idx, size in enumerate(layer_sizes):
+        lines.append(f"  real l{layer_idx} [0:{size - 1}];")
+
+    lines.extend(["", "  analog begin"])
+    lines.append(f"    freq_hz = {frequency_expression};")
+    lines.append(
+        "    if (clamp_frequency != 0 && freq_hz < min_frequency_hz) "
+        "freq_hz = min_frequency_hz;"
+    )
+    lines.append(f"    normalized_frequency = freq_hz/({veriloga_float(float(f_scale))});")
+    lines.append("")
+    for idx, (ident, scale_ident) in enumerate(zip(param_ids, scale_ids)):
+        lines.append(
+            f"    l0[{idx}] = ((({ident})/({scale_ident})) - "
+            f"({veriloga_float(float(x_mean_array[idx]))}))"
+            f"/({veriloga_float(float(x_std_array[idx]))}); // {parameter_names[idx]}"
+        )
+    lines.append("")
+
+    for layer_idx, (weight, bias) in enumerate(zip(numeric_weights, numeric_biases)):
+        hidden_activation = activation if layer_idx < len(numeric_weights) - 1 else None
+        _veriloga_layer_assignments(
+            lines,
+            source=f"l{layer_idx}",
+            dest=f"l{layer_idx + 1}",
+            weight=weight,
+            bias=bias,
+            activation=hidden_activation,
+        )
+    final_layer = f"l{len(layer_sizes) - 1}"
+    for idx in range(n_network_outputs):
+        lines.append(
+            f"    coeff[{idx}] = {final_layer}[{idx}]"
+            f"*({veriloga_float(float(y_std_array[idx]))}) "
+            f"+ ({veriloga_float(float(y_mean_array[idx]))});"
+        )
+    lines.extend(["", "    // Fixed-pole rational basis: 1, 1/(j*f/f_scale - pole_k)."])
+    lines.append("    basis_r[0] = 1.0;")
+    lines.append("    basis_i[0] = 0.0;")
+    for pole_idx, pole in enumerate(poles_array, start=1):
+        real_part = -float(pole.real)
+        imag_part = float(pole.imag)
+        lines.append(
+            f"    den = ({veriloga_float(real_part)})*({veriloga_float(real_part)}) + "
+            f"(normalized_frequency - ({veriloga_float(imag_part)}))"
+            f"*(normalized_frequency - ({veriloga_float(imag_part)}));"
+        )
+        lines.append("    if (den < 1.0e-30) den = 1.0e-30;")
+        lines.append(
+            f"    basis_r[{pole_idx}] = ({veriloga_float(real_part)})/den;"
+        )
+        lines.append(
+            f"    basis_i[{pole_idx}] = "
+            f"-(normalized_frequency - ({veriloga_float(imag_part)}))/den;"
+        )
+    lines.append("")
+
+    coefficient_half = n_sparams * n_coeffs
+    for sparam_idx, label in enumerate(sparam_labels):
+        row_number, col_number = sparam_indices(label) or (0, 0)
+        flat = (row_number - 1) * nports + (col_number - 1)
+        lines.append(f"    sr[{flat}] = 0.0; // {label} real")
+        lines.append(f"    si[{flat}] = 0.0; // {label} imag")
+        for coeff_idx in range(n_coeffs):
+            real_index = sparam_idx * n_coeffs + coeff_idx
+            imag_index = coefficient_half + real_index
+            lines.append(
+                f"    sr[{flat}] = sr[{flat}] + coeff[{real_index}]"
+                f"*basis_r[{coeff_idx}] - coeff[{imag_index}]"
+                f"*basis_i[{coeff_idx}];"
+            )
+            lines.append(
+                f"    si[{flat}] = si[{flat}] + coeff[{real_index}]"
+                f"*basis_i[{coeff_idx}] + coeff[{imag_index}]"
+                f"*basis_r[{coeff_idx}];"
+            )
+        lines.append("")
+
+    _append_veriloga_s_to_y_conversion(lines, nports)
+    _append_veriloga_port_stamps(
+        lines,
+        port_ids,
+        [f"yr[{flat}]" for flat in range(matrix_size)],
+        [f"yi[{flat}]" for flat in range(matrix_size)],
+    )
+    lines.extend(["  end", "endmodule", ""])
+
+    coefficient_columns = [
+        f"{label}_c{coeff_idx}_real"
+        for label in sparam_labels
+        for coeff_idx in range(n_coeffs)
+    ] + [
+        f"{label}_c{coeff_idx}_imag"
+        for label in sparam_labels
+        for coeff_idx in range(n_coeffs)
+    ]
+    manifest: dict[str, object] = {
+        "module_name": module_id,
+        "model_kind": "Neuro-TF",
+        "nports": nports,
+        "parameter_names": list(parameter_names),
+        "parameter_identifiers": param_ids,
+        "parameter_scale_identifiers": scale_ids,
+        "parameter_input_scales": {
+            name: float(scale) for name, scale in zip(parameter_names, param_scales)
+        },
+        "parameter_defaults": param_defaults,
+        "parameter_instance_defaults": param_defaults,
+        "parameter_model_defaults": param_model_defaults,
+        "sparam_labels": list(sparam_labels),
+        "input_columns": list(parameter_names),
+        "output_columns": coefficient_columns,
+        "output_domain": "s",
+        "representation": "fixed-pole rational transfer function",
+        "frequency_expression": frequency_expression,
+        "z0": float(z0),
+        "activation": activation,
+        "layer_sizes": list(layer_sizes),
+        "folded_input_scaler": False,
+        "folded_output_scaler": False,
+        "uses_coarse_inputs": False,
+        "adds_coarse_to_output": False,
+        "embedded_coarse_model": False,
+        "fully_self_contained": True,
+        "n_poles": int(len(poles_array)),
+        "n_coeffs_per_sparam": int(n_coeffs),
+        "poles_real": [float(value) for value in poles_array.real],
+        "poles_imag": [float(value) for value in poles_array.imag],
+        "f_scale": float(f_scale),
+        "implementation_note": (
+            "Direct Verilog-A embeds the trained geometry-to-coefficient MLP and fixed "
+            "rational poles, evaluates the S-matrix at simulator frequency, and converts "
+            "it to a small-signal Y-matrix. Intended for AC/SP analyses."
+        ),
+    }
+    return "\n".join(lines), manifest
+
+
+def write_neurotf_veriloga_package(
+    out_dir: Path,
+    module_name: str,
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+    activation: str,
+    layer_sizes: Sequence[int],
+    weights: Sequence[np.ndarray],
+    biases: Sequence[np.ndarray],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+    poles: np.ndarray,
+    f_scale: float,
+    z0: float = 50.0,
+    frequency_expression: str = "$freq",
+    parameter_input_scales: dict[str, float] | None = None,
+    source_model_dir: str | None = None,
+) -> dict[str, object]:
+    """Write a self-contained Neuro-TF Verilog-A package."""
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    module_id = veriloga_identifier(module_name, "neuro_tf_va")
+    va_text, manifest = neurotf_veriloga_module_text(
+        module_name=module_id,
+        parameter_names=parameter_names,
+        sparam_labels=sparam_labels,
+        activation=activation,
+        layer_sizes=layer_sizes,
+        weights=weights,
+        biases=biases,
+        x_mean=x_mean,
+        x_std=x_std,
+        y_mean=y_mean,
+        y_std=y_std,
+        poles=poles,
+        f_scale=f_scale,
+        z0=z0,
+        frequency_expression=frequency_expression,
+        parameter_input_scales=parameter_input_scales,
+    )
+    va_name = f"{module_id}.va"
+    manifest_name = "veriloga_manifest.json"
+    manifest.update(
+        {
+            "format": "direct_veriloga_neurotf",
+            "veriloga_file": va_name,
+            "source_model_dir": source_model_dir,
+            "reference_note": (
+                "Generated from saved local model.npz weights and fixed poles. ADS "
+                "Verilog-A frequency defaults to $freq; verify against the target ADS release."
+            ),
+        }
+    )
+    (out_dir / va_name).write_text(va_text)
+    (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
+    response_relation = (
+        "- Neural output: complex fixed-pole rational coefficients\n"
+        "- Runtime response: `Sij(f) = c0 + sum(c_k / (j*f/f_scale - pole_k))`\n"
+        f"- Reference impedance used for S-to-Y conversion: `{z0:g} ohm`\n"
+        "- Current relation: `Y = (I - S) * inverse(I + S) / Z0`, then "
+        "`Iport = Y * Vport`"
+    )
+    (out_dir / "VERILOGA_README.md").write_text(
+        _veriloga_readme(
+            model_kind="Neuro-TF",
+            module_name=module_id,
+            va_file=va_name,
+            manifest_name=manifest_name,
+            nports=int(manifest["nports"]),
+            parameter_names=parameter_names,
+            parameter_identifiers=manifest["parameter_identifiers"],
+            parameter_scale_identifiers=manifest["parameter_scale_identifiers"],
+            parameter_input_scales=[
+                manifest["parameter_input_scales"][name] for name in parameter_names
+            ],
+            parameter_instance_defaults=manifest["parameter_instance_defaults"],
+            input_columns=manifest["input_columns"],
+            output_columns=manifest["output_columns"],
+            freq_transform="fixed-pole rational basis using freq_hz/f_scale",
+            frequency_expression=frequency_expression,
+            z0=z0,
+            output_domain="s",
+            folded_input_scaler=False,
+            folded_output_scaler=False,
+            uses_coarse_inputs=False,
+            adds_coarse_to_output=False,
+            embedded_coarse_model=False,
+            extra_notes=[
+                "The model is self-contained: no MDIF table, Python runtime, or external "
+                "coarse model is required by the generated component.",
+                "The rational frequency response and admittance stamping target AC/SP "
+                "analysis, not causal transient behavior.",
+            ],
+            response_relation_override=response_relation,
         )
     )
     return manifest
@@ -4993,6 +5390,18 @@ def repository_relative_path(path: str | Path, repository_root: Path) -> str:
     )
 
 
+def veriloga_command_defaults(
+    script_path: Path,
+    model_dir: Path,
+) -> tuple[str, str]:
+    """Return an explicit module name and one unity scale for all parameters."""
+
+    resolved_model_dir = model_dir.resolve()
+    fallback_name = normalize_name(script_path.stem) or "model"
+    module_name = f"{normalize_name(resolved_model_dir.name) or fallback_name}_va"
+    return module_name, "1.0"
+
+
 def build_training_export_commands(
     script_path: Path,
     model_dir: Path,
@@ -5016,6 +5425,10 @@ def build_training_export_commands(
     )
     commands: list[tuple[str, str]] = []
     if include_veriloga:
+        module_name, parameter_scale_spec = veriloga_command_defaults(
+            resolved_script_path,
+            resolved_model_dir,
+        )
         commands.append(
             (
                 "Self-contained Verilog-A",
@@ -5031,6 +5444,10 @@ def build_training_export_commands(
                             resolved_model_dir / "veriloga_export",
                             repository_root,
                         ),
+                        "--module-name",
+                        module_name,
+                        "--parameter-input-scales",
+                        parameter_scale_spec,
                     ]
                 ),
             )

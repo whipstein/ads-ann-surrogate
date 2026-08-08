@@ -87,6 +87,7 @@ from surrogate_common import (  # noqa: E402
     terminal_status_line,
     trial_plot_paths,
     verification_metrics,
+    veriloga_command_defaults,
     write_training_verification_artifacts,
     write_ads_ann_package,
     write_ads_export_package,
@@ -351,6 +352,10 @@ def write_composite_model_manifest(
     metadata = kbnn_metadata(resolved_model_dir)
     coarse_identity = metadata.get("coarse_model")
     coarse_payload: dict[str, object] | None = None
+    module_name, parameter_scale_spec = veriloga_command_defaults(
+        Path(__file__),
+        resolved_model_dir,
+    )
     export_argv = [
         Path(sys.executable).name or "python3",
         repository_relative_path(Path(__file__), repository_root),
@@ -359,6 +364,10 @@ def write_composite_model_manifest(
         repository_relative_path(resolved_model_dir, repository_root),
         "--out-dir",
         repository_relative_path(resolved_model_dir / "veriloga", repository_root),
+        "--module-name",
+        module_name,
+        "--parameter-input-scales",
+        parameter_scale_spec,
     ]
     if isinstance(coarse_identity, dict):
         coarse_path = Path(str(coarse_identity.get("source_model_dir") or ""))
@@ -2664,9 +2673,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     export_va.add_argument(
         "--parameter-input-scales",
+        metavar="SCALE",
         help=(
-            "Optional NAME=SCALE mappings converting ADS/base-unit instance parameters "
-            "to model-training units. Example: W=1um,L=1um or all=1um"
+            "Optional positive scale applied to every ADS/base-unit instance parameter "
+            "before conversion to model-training units. Example: 1um"
         ),
     )
     export_va.add_argument(

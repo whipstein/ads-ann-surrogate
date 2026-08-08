@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neuro-TF trainer, predictor, sweep, and ADS-MDIF export CLI."""
+"""Neuro-TF trainer, predictor, sweep, and ADS export CLI."""
 
 from __future__ import annotations
 
@@ -329,12 +329,13 @@ def neurotf_export_commands(
     model_dir: Path,
     template_mdif: str | Path | None = None,
 ) -> list[tuple[str, str]]:
-    """Build a runnable sampled-MDIF export command for Neuro-TF."""
+    """Build runnable direct-Verilog-A and sampled-MDIF Neuro-TF commands."""
 
     return build_training_export_commands(
         Path(__file__),
         model_dir,
         template_mdif,
+        include_veriloga=True,
     )
 
 
@@ -558,6 +559,51 @@ def command_export_ads(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_export_veriloga(args: argparse.Namespace) -> int:
+    model_dir = Path(args.model_dir)
+    model = NeuroTF.load(model_dir)
+    out_dir = Path(args.out_dir)
+    module_name = args.module_name or f"{normalize_name(model_dir.name) or 'neuro_tf'}_va"
+    parameter_input_scales = parse_parameter_scale_spec(
+        model.parameter_names,
+        args.parameter_input_scales,
+    )
+    manifest = write_neurotf_veriloga_package(
+        out_dir=out_dir,
+        module_name=module_name,
+        parameter_names=model.parameter_names,
+        sparam_labels=model.sparam_labels,
+        activation=model.mlp.activation,
+        layer_sizes=model.mlp.layer_sizes,
+        weights=model.mlp.weights,
+        biases=model.mlp.biases,
+        x_mean=np.asarray(model.x_scaler.mean, dtype=float),
+        x_std=np.asarray(model.x_scaler.std, dtype=float),
+        y_mean=np.asarray(model.y_scaler.mean, dtype=float),
+        y_std=np.asarray(model.y_scaler.std, dtype=float),
+        poles=model.poles,
+        f_scale=model.f_scale,
+        z0=args.z0,
+        frequency_expression=args.frequency_expression,
+        parameter_input_scales=parameter_input_scales,
+        source_model_dir=str(model_dir),
+    )
+    print(json.dumps({
+        "out_dir": str(out_dir),
+        "veriloga": str(out_dir / manifest["veriloga_file"]),
+        "manifest": str(out_dir / "veriloga_manifest.json"),
+        "readme": str(out_dir / "VERILOGA_README.md"),
+        "module_name": manifest["module_name"],
+        "nports": manifest["nports"],
+        "parameters": manifest["parameter_identifiers"],
+        "parameter_input_scales": manifest["parameter_input_scales"],
+        "n_poles": manifest["n_poles"],
+        "f_scale": manifest["f_scale"],
+        "fully_self_contained": manifest["fully_self_contained"],
+    }, indent=2))
+    return 0
+
+
 def command_inspect(args: argparse.Namespace) -> int:
     blocks = read_mdif(Path(args.mdif))
     labels = common_sparameter_labels(blocks)
@@ -732,6 +778,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     export_ads.add_argument("--output-name", default="surrogate_ads.mdif", help="Output MDIF file name")
     export_ads.set_defaults(func=command_export_ads)
+
+    export_va = sub.add_parser(
+        "export-veriloga",
+        help=(
+            "Export a trained Neuro-TF directly as a self-contained Verilog-A "
+            "N-port using its saved coefficient network and fixed poles"
+        ),
+    )
+    export_va.add_argument(
+        "--model-dir",
+        required=True,
+        help="Directory containing trained model.npz and metadata.json",
+    )
+    export_va.add_argument(
+        "--out-dir",
+        required=True,
+        help="Output directory for the Verilog-A package",
+    )
+    export_va.add_argument(
+        "--module-name",
+        help="Verilog-A module name. Defaults to the model directory name plus _va",
+    )
+    export_va.add_argument(
+        "--z0",
+        type=float,
+        default=50.0,
+        help="Reference impedance for S-to-Y conversion",
+    )
+    export_va.add_argument(
+        "--frequency-expression",
+        default="$freq",
+        help="Verilog-A expression for simulator frequency in Hz. Default: $freq",
+    )
+    export_va.add_argument(
+        "--parameter-input-scales",
+        metavar="SCALE",
+        help=(
+            "Optional positive scale applied to every ADS/base-unit instance parameter "
+            "before conversion to model-training units. Example: 1um"
+        ),
+    )
+    export_va.set_defaults(func=command_export_veriloga)
 
     inspect = sub.add_parser("inspect-mdif", help="Inspect parsed MDIF blocks")
     inspect.add_argument("--mdif", required=True)
