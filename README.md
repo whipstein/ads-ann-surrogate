@@ -334,6 +334,38 @@ The reported Verilog-A commands include an explicit default module name and a
 single `--parameter-input-scales 1.0` value applied to every fitted parameter,
 making either value easy to edit before export.
 
+### Distinct DC Point
+
+Every DNN, KBNN, and Neuro-TF fit now stores a parameter-independent DC
+equivalent resistance in `metadata.json` and reports it in
+`training_summary.md`. The corresponding real/imaginary S-point is stored under
+`dc_sparameters`. It is deliberately separate from the fitted response:
+
+1. For each training block, the lowest positive-frequency S-matrix is converted
+   to Y using the model reference impedance.
+2. A one-amp balanced current is applied between each port pair with all other
+   ports open; the real differential voltage gives that pair's equivalent
+   resistance.
+3. The arithmetic mean of all positive, finite values is saved as
+   `dc_equivalent_resistance_ohm`.
+4. Zero-frequency rows are excluded from neural/rational fitting, so changing
+   an input MDIF's DC samples cannot change the fitted weights or poles.
+
+At exactly zero Hz, prediction and sampled-MDIF export use an equal-resistance
+port network whose equivalent resistance between any two ports is the saved
+average. Sampled ADS exports prepend this zero-Hz point automatically. Direct
+Verilog-A exports bypass all fitted network/rational arithmetic at DC and stamp
+the resistor network instead; positive frequencies continue to use the fitted
+model. Existing saved models must be retrained to acquire this data-derived DC
+value.
+
+For an integrated residual or prior-input KBNN, the coarse DNN and fine KBNN
+store their own independently extracted resistance values. The composite
+Verilog-A component uses the fine-data resistance and bypasses both networks at
+DC. Native ADS ANN retraining excludes zero-Hz rows, but its generated ANN alone
+does not implement the distinct resistor branch; use the direct Verilog-A or
+sampled-MDIF handoff when DC behavior is required.
+
 Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
 per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
 directory. At completion, each sweep prints a copyable standalone `train`

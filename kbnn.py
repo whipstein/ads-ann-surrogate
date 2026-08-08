@@ -41,6 +41,7 @@ from surrogate_common import (  # noqa: E402
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
     ads_ann_training_type_enum,
+    apply_distinct_dc_response,
     build_ads_export_blocks,
     build_training_export_commands,
     cleanup_trial_dir,
@@ -50,6 +51,7 @@ from surrogate_common import (  # noqa: E402
     csv_number,
     debug_print,
     debug_traceback,
+    extract_average_dc_resistance,
     frequency_feature_columns,
     infer_parameter_names,
     load_sweep_rows,
@@ -71,6 +73,7 @@ from surrogate_common import (  # noqa: E402
     plot_sweep_diagnostics,
     plot_worst_case_fits,
     plot_worst_case_y_fits,
+    positive_frequency_blocks,
     print_cli_error,
     read_mdif,
     read_model_metadata,
@@ -376,6 +379,7 @@ def write_composite_model_manifest(
             packaged_candidate = (resolved_model_dir / str(packaged_relative)).resolve()
             if packaged_candidate.is_dir():
                 coarse_path = packaged_candidate
+        coarse_metadata = json.loads((coarse_path / "metadata.json").read_text())
         coarse_payload = {
             "role": "frozen_coarse_s_domain_dnn",
             "model_dir": str(coarse_path),
@@ -385,6 +389,13 @@ def write_composite_model_manifest(
             "metadata_sha256": coarse_identity.get("metadata_sha256"),
             "training_summary": str(coarse_path / "training_summary.md"),
             "verification_summary": str(coarse_path / "verification_summary.json"),
+            "dc_equivalent_resistance_ohm": coarse_metadata.get(
+                "dc_equivalent_resistance_ohm"
+            ),
+            "dc_is_separate_from_fitted_response": coarse_metadata.get(
+                "dc_is_separate_from_fitted_response",
+                False,
+            ),
         }
         export_argv.extend(
             [
@@ -409,6 +420,8 @@ def write_composite_model_manifest(
             "metadata_sha256": file_sha256(resolved_model_dir / "metadata.json"),
             "training_summary": str(resolved_model_dir / "training_summary.md"),
             "verification_summary": str(resolved_model_dir / "verification_summary.json"),
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_is_separate_from_fitted_response": True,
         },
         "coarse_model": coarse_payload,
         "veriloga_ready": bool(model.mode == "plain" or coarse_payload is not None),
@@ -1123,6 +1136,7 @@ class KBNN:
         mode: str,
         include_coarse_input: bool,
         freq_transform: str,
+        dc_equivalent_resistance_ohm: float | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -1132,6 +1146,11 @@ class KBNN:
         self.mode = mode
         self.include_coarse_input = include_coarse_input
         self.freq_transform = freq_transform
+        self.dc_equivalent_resistance_ohm = (
+            None
+            if dc_equivalent_resistance_ohm is None
+            else float(dc_equivalent_resistance_ohm)
+        )
 
     def predict_blocks(
         self,
@@ -1164,6 +1183,13 @@ class KBNN:
                 pred_values = coarse_values + block_y_complex
             else:
                 pred_values = block_y_complex
+            pred_values = apply_distinct_dc_response(
+                pred_values,
+                fine.freq_hz,
+                self.sparam_labels,
+                self.dc_equivalent_resistance_ohm,
+                z0=50.0,
+            )
             sparams = {
                 label: pred_values[:, idx]
                 for idx, label in enumerate(self.sparam_labels)
@@ -1200,6 +1226,7 @@ class KBNN:
             "mode": self.mode,
             "include_coarse_input": self.include_coarse_input,
             "freq_transform": self.freq_transform,
+            "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -1227,6 +1254,7 @@ class KBNN:
             mode=metadata["mode"],
             include_coarse_input=bool(metadata["include_coarse_input"]),
             freq_transform=metadata["freq_transform"],
+            dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
         )
 
 
@@ -1260,9 +1288,13 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
 
     parameter_names = infer_parameter_names(all_fine, requested=args.parameter_names, split_var=args.split_var)
     labels = determine_labels(all_fine, None)
+    dc_metadata = extract_average_dc_resistance(train_fine, labels, z0=50.0)
+    fit_train_fine = positive_frequency_blocks(train_fine)
+    fit_verify_fine = positive_frequency_blocks(verify_fine) if verify_fine else []
     coarse_identity: dict[str, object] | None = None
     if mode == "plain":
         train_coarse: list[MDIFBlock] = []
+        fit_verify_coarse: list[MDIFBlock] = []
         verify_coarse: list[MDIFBlock] = []
     else:
         coarse_model, coarse_identity = load_frozen_coarse_dnn(
@@ -1275,11 +1307,14 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
                 Path(str(coarse_model_dir)).expanduser().resolve(),
                 Path(args.out_dir).expanduser().resolve(),
             )
-        train_coarse = coarse_model.predict_blocks(train_fine)
+        train_coarse = coarse_model.predict_blocks(fit_train_fine)
+        fit_verify_coarse = (
+            coarse_model.predict_blocks(fit_verify_fine) if fit_verify_fine else []
+        )
         verify_coarse = coarse_model.predict_blocks(verify_fine) if verify_fine else []
 
     x_train, y_train = make_feature_target_samples(
-        train_fine,
+        fit_train_fine,
         train_coarse,
         parameter_names,
         labels,
@@ -1287,10 +1322,10 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         include_coarse_input,
         args.freq_transform,
     )
-    if verify_fine:
+    if fit_verify_fine:
         x_verify, y_verify = make_feature_target_samples(
-            verify_fine,
-            verify_coarse,
+            fit_verify_fine,
+            fit_verify_coarse,
             parameter_names,
             labels,
             mode,
@@ -1355,6 +1390,9 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         mode=mode,
         include_coarse_input=include_coarse_input,
         freq_transform=args.freq_transform,
+        dc_equivalent_resistance_ohm=float(
+            dc_metadata["dc_equivalent_resistance_ohm"]
+        ),
     )
     metadata = {
         "training_blocks": len(train_fine),
@@ -1374,6 +1412,7 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training, so the average normalized weight is 1.0.",
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
+        **dc_metadata,
     }
     if getattr(args, "debug", False):
         debug_info = build_training_debug_info(
@@ -1382,10 +1421,10 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
             include_coarse_input,
             parameter_names,
             labels,
-            train_fine,
-            verify_fine,
+            fit_train_fine,
+            fit_verify_fine,
             train_coarse,
-            verify_coarse,
+            fit_verify_coarse,
             x_train,
             y_train,
             x_verify,
@@ -1444,6 +1483,9 @@ def command_train(args: argparse.Namespace) -> int:
         "mode": model.mode,
         "include_coarse_input": model.include_coarse_input,
         "freq_transform": model.freq_transform,
+        "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_is_separate_from_fitted_response": True,
         "coarse_source": metadata["coarse_source"],
         "coarse_model": metadata["coarse_model"],
         "hidden_layers": args.hidden_layers,
@@ -1516,6 +1558,7 @@ def command_train(args: argparse.Namespace) -> int:
             "sparam_weight_mean": metadata["sparam_weight_mean"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
@@ -1575,6 +1618,10 @@ def command_export_ads(args: argparse.Namespace) -> int:
     write_mdif(out_dir / mdif_name, pred_blocks, model.sparam_labels)
 
     notes = []
+    notes.append(
+        "Every exported block includes a zero-Hz point from the saved average "
+        "equivalent resistance; it bypasses both fitted networks."
+    )
     if coarse_identity is not None:
         notes.append(
             "The same frozen coarse DNN used during KBNN training was evaluated during export; ADS only needs the final exported MDIF."
@@ -1594,6 +1641,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "layer_sizes": model.mlp.layer_sizes,
             "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
             "coarse_model": coarse_identity,
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_is_separate_from_fitted_response": True,
         },
         extra_notes=notes,
     )
@@ -1689,6 +1738,12 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             )
     else:
         labels = determine_labels(all_fine, all_coarse_raw or None)
+    train_fine = positive_frequency_blocks(train_fine, purpose="ADS ANN fitting")
+    verify_fine = (
+        positive_frequency_blocks(verify_fine, purpose="ADS ANN verification")
+        if verify_fine
+        else []
+    )
     if mode == "plain":
         train_coarse = []
         verify_coarse = []
@@ -1774,6 +1829,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
     notes = [
         "This export retrains the ANN in ADS; it does not import NumPy model.npz weights.",
         "When --model-dir is supplied, metadata from that trained or optimized model is used to seed the ADS ANN architecture/settings.",
+        "Zero-Hz rows are excluded from ADS ANN fitting. Use the self-contained Verilog-A or sampled-MDIF export when the distinct saved DC resistance is required.",
     ]
     if mode == "residual" and target == "native":
         notes.append(
@@ -1887,6 +1943,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "This direct Verilog-A export embeds the saved local model.npz weights; it does not retrain in ADS ANN.",
         "The generated N-port is intended for S-parameter and small-signal AC simulation. It is not a causal transient model.",
         "The default frequency expression is $freq. If your ADS Verilog-A environment uses a different frequency variable, regenerate with --frequency-expression.",
+        "At exactly zero frequency, both the fine KBNN and embedded coarse DNN are bypassed and the fine-data average equivalent resistance is used instead.",
     ]
     if coarse_model is not None:
         notes.append(
@@ -1930,6 +1987,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         adds_coarse_to_output=adds_coarse_to_output,
         parameter_input_scales=parameter_input_scales,
         embedded_coarse_model=embedded_coarse_model,
+        dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "knowledge_based_neural_network",
@@ -1961,6 +2019,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "coarse_model_match_verified": manifest["coarse_model_match_verified"],
         "fully_self_contained": manifest["fully_self_contained"],
         "requires_coarse_hooks": manifest["requires_coarse_hooks"],
+        "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
     }, indent=2))
     return 0
 

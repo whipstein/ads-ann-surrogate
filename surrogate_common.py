@@ -527,6 +527,249 @@ def ensure_block_sparams(blocks: Sequence[MDIFBlock], labels: Sequence[str]) -> 
     return fixed
 
 
+def positive_frequency_blocks(
+    blocks: Sequence[MDIFBlock],
+    *,
+    purpose: str = "model fitting",
+) -> list[MDIFBlock]:
+    """Copy blocks with DC/nonphysical frequency rows excluded from a fitted model."""
+
+    positive_blocks: list[MDIFBlock] = []
+    for block in blocks:
+        mask = np.asarray(block.freq_hz, dtype=float) > 0.0
+        if not np.any(mask):
+            raise ValueError(
+                f"MDIF block {block.source_index} has no positive-frequency samples for {purpose}"
+            )
+        positive_blocks.append(
+            MDIFBlock(
+                params=dict(block.params),
+                freq_hz=np.asarray(block.freq_hz, dtype=float)[mask].copy(),
+                sparams={
+                    label: np.asarray(values, dtype=complex)[mask].copy()
+                    for label, values in block.sparams.items()
+                },
+                source_index=block.source_index,
+            )
+        )
+    return positive_blocks
+
+
+def validate_dc_equivalent_resistance(
+    value: float | None,
+    *,
+    context: str = "model",
+) -> float:
+    """Return a valid stored DC equivalent resistance or request a refit."""
+
+    if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise ValueError(
+            f"{context} does not contain a valid data-derived DC equivalent resistance. "
+            "Retrain the model with this version before requesting a DC response or "
+            "Verilog-A export."
+        )
+    return float(value)
+
+
+def _block_s_matrix(
+    block: MDIFBlock,
+    labels: Sequence[str],
+    frequency_index: int,
+    nports: int,
+) -> np.ndarray:
+    matrix = np.zeros((nports, nports), dtype=complex)
+    for label in labels:
+        indices = sparam_indices(label)
+        if indices is None:
+            raise ValueError(f"DC resistance extraction requires Sij labels, got {label!r}")
+        row, col = indices
+        matrix[row - 1, col - 1] = complex(block.sparams[label][frequency_index])
+    return matrix
+
+
+def _s_to_y_matrix(s_matrix: np.ndarray, z0: float) -> np.ndarray:
+    identity = np.eye(s_matrix.shape[0], dtype=complex)
+    lhs = identity + s_matrix
+    rhs = identity - s_matrix
+    try:
+        return np.linalg.solve(lhs.T, rhs.T).T / float(z0)
+    except np.linalg.LinAlgError:
+        return rhs @ np.linalg.pinv(lhs) / float(z0)
+
+
+def extract_average_dc_resistance(
+    blocks: Sequence[MDIFBlock],
+    labels: Sequence[str],
+    *,
+    z0: float = 50.0,
+) -> dict[str, object]:
+    """Extract one distinct DC resistance from low-frequency training data.
+
+    Each training block contributes one equivalent resistance for every port
+    pair at that block's lowest positive frequency. A balanced one-amp current
+    is injected into one port and removed from the other with all remaining
+    ports open; the real differential voltage is the equivalent resistance.
+    Their arithmetic mean becomes the model's parameter-independent DC point.
+    """
+
+    if not math.isfinite(float(z0)) or float(z0) <= 0.0:
+        raise ValueError("DC resistance extraction z0 must be positive and finite")
+    nports = infer_complete_sparameter_ports(labels)
+    resistances: list[float] = []
+    frequencies: list[float] = []
+    contributing_blocks: set[int] = set()
+    for block_index, block in enumerate(blocks):
+        freq = np.asarray(block.freq_hz, dtype=float)
+        positive_indices = np.flatnonzero(freq > 0.0)
+        if positive_indices.size == 0:
+            continue
+        frequency_index = int(positive_indices[np.argmin(freq[positive_indices])])
+        s_matrix = _block_s_matrix(block, labels, frequency_index, nports)
+        y_matrix = _s_to_y_matrix(s_matrix, z0)
+        z_matrix = np.linalg.pinv(y_matrix)
+        if nports == 1:
+            block_resistances = [float(np.real(z_matrix[0, 0]))]
+        else:
+            block_resistances = []
+            for first in range(nports):
+                for second in range(first + 1, nports):
+                    differential = np.zeros(nports, dtype=complex)
+                    differential[first] = 1.0
+                    differential[second] = -1.0
+                    resistance = float(
+                        np.real(
+                            np.conjugate(differential)
+                            @ z_matrix
+                            @ differential
+                        )
+                    )
+                    block_resistances.append(resistance)
+        for resistance in block_resistances:
+            if not math.isfinite(resistance) or resistance <= 0.0:
+                continue
+            resistances.append(float(resistance))
+            frequencies.append(float(freq[frequency_index]))
+            contributing_blocks.add(block_index)
+    if not resistances:
+        raise ValueError(
+            "Could not extract a positive finite equivalent resistance from the "
+            "lowest positive-frequency S-parameters in the training data"
+        )
+    resistance = float(np.mean(np.asarray(resistances, dtype=float)))
+    dc_values = dc_sparameter_values(labels, resistance, z0=z0)
+    return {
+        "dc_equivalent_resistance_ohm": resistance,
+        "dc_resistance_sample_count": len(resistances),
+        "dc_resistance_block_count": len(contributing_blocks),
+        "dc_resistance_source_z0_ohm": float(z0),
+        "dc_resistance_source_frequency_min_hz": float(min(frequencies)),
+        "dc_resistance_source_frequency_max_hz": float(max(frequencies)),
+        "dc_resistance_extraction": (
+            "Arithmetic mean of positive pairwise open-port equivalent resistances "
+            "computed by balanced current injection from each training block at its "
+            "lowest positive frequency"
+        ),
+        "dc_response_topology": (
+            "Parameter-independent equal-resistance complete graph whose equivalent "
+            "resistance between any two ports equals dc_equivalent_resistance_ohm"
+        ),
+        "dc_is_separate_from_fitted_response": True,
+        "dc_sparameters": {
+            label: {
+                "real": float(value.real),
+                "imag": float(value.imag),
+            }
+            for label, value in zip(labels, dc_values)
+        },
+    }
+
+
+def dc_sparameter_values(
+    labels: Sequence[str],
+    dc_equivalent_resistance_ohm: float,
+    *,
+    z0: float = 50.0,
+) -> np.ndarray:
+    """Return the S-vector for the fixed DC resistor topology."""
+
+    resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context="DC response",
+    )
+    nports = infer_complete_sparameter_ports(labels)
+    y_matrix = np.zeros((nports, nports), dtype=complex)
+    if nports == 1:
+        y_matrix[0, 0] = 1.0 / resistance
+    else:
+        branch_conductance = 2.0 / (float(nports) * resistance)
+        for first in range(nports):
+            for second in range(first + 1, nports):
+                y_matrix[first, first] += branch_conductance
+                y_matrix[second, second] += branch_conductance
+                y_matrix[first, second] -= branch_conductance
+                y_matrix[second, first] -= branch_conductance
+    identity = np.eye(nports, dtype=complex)
+    normalized_y = float(z0) * y_matrix
+    lhs = identity + normalized_y
+    rhs = identity - normalized_y
+    try:
+        s_matrix = np.linalg.solve(lhs.T, rhs.T).T
+    except np.linalg.LinAlgError:
+        s_matrix = rhs @ np.linalg.pinv(lhs)
+    values = []
+    for label in labels:
+        row, col = sparam_indices(label) or (0, 0)
+        values.append(s_matrix[row - 1, col - 1])
+    return np.asarray(values, dtype=complex)
+
+
+def apply_distinct_dc_response(
+    values: np.ndarray,
+    freq_hz: np.ndarray,
+    labels: Sequence[str],
+    dc_equivalent_resistance_ohm: float | None,
+    *,
+    z0: float = 50.0,
+) -> np.ndarray:
+    """Replace exact-DC rows without evaluating or extrapolating the fitted model."""
+
+    dc_mask = np.asarray(freq_hz, dtype=float) == 0.0
+    if not np.any(dc_mask):
+        return values
+    resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context="Saved surrogate model",
+    )
+    result = np.asarray(values, dtype=complex).copy()
+    result[dc_mask, :] = dc_sparameter_values(labels, resistance, z0=z0)[None, :]
+    return result
+
+
+def ensure_dc_frequency_point(blocks: Sequence[MDIFBlock]) -> list[MDIFBlock]:
+    """Prepend an exact zero-Hz row to every sampled-export block when absent."""
+
+    result: list[MDIFBlock] = []
+    for block in blocks:
+        freq = np.asarray(block.freq_hz, dtype=float)
+        if np.any(freq == 0.0):
+            result.append(block)
+            continue
+        result.append(
+            MDIFBlock(
+                params=dict(block.params),
+                freq_hz=np.concatenate([np.asarray([0.0]), freq]),
+                sparams={
+                    label: np.concatenate(
+                        [np.asarray([0.0 + 0.0j]), np.asarray(values, dtype=complex)]
+                    )
+                    for label, values in block.sparams.items()
+                },
+                source_index=block.source_index,
+            )
+        )
+    return result
+
+
 def build_ads_export_blocks(
     template_mdif: str | None,
     parameter_grid_specs: Sequence[str],
@@ -535,7 +778,9 @@ def build_ads_export_blocks(
     sparam_labels: Sequence[str],
 ) -> list[MDIFBlock]:
     if template_mdif:
-        return ensure_block_sparams(read_mdif(Path(template_mdif)), sparam_labels)
+        return ensure_dc_frequency_point(
+            ensure_block_sparams(read_mdif(Path(template_mdif)), sparam_labels)
+        )
     if not parameter_grid_specs:
         raise ValueError("Provide --template-mdif or at least one --parameter-grid")
     if not freqs_spec:
@@ -564,7 +809,7 @@ def build_ads_export_blocks(
             )
         )
         source_index += 1
-    return blocks
+    return ensure_dc_frequency_point(blocks)
 
 
 def ads_export_readme(
@@ -629,6 +874,22 @@ def write_ads_export_package(
     extra_notes: Sequence[str] | None = None,
 ) -> dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    dc_point: dict[str, object] | None = None
+    if blocks:
+        zero_indices = np.flatnonzero(np.asarray(blocks[0].freq_hz, dtype=float) == 0.0)
+        if zero_indices.size:
+            zero_index = int(zero_indices[0])
+            dc_point = {
+                "frequency_hz": 0.0,
+                "sparameters": {
+                    label: {
+                        "real": float(complex(blocks[0].sparams[label][zero_index]).real),
+                        "imag": float(complex(blocks[0].sparams[label][zero_index]).imag),
+                    }
+                    for label in sparam_labels
+                },
+                "parameter_independent": True,
+            }
     manifest: dict[str, object] = {
         "format": "ads_sparameter_mdif_surrogate",
         "model_kind": model_kind,
@@ -638,6 +899,7 @@ def write_ads_export_package(
         "sparam_labels": list(sparam_labels),
         "blocks": len(blocks),
         "frequency_points_per_block": int(len(blocks[0].freq_hz)) if blocks else 0,
+        "dc_point": dc_point,
         "usage": "Use the MDIF with an ADS data-based n-port/data access component and schematic variables matching the MDIF VAR names.",
     }
     if extra_manifest:
@@ -1394,13 +1656,34 @@ def _append_veriloga_s_to_y_conversion(
     lines.append("")
 
 
+def _append_veriloga_dc_stamps(
+    lines: list[str],
+    port_ids: Sequence[str],
+) -> None:
+    """Append the fixed resistor network used only at exact DC."""
+
+    nports = len(port_ids)
+    if nports == 1:
+        lines.append(
+            f"      I({port_ids[0]}) <+ V({port_ids[0]})/dc_equivalent_resistance_ohm;"
+        )
+        return
+    branch_factor = veriloga_float(float(nports) / 2.0)
+    for first, port_i in enumerate(port_ids):
+        for port_j in port_ids[first + 1 :]:
+            lines.append(
+                f"      I({port_i}, {port_j}) <+ V({port_i}, {port_j})/"
+                f"(({branch_factor})*dc_equivalent_resistance_ohm);"
+            )
+
+
 def _append_veriloga_port_stamps(
     lines: list[str],
     port_ids: Sequence[str],
     real_by_flat: Sequence[str],
     imag_by_flat: Sequence[str],
 ) -> None:
-    """Append common small-signal complex-admittance port contributions."""
+    """Append fitted positive-frequency small-signal contributions."""
 
     lines.append("    omega = 6.2831853071795864769*freq_hz;")
     lines.append("    if (omega < 1.0e-30) omega = 1.0e-30;")
@@ -1430,6 +1713,7 @@ def _veriloga_readme(
     freq_transform: str,
     frequency_expression: str,
     z0: float,
+    dc_equivalent_resistance_ohm: float,
     output_domain: str,
     folded_input_scaler: bool,
     folded_output_scaler: bool,
@@ -1555,6 +1839,15 @@ ADS uses meters, export with `--parameter-input-scales 1um`. The one scale is
 applied to every fitted parameter and means "ADS/base-unit value per one
 model-training unit".
 
+## Distinct DC Point
+
+At an exact simulator frequency of zero, the fitted neural/rational response is
+bypassed completely. The module instead uses the fixed, parameter-independent
+equivalent resistance `{dc_equivalent_resistance_ohm:.17g} ohm` extracted from
+the training data. For a multiport, equal resistors form a complete graph sized
+so that the equivalent resistance measured between any two ports is that value.
+Positive frequencies continue to use the fitted response.
+
 ## Implementation
 
 - Neural feature columns, computed internally unless they are geometry/process
@@ -1597,12 +1890,17 @@ def veriloga_module_text(
     fold_input_scaler: bool = False,
     fold_output_scaler: bool = False,
     embedded_coarse_model: dict[str, object] | None = None,
+    dc_equivalent_resistance_ohm: float | None = None,
 ) -> tuple[str, dict[str, object]]:
     output_domain = output_domain.lower().strip()
     if output_domain not in {"s", "y"}:
         raise ValueError("Verilog-A output_domain must be 's' or 'y'")
     if output_domain == "y" and (uses_coarse_inputs or adds_coarse_to_output):
         raise ValueError("Direct-Y Verilog-A export is currently supported only without coarse hooks")
+    dc_resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context=f"{model_kind} model",
+    )
     nports = infer_complete_sparameter_ports(sparam_labels)
     n_sparams = len(sparam_labels)
     n_outputs = 2 * n_sparams
@@ -1790,6 +2088,7 @@ def veriloga_module_text(
         "",
         "  parameter integer clamp_frequency = 1;",
         "  parameter real min_frequency_hz = 1.0;",
+        f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)};",
     ]
     if output_domain == "s":
         lines.append(f"  parameter real z0 = {veriloga_float(z0)};")
@@ -1831,6 +2130,7 @@ def veriloga_module_text(
             "  real freq_hz;",
             "  real freq_log10_hz;",
             "  real omega;",
+            "  integer dc_operating_point;",
         ]
     )
     if output_domain == "s":
@@ -1888,6 +2188,10 @@ def veriloga_module_text(
 
     lines.extend(["", "  analog begin"])
     lines.append(f"    freq_hz = {frequency_expression};")
+    lines.append("    dc_operating_point = (freq_hz == 0.0);")
+    lines.append("    if (dc_operating_point != 0) begin")
+    _append_veriloga_dc_stamps(lines, port_ids)
+    lines.append("    end else begin")
     lines.append("    if (clamp_frequency != 0 && freq_hz < min_frequency_hz) freq_hz = min_frequency_hz;")
     lines.append("    freq_log10_hz = log(freq_hz)/log(10.0);")
     lines.append("")
@@ -2032,7 +2336,7 @@ def veriloga_module_text(
         stamp_real = [f"yr[{flat}]" for flat in range(matrix_size)]
         stamp_imag = [f"yi[{flat}]" for flat in range(matrix_size)]
     _append_veriloga_port_stamps(lines, port_ids, stamp_real, stamp_imag)
-    lines.extend(["  end", "endmodule", ""])
+    lines.extend(["    end", "  end", "endmodule", ""])
 
     output_columns = (
         sparameter_real_imag_columns(sparam_labels, prefix="fine_y")
@@ -2100,6 +2404,22 @@ def veriloga_module_text(
             else None
         ),
         "implementation_note": implementation_note,
+        "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_response_topology": (
+            "Parameter-independent equal-resistance complete graph; the fitted neural "
+            "response is bypassed when simulator frequency is exactly zero"
+        ),
+        "dc_is_separate_from_fitted_response": True,
+        "dc_sparameters": {
+            label: {
+                "real": float(value.real),
+                "imag": float(value.imag),
+            }
+            for label, value in zip(
+                sparam_labels,
+                dc_sparameter_values(sparam_labels, dc_resistance, z0=z0),
+            )
+        },
     }
     return "\n".join(lines), manifest
 
@@ -2128,6 +2448,7 @@ def write_veriloga_package(
     fold_input_scaler: bool = False,
     fold_output_scaler: bool = False,
     embedded_coarse_model: dict[str, object] | None = None,
+    dc_equivalent_resistance_ohm: float | None = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -2157,6 +2478,7 @@ def write_veriloga_package(
         fold_input_scaler=fold_input_scaler,
         fold_output_scaler=fold_output_scaler,
         embedded_coarse_model=embedded_coarse_model,
+        dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -2194,6 +2516,9 @@ def write_veriloga_package(
             freq_transform=freq_transform,
             frequency_expression=frequency_expression,
             z0=z0,
+            dc_equivalent_resistance_ohm=float(
+                manifest["dc_equivalent_resistance_ohm"]
+            ),
             output_domain=manifest["output_domain"],
             folded_input_scaler=bool(manifest["folded_input_scaler"]),
             folded_output_scaler=bool(manifest["folded_output_scaler"]),
@@ -2223,6 +2548,7 @@ def neurotf_veriloga_module_text(
     z0: float,
     frequency_expression: str,
     parameter_input_scales: dict[str, float] | None = None,
+    dc_equivalent_resistance_ohm: float | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Generate a direct Neuro-TF Verilog-A implementation."""
 
@@ -2232,6 +2558,10 @@ def neurotf_veriloga_module_text(
     n_coeffs = len(poles_array) + 1
     n_network_outputs = 2 * n_sparams * n_coeffs
     matrix_size = nports * nports
+    dc_resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context="Neuro-TF model",
+    )
     if not parameter_names:
         raise ValueError("Neuro-TF Verilog-A export requires at least one model parameter")
     if len(layer_sizes) < 2:
@@ -2319,6 +2649,7 @@ def neurotf_veriloga_module_text(
         "",
         "  parameter integer clamp_frequency = 1;",
         "  parameter real min_frequency_hz = 1.0;",
+        f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)};",
         f"  parameter real z0 = {veriloga_float(z0)};",
         "  parameter real pivot_floor = 1.0e-24;",
     ]
@@ -2352,6 +2683,7 @@ def neurotf_veriloga_module_text(
             "  integer idx;",
             "  integer piv;",
             "  integer pivrow;",
+            "  integer dc_operating_point;",
             "  real freq_hz;",
             "  real normalized_frequency;",
             "  real omega;",
@@ -2384,6 +2716,10 @@ def neurotf_veriloga_module_text(
 
     lines.extend(["", "  analog begin"])
     lines.append(f"    freq_hz = {frequency_expression};")
+    lines.append("    dc_operating_point = (freq_hz == 0.0);")
+    lines.append("    if (dc_operating_point != 0) begin")
+    _append_veriloga_dc_stamps(lines, port_ids)
+    lines.append("    end else begin")
     lines.append(
         "    if (clamp_frequency != 0 && freq_hz < min_frequency_hz) "
         "freq_hz = min_frequency_hz;"
@@ -2464,7 +2800,7 @@ def neurotf_veriloga_module_text(
         [f"yr[{flat}]" for flat in range(matrix_size)],
         [f"yi[{flat}]" for flat in range(matrix_size)],
     )
-    lines.extend(["  end", "endmodule", ""])
+    lines.extend(["    end", "  end", "endmodule", ""])
 
     coefficient_columns = [
         f"{label}_c{coeff_idx}_real"
@@ -2513,6 +2849,22 @@ def neurotf_veriloga_module_text(
             "rational poles, evaluates the S-matrix at simulator frequency, and converts "
             "it to a small-signal Y-matrix. Intended for AC/SP analyses."
         ),
+        "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_response_topology": (
+            "Parameter-independent equal-resistance complete graph; the fitted "
+            "coefficient network and rational response are bypassed at exactly zero Hz"
+        ),
+        "dc_is_separate_from_fitted_response": True,
+        "dc_sparameters": {
+            label: {
+                "real": float(value.real),
+                "imag": float(value.imag),
+            }
+            for label, value in zip(
+                sparam_labels,
+                dc_sparameter_values(sparam_labels, dc_resistance, z0=z0),
+            )
+        },
     }
     return "\n".join(lines), manifest
 
@@ -2535,6 +2887,7 @@ def write_neurotf_veriloga_package(
     z0: float = 50.0,
     frequency_expression: str = "$freq",
     parameter_input_scales: dict[str, float] | None = None,
+    dc_equivalent_resistance_ohm: float | None = None,
     source_model_dir: str | None = None,
 ) -> dict[str, object]:
     """Write a self-contained Neuro-TF Verilog-A package."""
@@ -2558,6 +2911,7 @@ def write_neurotf_veriloga_package(
         z0=z0,
         frequency_expression=frequency_expression,
         parameter_input_scales=parameter_input_scales,
+        dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -2600,6 +2954,9 @@ def write_neurotf_veriloga_package(
             freq_transform="fixed-pole rational basis using freq_hz/f_scale",
             frequency_expression=frequency_expression,
             z0=z0,
+            dc_equivalent_resistance_ohm=float(
+                manifest["dc_equivalent_resistance_ohm"]
+            ),
             output_domain="s",
             folded_input_scaler=False,
             folded_output_scaler=False,

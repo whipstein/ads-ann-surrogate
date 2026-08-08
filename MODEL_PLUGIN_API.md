@@ -36,11 +36,14 @@ from surrogate_common import (
     MDIFBlock,
     MLP,
     Standardizer,
+    apply_distinct_dc_response,
     common_sparameter_labels,
+    extract_average_dc_resistance,
     infer_parameter_names,
     make_training_progress_callback,
     parse_csv_set,
     progress_interval_from_args,
+    positive_frequency_blocks,
     read_mdif,
     run_sweep_command,
     split_blocks,
@@ -116,6 +119,29 @@ The saved model directory should contain:
 - `metadata.json`
 - enough metadata to reconstruct `parameter_names`, `sparam_labels`, model
   dimensions, training domain, and export assumptions
+- `dc_equivalent_resistance_ohm`, `dc_sparameters`, and the accompanying DC
+  extraction metadata described below
+
+## Required Distinct DC Contract
+
+Every model family must keep exact DC separate from its fitted frequency
+response. Before creating training features or rational coefficients:
+
+```python
+dc_metadata = extract_average_dc_resistance(train_blocks, labels, z0=50.0)
+fit_train_blocks = positive_frequency_blocks(train_blocks)
+fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
+```
+
+Store `dc_metadata` in `metadata.json` and place
+`dc_equivalent_resistance_ohm` on the loaded model. `predict_blocks()` must use
+`apply_distinct_dc_response()` after forming its normal S-parameter values.
+This guarantees that zero-Hz input data cannot affect fitted weights or poles.
+
+`build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
+Direct Verilog-A writers must receive the saved
+`dc_equivalent_resistance_ohm`; the shared writers then stamp the distinct
+resistor topology at zero Hz and bypass the fitted response.
 
 ## Training Command Contract
 

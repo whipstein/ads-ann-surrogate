@@ -34,6 +34,7 @@ from surrogate_common import (  # noqa: E402
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
     ads_ann_training_type_enum,
+    apply_distinct_dc_response,
     build_ads_export_blocks,
     build_training_export_commands,
     cleanup_trial_dir,
@@ -41,6 +42,7 @@ from surrogate_common import (  # noqa: E402
     configure_parallel_numeric_threads,
     copy_trial_model,
     csv_number,
+    extract_average_dc_resistance,
     frequency_feature_columns,
     infer_complete_sparameter_ports,
     infer_parameter_names,
@@ -67,6 +69,7 @@ from surrogate_common import (  # noqa: E402
     plot_sweep_diagnostics,
     plot_worst_case_fits,
     plot_worst_case_y_fits,
+    positive_frequency_blocks,
     print_cli_error,
     read_mdif,
     read_model_metadata,
@@ -361,6 +364,7 @@ class DNN:
         freq_transform: str,
         output_domain: str = "s",
         target_z0: float = 50.0,
+        dc_equivalent_resistance_ohm: float | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -370,6 +374,11 @@ class DNN:
         self.freq_transform = freq_transform
         self.output_domain = validate_output_domain(output_domain)
         self.target_z0 = float(target_z0)
+        self.dc_equivalent_resistance_ohm = (
+            None
+            if dc_equivalent_resistance_ohm is None
+            else float(dc_equivalent_resistance_ohm)
+        )
 
     def predict_blocks(self, blocks: Sequence[MDIFBlock]) -> list[MDIFBlock]:
         predicted = []
@@ -380,6 +389,13 @@ class DNN:
             values = columns_to_complex(y_columns)
             if self.output_domain == "y":
                 values = y_values_to_s_values(values, self.sparam_labels, self.target_z0)
+            values = apply_distinct_dc_response(
+                values,
+                block.freq_hz,
+                self.sparam_labels,
+                self.dc_equivalent_resistance_ohm,
+                z0=self.target_z0,
+            )
             sparams = {label: values[:, idx] for idx, label in enumerate(self.sparam_labels)}
             predicted.append(
                 MDIFBlock(
@@ -412,6 +428,7 @@ class DNN:
             "freq_transform": self.freq_transform,
             "output_domain": self.output_domain,
             "target_z0": self.target_z0,
+            "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -439,6 +456,7 @@ class DNN:
             freq_transform=metadata["freq_transform"],
             output_domain=metadata.get("output_domain", "s"),
             target_z0=float(metadata.get("target_z0", 50.0)),
+            dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
         )
 
 
@@ -455,17 +473,24 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         raise ValueError("--target-z0 must be positive and finite")
     if output_domain == "y":
         infer_complete_sparameter_ports(labels)
-    x_train, y_train = make_feature_target_samples(
+    dc_metadata = extract_average_dc_resistance(
         train_blocks,
+        labels,
+        z0=target_z0,
+    )
+    fit_train_blocks = positive_frequency_blocks(train_blocks)
+    fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
+    x_train, y_train = make_feature_target_samples(
+        fit_train_blocks,
         parameter_names,
         labels,
         args.freq_transform,
         output_domain,
         target_z0,
     )
-    if verify_blocks:
+    if fit_verify_blocks:
         x_verify, y_verify = make_feature_target_samples(
-            verify_blocks,
+            fit_verify_blocks,
             parameter_names,
             labels,
             args.freq_transform,
@@ -518,6 +543,9 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         freq_transform=args.freq_transform,
         output_domain=output_domain,
         target_z0=target_z0,
+        dc_equivalent_resistance_ohm=float(
+            dc_metadata["dc_equivalent_resistance_ohm"]
+        ),
     )
     metadata = {
         "training_blocks": len(train_blocks),
@@ -535,6 +563,7 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training, so the average normalized weight is 1.0.",
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
+        **dc_metadata,
     }
     return model, verify_blocks, parameter_names, labels, history, metadata
 
@@ -568,6 +597,9 @@ def command_train(args: argparse.Namespace) -> int:
         "freq_transform": model.freq_transform,
         "output_domain": model.output_domain,
         "target_z0": model.target_z0,
+        "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_is_separate_from_fitted_response": True,
         "hidden_layers": args.hidden_layers,
         "activation": model.mlp.activation,
         "learning_rate": args.learning_rate,
@@ -630,6 +662,7 @@ def command_train(args: argparse.Namespace) -> int:
             "freq_transform": model.freq_transform,
             "output_domain": model.output_domain,
             "target_z0": model.target_z0,
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "layer_sizes": model.mlp.layer_sizes,
             "sparam_weights": metadata["sparam_weights"],
             "normalized_sparam_weights": metadata["normalized_sparam_weights"],
@@ -681,7 +714,13 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "layer_sizes": model.mlp.layer_sizes,
             "output_domain": model.output_domain,
             "target_z0": model.target_z0,
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_is_separate_from_fitted_response": True,
         },
+        extra_notes=[
+            "Every exported block includes a zero-Hz point from the saved average "
+            "equivalent resistance; it is not an extrapolation of the fitted DNN."
+        ],
     )
     print(json.dumps({
         "out_dir": str(out_dir),
@@ -732,6 +771,12 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             )
     else:
         labels = common_sparameter_labels(all_blocks)
+    train_blocks = positive_frequency_blocks(train_blocks, purpose="ADS ANN fitting")
+    verify_blocks = (
+        positive_frequency_blocks(verify_blocks, purpose="ADS ANN verification")
+        if verify_blocks
+        else []
+    )
     x_train, y_train = make_feature_target_samples(
         train_blocks,
         parameter_names,
@@ -808,6 +853,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             "When --model-dir is supplied, metadata from that trained or optimized model is used to seed the ADS ANN architecture/settings.",
             "The package records S-parameter weights in the manifest. ADS ANN's documented Python API does not expose direct per-output loss weights, so the included ADS training script does not apply those weights.",
             "The native ADS ANN output predicts fine S-parameter real/imaginary values directly.",
+            "Zero-Hz rows are excluded from ADS ANN fitting. Use the self-contained Verilog-A or sampled-MDIF export when the distinct saved DC resistance is required.",
         ],
     )
     print(json.dumps({
@@ -844,6 +890,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "This direct Verilog-A export embeds the saved local model.npz weights; it does not retrain in ADS ANN.",
         "The generated N-port is intended for S-parameter and small-signal AC simulation. It is not a causal transient model.",
         "The default frequency expression is $freq. If your ADS Verilog-A environment uses a different frequency variable, regenerate with --frequency-expression.",
+        "At exactly zero frequency, the fitted DNN is bypassed and the data-derived average equivalent resistance is used instead.",
     ]
     if model.output_domain == "y":
         export_notes.append(
@@ -874,6 +921,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         output_domain=model.output_domain,
         fold_input_scaler=fold_scalers,
         fold_output_scaler=fold_scalers,
+        dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",
@@ -895,6 +943,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "output_domain": manifest["output_domain"],
         "folded_input_scaler": manifest["folded_input_scaler"],
         "folded_output_scaler": manifest["folded_output_scaler"],
+        "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
     }, indent=2))
     return 0
 

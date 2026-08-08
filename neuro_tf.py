@@ -121,6 +121,7 @@ class NeuroTF:
         sparam_labels: list[str],
         poles: np.ndarray,
         f_scale: float,
+        dc_equivalent_resistance_ohm: float | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -129,6 +130,11 @@ class NeuroTF:
         self.sparam_labels = sparam_labels
         self.poles = poles
         self.f_scale = f_scale
+        self.dc_equivalent_resistance_ohm = (
+            None
+            if dc_equivalent_resistance_ohm is None
+            else float(dc_equivalent_resistance_ohm)
+        )
 
     @property
     def n_coeffs(self) -> int:
@@ -146,6 +152,13 @@ class NeuroTF:
         for block, row in zip(blocks, coeff_rows):
             coeffs = unflatten_coefficients(row, len(self.sparam_labels), self.n_coeffs)
             values_by_label = evaluate_coefficients(coeffs, block.freq_hz, self.poles, self.f_scale)
+            values_by_label = apply_distinct_dc_response(
+                values_by_label.T,
+                block.freq_hz,
+                self.sparam_labels,
+                self.dc_equivalent_resistance_ohm,
+                z0=50.0,
+            ).T
             sparams = {
                 label: values_by_label[idx, :]
                 for idx, label in enumerate(self.sparam_labels)
@@ -183,6 +196,7 @@ class NeuroTF:
             "n_coeffs_per_sparam": int(self.n_coeffs),
             "layer_sizes": self.mlp.layer_sizes,
             "activation": self.mlp.activation,
+            "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -211,6 +225,7 @@ class NeuroTF:
             sparam_labels=list(metadata["sparam_labels"]),
             poles=poles,
             f_scale=f_scale,
+            dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
         )
 
 
@@ -366,13 +381,20 @@ def command_train(args: argparse.Namespace) -> int:
         split_var=args.split_var,
     )
     sparam_labels = common_sparameter_labels(split_data.all_blocks)
-    poles, f_scale = build_fixed_poles(train_blocks, args.order, args.pole_damping)
-    x_train = parameter_matrix(train_blocks, parameter_names)
-    y_train = fit_all_coefficients(train_blocks, sparam_labels, poles, f_scale, args.ridge)
+    dc_metadata = extract_average_dc_resistance(train_blocks, sparam_labels, z0=50.0)
+    fit_train_blocks = positive_frequency_blocks(train_blocks)
+    fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
+    poles, f_scale = build_fixed_poles(fit_train_blocks, args.order, args.pole_damping)
+    x_train = parameter_matrix(fit_train_blocks, parameter_names)
+    y_train = fit_all_coefficients(
+        fit_train_blocks, sparam_labels, poles, f_scale, args.ridge
+    )
 
-    if verify_blocks:
-        x_verify = parameter_matrix(verify_blocks, parameter_names)
-        y_verify = fit_all_coefficients(verify_blocks, sparam_labels, poles, f_scale, args.ridge)
+    if fit_verify_blocks:
+        x_verify = parameter_matrix(fit_verify_blocks, parameter_names)
+        y_verify = fit_all_coefficients(
+            fit_verify_blocks, sparam_labels, poles, f_scale, args.ridge
+        )
     else:
         x_verify = None
         y_verify = None
@@ -414,6 +436,9 @@ def command_train(args: argparse.Namespace) -> int:
         sparam_labels=sparam_labels,
         poles=poles,
         f_scale=f_scale,
+        dc_equivalent_resistance_ohm=float(
+            dc_metadata["dc_equivalent_resistance_ohm"]
+        ),
     )
 
     out_dir = Path(args.out_dir)
@@ -426,6 +451,7 @@ def command_train(args: argparse.Namespace) -> int:
         "split_var": args.split_var,
         "train_values": sorted(parse_csv_set(args.train_values)),
         "verify_values": sorted(parse_csv_set(args.verify_values)),
+        **dc_metadata,
     }
     model.save(
         out_dir,
@@ -442,6 +468,9 @@ def command_train(args: argparse.Namespace) -> int:
         "pole_damping": args.pole_damping,
         "ridge": args.ridge,
         "f_scale": f_scale,
+        "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_is_separate_from_fitted_response": True,
         "hidden_layers": args.hidden_layers,
         "activation": mlp.activation,
         "learning_rate": args.learning_rate,
@@ -499,6 +528,7 @@ def command_train(args: argparse.Namespace) -> int:
             "parameters": parameter_names,
             "sparameters": sparam_labels,
             "n_poles": args.order,
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
@@ -544,9 +574,12 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "f_scale": model.f_scale,
             "layer_sizes": model.mlp.layer_sizes,
             "representation": "fixed-pole rational transfer function",
+            "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_is_separate_from_fitted_response": True,
         },
         extra_notes=[
-            "The exported MDIF samples the fitted fixed-pole Neuro-TF response; ADS does not execute the neural network or rational basis directly."
+            "The exported MDIF samples the fitted fixed-pole Neuro-TF response; ADS does not execute the neural network or rational basis directly.",
+            "Every exported block includes a zero-Hz point from the saved average equivalent resistance; the coefficient network and rational basis are bypassed there.",
         ],
     )
     print(json.dumps({
@@ -586,6 +619,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         z0=args.z0,
         frequency_expression=args.frequency_expression,
         parameter_input_scales=parameter_input_scales,
+        dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
         source_model_dir=str(model_dir),
     )
     print(json.dumps({
@@ -600,6 +634,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "n_poles": manifest["n_poles"],
         "f_scale": manifest["f_scale"],
         "fully_self_contained": manifest["fully_self_contained"],
+        "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
     }, indent=2))
     return 0
 
