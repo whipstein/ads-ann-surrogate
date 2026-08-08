@@ -35,6 +35,7 @@ from surrogate_common import (  # noqa: E402
     ads_ann_output_format_enum,
     ads_ann_training_type_enum,
     build_ads_export_blocks,
+    build_training_export_commands,
     cleanup_trial_dir,
     common_sparameter_labels,
     configure_parallel_numeric_threads,
@@ -88,6 +89,7 @@ from surrogate_common import (  # noqa: E402
     write_mdif,
     write_sweep_markdown,
     write_training_markdown,
+    update_training_export_commands,
     write_veriloga_package,
 )
 
@@ -539,6 +541,20 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
     return model, verify_blocks, parameter_names, labels, history, metadata
 
 
+def dnn_export_commands(
+    model_dir: Path,
+    template_mdif: str | Path | None = None,
+) -> list[tuple[str, str]]:
+    """Build runnable export commands for a fitted DNN report."""
+
+    return build_training_export_commands(
+        Path(__file__),
+        model_dir,
+        template_mdif,
+        include_veriloga=True,
+    )
+
+
 def command_train(args: argparse.Namespace) -> int:
     model, verify_blocks, parameter_names, labels, history, metadata = train_model(args)
     out_dir = Path(args.out_dir)
@@ -597,12 +613,14 @@ def command_train(args: argparse.Namespace) -> int:
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
+    export_commands = dnn_export_commands(out_dir, args.mdif)
     write_training_markdown(
         out_dir / "training_summary.md",
         model_kind="DNN",
         config=training_config,
         summary=summary,
         history=history,
+        export_commands=export_commands,
     )
 
     if not getattr(args, "quiet", False):
@@ -620,6 +638,7 @@ def command_train(args: argparse.Namespace) -> int:
             "sparam_weight_mean": metadata["sparam_weight_mean"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
+            "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
         }, indent=2))
@@ -993,7 +1012,7 @@ def dnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object], 
 
 
 def command_sweep(args: argparse.Namespace) -> int:
-    return run_sweep_command(
+    status = run_sweep_command(
         args,
         sweep_candidate_grid(args),
         worker_func=dnn_sweep_trial_worker,
@@ -1006,6 +1025,16 @@ def command_sweep(args: argparse.Namespace) -> int:
         diagnostics_prefix="dnn",
         train_command_prefix=[sys.executable, "dnn.py", "train"],
     )
+    best_dir = Path(args.out_dir) / "best_model"
+    update_training_export_commands(
+        best_dir / "training_summary.md",
+        dnn_export_commands(best_dir, args.mdif),
+    )
+    update_training_export_commands(
+        Path(args.out_dir) / "dnn_sweep_summary.md",
+        dnn_export_commands(best_dir, args.mdif),
+    )
+    return status
 
 
 def command_rerank_sweep(args: argparse.Namespace) -> int:
@@ -1082,6 +1111,16 @@ def command_rerank_sweep(args: argparse.Namespace) -> int:
             best_model_dir,
             overwrite=overwrite,
         )
+        if promoted and best_model_dir is not None:
+            export_commands = dnn_export_commands(best_model_dir)
+            update_training_export_commands(
+                best_model_dir / "training_summary.md",
+                export_commands,
+            )
+            update_training_export_commands(
+                summary_path,
+                export_commands,
+            )
 
     payload = {
         "sweep_dir": str(sweep_dir),

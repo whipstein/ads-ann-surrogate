@@ -26,8 +26,8 @@ The repository provides three surrogate-model front ends:
 | Neuro-TF | `neuro_tf.py` | Smooth frequency responses where a rational transfer-function structure is useful. | Fixed stable poles define rational transfer functions; a neural network maps geometry/process variables to the fitted coefficients. |
 
 All three tools read MDIF, train models, run sweeps, write verification
-artifacts, and predict new response blocks. DNN and KBNN also include direct ADS
-handoff commands for sampled MDIF export, native ADS ANN package export, and
+artifacts, predict new response blocks, and export sampled ADS MDIF packages.
+DNN and KBNN additionally support native ADS ANN package generation and direct
 Verilog-A n-port export.
 
 ## Repository Layout
@@ -253,7 +253,7 @@ python3 dnn.py predict \
   --out-mdif predicted.mdif
 ```
 
-Export a trained DNN or KBNN as a sampled ADS MDIF package:
+Export any trained model family as a sampled ADS MDIF package:
 
 ```bash
 python3 dnn.py export-ads-mdif \
@@ -320,7 +320,8 @@ A normal `train` run writes:
 - `verification_summary.json` with global errors and passivity summary data.
 - `training_history.csv` and `training_history.pdf` with train/verification
   loss history and convergence plots.
-- `training_summary.md` with a human-readable run summary.
+- `training_summary.md` with a human-readable run summary and copyable export
+  commands using the fitted model's resolved paths.
 - `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
   and error views.
 - `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
@@ -333,9 +334,11 @@ Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
 per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
 directory. At completion, each sweep prints a copyable standalone `train`
 command for the winning configuration; the same command is saved in the
-best-configuration JSON and Markdown summary. DNN and KBNN sweep results can
-also be reranked after the fact to choose a different passive or weighted-error
-winner without repeating every trial.
+best-configuration JSON and Markdown summary. The sweep summary and the
+promoted model's `training_summary.md` also contain export commands resolved to
+`best_model/`. DNN and KBNN sweep results can be reranked after the fact to
+choose a different passive or weighted-error winner without repeating every
+trial.
 
 ## ADS Integration Paths
 
@@ -467,7 +470,8 @@ real/imaginary frequency plots. Use `--worst-plots 0` to skip both plot sets
 during large experiments.
 Each single `train` run also writes `training_summary.md`, which collects the
 chosen settings, final loss values, verification metrics, passivity summary,
-and links to the generated S- and Y-parameter worst-case plots.
+links to the generated S- and Y-parameter worst-case plots, and copyable
+self-contained Verilog-A and sampled ADS MDIF export commands.
 
 #### Options
 
@@ -1025,7 +1029,8 @@ Outputs:
 - `verification_metrics.csv`: per-block and per-S-parameter errors, including EVM
 - `verification_summary.json`: global error, passivity summary, plot paths
 - `training_summary.md`: settings, final loss values, verification metrics,
-  passivity summary, and links to S- and Y-parameter worst-case plots
+  passivity summary, links to S- and Y-parameter worst-case plots, and
+  copyable self-contained Verilog-A and sampled ADS MDIF export commands
 - `training_history.csv`: neural training loss history
 - `training_history.pdf`: train/verification loss versus epoch convergence plot
 - `worst_case_plots/*.pdf`: multi-page worst verification case plots
@@ -1687,6 +1692,8 @@ python3 neuro_tf.py train \
 Outputs:
 
 - `model.npz` and `metadata.json`: trained Neuro-TF model
+- `training_summary.md`: settings, metrics, plot links, and a copyable sampled
+  ADS MDIF export command
 - `predicted_verification.mdif`: model predictions at verification points
 - `verification_metrics.csv`: per-block and per-S-parameter errors, including EVM
 - `verification_summary.json`: global error, passivity summary, and plot paths
@@ -1714,7 +1721,8 @@ where modeled and measured admittance are shown as real/imaginary frequency
 plots. Use `--worst-plots 0` to skip both plot sets during large experiments.
 Each single `train` run also writes `training_summary.md`, which collects the
 chosen settings, final loss values, verification metrics, passivity summary,
-and links to the generated S- and Y-parameter worst-case plots.
+links to the generated S- and Y-parameter worst-case plots, and a copyable
+sampled ADS MDIF export command.
 
 #### Options
 
@@ -1858,10 +1866,36 @@ python3 neuro_tf.py predict \
 | <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
 | <nobr><code>--out-mdif PATH</code></nobr> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 
+### Export Sampled ADS MDIF
+
+Export the fitted fixed-pole Neuro-TF response on either the exact geometry and
+frequency blocks of a template MDIF or an explicit parameter/frequency grid:
+
+```bash
+python3 neuro_tf.py export-ads-mdif \
+  --model-dir neuro_tf_model \
+  --out-dir neuro_tf_ads_export \
+  --template-mdif ads_sweep_template.mdif
+```
+
+The command writes `surrogate_ads.mdif`, `ads_model_manifest.json`, and
+`ADS_README.md`. The template's S-parameter values are ignored; only its
+parameter blocks and frequency grids are used. Instead of `--template-mdif`,
+repeat `--parameter-grid` once for each model parameter and supply `--freqs`.
+
+#### Options
+
+| Option Name | Description | Example |
+| ------------------------------- | --- | ------------------------------------------------ |
+| <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained Neuro-TF `model.npz` and `metadata.json`. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
+| <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the ADS MDIF package. | <nobr><code>--out-dir neuro_tf_ads_export</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | MDIF whose parameter/frequency blocks define the export sampling grid. Mutually exclusive in practice with the explicit-grid form. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--parameter-grid SPEC</code></nobr> | Explicit grid for one model parameter. Repeat once per parameter; requires `--freqs`. | <nobr><code>--parameter-grid W=0.4mm:0.8mm:9</code></nobr> |
+| <nobr><code>--freqs SPEC</code></nobr> | Frequency grid used with `--parameter-grid`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
+| <nobr><code>--output-name NAME</code></nobr> | Exported MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name neuro_tf_ads.mdif</code></nobr> |
+
 ### ADS Note
 
-This is an offline trainer and verifier. It produces a differentiable
-coefficient model plus MDIF predictions. For direct in-circuit ADS optimization,
-the next integration step is to emit an ADS equation/SDD or Verilog-A wrapper
-that evaluates the neural coefficient map and rational transfer functions for
-the ADS simulator context you want to target.
+Neuro-TF currently exports a sampled MDIF table for ADS interpolation. A direct
+equation/SDD or Verilog-A wrapper that evaluates the neural coefficient map and
+rational transfer functions inside the simulator is not currently generated.

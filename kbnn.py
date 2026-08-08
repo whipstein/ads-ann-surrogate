@@ -42,6 +42,7 @@ from surrogate_common import (  # noqa: E402
     ads_ann_output_format_enum,
     ads_ann_training_type_enum,
     build_ads_export_blocks,
+    build_training_export_commands,
     cleanup_trial_dir,
     common_sparameter_labels,
     configure_parallel_numeric_threads,
@@ -92,9 +93,10 @@ from surrogate_common import (  # noqa: E402
     write_mdif,
     write_sweep_markdown,
     write_training_markdown,
+    update_training_export_commands,
     write_veriloga_package,
 )
-from dnn import DNN, command_train as command_train_dnn  # noqa: E402
+from dnn import DNN, command_train as command_train_dnn, dnn_export_commands  # noqa: E402
 
 
 VERSION = "0.2.0-rc3"
@@ -408,10 +410,18 @@ def set_packaged_coarse_reference(model_dir: Path, coarse_model_dir: Path) -> No
     if not isinstance(coarse_identity, dict):
         return
     packaged_coarse_dir = resolved_model_dir / COARSE_MODEL_DIRNAME
+    copied_coarse_package = False
     if packaged_coarse_dir.resolve() != resolved_coarse_dir:
         if packaged_coarse_dir.exists():
             shutil.rmtree(packaged_coarse_dir)
         shutil.copytree(resolved_coarse_dir, packaged_coarse_dir)
+        copied_coarse_package = True
+    coarse_report = packaged_coarse_dir / "training_summary.md"
+    if copied_coarse_package and coarse_report.is_file():
+        update_training_export_commands(
+            coarse_report,
+            dnn_export_commands(packaged_coarse_dir),
+        )
     coarse_identity["source_model_dir"] = str(packaged_coarse_dir)
     coarse_identity["packaged_relative_model_dir"] = os.path.relpath(
         packaged_coarse_dir,
@@ -1373,6 +1383,20 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
     return model, verify_fine, verify_coarse, parameter_names, labels, history, metadata
 
 
+def kbnn_export_commands(
+    model_dir: Path,
+    template_mdif: str | Path | None = None,
+) -> list[tuple[str, str]]:
+    """Build runnable export commands for a fitted composite KBNN report."""
+
+    return build_training_export_commands(
+        Path(__file__),
+        model_dir,
+        template_mdif,
+        include_veriloga=True,
+    )
+
+
 def command_train(args: argparse.Namespace) -> int:
     if normalize_mode(args.mode) == "plain" and (
         getattr(args, "coarse_mdif", None) or getattr(args, "coarse_model_dir", None)
@@ -1443,12 +1467,14 @@ def command_train(args: argparse.Namespace) -> int:
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
+    export_commands = kbnn_export_commands(out_dir, args.mdif)
     write_training_markdown(
         out_dir / "training_summary.md",
         model_kind="KBNN",
         config=training_config,
         summary=summary,
         history=history,
+        export_commands=export_commands,
     )
     composite_manifest = write_composite_model_manifest(out_dir, model)
 
@@ -1468,6 +1494,7 @@ def command_train(args: argparse.Namespace) -> int:
             "sparam_weight_mean": metadata["sparam_weight_mean"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
+            "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
         }, indent=2))
@@ -2080,6 +2107,11 @@ def command_sweep(args: argparse.Namespace) -> int:
             Path(prepared_args.out_dir) / "best_model",
             Path(prepared_args.coarse_model_dir),
         )
+    best_dir = Path(prepared_args.out_dir) / "best_model"
+    update_training_export_commands(
+        best_dir / "training_summary.md",
+        kbnn_export_commands(best_dir, args.mdif),
+    )
     best_config_path = Path(prepared_args.out_dir) / "kbnn_best_config.json"
     best_payload = json.loads(best_config_path.read_text())
     best_candidate = dict(best_payload["config"])
@@ -2128,6 +2160,10 @@ def command_sweep(args: argparse.Namespace) -> int:
     summary_path.write_text(
         f"{summary_text}\n\n## Reproduce Best Model\n\n```bash\n"
         f"{reproduction_command}\n```\n"
+    )
+    update_training_export_commands(
+        summary_path,
+        kbnn_export_commands(best_dir, args.mdif),
     )
     print("reproduce best model:", flush=True)
     print(reproduction_command, flush=True)
@@ -2211,6 +2247,16 @@ def command_rerank_sweep(args: argparse.Namespace) -> int:
         packaged_coarse_dir = sweep_dir / COARSE_MODEL_DIRNAME
         if promoted and best_model_dir is not None and packaged_coarse_dir.is_dir():
             set_packaged_coarse_reference(best_model_dir, packaged_coarse_dir)
+        if promoted and best_model_dir is not None:
+            export_commands = kbnn_export_commands(best_model_dir)
+            update_training_export_commands(
+                best_model_dir / "training_summary.md",
+                export_commands,
+            )
+            update_training_export_commands(
+                summary_path,
+                export_commands,
+            )
 
     payload = {
         "sweep_dir": str(sweep_dir),

@@ -4963,7 +4963,113 @@ def single_model_train_command(
         if isinstance(value, (list, tuple)):
             value = ",".join(str(item) for item in value)
         argv.extend([flag, str(value)])
-    return " ".join(shlex.quote(part) for part in argv)
+    return shell_command(argv)
+
+
+def shell_command(argv: Sequence[object]) -> str:
+    """Render command arguments as a shell-copyable command line."""
+
+    return " ".join(shlex.quote(str(part)) for part in argv)
+
+
+def build_training_export_commands(
+    script_path: Path,
+    model_dir: Path,
+    template_mdif: str | Path | None = None,
+    *,
+    include_veriloga: bool = False,
+) -> list[tuple[str, str]]:
+    """Build standard export commands with fully resolved paths."""
+
+    resolved_script_path = script_path.resolve()
+    resolved_model_dir = model_dir.resolve()
+    commands: list[tuple[str, str]] = []
+    if include_veriloga:
+        commands.append(
+            (
+                "Self-contained Verilog-A",
+                shell_command(
+                    [
+                        sys.executable,
+                        resolved_script_path,
+                        "export-veriloga",
+                        "--model-dir",
+                        resolved_model_dir,
+                        "--out-dir",
+                        resolved_model_dir / "veriloga_export",
+                    ]
+                ),
+            )
+        )
+    template_path = Path(template_mdif).resolve() if template_mdif else None
+    if template_path is None:
+        candidate = resolved_model_dir / "predicted_verification.mdif"
+        template_path = candidate if candidate.exists() else None
+    if template_path is not None:
+        commands.append(
+            (
+                "Sampled ADS MDIF",
+                shell_command(
+                    [
+                        sys.executable,
+                        resolved_script_path,
+                        "export-ads-mdif",
+                        "--model-dir",
+                        resolved_model_dir,
+                        "--out-dir",
+                        resolved_model_dir / "ads_mdif_export",
+                        "--template-mdif",
+                        template_path,
+                    ]
+                ),
+            )
+        )
+    return commands
+
+
+def training_export_section(
+    export_commands: Sequence[tuple[str, str]],
+) -> list[str]:
+    """Render copyable model-export commands for a training report."""
+
+    if not export_commands:
+        return []
+    lines = [
+        "## Export Model",
+        "",
+        "Run any of these commands from any directory:",
+        "",
+    ]
+    for label, command in export_commands:
+        lines.extend(
+            [
+                f"### {markdown_escape(label)}",
+                "",
+                "```bash",
+                command,
+                "```",
+                "",
+            ]
+        )
+    return lines
+
+
+def update_training_export_commands(
+    path: Path,
+    export_commands: Sequence[tuple[str, str]],
+) -> None:
+    """Replace the export section after a sweep promotes a trial model."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Training report not found: {path}")
+    heading = "## Export Model"
+    text = path.read_text()
+    prefix = text.split(f"\n{heading}\n", 1)[0].rstrip()
+    section = training_export_section(export_commands)
+    if section:
+        path.write_text(f"{prefix}\n\n" + "\n".join(section))
+    else:
+        path.write_text(f"{prefix}\n")
 
 
 def write_training_markdown(
@@ -4972,6 +5078,7 @@ def write_training_markdown(
     config: dict[str, object],
     summary: dict[str, object],
     history: Sequence[dict[str, float]],
+    export_commands: Sequence[tuple[str, str]] | None = None,
 ) -> None:
     lines = [
         "# Training Summary",
@@ -5102,6 +5209,8 @@ def write_training_markdown(
         for idx, plot_path in enumerate(raw_y_plots, start=1):
             lines.append(f"- [plot {idx}]({markdown_escape(plot_path)})")
         lines.append("")
+
+    lines.extend(training_export_section(export_commands or []))
 
     path.write_text("\n".join(lines))
 

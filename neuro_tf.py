@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neuro-TF trainer, predictor, and sweep CLI for parameterized MDIF data."""
+"""Neuro-TF trainer, predictor, sweep, and ADS-MDIF export CLI."""
 
 from __future__ import annotations
 
@@ -300,7 +300,7 @@ def neurotf_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, objec
 
 
 def command_sweep(args: argparse.Namespace) -> int:
-    return run_sweep_command(
+    status = run_sweep_command(
         args,
         sweep_candidate_grid(args),
         worker_func=neurotf_sweep_trial_worker,
@@ -312,6 +312,29 @@ def command_sweep(args: argparse.Namespace) -> int:
         summary_filename="neurotf_sweep_summary.md",
         diagnostics_prefix="neurotf",
         train_command_prefix=[sys.executable, "neuro_tf.py", "train"],
+    )
+    best_dir = Path(args.out_dir) / "best_model"
+    update_training_export_commands(
+        best_dir / "training_summary.md",
+        neurotf_export_commands(best_dir, args.mdif),
+    )
+    update_training_export_commands(
+        Path(args.out_dir) / "neurotf_sweep_summary.md",
+        neurotf_export_commands(best_dir, args.mdif),
+    )
+    return status
+
+
+def neurotf_export_commands(
+    model_dir: Path,
+    template_mdif: str | Path | None = None,
+) -> list[tuple[str, str]]:
+    """Build a runnable sampled-MDIF export command for Neuro-TF."""
+
+    return build_training_export_commands(
+        Path(__file__),
+        model_dir,
+        template_mdif,
     )
 
 
@@ -456,12 +479,14 @@ def command_train(args: argparse.Namespace) -> int:
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
+    export_commands = neurotf_export_commands(out_dir, args.mdif)
     write_training_markdown(
         out_dir / "training_summary.md",
         model_kind="Neuro-TF",
         config=training_config,
         summary=summary,
         history=history,
+        export_commands=export_commands,
     )
 
     if not getattr(args, "quiet", False):
@@ -473,6 +498,7 @@ def command_train(args: argparse.Namespace) -> int:
             "parameters": parameter_names,
             "sparameters": sparam_labels,
             "n_poles": args.order,
+            "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
         }, indent=2))
@@ -486,6 +512,49 @@ def command_predict(args: argparse.Namespace) -> int:
     out_path = Path(args.out_mdif)
     write_mdif(out_path, pred_blocks, model.sparam_labels)
     print(f"Wrote {out_path}")
+    return 0
+
+
+def command_export_ads(args: argparse.Namespace) -> int:
+    model_dir = Path(args.model_dir)
+    model = NeuroTF.load(model_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mdif_name = args.output_name
+    blocks = build_ads_export_blocks(
+        template_mdif=args.template_mdif,
+        parameter_grid_specs=args.parameter_grid,
+        freqs_spec=args.freqs,
+        parameter_names=model.parameter_names,
+        sparam_labels=model.sparam_labels,
+    )
+    pred_blocks = model.predict_blocks(blocks)
+    write_mdif(out_dir / mdif_name, pred_blocks, model.sparam_labels)
+    manifest = write_ads_export_package(
+        out_dir=out_dir,
+        model_kind="Neuro-TF",
+        model_dir=model_dir,
+        mdif_name=mdif_name,
+        blocks=pred_blocks,
+        parameter_names=model.parameter_names,
+        sparam_labels=model.sparam_labels,
+        extra_manifest={
+            "order": int(len(model.poles)),
+            "f_scale": model.f_scale,
+            "layer_sizes": model.mlp.layer_sizes,
+            "representation": "fixed-pole rational transfer function",
+        },
+        extra_notes=[
+            "The exported MDIF samples the fitted fixed-pole Neuro-TF response; ADS does not execute the neural network or rational basis directly."
+        ],
+    )
+    print(json.dumps({
+        "out_dir": str(out_dir),
+        "mdif": str(out_dir / mdif_name),
+        "manifest": str(out_dir / "ads_model_manifest.json"),
+        "blocks": manifest["blocks"],
+        "frequency_points_per_block": manifest["frequency_points_per_block"],
+    }, indent=2))
     return 0
 
 
@@ -639,6 +708,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     predict.add_argument("--mdif", required=True)
     predict.add_argument("--out-mdif", required=True)
     predict.set_defaults(func=command_predict)
+
+    export_ads = sub.add_parser(
+        "export-ads-mdif",
+        aliases=["export-ads"],
+        help="Export a trained Neuro-TF model as an ADS-ready parameterized S-parameter MDIF package",
+    )
+    export_ads.add_argument("--model-dir", required=True, help="Directory containing a trained model.npz and metadata.json")
+    export_ads.add_argument("--out-dir", required=True, help="Output directory for the ADS MDIF package")
+    export_ads.add_argument(
+        "--template-mdif",
+        help="MDIF containing the exact parameter/frequency blocks to evaluate; S-data is ignored",
+    )
+    export_ads.add_argument(
+        "--parameter-grid",
+        action="append",
+        default=[],
+        help="Parameter grid item such as W=0.4mm:0.8mm:9 or W=0.4mm,0.5mm. Repeat once per model parameter.",
+    )
+    export_ads.add_argument(
+        "--freqs",
+        help="Frequency grid such as 1GHz:20GHz:401 or 1GHz,2GHz,4GHz. Required with --parameter-grid.",
+    )
+    export_ads.add_argument("--output-name", default="surrogate_ads.mdif", help="Output MDIF file name")
+    export_ads.set_defaults(func=command_export_ads)
 
     inspect = sub.add_parser("inspect-mdif", help="Inspect parsed MDIF blocks")
     inspect.add_argument("--mdif", required=True)
