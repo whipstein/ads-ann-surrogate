@@ -175,7 +175,33 @@ def coarse_dnn_train_namespace(args: argparse.Namespace, out_dir: Path) -> argpa
             or getattr(args, "sparam_weights", None)
         ),
         debug=bool(getattr(args, "debug", False)),
-        quiet=bool(getattr(args, "quiet", False)),
+        # The joint KBNN command owns CLI reporting. Suppress the standalone
+        # DNN command's multi-line JSON and emit one compact coarse-stage line.
+        quiet=True,
+    )
+
+
+def coarse_fit_status_line(model_dir: Path) -> str:
+    summary_path = model_dir / "verification_summary.json"
+    summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+    passivity = summary.get("passivity")
+    passivity = passivity if isinstance(passivity, dict) else {}
+
+    def metric(value: object) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        return f"{number:.6g}" if math.isfinite(number) else "n/a"
+
+    return " ".join(
+        [
+            "Coarse DNN fit complete",
+            f"RMSE={metric(summary.get('rmse_abs'))}",
+            f"pv={metric(passivity.get('violating_points'))}",
+            f"sigma={metric(passivity.get('max_singular_value'))}",
+            f"model={model_dir}",
+        ]
     )
 
 
@@ -198,11 +224,11 @@ def prepare_fitted_coarse_model(
         return prepared
 
     fitted_dir = (output_root / COARSE_MODEL_DIRNAME).resolve()
-    if not getattr(prepared, "quiet", False):
-        print(f"fitting coarse DNN -> {fitted_dir}", flush=True)
     status = command_train_dnn(coarse_dnn_train_namespace(prepared, fitted_dir))
     if status != 0:
         raise RuntimeError(f"Coarse DNN fitting failed with status {status}")
+    if not getattr(prepared, "quiet", False):
+        print(coarse_fit_status_line(fitted_dir), flush=True)
     prepared.coarse_model_dir = str(fitted_dir)
     prepared.coarse_model_packaged = True
     return prepared
