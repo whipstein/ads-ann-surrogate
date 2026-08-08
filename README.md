@@ -98,10 +98,11 @@ such as `S11R S11I`.
 
 For combined training and verification files, use a split variable such as
 `dataset=train` and `dataset=verification`. If no split values are present, the
-trainers can reserve a holdout fraction of blocks for verification. KBNN also
-accepts a separate coarse/prior MDIF; fine and coarse blocks are matched by
-numeric geometry variables and the coarse response is interpolated onto the fine
-frequency grid when needed.
+trainers can reserve a holdout fraction of blocks for verification. For KBNN,
+pass the coarse/prior MDIF together with the fine MDIF. The integrated workflow
+first fits and saves an S-domain coarse DNN, then evaluates that frozen DNN at
+every fine training and verification point. This matches the two-network model
+that will be embedded in a self-contained export.
 
 ## Point Generation
 
@@ -205,7 +206,7 @@ python3 dnn.py train \
   --hidden-layers 128,128,64
 ```
 
-Train a KBNN residual model with fine and coarse MDIF data:
+Fit the coarse DNN and fine KBNN together as one residual-model workflow:
 
 ```bash
 python3 kbnn.py train \
@@ -270,27 +271,29 @@ python3 dnn.py export-veriloga \
   --module-name my_dnn_4port
 ```
 
-Residual and prior-input KBNNs need the coarse response at runtime. For one
-self-contained Verilog-A component, first train a compact S-domain DNN on the
-coarse MDIF, then embed both saved networks without retraining the KBNN:
+Residual and prior-input KBNNs use a frozen coarse DNN during fitting and at
+runtime. The integrated KBNN command fits the coarse model once, saves it under
+`coarse_model/`, fits the fine network from its predictions, and retains both
+models for one self-contained Verilog-A component:
 
 ```bash
-python3 dnn.py train \
-  --mdif coarse_train_verify.mdif \
-  --out-dir outputs/coarse_dnn_model \
+python3 kbnn.py train \
+  --mdif fine_train_verify.mdif \
+  --coarse-mdif coarse_train_verify.mdif \
+  --out-dir outputs/kbnn_model \
   --parameter-names W,L \
-  --output-domain s
+  --mode residual
 
 python3 kbnn.py export-veriloga \
   --model-dir outputs/kbnn_model \
-  --coarse-model-dir outputs/coarse_dnn_model \
   --out-dir outputs/kbnn_veriloga \
   --module-name my_kbnn_4port
 ```
 
 The generated KBNN module computes both networks and the S-to-Y conversion
 internally. ADS supplies only the electrical ports, geometry/process instance
-parameters, and simulator frequency.
+parameters, and simulator frequency. The exporter automatically finds the
+packaged `coarse_model/` directory and verifies its saved file hashes.
 
 Export a DNN or KBNN dataset for native ADS ANN extraction:
 
@@ -321,6 +324,10 @@ A normal `train` run writes:
 - `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
   and error views.
 - `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
+
+An integrated residual or prior-input KBNN run also writes a complete coarse
+DNN package under `coarse_model/` and a `composite_model_manifest.json` that
+identifies and hashes both saved networks for later Verilog-A extraction.
 
 Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
 per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
@@ -932,8 +939,8 @@ Verilog-A/C/equation artifacts on an ADS machine.
 ## KBNN
 
 This is the KBNN companion to the Neuro-TF prototype. It trains a neural model
-from a fine/target S-parameter MDIF and, optionally, a coarse/prior S-parameter
-MDIF at matching geometry points.
+from a fine/target S-parameter MDIF and, for knowledge-based modes, the
+predictions of a frozen S-domain DNN previously fitted to the coarse response.
 
 Supported forms:
 
@@ -944,8 +951,9 @@ prior-input  : NN(geometry, frequency, coarse S) -> fine S
 ```
 
 The default is `residual`, which is the classic knowledge-based difference
-method: the coarse model carries most of the physics and the NN learns the
-remaining correction.
+method: the fitted coarse DNN carries most of the physics and the KBNN learns
+the remaining correction. Using the fitted response here makes training match
+the two-network model used for prediction and self-contained export.
 
 The trainer automatically floors zero-variance output scaler columns to a
 representative response scale, which prevents constant residual or isolation
@@ -954,8 +962,9 @@ terms from becoming oversized learned delta-S errors in exported models.
 ### Expected MDIF Shape
 
 Fine and coarse MDIF files use the same generic block structure as the Neuro-TF
-trainer. Blocks are matched by numeric geometry `VAR`s, so the coarse file can
-be in a different order as long as the geometry values match.
+trainer. Supply them together with `--mdif` and `--coarse-mdif`. The integrated
+workflow fits the coarse DNN first and enforces the same parameter names/order
+and S-parameter labels when fitting the fine KBNN.
 
 ```text
 VAR dataset=train
@@ -969,9 +978,9 @@ BEGIN ACDATA
 END
 ```
 
-If the coarse frequency grid differs from the fine grid, the coarse
-S-parameters are linearly interpolated onto the fine grid. The coarse grid must
-cover the fine frequency range.
+KBNN evaluates the fitted coarse DNN directly at every fine-data geometry and
+frequency point. The original coarse grid therefore does not need to match the
+fine grid, provided the fitted DNN is valid across the fine model's domain.
 
 ### Inspect MDIF
 
@@ -1005,7 +1014,13 @@ python3 kbnn.py train \
 
 Outputs:
 
-- `model.npz` and `metadata.json`: trained KBNN
+- `model.npz` and `metadata.json`: trained fine KBNN/correction network
+- `coarse_model/model.npz` and `coarse_model/metadata.json`: fitted frozen
+  coarse S-domain DNN
+- `coarse_model/`: the coarse model's training history, verification metrics,
+  predicted verification MDIF, summary, and plots
+- `composite_model_manifest.json`: both required model paths, file hashes,
+  fit order, and a copyable self-contained Verilog-A extraction command
 - `predicted_verification.mdif`: model predictions at verification points
 - `verification_metrics.csv`: per-block and per-S-parameter errors, including EVM
 - `verification_summary.json`: global error, passivity summary, plot paths
@@ -1034,11 +1049,14 @@ magnitude, phase, and error-focus pages. The matching Y-parameter plots under
 real/imaginary frequency plots. Use `--worst-plots 0` to skip both plot sets
 during large experiments.
 
-For `plain` models, `--coarse-mdif` is not needed. For `prior-input` models, it
-is required. For `residual` models, omitting `--coarse-mdif` uses a zero coarse
-model, which reduces the method to a plain correction model. Residual models
-with `--include-coarse-input` also require `--coarse-mdif` because there is no
-coarse response to append as an input otherwise.
+For `plain` models, omit both coarse-source options. For `residual` and
+`prior-input`, use `--coarse-mdif` to fit and package both models together.
+`--coarse-model-dir` remains available when intentionally reusing a previously
+fitted coarse DNN. Residual targets are computed as
+`fine - fitted_coarse_dnn`; when coarse inputs are enabled, those same
+predictions are appended to the input. Prior-input mode always uses the
+predictions as inputs. The KBNN metadata records relative and absolute coarse
+model paths plus file hashes for later prediction and export.
 
 #### Options
 
@@ -1046,8 +1064,21 @@ coarse response to append as an input otherwise.
 | ------------------------------- | --- | ------------------------------------------------ |
 | <nobr><code>--activation {tanh,relu}</code></nobr> | Hidden activation. `tanh` is smoother; `relu` can help larger datasets. Default: `tanh`. | <nobr><code>--activation tanh</code></nobr> |
 | <nobr><code>--batch-size INT</code></nobr> | Frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Optional coarse/prior S-parameter MDIF. Required for `prior-input`, strongly recommended for `residual`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
-| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-mdif PATH</code></nobr> | Recommended coarse source for `residual` and `prior-input`. Fits an S-domain DNN first and saves its complete outputs under `<out-dir>/coarse_model/`. Mutually exclusive with `--coarse-model-dir`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-model-dir PATH</code></nobr> | Reuse an existing frozen S-domain DNN instead of fitting `--coarse-mdif`. Parameter order and S-parameter labels must match. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
+| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate verification MDIF used while fitting `--coarse-mdif`. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-hidden-layers LIST</code></nobr> | Coarse-DNN hidden layout. Default: `64,64`. | <nobr><code>--coarse-hidden-layers 64,64</code></nobr> |
+| <nobr><code>--coarse-activation {tanh,relu}</code></nobr> | Coarse-DNN hidden activation. Default: `tanh`. | <nobr><code>--coarse-activation tanh</code></nobr> |
+| <nobr><code>--coarse-freq-transform {log,linear,log-linear}</code></nobr> | Coarse-DNN frequency transform. Defaults to the fine KBNN `--freq-transform`. | <nobr><code>--coarse-freq-transform log-linear</code></nobr> |
+| <nobr><code>--coarse-learning-rate FLOAT</code></nobr> | Coarse-DNN Adam step size. Default: `0.002`. | <nobr><code>--coarse-learning-rate 0.002</code></nobr> |
+| <nobr><code>--coarse-epochs INT</code></nobr> | Coarse-DNN maximum epochs. Defaults to `--epochs`. | <nobr><code>--coarse-epochs 2000</code></nobr> |
+| <nobr><code>--coarse-batch-size INT</code></nobr> | Coarse-DNN batch size. Defaults to `--batch-size`. | <nobr><code>--coarse-batch-size 256</code></nobr> |
+| <nobr><code>--coarse-patience INT</code></nobr> | Coarse-DNN early-stopping patience. Defaults to `--patience`. | <nobr><code>--coarse-patience 200</code></nobr> |
+| <nobr><code>--coarse-loss-interval INT</code></nobr> | Coarse-DNN full-loss check interval. Defaults to `--loss-interval`. | <nobr><code>--coarse-loss-interval 5</code></nobr> |
+| <nobr><code>--coarse-progress-interval INT</code></nobr> | Coarse-DNN console progress interval. Defaults to `--progress-interval`. | <nobr><code>--coarse-progress-interval 25</code></nobr> |
+| <nobr><code>--coarse-seed INT</code></nobr> | Coarse-DNN random seed. Defaults to `--seed`. | <nobr><code>--coarse-seed 1234</code></nobr> |
+| <nobr><code>--coarse-worst-plots INT</code></nobr> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
+| <nobr><code>--coarse-sparam-weights SPEC</code></nobr> | Optional coarse-DNN loss weights. Defaults to the fine `--sparam-weights`. | <nobr><code>--coarse-sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
 | <nobr><code>--debug</code></nobr> | Print common diagnostics plus KBNN data/loss diagnostics, show Python tracebacks for failed commands, and write `kbnn_training_debug.json`. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform. `log` uses `log10(freq_hz)` and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
@@ -1057,7 +1088,7 @@ coarse response to append as an input otherwise.
 | <nobr><code>--learning-rate FLOAT</code></nobr> | Adam step size. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
 | <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | Required. Fine/target S-parameter MDIF. If `--verification-mdif` is omitted, this file should contain both training and verification blocks. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
-| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | KBNN formulation. `residual` learns `fine - coarse`; `prior-input` predicts fine S using coarse S as inputs; `plain` ignores coarse data. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
+| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | KBNN formulation. `residual` learns `fine - fitted_coarse_dnn`; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for the trained model, `training_summary.md`, metrics, predictions, and S/Y worst-case PDF plots. | <nobr><code>--out-dir kbnn_model</code></nobr> |
 | <nobr><code>--parameter-names LIST</code></nobr> | Comma-separated geometry/process variables used as model inputs. If omitted, common numeric `VAR`s are inferred. | <nobr><code>--parameter-names W,L,H</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | Early-stopping patience in epochs. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
@@ -1103,8 +1134,18 @@ try for the single-model `--include-coarse-input` switch. `false` trains
 residual candidates from geometry and frequency only; `true` also feeds the
 coarse real/imaginary S-parameters into the residual network. Impossible mode
 combinations are skipped: `plain` forces this off and `prior-input` forces it
-on. If `--coarse-mdif` is omitted, `prior-input` and coarse-input residual
-candidates are skipped before the sweep starts.
+on. With `--coarse-mdif`, the coarse DNN is fitted exactly once under
+`kbnn_sweep/coarse_model/` and the same frozen model is evaluated for every
+trial. The winning copyable `train` command repeats the integrated coarse fit
+with the same coarse MDIF and settings, so it regenerates both saved networks.
+The coarse package is also copied into `best_model/coarse_model/`, making
+`best_model/` independently movable. Its `composite_model_manifest.json`
+records both selected networks and the Verilog-A extraction command.
+
+All integrated coarse-DNN controls listed for `train` (`--coarse-hidden-layers`,
+`--coarse-epochs`, activation, learning rate, batch size, patience, frequency
+transform, seed, weights, and reporting intervals) also apply to `optimize`.
+They configure the one shared coarse fit, not separate per-trial fits.
 
 For fitting failures that do not produce an obvious Python error, rerun a small
 or representative sweep with `--debug --jobs 1`. The shared sweep debug mode
@@ -1185,8 +1226,9 @@ of rebuilding them.
 | ------------------------------- | --- | ------------------------------------------------ |
 | <nobr><code>--activation-options LIST</code></nobr> | Comma-separated activations to try. Default: `tanh,relu`. | <nobr><code>--activation-options tanh,relu</code></nobr> |
 | <nobr><code>--batch-size INT</code></nobr> | Frequency-sample rows per Adam update in each candidate. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Optional coarse/prior S-parameter MDIF. Required for `prior-input` candidates and strongly recommended for `residual` candidates. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
-| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-mdif PATH</code></nobr> | Fit one shared coarse S-domain DNN under `<out-dir>/coarse_model/` before running non-plain candidates. Mutually exclusive with `--coarse-model-dir`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-model-dir PATH</code></nobr> | Reuse an existing frozen coarse DNN for every non-plain candidate and include it in the winning reproduction command. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
+| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate verification MDIF for the integrated coarse-DNN fit. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
 | <nobr><code>--debug</code></nobr> | Print the selected candidate list, show tracebacks for failed trials, include tracebacks in failed trial summaries, and write KBNN per-trial debug diagnostics. Use `--jobs 1` for the cleanest trace. | <nobr><code>--debug --jobs 1</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs for each candidate and the final retrain. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform used when `--freq-transform-options` is omitted. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
@@ -1279,19 +1321,20 @@ Predict new parameter blocks after training:
 python3 kbnn.py predict \
   --model-dir kbnn_model \
   --mdif new_fine_shape.mdif \
-  --coarse-mdif new_coarse_prior.mdif \
   --out-mdif predicted.mdif
 ```
 
-For `plain` models, `--coarse-mdif` is not needed. For `prior-input` models, it
-is required. For `residual` models, omitting `--coarse-mdif` uses a zero coarse
-model, which reduces the method to a plain correction model.
+For residual and prior-input models, prediction evaluates the same frozen
+coarse DNN used during KBNN training. The packaged relative path is used first,
+then the recorded absolute path. If the coarse model was moved separately, pass
+its new path with
+`--coarse-model-dir`; the saved model and metadata hashes must still match.
 
 #### Options
 
 | Option Name | Description | Example |
 | ------------------------------- | --- | ------------------------------------------------ |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Coarse/prior MDIF. Required for `prior-input`; recommended for `residual`. | <nobr><code>--coarse-mdif new_coarse_prior.mdif</code></nobr> |
+| <nobr><code>--coarse-model-dir PATH</code></nobr> | Optional relocated path to the exact frozen coarse DNN. If omitted, the packaged relative path and then the recorded source path are tried. | <nobr><code>--coarse-model-dir kbnn_model/coarse_model</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | Required. MDIF providing geometry variables and frequency grids. | <nobr><code>--mdif new_fine_shape.mdif</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_model</code></nobr> |
 | <nobr><code>--out-mdif PATH</code></nobr> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
@@ -1300,7 +1343,7 @@ model, which reduces the method to a plain correction model.
 
 After training, export a parameterized S-parameter table that ADS can use
 directly through an MDIF-capable data-based n-port or data access component.
-For residual and prior-input KBNNs, the coarse/prior response is evaluated
+For residual and prior-input KBNNs, the frozen fitted coarse DNN is evaluated
 during export; ADS only needs the final exported fine-response MDIF.
 
 The safest export is template driven: provide an MDIF containing the exact
@@ -1311,19 +1354,17 @@ fine S-parameter values are accepted and ignored.
 python3 kbnn.py export-ads-mdif \
   --model-dir kbnn_model \
   --out-dir ads_export \
-  --template-mdif ads_sweep_template.mdif \
-  --coarse-mdif coarse_prior_for_ads_sweep.mdif
+  --template-mdif ads_sweep_template.mdif
 ```
 
-You can also generate a rectangular parameter/frequency grid directly. When a
-coarse/prior MDIF is supplied, it must contain matching geometry blocks and
-cover the exported frequency range.
+You can also generate a rectangular parameter/frequency grid directly. The
+exporter evaluates the packaged coarse DNN at every generated point. If that
+model was moved separately, provide its new path with `--coarse-model-dir`.
 
 ```bash
 python3 kbnn.py export-ads-mdif \
   --model-dir kbnn_model \
   --out-dir ads_export \
-  --coarse-mdif coarse_prior_for_ads_sweep.mdif \
   --parameter-grid W=0.40mm:0.80mm:9 \
   --parameter-grid L=1.00mm:1.60mm:7 \
   --freqs 1GHz:20GHz:401
@@ -1344,7 +1385,7 @@ interpolate between sampled points rather than evaluate the neural network.
 
 | Option Name | Description | Example |
 | ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
-| <nobr><code>--coarse-mdif PATH</code></nobr> | Optional for `residual`, required for `prior-input`. Coarse/prior MDIF evaluated during export and baked into the final ADS MDIF. | <nobr><code>--coarse-mdif coarse_prior_for_ads_sweep.mdif</code></nobr> |
+| <nobr><code>--coarse-model-dir PATH</code></nobr> | Optional relocated path to the exact frozen coarse DNN. If omitted, the packaged relative path and then the recorded source path are tried. | <nobr><code>--coarse-model-dir kbnn_model/coarse_model</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_model</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | Required. Output directory for `surrogate_ads.mdif`, `ads_model_manifest.json`, and `ADS_README.md`. | <nobr><code>--out-dir ads_export</code></nobr> |
@@ -1379,7 +1420,9 @@ The export writes `ads_ann_training.csv`, optional
 `ads_ann_verification.csv`, `ads_ann_manifest.json`, `train_ads_ann.py`, and
 `ADS_ANN_README.md`. Run `train_ads_ann.py` with the ADS Python interpreter on
 a licensed ADS machine. This path retrains the network in ADS ANN; it does not
-import the local NumPy `model.npz` weights.
+import the local NumPy `model.npz` weights. Consequently, this separate ADS ANN
+retraining workflow still accepts raw coarse MDIF data; it is distinct from
+local KBNN fitting, prediction, sampled-MDIF export, and direct Verilog-A export.
 
 ADS reference used:
 
@@ -1470,33 +1513,36 @@ Schematic use:
 Use `export-veriloga` when you want a self-contained Verilog-A n-port instead
 of exporting a sampled MDIF table or retraining with ADS ANN. A residual or
 prior-input KBNN needs two saved models: the optimized KBNN and an S-domain DNN
-trained on the coarse MDIF. Training the coarse DNN does not retrain or alter
-the optimized KBNN.
+trained on the coarse MDIF. The KBNN itself must have been trained with that
+frozen DNN, so its fitted response is represented in both optimization and
+export.
 
-First train or optimize a compact DNN on the same coarse response used by the
-KBNN. Supply `--parameter-names` explicitly so its input order matches the
-KBNN, and keep `--output-domain s`. Run these commands from the repository root:
+Fit the coarse DNN once and optimize the fine KBNN in one command. Supply
+`--parameter-names` explicitly so both model inputs have the same order:
 
 ```bash
-python3 dnn.py train \
-  --mdif coarse_train_verify.mdif \
-  --out-dir coarse_dnn_model \
+python3 kbnn.py optimize \
+  --mdif fine_train_verify.mdif \
+  --coarse-mdif coarse_train_verify.mdif \
+  --out-dir kbnn_sweep \
   --parameter-names W,L \
-  --output-domain s \
-  --hidden-layers 64,64
+  --coarse-hidden-layers 64,64 \
+  --mode-options residual,prior-input
 ```
 
-Check the coarse DNN's `training_summary.md`, verification metrics, plots, and
-passivity results before embedding it. Its approximation error contributes to
-the final self-contained model. Use the normal DNN `sweep`/`optimize` workflow
-when the coarse response needs architecture optimization.
+This writes the coarse DNN and all of its verification outputs under
+`kbnn_sweep/coarse_model/`, the selected fine KBNN under
+`kbnn_sweep/best_model/`, a packaged copy under
+`kbnn_sweep/best_model/coarse_model/`, and a composite manifest under
+`best_model/`. Review both training summaries and verification reports because
+coarse-model approximation error contributes to the final composite response.
 
-Then export the composite model:
+Finally, export the composite model. The packaged relative coarse-model path is
+used automatically, so `best_model/` can be moved as one unit:
 
 ```bash
 python3 kbnn.py export-veriloga \
   --model-dir kbnn_sweep/best_model \
-  --coarse-model-dir coarse_dnn_model \
   --out-dir kbnn_veriloga \
   --module-name my_kbnn_4port
 ```
@@ -1508,18 +1554,22 @@ admittance with `Y = (I - S) * inverse(I + S) / Z0`, and contributes the
 corresponding port currents. The model must contain a complete square
 S-parameter matrix, such as all 16 terms for a four-port.
 
-Plain KBNN exports contain one network. Residual and prior-input exports with
-`--coarse-model-dir` contain two networks. The embedded coarse DNN evaluates
+Plain KBNN exports contain one network. Residual and prior-input exports contain
+two networks. The embedded coarse DNN evaluates
 `Scoarse(geometry, frequency)` internally. A residual export adds the KBNN
 correction to that response; a prior-input export feeds that response into the
 KBNN. The final S-matrix is then converted to Y and stamped at the electrical
 ports. No coarse MDIF, coarse circuit, coarse S-parameter instance settings, or
 extra pins are needed in ADS.
 
-For safety, residual and prior-input exports fail when `--coarse-model-dir` is
-omitted. `--allow-coarse-hooks` restores the legacy zero-default hook package
-only for fixed-point diagnostics or hand-written coarse equations; that package
-is explicitly marked as not self-contained.
+For safety, residual and prior-input exports verify the coarse DNN's saved-model
+and metadata hashes against the identity recorded during KBNN training. If the
+joint output directory moved, its packaged relative path is used automatically.
+If the coarse model moved separately, pass its new location with
+`--coarse-model-dir`; a different model is rejected. `--allow-coarse-hooks`
+restores the legacy zero-default hook
+package only for fixed-point diagnostics or hand-written coarse equations; that
+package is explicitly marked as not self-contained.
 
 This path is intended for S-parameter and small-signal AC use in ADS. It uses
 `$freq` as the default frequency expression; if your ADS Verilog-A environment
@@ -1547,7 +1597,7 @@ remain in meters.
 | Option Name | Description | Example |
 | ------------------------------------------------------ | --- | ------------------------------------------------------------------------ |
 | <nobr><code>--allow-coarse-hooks</code></nobr> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
-| <nobr><code>--coarse-model-dir PATH</code></nobr> | S-domain DNN model trained on the KBNN coarse MDIF. Required for a self-contained residual or prior-input export. Its parameter names/order and S-parameter labels/order must exactly match the KBNN. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
+| <nobr><code>--coarse-model-dir PATH</code></nobr> | Optional relocated path to the exact frozen S-domain DNN used during KBNN training. If omitted, the packaged relative path and then recorded source path are tried. Parameter order, S-parameter labels, and saved file hashes must match. | <nobr><code>--coarse-model-dir kbnn_model/coarse_model</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | Required. Directory containing a trained `model.npz` and `metadata.json`. | <nobr><code>--model-dir kbnn_sweep/best_model</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |

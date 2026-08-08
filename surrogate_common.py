@@ -4751,6 +4751,7 @@ def cleanup_trial_dir(trial_dir: Path, keep_trial_models: bool) -> None:
     for name in [
         "model.npz",
         "metadata.json",
+        "composite_model_manifest.json",
         "predicted_verification.mdif",
         "training_history.csv",
         "training_summary.md",

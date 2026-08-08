@@ -7,17 +7,22 @@ The supported KBNN forms are:
     residual    : coarse S + NN(geometry, frequency[, coarse S]) -> fine S
     prior-input : NN(geometry, frequency, coarse S) -> fine S
 
-The residual mode is the classic difference-method KBNN: a cheap coarse model
-captures most of the physics, and the neural network only learns the correction.
+The integrated workflow fits and saves an S-domain DNN for the coarse response,
+freezes it, and uses its predictions for fine KBNN fitting.  The same fitted
+coarse network drives verification, prediction, and self-contained Verilog-A
+export.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import itertools
 import json
 import math
+import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -70,6 +75,7 @@ from surrogate_common import (  # noqa: E402
     read_model_metadata,
     rerank_sweep_rows,
     run_sweep_command,
+    single_model_train_command,
     sparam_sort_key,
     sparam_weight_mean,
     sparameter_real_imag_columns,
@@ -88,10 +94,12 @@ from surrogate_common import (  # noqa: E402
     write_training_markdown,
     write_veriloga_package,
 )
-from dnn import DNN  # noqa: E402
+from dnn import DNN, command_train as command_train_dnn  # noqa: E402
 
 
-VERSION = "0.2.0-rc2"
+VERSION = "0.2.0-rc3"
+COARSE_MODEL_DIRNAME = "coarse_model"
+COMPOSITE_MANIFEST_FILENAME = "composite_model_manifest.json"
 KBNN_SWEEP_RESULT_COLUMNS = [
     "mode",
     "include_coarse_input",
@@ -121,6 +129,268 @@ def read_mdif_cached(path_text: str) -> list[MDIFBlock]:
         cached = read_mdif(Path(key[0]))
         _MDIF_BLOCK_CACHE[key] = cached
     return cached
+
+
+def coarse_dnn_train_namespace(args: argparse.Namespace, out_dir: Path) -> argparse.Namespace:
+    coarse_epochs = getattr(args, "coarse_epochs", None)
+    coarse_batch_size = getattr(args, "coarse_batch_size", None)
+    coarse_patience = getattr(args, "coarse_patience", None)
+    coarse_loss_interval = getattr(args, "coarse_loss_interval", None)
+    coarse_progress_interval = getattr(args, "coarse_progress_interval", None)
+    coarse_seed = getattr(args, "coarse_seed", None)
+    coarse_worst_plots = getattr(args, "coarse_worst_plots", None)
+    return argparse.Namespace(
+        mdif=args.coarse_mdif,
+        verification_mdif=getattr(args, "coarse_verification_mdif", None),
+        out_dir=str(out_dir),
+        split_var=args.split_var,
+        train_values=args.train_values,
+        verify_values=args.verify_values,
+        parameter_names=args.parameter_names,
+        holdout_fraction=args.holdout_fraction,
+        freq_transform=getattr(args, "coarse_freq_transform", None) or args.freq_transform,
+        hidden_layers=getattr(args, "coarse_hidden_layers", "64,64"),
+        activation=getattr(args, "coarse_activation", "tanh"),
+        epochs=args.epochs if coarse_epochs is None else coarse_epochs,
+        batch_size=args.batch_size if coarse_batch_size is None else coarse_batch_size,
+        learning_rate=getattr(args, "coarse_learning_rate", 2e-3),
+        patience=args.patience if coarse_patience is None else coarse_patience,
+        loss_interval=args.loss_interval if coarse_loss_interval is None else coarse_loss_interval,
+        progress_interval=(
+            args.progress_interval
+            if coarse_progress_interval is None
+            else coarse_progress_interval
+        ),
+        progress_label="Coarse DNN fit",
+        seed=args.seed if coarse_seed is None else coarse_seed,
+        output_domain="s",
+        target_z0=50.0,
+        worst_plots=(
+            getattr(args, "worst_plots", 6)
+            if coarse_worst_plots is None
+            else coarse_worst_plots
+        ),
+        sparam_weights=(
+            getattr(args, "coarse_sparam_weights", None)
+            or getattr(args, "sparam_weights", None)
+        ),
+        debug=bool(getattr(args, "debug", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
+
+
+def prepare_fitted_coarse_model(
+    args: argparse.Namespace,
+    output_root: Path,
+) -> argparse.Namespace:
+    """Fit the coarse DNN once, or retain an explicitly supplied frozen model."""
+
+    prepared = argparse.Namespace(**vars(args))
+    coarse_mdif = getattr(prepared, "coarse_mdif", None)
+    coarse_model_dir = getattr(prepared, "coarse_model_dir", None)
+    coarse_verification_mdif = getattr(prepared, "coarse_verification_mdif", None)
+    if coarse_mdif and coarse_model_dir:
+        raise ValueError("Use either --coarse-mdif or --coarse-model-dir, not both")
+    if coarse_verification_mdif and not coarse_mdif:
+        raise ValueError("--coarse-verification-mdif requires --coarse-mdif")
+    if not coarse_mdif:
+        prepared.coarse_model_packaged = False
+        return prepared
+
+    fitted_dir = (output_root / COARSE_MODEL_DIRNAME).resolve()
+    if not getattr(prepared, "quiet", False):
+        print(f"fitting coarse DNN -> {fitted_dir}", flush=True)
+    status = command_train_dnn(coarse_dnn_train_namespace(prepared, fitted_dir))
+    if status != 0:
+        raise RuntimeError(f"Coarse DNN fitting failed with status {status}")
+    prepared.coarse_model_dir = str(fitted_dir)
+    prepared.coarse_model_packaged = True
+    return prepared
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def coarse_dnn_identity(model_dir: Path, model: DNN) -> dict[str, object]:
+    resolved = model_dir.expanduser().resolve()
+    return {
+        "source_model_dir": str(resolved),
+        "model_npz_sha256": file_sha256(resolved / "model.npz"),
+        "metadata_sha256": file_sha256(resolved / "metadata.json"),
+        "output_domain": model.output_domain,
+        "parameter_names": list(model.parameter_names),
+        "sparam_labels": list(model.sparam_labels),
+    }
+
+
+def load_frozen_coarse_dnn(
+    model_dir: Path,
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    expected_identity: dict[str, object] | None = None,
+) -> tuple[DNN, dict[str, object]]:
+    resolved = model_dir.expanduser().resolve()
+    model = DNN.load(resolved)
+    if model.output_domain != "s":
+        raise ValueError(
+            "The fitted coarse DNN must be trained with --output-domain s"
+        )
+    if model.parameter_names != list(parameter_names):
+        raise ValueError(
+            "The fitted coarse DNN parameter names/order must match the KBNN: "
+            f"expected {list(parameter_names)}, got {model.parameter_names}"
+        )
+    if model.sparam_labels != list(labels):
+        raise ValueError(
+            "The fitted coarse DNN S-parameter labels/order must match the KBNN: "
+            f"expected {list(labels)}, got {model.sparam_labels}"
+        )
+    identity = coarse_dnn_identity(resolved, model)
+    if expected_identity is not None:
+        for key in ("model_npz_sha256", "metadata_sha256"):
+            expected = expected_identity.get(key)
+            actual = identity[key]
+            if not expected or str(expected) != str(actual):
+                raise ValueError(
+                    "The supplied coarse DNN does not match the model used during KBNN "
+                    f"training ({key}: expected {expected!r}, got {actual!r})"
+                )
+    return model, identity
+
+
+def kbnn_metadata(model_dir: Path) -> dict[str, object]:
+    return json.loads((model_dir / "metadata.json").read_text())
+
+
+def load_matching_coarse_dnn(
+    kbnn_model_dir: Path,
+    model: "KBNN",
+    coarse_model_dir: str | None,
+) -> tuple[DNN, dict[str, object]]:
+    metadata = kbnn_metadata(kbnn_model_dir)
+    expected = metadata.get("coarse_model")
+    if not isinstance(expected, dict):
+        raise ValueError(
+            "This KBNN was not trained against a fitted coarse DNN. Retrain it with "
+            "--coarse-mdif or --coarse-model-dir before creating a deployment-matched export."
+        )
+    selected = coarse_model_dir
+    if not selected:
+        packaged_relative = expected.get("packaged_relative_model_dir")
+        if packaged_relative:
+            packaged_candidate = (
+                kbnn_model_dir.expanduser().resolve() / str(packaged_relative)
+            ).resolve()
+            if (
+                (packaged_candidate / "model.npz").is_file()
+                and (packaged_candidate / "metadata.json").is_file()
+            ):
+                selected = str(packaged_candidate)
+    if not selected:
+        selected = str(expected.get("source_model_dir") or "")
+    if not selected:
+        raise ValueError(
+            "A matching fitted coarse DNN is required; pass --coarse-model-dir"
+        )
+    return load_frozen_coarse_dnn(
+        Path(selected),
+        model.parameter_names,
+        model.sparam_labels,
+        expected_identity=expected,
+    )
+
+
+def write_composite_model_manifest(
+    model_dir: Path,
+    model: "KBNN",
+) -> Path:
+    resolved_model_dir = model_dir.expanduser().resolve()
+    metadata = kbnn_metadata(resolved_model_dir)
+    coarse_identity = metadata.get("coarse_model")
+    coarse_payload: dict[str, object] | None = None
+    export_argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "export-veriloga",
+        "--model-dir",
+        str(resolved_model_dir),
+        "--out-dir",
+        str(resolved_model_dir / "veriloga"),
+    ]
+    if isinstance(coarse_identity, dict):
+        coarse_path = Path(str(coarse_identity.get("source_model_dir") or ""))
+        packaged_relative = coarse_identity.get("packaged_relative_model_dir")
+        if packaged_relative:
+            packaged_candidate = (resolved_model_dir / str(packaged_relative)).resolve()
+            if packaged_candidate.is_dir():
+                coarse_path = packaged_candidate
+        coarse_payload = {
+            "role": "frozen_coarse_s_domain_dnn",
+            "model_dir": str(coarse_path),
+            "packaged_relative_model_dir": packaged_relative,
+            "required_files": ["model.npz", "metadata.json"],
+            "model_npz_sha256": coarse_identity.get("model_npz_sha256"),
+            "metadata_sha256": coarse_identity.get("metadata_sha256"),
+            "training_summary": str(coarse_path / "training_summary.md"),
+            "verification_summary": str(coarse_path / "verification_summary.json"),
+        }
+        export_argv.extend(["--coarse-model-dir", str(coarse_path)])
+    manifest = {
+        "version": VERSION,
+        "model_family": "composite_kbnn",
+        "mode": model.mode,
+        "fit_order": ["coarse_dnn", "fine_kbnn"],
+        "fit_contract": (
+            "The coarse S-domain DNN is fitted first and frozen. Its predictions, "
+            "not raw coarse MDIF samples, are used to fit and verify the fine KBNN."
+        ),
+        "fine_model": {
+            "role": "fine_kbnn_correction_or_prior_network",
+            "model_dir": str(resolved_model_dir),
+            "required_files": ["model.npz", "metadata.json"],
+            "model_npz_sha256": file_sha256(resolved_model_dir / "model.npz"),
+            "metadata_sha256": file_sha256(resolved_model_dir / "metadata.json"),
+            "training_summary": str(resolved_model_dir / "training_summary.md"),
+            "verification_summary": str(resolved_model_dir / "verification_summary.json"),
+        },
+        "coarse_model": coarse_payload,
+        "veriloga_ready": bool(model.mode == "plain" or coarse_payload is not None),
+        "veriloga_export_command": shlex.join(export_argv),
+    }
+    path = resolved_model_dir / COMPOSITE_MANIFEST_FILENAME
+    path.write_text(json.dumps(manifest, indent=2))
+    return path
+
+
+def set_packaged_coarse_reference(model_dir: Path, coarse_model_dir: Path) -> None:
+    """Copy the frozen coarse package beside a promoted fine model and relink it."""
+
+    resolved_model_dir = model_dir.expanduser().resolve()
+    resolved_coarse_dir = coarse_model_dir.expanduser().resolve()
+    metadata_path = resolved_model_dir / "metadata.json"
+    if not metadata_path.is_file():
+        return
+    metadata = json.loads(metadata_path.read_text())
+    coarse_identity = metadata.get("coarse_model")
+    if not isinstance(coarse_identity, dict):
+        return
+    packaged_coarse_dir = resolved_model_dir / COARSE_MODEL_DIRNAME
+    if packaged_coarse_dir.resolve() != resolved_coarse_dir:
+        if packaged_coarse_dir.exists():
+            shutil.rmtree(packaged_coarse_dir)
+        shutil.copytree(resolved_coarse_dir, packaged_coarse_dir)
+    coarse_identity["source_model_dir"] = str(packaged_coarse_dir)
+    coarse_identity["packaged_relative_model_dir"] = os.path.relpath(
+        packaged_coarse_dir,
+        resolved_model_dir,
+    )
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    write_composite_model_manifest(resolved_model_dir, KBNN.load(resolved_model_dir))
 
 
 def normalize_mode(mode: str) -> str:
@@ -427,8 +697,8 @@ def build_training_debug_info(
     return {
         "mode": mode,
         "include_coarse_input": bool(include_coarse_input),
-        "coarse_mdif_supplied": bool(args.coarse_mdif),
-        "coarse_verification_mdif_supplied": bool(args.coarse_verification_mdif),
+        "coarse_source": "fitted_dnn" if mode != "plain" else None,
+        "coarse_model_dir": getattr(args, "coarse_model_dir", None),
         "freq_transform": args.freq_transform,
         "parameter_names": list(parameter_names),
         "sparam_labels": list(labels),
@@ -496,7 +766,7 @@ def emit_training_debug(args: argparse.Namespace, info: dict[str, object]) -> No
         args,
         (
             f"mode={info.get('mode')} coarse_input={info.get('include_coarse_input')} "
-            f"coarse_mdif={info.get('coarse_mdif_supplied')}"
+            f"coarse_model={info.get('coarse_model_dir')}"
         ),
     )
     debug_print(
@@ -913,33 +1183,40 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         include_coarse_input = False
     if mode == "prior-input":
         include_coarse_input = True
-    if mode == "prior-input" and not args.coarse_mdif:
-        raise ValueError("--mode prior-input requires --coarse-mdif")
-    if include_coarse_input and not args.coarse_mdif:
-        raise ValueError("--include-coarse-input requires --coarse-mdif")
+    coarse_model_dir = getattr(args, "coarse_model_dir", None)
+    if mode == "plain" and coarse_model_dir:
+        raise ValueError("--coarse-model-dir is only valid for residual or prior-input KBNNs")
+    if mode != "plain" and not coarse_model_dir:
+        raise ValueError(
+            "Residual and prior-input KBNN training requires --coarse-mdif or "
+            "--coarse-model-dir. "
+            "The frozen fitted DNN is evaluated on the fine-model grids so training "
+            "matches the self-contained export."
+        )
 
     train_fine, verify_fine, all_fine = split_fine_blocks(args)
     if not train_fine:
         raise ValueError("No training blocks found")
 
     parameter_names = infer_parameter_names(all_fine, requested=args.parameter_names, split_var=args.split_var)
+    labels = determine_labels(all_fine, None)
+    coarse_identity: dict[str, object] | None = None
     if mode == "plain":
-        coarse_train_raw = None
-        coarse_verify_raw = None
-        all_coarse_raw: list[MDIFBlock] = []
-        labels = determine_labels(all_fine, None)
         train_coarse: list[MDIFBlock] = []
         verify_coarse: list[MDIFBlock] = []
     else:
-        coarse_train_raw, coarse_verify_raw = split_coarse_blocks(args, train_fine, verify_fine)
-        all_coarse_raw = []
-        if coarse_train_raw:
-            all_coarse_raw.extend(coarse_train_raw)
-        if coarse_verify_raw:
-            all_coarse_raw.extend(coarse_verify_raw)
-        labels = determine_labels(all_fine, all_coarse_raw or None)
-        train_coarse = align_coarse_blocks(train_fine, coarse_train_raw, parameter_names, labels)
-        verify_coarse = align_coarse_blocks(verify_fine, coarse_verify_raw, parameter_names, labels) if verify_fine else []
+        coarse_model, coarse_identity = load_frozen_coarse_dnn(
+            Path(str(coarse_model_dir)),
+            parameter_names,
+            labels,
+        )
+        if getattr(args, "coarse_model_packaged", False):
+            coarse_identity["packaged_relative_model_dir"] = os.path.relpath(
+                Path(str(coarse_model_dir)).expanduser().resolve(),
+                Path(args.out_dir).expanduser().resolve(),
+            )
+        train_coarse = coarse_model.predict_blocks(train_fine)
+        verify_coarse = coarse_model.predict_blocks(verify_fine) if verify_fine else []
 
     x_train, y_train = make_feature_target_samples(
         train_fine,
@@ -1026,7 +1303,8 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         "mode": mode,
         "include_coarse_input": include_coarse_input,
         "freq_transform": args.freq_transform,
-        "coarse_mdif": bool(args.coarse_mdif),
+        "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
+        "coarse_model": coarse_identity,
         "split_var": args.split_var,
         "train_values": sorted(parse_csv_set(args.train_values)),
         "verify_values": sorted(parse_csv_set(args.verify_values)),
@@ -1068,6 +1346,11 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
 
 
 def command_train(args: argparse.Namespace) -> int:
+    if normalize_mode(args.mode) == "plain" and (
+        getattr(args, "coarse_mdif", None) or getattr(args, "coarse_model_dir", None)
+    ):
+        raise ValueError("Coarse-model fitting is only valid for residual or prior-input KBNNs")
+    args = prepare_fitted_coarse_model(args, Path(args.out_dir))
     model, verify_fine, verify_coarse, parameter_names, labels, history, metadata = train_model(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1087,7 +1370,8 @@ def command_train(args: argparse.Namespace) -> int:
         "mode": model.mode,
         "include_coarse_input": model.include_coarse_input,
         "freq_transform": model.freq_transform,
-        "coarse_mdif": metadata["coarse_mdif"],
+        "coarse_source": metadata["coarse_source"],
+        "coarse_model": metadata["coarse_model"],
         "hidden_layers": args.hidden_layers,
         "activation": model.mlp.activation,
         "learning_rate": args.learning_rate,
@@ -1138,13 +1422,17 @@ def command_train(args: argparse.Namespace) -> int:
         summary=summary,
         history=history,
     )
+    composite_manifest = write_composite_model_manifest(out_dir, model)
 
     if not getattr(args, "quiet", False):
         print(json.dumps({
             "out_dir": str(out_dir),
             "training_summary": str(out_dir / "training_summary.md"),
+            "composite_manifest": str(composite_manifest),
             "mode": model.mode,
             "include_coarse_input": model.include_coarse_input,
+            "coarse_source": metadata["coarse_source"],
+            "coarse_model": metadata["coarse_model"],
             "parameters": parameter_names,
             "sparameters": labels,
             "sparam_weights": metadata["sparam_weights"],
@@ -1159,15 +1447,20 @@ def command_train(args: argparse.Namespace) -> int:
 
 
 def command_predict(args: argparse.Namespace) -> int:
-    model = KBNN.load(Path(args.model_dir))
+    model_dir = Path(args.model_dir)
+    model = KBNN.load(model_dir)
     blocks = read_mdif_cached(args.mdif)
-    if model.mode == "prior-input" and not args.coarse_mdif:
-        raise ValueError("This model requires --coarse-mdif for prediction")
     if model.mode == "plain":
+        if args.coarse_model_dir:
+            raise ValueError("--coarse-model-dir is only valid for residual or prior-input KBNN models")
         coarse = []
     else:
-        coarse_raw = read_mdif_cached(args.coarse_mdif) if args.coarse_mdif else None
-        coarse = align_coarse_blocks(blocks, coarse_raw, model.parameter_names, model.sparam_labels)
+        coarse_model, _ = load_matching_coarse_dnn(
+            model_dir,
+            model,
+            args.coarse_model_dir,
+        )
+        coarse = coarse_model.predict_blocks(blocks)
     pred_blocks = model.predict_blocks(blocks, coarse)
     out_path = Path(args.out_mdif)
     write_mdif(out_path, pred_blocks, model.sparam_labels)
@@ -1178,8 +1471,6 @@ def command_predict(args: argparse.Namespace) -> int:
 def command_export_ads(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = KBNN.load(model_dir)
-    if model.mode == "prior-input" and not args.coarse_mdif:
-        raise ValueError("This KBNN prior-input model requires --coarse-mdif for ADS export")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1192,21 +1483,25 @@ def command_export_ads(args: argparse.Namespace) -> int:
         sparam_labels=model.sparam_labels,
     )
     if model.mode == "plain":
+        if args.coarse_model_dir:
+            raise ValueError("--coarse-model-dir is only valid for residual or prior-input KBNN models")
         coarse = []
-        coarse_raw = None
+        coarse_identity = None
     else:
-        coarse_raw = read_mdif_cached(args.coarse_mdif) if args.coarse_mdif else None
-        coarse = align_coarse_blocks(blocks, coarse_raw, model.parameter_names, model.sparam_labels)
+        coarse_model, coarse_identity = load_matching_coarse_dnn(
+            model_dir,
+            model,
+            args.coarse_model_dir,
+        )
+        coarse = coarse_model.predict_blocks(blocks)
     pred_blocks = model.predict_blocks(blocks, coarse)
     write_mdif(out_dir / mdif_name, pred_blocks, model.sparam_labels)
 
     notes = []
-    if args.coarse_mdif:
+    if coarse_identity is not None:
         notes.append(
-            "The coarse/prior response was evaluated during export; ADS only needs the final exported MDIF."
+            "The same frozen coarse DNN used during KBNN training was evaluated during export; ADS only needs the final exported MDIF."
         )
-    elif model.mode == "residual":
-        notes.append("No coarse/prior MDIF was supplied for export, so the residual model used a zero coarse response.")
     manifest = write_ads_export_package(
         out_dir=out_dir,
         model_kind="KBNN",
@@ -1220,7 +1515,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "include_coarse_input": model.include_coarse_input,
             "freq_transform": model.freq_transform,
             "layer_sizes": model.mlp.layer_sizes,
-            "coarse_mdif": args.coarse_mdif,
+            "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
+            "coarse_model": coarse_identity,
         },
         extra_notes=notes,
     )
@@ -1480,39 +1776,23 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     uses_coarse_inputs = bool(model.include_coarse_input or model.mode == "prior-input")
     adds_coarse_to_output = model.mode == "residual"
     needs_coarse_response = bool(uses_coarse_inputs or adds_coarse_to_output)
-    coarse_model = DNN.load(Path(args.coarse_model_dir)) if args.coarse_model_dir else None
-    if coarse_model is not None and not needs_coarse_response:
+    allow_coarse_hooks = bool(getattr(args, "allow_coarse_hooks", False))
+    if args.coarse_model_dir and not needs_coarse_response:
         raise ValueError(
             "--coarse-model-dir is only valid for residual or prior-input KBNN models"
         )
-    if coarse_model is not None:
-        if coarse_model.output_domain != "s":
-            raise ValueError(
-                "The embedded coarse DNN must be trained with --output-domain s because the "
-                "KBNN coarse response is an S-parameter matrix"
-            )
-        if coarse_model.parameter_names != model.parameter_names:
-            raise ValueError(
-                "The coarse DNN parameter names/order must match the KBNN: "
-                f"expected {model.parameter_names}, got {coarse_model.parameter_names}"
-            )
-        if coarse_model.sparam_labels != model.sparam_labels:
-            raise ValueError(
-                "The coarse DNN S-parameter labels/order must match the KBNN: "
-                f"expected {model.sparam_labels}, got {coarse_model.sparam_labels}"
-            )
-    allow_coarse_hooks = bool(getattr(args, "allow_coarse_hooks", False))
-    if needs_coarse_response and coarse_model is None and not allow_coarse_hooks:
-        raise ValueError(
-            "This KBNN requires a coarse response. For a self-contained Verilog-A package, "
-            "train an S-domain DNN on the coarse MDIF and pass --coarse-model-dir. "
-            "Use --allow-coarse-hooks only to intentionally generate the legacy incomplete "
-            "hook model."
+    coarse_model: DNN | None = None
+    coarse_identity: dict[str, object] | None = None
+    if needs_coarse_response and (args.coarse_model_dir or not allow_coarse_hooks):
+        coarse_model, coarse_identity = load_matching_coarse_dnn(
+            model_dir,
+            model,
+            args.coarse_model_dir,
         )
     embedded_coarse_model = None
-    if coarse_model is not None:
+    if coarse_model is not None and coarse_identity is not None:
         embedded_coarse_model = {
-            "source_model_dir": str(Path(args.coarse_model_dir)),
+            "source_model_dir": str(coarse_identity["source_model_dir"]),
             "parameter_names": coarse_model.parameter_names,
             "sparam_labels": coarse_model.sparam_labels,
             "freq_transform": coarse_model.freq_transform,
@@ -1533,7 +1813,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     ]
     if coarse_model is not None:
         notes.append(
-            "This package embeds the supplied coarse S-domain DNN and is fully self-contained; ADS only supplies geometry/process parameters and simulator frequency."
+            "This package embeds the exact frozen coarse S-domain DNN used during KBNN training and is fully self-contained; ADS only supplies geometry/process parameters and simulator frequency."
         )
     elif needs_coarse_response:
         notes.append(
@@ -1578,7 +1858,14 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             "model_family": "knowledge_based_neural_network",
             "mode": model.mode,
             "include_coarse_input": model.include_coarse_input,
-            "coarse_model_dir": str(Path(args.coarse_model_dir)) if args.coarse_model_dir else None,
+            "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
+            "coarse_model": coarse_identity,
+            "coarse_model_dir": (
+                str(coarse_identity["source_model_dir"])
+                if coarse_identity is not None
+                else None
+            ),
+            "coarse_model_match_verified": coarse_identity is not None,
             "fully_self_contained": bool(not needs_coarse_response or coarse_model is not None),
             "requires_coarse_hooks": bool(needs_coarse_response and coarse_model is None),
         },
@@ -1594,6 +1881,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "parameters": manifest["parameter_identifiers"],
         "parameter_input_scales": manifest["parameter_input_scales"],
         "coarse_model_dir": manifest["coarse_model_dir"],
+        "coarse_model_match_verified": manifest["coarse_model_match_verified"],
         "fully_self_contained": manifest["fully_self_contained"],
         "requires_coarse_hooks": manifest["requires_coarse_hooks"],
     }, indent=2))
@@ -1636,35 +1924,29 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
     }
     candidates = []
     keys = list(axes)
-    skipped_without_coarse = 0
+    skipped_without_coarse_model = 0
     for values in itertools.product(*(axes[key] for key in keys)):
         candidate = dict(zip(keys, values))
         if candidate["mode"] == "plain" and candidate["include_coarse_input"]:
             continue
         if candidate["mode"] == "prior-input" and not candidate["include_coarse_input"]:
             continue
-        if not args.coarse_mdif and (
-            candidate["mode"] == "prior-input" or bool(candidate["include_coarse_input"])
-        ):
-            skipped_without_coarse += 1
+        if not args.coarse_model_dir and candidate["mode"] != "plain":
+            skipped_without_coarse_model += 1
             continue
         candidates.append(candidate)
-    if skipped_without_coarse:
+    if skipped_without_coarse_model:
         print(
             "warning: skipped "
-            f"{skipped_without_coarse} KBNN candidate(s) that require --coarse-mdif",
-            file=sys.stderr,
-        )
-    if candidates and not args.coarse_mdif and any(candidate["mode"] == "residual" for candidate in candidates):
-        print(
-            "warning: --coarse-mdif was not supplied; residual KBNN candidates "
-            "will use a zero coarse response",
+            f"{skipped_without_coarse_model} KBNN candidate(s) that require "
+            "--coarse-mdif or --coarse-model-dir",
             file=sys.stderr,
         )
     if not candidates:
         raise ValueError(
-            "No valid KBNN sweep candidates. prior-input mode and coarse-input "
-            "residual candidates require --coarse-mdif."
+            "No valid KBNN sweep candidates. Residual and prior-input modes require "
+            "--coarse-mdif or --coarse-model-dir so the sweep uses the fitted "
+            "deployment model."
         )
     if args.mode == "random" and args.max_trials and args.max_trials < len(candidates):
         rng = np.random.default_rng(args.seed)
@@ -1686,8 +1968,7 @@ def namespace_for_trial(
     return argparse.Namespace(
         mdif=args.mdif,
         verification_mdif=args.verification_mdif,
-        coarse_mdif=args.coarse_mdif,
-        coarse_verification_mdif=args.coarse_verification_mdif,
+        coarse_model_dir=args.coarse_model_dir,
         out_dir=str(out_dir),
         split_var=args.split_var,
         train_values=args.train_values,
@@ -1748,9 +2029,14 @@ def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object],
 
 
 def command_sweep(args: argparse.Namespace) -> int:
-    return run_sweep_command(
-        args,
-        sweep_candidate_grid(args),
+    integrated_coarse_fit = bool(getattr(args, "coarse_mdif", None))
+    prepared_args = prepare_fitted_coarse_model(args, Path(args.out_dir))
+    # Trial directories are transient, so package the shared coarse model only
+    # after the winning fine model has been promoted into best_model/.
+    prepared_args.coarse_model_packaged = False
+    status = run_sweep_command(
+        prepared_args,
+        sweep_candidate_grid(prepared_args),
         worker_func=kbnn_sweep_trial_worker,
         namespace_for_trial_func=namespace_for_trial,
         train_func=command_train,
@@ -1759,8 +2045,65 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="kbnn_best_config.json",
         summary_filename="kbnn_sweep_summary.md",
         diagnostics_prefix="kbnn",
-        train_command_prefix=[sys.executable, "kbnn.py", "train"],
+        train_command_prefix=None,
     )
+    if integrated_coarse_fit and prepared_args.coarse_model_dir:
+        set_packaged_coarse_reference(
+            Path(prepared_args.out_dir) / "best_model",
+            Path(prepared_args.coarse_model_dir),
+        )
+    best_config_path = Path(prepared_args.out_dir) / "kbnn_best_config.json"
+    best_payload = json.loads(best_config_path.read_text())
+    best_candidate = dict(best_payload["config"])
+    best_uses_coarse = normalize_mode(str(best_candidate["mode"])) != "plain"
+    reproduction_args = namespace_for_trial(
+        prepared_args,
+        best_candidate,
+        Path(prepared_args.out_dir) / "reproduced_model",
+        int(best_payload["trial"]),
+        plots=prepared_args.worst_plots,
+    )
+    if not best_uses_coarse:
+        reproduction_args.coarse_model_dir = None
+    elif integrated_coarse_fit:
+        reproduction_args.coarse_model_dir = None
+        reproduction_args.coarse_mdif = args.coarse_mdif
+        reproduction_args.coarse_verification_mdif = getattr(
+            args,
+            "coarse_verification_mdif",
+            None,
+        )
+        for name in (
+            "coarse_hidden_layers",
+            "coarse_activation",
+            "coarse_freq_transform",
+            "coarse_learning_rate",
+            "coarse_epochs",
+            "coarse_batch_size",
+            "coarse_patience",
+            "coarse_loss_interval",
+            "coarse_progress_interval",
+            "coarse_seed",
+            "coarse_worst_plots",
+            "coarse_sparam_weights",
+        ):
+            setattr(reproduction_args, name, getattr(args, name, None))
+    reproduction_command = single_model_train_command(
+        [sys.executable, "kbnn.py", "train"],
+        reproduction_args,
+        Path(prepared_args.out_dir) / "reproduced_model",
+    )
+    best_payload["reproduction_command"] = reproduction_command
+    best_config_path.write_text(json.dumps(best_payload, indent=2))
+    summary_path = Path(prepared_args.out_dir) / "kbnn_sweep_summary.md"
+    summary_text = summary_path.read_text().rstrip()
+    summary_path.write_text(
+        f"{summary_text}\n\n## Reproduce Best Model\n\n```bash\n"
+        f"{reproduction_command}\n```\n"
+    )
+    print("reproduce best model:", flush=True)
+    print(reproduction_command, flush=True)
+    return status
 
 
 def command_rerank_sweep(args: argparse.Namespace) -> int:
@@ -1837,6 +2180,9 @@ def command_rerank_sweep(args: argparse.Namespace) -> int:
             best_model_dir,
             overwrite=overwrite,
         )
+        packaged_coarse_dir = sweep_dir / COARSE_MODEL_DIRNAME
+        if promoted and best_model_dir is not None and packaged_coarse_dir.is_dir():
+            set_packaged_coarse_reference(best_model_dir, packaged_coarse_dir)
 
     payload = {
         "sweep_dir": str(sweep_dir),
@@ -1882,8 +2228,25 @@ def command_inspect(args: argparse.Namespace) -> int:
 def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mdif", required=True, help="Fine/target S-parameter MDIF")
     parser.add_argument("--verification-mdif", help="Optional separate fine/target verification MDIF")
-    parser.add_argument("--coarse-mdif", help="Optional coarse/prior S-parameter MDIF")
-    parser.add_argument("--coarse-verification-mdif", help="Optional separate coarse/prior verification MDIF")
+    coarse_source = parser.add_mutually_exclusive_group()
+    coarse_source.add_argument(
+        "--coarse-mdif",
+        help=(
+            "Coarse/prior S-parameter MDIF. Fits and saves an S-domain DNN under "
+            "<out-dir>/coarse_model before fitting the KBNN."
+        ),
+    )
+    coarse_source.add_argument(
+        "--coarse-model-dir",
+        help=(
+            "Reuse an existing frozen S-domain DNN instead of fitting --coarse-mdif. "
+            "Residual and prior-input modes require one of these two coarse sources."
+        ),
+    )
+    parser.add_argument(
+        "--coarse-verification-mdif",
+        help="Optional separate verification MDIF used only while fitting --coarse-mdif",
+    )
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--split-var", default="dataset")
     parser.add_argument("--train-values", default="train,training")
@@ -1902,6 +2265,34 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--patience", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1234)
+    coarse_fit = parser.add_argument_group("integrated coarse DNN fitting")
+    coarse_fit.add_argument("--coarse-hidden-layers", default="64,64")
+    coarse_fit.add_argument("--coarse-activation", choices=["tanh", "relu"], default="tanh")
+    coarse_fit.add_argument(
+        "--coarse-freq-transform",
+        choices=["log", "linear", "log-linear"],
+        help="Coarse-DNN frequency transform. Defaults to --freq-transform.",
+    )
+    coarse_fit.add_argument("--coarse-learning-rate", type=float, default=2e-3)
+    coarse_fit.add_argument("--coarse-epochs", type=int, help="Defaults to --epochs")
+    coarse_fit.add_argument("--coarse-batch-size", type=int, help="Defaults to --batch-size")
+    coarse_fit.add_argument("--coarse-patience", type=int, help="Defaults to --patience")
+    coarse_fit.add_argument("--coarse-loss-interval", type=int, help="Defaults to --loss-interval")
+    coarse_fit.add_argument(
+        "--coarse-progress-interval",
+        type=int,
+        help="Defaults to --progress-interval",
+    )
+    coarse_fit.add_argument("--coarse-seed", type=int, help="Defaults to --seed")
+    coarse_fit.add_argument(
+        "--coarse-worst-plots",
+        type=int,
+        help="Defaults to --worst-plots",
+    )
+    coarse_fit.add_argument(
+        "--coarse-sparam-weights",
+        help="Optional coarse-DNN S-parameter weights. Defaults to --sparam-weights.",
+    )
     add_debug_argument(
         parser,
         (
@@ -1914,7 +2305,7 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a knowledge-based neural network from fine/coarse S-parameter MDIF data."
+        description="Fit a coarse S-domain DNN and fine knowledge-based neural network as one Verilog-A-ready workflow."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2073,7 +2464,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     predict = sub.add_parser("predict", help="Predict S-parameters for MDIF parameter blocks")
     predict.add_argument("--model-dir", required=True)
     predict.add_argument("--mdif", required=True)
-    predict.add_argument("--coarse-mdif", help="Coarse/prior MDIF for residual or prior-input models")
+    predict.add_argument(
+        "--coarse-model-dir",
+        help="Matching fitted coarse DNN; defaults to the path recorded during KBNN training",
+    )
     predict.add_argument("--out-mdif", required=True)
     predict.set_defaults(func=command_predict)
 
@@ -2089,8 +2483,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="MDIF containing the exact parameter/frequency blocks to evaluate; S-data is ignored",
     )
     export_ads.add_argument(
-        "--coarse-mdif",
-        help="Coarse/prior MDIF evaluated during export for residual or prior-input models",
+        "--coarse-model-dir",
+        help="Matching fitted coarse DNN; defaults to the path recorded during KBNN training",
     )
     export_ads.add_argument(
         "--parameter-grid",
@@ -2169,8 +2563,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_va.add_argument(
         "--coarse-model-dir",
         help=(
-            "Directory containing an S-domain DNN trained on the KBNN coarse MDIF. "
-            "Required for a self-contained residual or prior-input export."
+            "Matching frozen S-domain DNN used during KBNN training. Defaults to the "
+            "recorded training path; hashes must match for a self-contained export."
         ),
     )
     export_va.add_argument("--out-dir", required=True, help="Output directory for the Verilog-A package")
