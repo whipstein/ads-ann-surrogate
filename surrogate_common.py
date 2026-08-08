@@ -1660,19 +1660,21 @@ def _append_veriloga_dc_stamps(
     lines: list[str],
     port_ids: Sequence[str],
 ) -> None:
-    """Append the fixed resistor network used only at exact DC."""
+    """Append the fixed resistor network, gated on only at exact DC."""
 
     nports = len(port_ids)
     if nports == 1:
         lines.append(
-            f"      I({port_ids[0]}) <+ V({port_ids[0]})/dc_equivalent_resistance_ohm;"
+            f"    I({port_ids[0]}) <+ dc_operating_point*V({port_ids[0]})/"
+            "dc_equivalent_resistance_ohm;"
         )
         return
     branch_factor = veriloga_float(float(nports) / 2.0)
     for first, port_i in enumerate(port_ids):
         for port_j in port_ids[first + 1 :]:
             lines.append(
-                f"      I({port_i}, {port_j}) <+ V({port_i}, {port_j})/"
+                f"    I({port_i}, {port_j}) <+ dc_operating_point*"
+                f"V({port_i}, {port_j})/"
                 f"(({branch_factor})*dc_equivalent_resistance_ohm);"
             )
 
@@ -1683,7 +1685,12 @@ def _append_veriloga_port_stamps(
     real_by_flat: Sequence[str],
     imag_by_flat: Sequence[str],
 ) -> None:
-    """Append fitted positive-frequency small-signal contributions."""
+    """Append fitted small-signal contributions, gated off at exact DC.
+
+    Keep ``ddt`` outside procedural conditionals. ADS and other Verilog-A
+    compilers reject analog operators in a runtime ``if`` branch even when the
+    condition is derived from simulator frequency.
+    """
 
     lines.append("    omega = 6.2831853071795864769*freq_hz;")
     lines.append("    if (omega < 1.0e-30) omega = 1.0e-30;")
@@ -1692,8 +1699,9 @@ def _append_veriloga_port_stamps(
         for col, port_j in enumerate(port_ids):
             flat = row * nports + col
             lines.append(
-                f"    I({port_i}) <+ ({real_by_flat[flat]})*V({port_j}) + "
-                f"(({imag_by_flat[flat]})/omega)*ddt(V({port_j}));"
+                f"    I({port_i}) <+ (1.0 - dc_operating_point)*("
+                f"({real_by_flat[flat]})*V({port_j}) + "
+                f"(({imag_by_flat[flat]})/omega)*ddt(V({port_j})));"
             )
 
 
@@ -1841,12 +1849,15 @@ model-training unit".
 
 ## Distinct DC Point
 
-At an exact simulator frequency of zero, the fitted neural/rational response is
-bypassed completely. The module instead uses the fixed, parameter-independent
-equivalent resistance `{dc_equivalent_resistance_ohm:.17g} ohm` extracted from
-the training data. For a multiport, equal resistors form a complete graph sized
-so that the equivalent resistance measured between any two ports is that value.
-Positive frequencies continue to use the fitted response.
+At an exact simulator frequency of zero, the fitted neural/rational contribution
+is electrically disabled. The module instead uses the fixed,
+parameter-independent equivalent resistance
+`{dc_equivalent_resistance_ohm:.17g} ohm` extracted from the training data. For
+a multiport, equal resistors form a complete graph sized so that the equivalent
+resistance measured between any two ports is that value. Positive frequencies
+use the complementary fitted-response contribution. The contributions are
+multiplied by enable factors rather than placed in a procedural conditional, so
+the `ddt()` analog operator remains in a legal Verilog-A context.
 
 ## Implementation
 
@@ -2189,9 +2200,7 @@ def veriloga_module_text(
     lines.extend(["", "  analog begin"])
     lines.append(f"    freq_hz = {frequency_expression};")
     lines.append("    dc_operating_point = (freq_hz == 0.0);")
-    lines.append("    if (dc_operating_point != 0) begin")
     _append_veriloga_dc_stamps(lines, port_ids)
-    lines.append("    end else begin")
     lines.append("    if (clamp_frequency != 0 && freq_hz < min_frequency_hz) freq_hz = min_frequency_hz;")
     lines.append("    freq_log10_hz = log(freq_hz)/log(10.0);")
     lines.append("")
@@ -2336,7 +2345,7 @@ def veriloga_module_text(
         stamp_real = [f"yr[{flat}]" for flat in range(matrix_size)]
         stamp_imag = [f"yi[{flat}]" for flat in range(matrix_size)]
     _append_veriloga_port_stamps(lines, port_ids, stamp_real, stamp_imag)
-    lines.extend(["    end", "  end", "endmodule", ""])
+    lines.extend(["  end", "endmodule", ""])
 
     output_columns = (
         sparameter_real_imag_columns(sparam_labels, prefix="fine_y")
@@ -2717,9 +2726,7 @@ def neurotf_veriloga_module_text(
     lines.extend(["", "  analog begin"])
     lines.append(f"    freq_hz = {frequency_expression};")
     lines.append("    dc_operating_point = (freq_hz == 0.0);")
-    lines.append("    if (dc_operating_point != 0) begin")
     _append_veriloga_dc_stamps(lines, port_ids)
-    lines.append("    end else begin")
     lines.append(
         "    if (clamp_frequency != 0 && freq_hz < min_frequency_hz) "
         "freq_hz = min_frequency_hz;"
@@ -2800,7 +2807,7 @@ def neurotf_veriloga_module_text(
         [f"yr[{flat}]" for flat in range(matrix_size)],
         [f"yi[{flat}]" for flat in range(matrix_size)],
     )
-    lines.extend(["    end", "  end", "endmodule", ""])
+    lines.extend(["  end", "endmodule", ""])
 
     coefficient_columns = [
         f"{label}_c{coeff_idx}_real"

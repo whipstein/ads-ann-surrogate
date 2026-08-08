@@ -378,10 +378,11 @@ equivalent resistance in `metadata.json` and reports it in
 At exactly zero Hz, prediction and sampled-MDIF export use an equal-resistance
 port network whose equivalent resistance between any two ports is the saved
 average. Sampled ADS exports prepend this zero-Hz point automatically. Direct
-Verilog-A exports bypass all fitted network/rational arithmetic at DC and stamp
-the resistor network instead; positive frequencies continue to use the fitted
-model. Existing saved models must be retrained to acquire this data-derived DC
-value.
+Verilog-A exports electrically disable the fitted-response stamps at DC and
+enable the resistor network instead; positive frequencies use the complementary
+fitted-response stamps. The contributions are gated without placing `ddt()` in
+a conditional, which keeps the generated source legal for ADS Verilog-A.
+Existing saved models must be retrained to acquire this data-derived DC value.
 
 For an integrated residual or prior-input KBNN, the coarse DNN and fine KBNN
 store their own independently extracted resistance values. The composite
