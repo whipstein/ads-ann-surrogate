@@ -365,8 +365,10 @@ equivalent resistance in `metadata.json` and reports it in
 `training_summary.md`. The corresponding real/imaginary S-point is stored under
 `dc_sparameters`. It is deliberately separate from the fitted response:
 
-1. For each training block, the lowest positive-frequency S-matrix is converted
-   to Y using the model reference impedance.
+1. If every training block contains an exact zero-Hz row, that S-matrix is
+   converted to Y using the model reference impedance. If no block contains
+   zero Hz, the lowest positive-frequency row is used as an explicit fallback.
+   Mixing blocks with and without zero-Hz rows is rejected.
 2. A one-amp balanced current is applied between each port pair with all other
    ports open; the real differential voltage gives that pair's equivalent
    resistance.
@@ -379,9 +381,10 @@ At exactly zero Hz, prediction and sampled-MDIF export use an equal-resistance
 port network whose equivalent resistance between any two ports is the saved
 average. Sampled ADS exports prepend this zero-Hz point automatically. Direct
 Verilog-A exports electrically disable the fitted-response stamps at DC and
-enable the resistor network instead; positive frequencies use the complementary
-fitted-response stamps. The contributions are gated without placing `ddt()` in
-a conditional, which keeps the generated source legal for ADS Verilog-A.
+enable the resistor network instead; positive frequencies use the fitted
+response. The exporter selects DC or fitted Y coefficients before an
+unconditional current contribution, so `ddt()` is never placed in a conditional
+and the generated source remains legal for ADS Verilog-A.
 Existing saved models must be retrained to acquire this data-derived DC value.
 
 For an integrated residual or prior-input KBNN, the coarse DNN and fine KBNN

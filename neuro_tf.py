@@ -542,6 +542,8 @@ def command_train(args: argparse.Namespace) -> int:
         "ridge": args.ridge,
         "f_scale": f_scale,
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+        "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_is_separate_from_fitted_response": True,
         "hidden_layers": args.hidden_layers,
@@ -605,6 +607,8 @@ def command_train(args: argparse.Namespace) -> int:
             "sparameters": sparam_labels,
             "n_poles": args.order,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+            "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
             "frequency_weights": metadata["frequency_weights"],
             "frequency_weight_mean": metadata["frequency_weight_mean"],
             "export_commands": dict(export_commands),
@@ -673,6 +677,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
 def command_export_veriloga(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = NeuroTF.load(model_dir)
+    source_metadata = read_model_metadata(str(model_dir))
     out_dir = Path(args.out_dir)
     module_name = args.module_name or f"{normalize_name(model_dir.name) or 'neuro_tf'}_va"
     parameter_input_scales = parse_parameter_scale_spec(
@@ -699,6 +704,14 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         parameter_input_scales=parameter_input_scales,
         dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
         source_model_dir=str(model_dir),
+        extra_manifest={
+            "dc_resistance_source_kind": source_metadata.get(
+                "dc_resistance_source_kind"
+            ),
+            "dc_resistance_pair_means_ohm": source_metadata.get(
+                "dc_resistance_pair_means_ohm"
+            ),
+        },
     )
     print(json.dumps({
         "out_dir": str(out_dir),
@@ -713,6 +726,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "f_scale": manifest["f_scale"],
         "fully_self_contained": manifest["fully_self_contained"],
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
+        "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
+        "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
     }, indent=2))
     return 0
 

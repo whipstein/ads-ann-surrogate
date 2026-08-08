@@ -1537,6 +1537,8 @@ def command_train(args: argparse.Namespace) -> int:
         "include_coarse_input": model.include_coarse_input,
         "freq_transform": model.freq_transform,
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+        "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_is_separate_from_fitted_response": True,
         "coarse_source": metadata["coarse_source"],
@@ -1617,6 +1619,8 @@ def command_train(args: argparse.Namespace) -> int:
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+            "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
@@ -1963,6 +1967,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
 def command_export_veriloga(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = KBNN.load(model_dir)
+    source_metadata = read_model_metadata(str(model_dir))
     out_dir = Path(args.out_dir)
     module_name = args.module_name or f"{normalize_name(model_dir.name) or 'kbnn'}_va"
     parameter_input_scales = parse_parameter_scale_spec(
@@ -2066,6 +2071,12 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             "coarse_model_match_verified": coarse_identity is not None,
             "fully_self_contained": bool(not needs_coarse_response or coarse_model is not None),
             "requires_coarse_hooks": bool(needs_coarse_response and coarse_model is None),
+            "dc_resistance_source_kind": source_metadata.get(
+                "dc_resistance_source_kind"
+            ),
+            "dc_resistance_pair_means_ohm": source_metadata.get(
+                "dc_resistance_pair_means_ohm"
+            ),
         },
         extra_notes=notes,
     )
@@ -2083,6 +2094,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "fully_self_contained": manifest["fully_self_contained"],
         "requires_coarse_hooks": manifest["requires_coarse_hooks"],
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
+        "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
+        "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
     }, indent=2))
     return 0
 

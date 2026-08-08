@@ -627,6 +627,8 @@ def command_train(args: argparse.Namespace) -> int:
         "output_domain": model.output_domain,
         "target_z0": model.target_z0,
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+        "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_is_separate_from_fitted_response": True,
         "hidden_layers": args.hidden_layers,
@@ -695,6 +697,8 @@ def command_train(args: argparse.Namespace) -> int:
             "output_domain": model.output_domain,
             "target_z0": model.target_z0,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+            "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
             "layer_sizes": model.mlp.layer_sizes,
             "sparam_weights": metadata["sparam_weights"],
             "normalized_sparam_weights": metadata["normalized_sparam_weights"],
@@ -908,6 +912,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
 def command_export_veriloga(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = DNN.load(model_dir)
+    source_metadata = read_model_metadata(str(model_dir))
     out_dir = Path(args.out_dir)
     module_name = args.module_name or f"{normalize_name(model_dir.name) or 'dnn'}_va"
     parameter_input_scales = parse_parameter_scale_spec(
@@ -964,6 +969,12 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             "fully_self_contained": True,
             "training_output_domain": model.output_domain,
             "training_target_z0": model.target_z0,
+            "dc_resistance_source_kind": source_metadata.get(
+                "dc_resistance_source_kind"
+            ),
+            "dc_resistance_pair_means_ohm": source_metadata.get(
+                "dc_resistance_pair_means_ohm"
+            ),
         },
         extra_notes=export_notes,
     )
@@ -980,6 +991,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "folded_input_scaler": manifest["folded_input_scaler"],
         "folded_output_scaler": manifest["folded_output_scaler"],
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
+        "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
+        "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
     }, indent=2))
     return 0
 

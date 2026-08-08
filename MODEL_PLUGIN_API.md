@@ -140,6 +140,10 @@ Store `dc_metadata` in `metadata.json` and place
 `apply_distinct_dc_response()` after forming its normal S-parameter values.
 This guarantees that zero-Hz input data cannot affect fitted weights or poles.
 
+`extract_average_dc_resistance()` uses exact zero-Hz rows when every training
+block supplies one. It falls back to each block's lowest positive-frequency row
+only when the dataset contains no zero-Hz rows, and rejects mixed coverage.
+
 `build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
 Direct Verilog-A writers must receive the saved
 `dc_equivalent_resistance_ohm`; the shared writers then stamp the distinct
