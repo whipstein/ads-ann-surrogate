@@ -504,6 +504,8 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
             getattr(args, "progress_label", "DNN fit"),
             args.epochs,
             progress_interval,
+            stream=getattr(args, "progress_stream", None),
+            terminal_only=bool(getattr(args, "progress_terminal_only", False)),
         ),
         progress_interval=progress_interval,
     )

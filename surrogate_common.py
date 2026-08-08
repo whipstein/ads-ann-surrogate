@@ -2784,9 +2784,20 @@ def make_training_progress_callback(
     label: str,
     epochs: int,
     progress_interval: int | None,
+    stream: object | None = None,
+    terminal_only: bool = False,
 ) -> Callable[[dict[str, object]], None] | None:
     if progress_interval is None or int(progress_interval) <= 0:
         return None
+    output = stream if stream is not None else sys.stderr
+    isatty = getattr(output, "isatty", None)
+    if terminal_only:
+        terminal_name = str(os.environ.get("TERM") or "").strip().lower()
+        redraw_supported = bool(isatty and isatty()) and terminal_name != "dumb"
+        if not redraw_supported:
+            return None
+    write = getattr(output, "write")
+    flush = getattr(output, "flush")
     total_epochs = max(1, int(epochs))
     start_time = time.monotonic()
 
@@ -2822,11 +2833,11 @@ def make_training_progress_callback(
         if event.get("stopped"):
             parts.append("early_stop")
         if is_final:
-            sys.stderr.write("\r\033[2K")
-            sys.stderr.flush()
+            write("\r\033[2K")
+            flush()
             return
-        sys.stderr.write("\r\033[2K" + " ".join(parts))
-        sys.stderr.flush()
+        write("\r\033[2K" + " ".join(parts))
+        flush()
 
     return callback
 

@@ -162,6 +162,8 @@ def coarse_dnn_train_namespace(args: argparse.Namespace, out_dir: Path) -> argpa
             else coarse_progress_interval
         ),
         progress_label="Coarse DNN fit",
+        progress_stream=sys.stdout,
+        progress_terminal_only=True,
         seed=args.seed if coarse_seed is None else coarse_seed,
         output_domain="s",
         target_z0=50.0,
