@@ -2770,6 +2770,29 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def fit_terminal_status_line(text: str, columns: int) -> str:
+    """Keep a redrawable status below the terminal's automatic-wrap width."""
+
+    limit = max(1, int(columns) - 1)
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return "." * limit
+    return text[: limit - 3].rstrip() + "..."
+
+
+def terminal_status_line(text: str, stream: object | None = None) -> str:
+    """Fit a status line to the attached terminal, with a stable fallback."""
+
+    output = stream if stream is not None else sys.stderr
+    fileno = getattr(output, "fileno", None)
+    try:
+        columns = os.get_terminal_size(fileno()).columns if fileno else 120
+    except (OSError, TypeError, ValueError):
+        columns = 120
+    return fit_terminal_status_line(text, columns)
+
+
 def progress_interval_from_args(args: argparse.Namespace, default: int = 25) -> int:
     raw_value = getattr(args, "progress_interval", default)
     if raw_value is None:
@@ -2825,7 +2848,7 @@ def make_training_progress_callback(
             sys.stderr.write("\r\033[2K")
             sys.stderr.flush()
             return
-        sys.stderr.write("\r\033[2K" + " ".join(parts))
+        sys.stderr.write("\r\033[2K" + terminal_status_line(" ".join(parts)))
         sys.stderr.flush()
 
     return callback

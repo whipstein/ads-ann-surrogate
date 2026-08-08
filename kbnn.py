@@ -84,6 +84,7 @@ from surrogate_common import (  # noqa: E402
     split_blocks,
     sweep_arg_values,
     sweep_trial_seed,
+    terminal_status_line,
     trial_plot_paths,
     verification_metrics,
     write_training_verification_artifacts,
@@ -203,7 +204,6 @@ def coarse_fit_status_line(model_dir: Path) -> str:
             f"RMSE={metric(summary.get('rmse_abs'))}",
             f"pv={metric(passivity.get('violating_points'))}",
             f"sigma={metric(passivity.get('max_singular_value'))}",
-            f"model={model_dir}",
         ]
     )
 
@@ -211,7 +211,8 @@ def coarse_fit_status_line(model_dir: Path) -> str:
 def finish_coarse_fit_status(model_dir: Path) -> None:
     """Replace the live coarse progress line with its final metrics."""
 
-    sys.stderr.write(f"\r\033[2K{coarse_fit_status_line(model_dir)}\n")
+    status = terminal_status_line(coarse_fit_status_line(model_dir))
+    sys.stderr.write(f"\r\033[2K{status}\n")
     sys.stderr.flush()
 
 
