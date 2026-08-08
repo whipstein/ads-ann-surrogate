@@ -39,8 +39,10 @@ from surrogate_common import (
     apply_distinct_dc_response,
     common_sparameter_labels,
     extract_average_dc_resistance,
+    frequency_weights_from_blocks,
     infer_parameter_names,
     make_training_progress_callback,
+    normalize_frequency_weights,
     parse_csv_set,
     progress_interval_from_args,
     positive_frequency_blocks,
@@ -154,6 +156,16 @@ def train_model(args: argparse.Namespace):
 def command_train(args: argparse.Namespace) -> int:
     ...
 ```
+
+Training and sweep commands should accept `--frequency-weights`. Parse the
+positive-frequency training rows with `frequency_weights_from_blocks()` and
+normalize them with `normalize_frequency_weights()` before applying them to
+the fitted loss. Supported selectors are `all`/`default`/`*`, exact
+engineering-unit frequencies, and inclusive `start:stop` ranges. Store the
+original specification, raw mean, minimum, maximum, and normalization note in
+`metadata.json`. If a model has a separate intermediate frequency-domain fit,
+such as Neuro-TF rational coefficient extraction, apply the weights at that
+stage.
 
 `train_model` is plugin-specific. It usually:
 
@@ -439,10 +451,12 @@ Common data and parsing:
 
 Metrics and weighting:
 
-- `verification_metrics(truth_blocks, pred_blocks, labels, parameter_names, sparam_weights)`
+- `verification_metrics(truth_blocks, pred_blocks, labels, parameter_names, sparam_weights, frequency_weights)`
 - `parse_sparam_weights(labels, spec)`
 - `normalize_sparam_weights(labels, weights)`
 - `output_weights_from_sparam_weights(labels, weights)`
+- `frequency_weights_from_blocks(blocks, spec)`
+- `normalize_frequency_weights(weights)`
 - `passivity_summary(blocks, labels)`
 - `summary_metric(summary, metric_name)`
 
@@ -450,7 +464,7 @@ Training helpers:
 
 - `MLP`
 - `Standardizer`
-- `mse(pred, truth, output_weights=None)`
+- `mse(pred, truth, output_weights=None, sample_weights=None)`
 - `write_history(path, history)`
 
 Plots and summaries:

@@ -3256,6 +3256,125 @@ def output_weights_from_sparam_weights(
     return values
 
 
+def frequency_weights_for_values(
+    freq_hz: np.ndarray,
+    spec: str | None,
+    *,
+    require_all_rules_match: bool = True,
+) -> np.ndarray:
+    """Return raw per-frequency weights from exact-frequency and range rules.
+
+    Rules use ``selector=weight`` entries separated by semicolons. A selector
+    is ``all``/``default``, one frequency, or an inclusive ``start:stop``
+    range. Commas may combine selectors on the left side, and later rules
+    override earlier rules.
+    """
+
+    frequencies = np.asarray(freq_hz, dtype=float).reshape(-1)
+    weights = np.ones(frequencies.shape, dtype=float)
+    if not spec:
+        return weights
+
+    rules = [rule.strip() for rule in str(spec).split(";") if rule.strip()]
+    if not rules:
+        return weights
+    for rule in rules:
+        if "=" not in rule:
+            raise ValueError(
+                f"Frequency weight rule {rule!r} must look like selector=weight"
+            )
+        left, right = rule.rsplit("=", 1)
+        try:
+            weight = float(right.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid frequency weight in {rule!r}") from exc
+        if weight < 0.0 or not math.isfinite(weight):
+            raise ValueError(
+                f"Frequency weights must be finite and non-negative, got {weight}"
+            )
+        selectors = [part.strip() for part in left.split(",") if part.strip()]
+        if not selectors:
+            raise ValueError(f"Frequency weight rule {rule!r} has no selector")
+        rule_mask = np.zeros(frequencies.shape, dtype=bool)
+        for selector in selectors:
+            normalized = selector.lower().replace(" ", "")
+            if normalized in {"all", "default", "*"}:
+                selector_mask = np.ones(frequencies.shape, dtype=bool)
+            elif ":" in selector:
+                parts = [part.strip() for part in selector.split(":")]
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"Frequency range {selector!r} must look like start:stop"
+                    )
+                start = parse_number(parts[0])
+                stop = parse_number(parts[1])
+                if start is None or stop is None:
+                    raise ValueError(f"Could not parse frequency range {selector!r}")
+                if start > stop:
+                    raise ValueError(
+                        f"Frequency range start must not exceed stop in {selector!r}"
+                    )
+                selector_mask = (frequencies >= float(start)) & (
+                    frequencies <= float(stop)
+                )
+            else:
+                target = parse_number(selector)
+                if target is None:
+                    raise ValueError(f"Could not parse frequency selector {selector!r}")
+                selector_mask = np.isclose(
+                    frequencies,
+                    float(target),
+                    rtol=1.0e-12,
+                    atol=max(1.0e-12, abs(float(target)) * 1.0e-12),
+                )
+            rule_mask |= selector_mask
+        if require_all_rules_match and not np.any(rule_mask):
+            raise ValueError(
+                f"Frequency weight selector {left!r} did not match any fitted frequency"
+            )
+        weights[rule_mask] = weight
+
+    if weights.size and float(np.sum(weights)) <= EPS:
+        raise ValueError("At least one fitted frequency weight must be greater than zero")
+    return weights
+
+
+def frequency_weights_from_blocks(
+    blocks: Sequence[MDIFBlock],
+    spec: str | None,
+    *,
+    require_all_rules_match: bool = True,
+) -> np.ndarray:
+    """Return weights aligned with the concatenated sample rows of MDIF blocks."""
+
+    frequencies = (
+        np.concatenate([np.asarray(block.freq_hz, dtype=float) for block in blocks])
+        if blocks
+        else np.asarray([], dtype=float)
+    )
+    return frequency_weights_for_values(
+        frequencies,
+        spec,
+        require_all_rules_match=require_all_rules_match,
+    )
+
+
+def normalize_frequency_weights(
+    weights: np.ndarray,
+    *,
+    mean: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Normalize per-sample frequency weights and return the applied raw mean."""
+
+    values = np.asarray(weights, dtype=float).reshape(-1)
+    if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError("Frequency weights must be finite and non-negative")
+    applied_mean = float(np.mean(values)) if mean is None else float(mean)
+    if not math.isfinite(applied_mean) or applied_mean <= EPS:
+        raise ValueError("At least one fitted frequency weight must be greater than zero")
+    return values / applied_mean, applied_mean
+
+
 
 
 class Standardizer:
@@ -3364,6 +3483,8 @@ class MLP:
         loss_interval: int = 1,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
         progress_interval: int = 25,
+        sample_weights: np.ndarray | None = None,
+        val_sample_weights: np.ndarray | None = None,
     ) -> list[dict[str, float]]:
         if output_weights is None:
             output_weights = np.ones(y_train.shape[1], dtype=float)
@@ -3374,6 +3495,41 @@ class MLP:
                     f"Expected {y_train.shape[1]} output weights, got {output_weights.shape}"
                 )
         weighted_outputs = bool(np.any(np.abs(output_weights - 1.0) > 1e-15))
+        if sample_weights is None:
+            sample_weights = np.ones(len(x_train), dtype=float)
+        else:
+            sample_weights = np.asarray(sample_weights, dtype=float).reshape(-1)
+            if sample_weights.shape != (len(x_train),):
+                raise ValueError(
+                    f"Expected {len(x_train)} training sample weights, got "
+                    f"{sample_weights.shape}"
+                )
+            if np.any(~np.isfinite(sample_weights)) or np.any(sample_weights < 0.0):
+                raise ValueError("Training sample weights must be finite and non-negative")
+            if float(np.sum(sample_weights)) <= EPS:
+                raise ValueError("At least one training sample weight must be greater than zero")
+        weighted_samples = bool(np.any(np.abs(sample_weights - 1.0) > 1e-15))
+        if x_val is None or y_val is None:
+            val_sample_weights = None
+        elif val_sample_weights is None:
+            val_sample_weights = np.ones(len(x_val), dtype=float)
+        else:
+            val_sample_weights = np.asarray(val_sample_weights, dtype=float).reshape(-1)
+            if val_sample_weights.shape != (len(x_val),):
+                raise ValueError(
+                    f"Expected {len(x_val)} validation sample weights, got "
+                    f"{val_sample_weights.shape}"
+                )
+            if np.any(~np.isfinite(val_sample_weights)) or np.any(
+                val_sample_weights < 0.0
+            ):
+                raise ValueError(
+                    "Validation sample weights must be finite and non-negative"
+                )
+            if float(np.sum(val_sample_weights)) <= EPS:
+                raise ValueError(
+                    "At least one validation sample weight must be greater than zero"
+                )
         rng = np.random.default_rng(seed)
         m_w = [np.zeros_like(w) for w in self.weights]
         v_w = [np.zeros_like(w) for w in self.weights]
@@ -3409,6 +3565,8 @@ class MLP:
                 delta = pred - yb
                 if weighted_outputs:
                     delta *= output_weights[None, :]
+                if weighted_samples:
+                    delta *= sample_weights[indices, None]
                 delta *= scale_base / len(xb)
                 grad_w: list[np.ndarray | None] = [None] * n_layers
                 grad_b: list[np.ndarray | None] = [None] * n_layers
@@ -3462,9 +3620,19 @@ class MLP:
                     )
                 continue
 
-            train_loss = mse(self.predict(x_train), y_train, output_weights=output_weights)
+            train_loss = mse(
+                self.predict(x_train),
+                y_train,
+                output_weights=output_weights,
+                sample_weights=sample_weights,
+            )
             val_loss = (
-                mse(self.predict(x_val), y_val, output_weights=output_weights)
+                mse(
+                    self.predict(x_val),
+                    y_val,
+                    output_weights=output_weights,
+                    sample_weights=val_sample_weights,
+                )
                 if x_val is not None and y_val is not None
                 else train_loss
             )
@@ -3506,12 +3674,20 @@ def mse(
     pred: np.ndarray | None,
     truth: np.ndarray | None,
     output_weights: np.ndarray | None = None,
+    sample_weights: np.ndarray | None = None,
 ) -> float:
     if pred is None or truth is None:
         return float("nan")
     err2 = (pred - truth) ** 2
     if output_weights is not None:
         err2 = err2 * np.asarray(output_weights, dtype=float)[None, :]
+    if sample_weights is not None:
+        weights = np.asarray(sample_weights, dtype=float).reshape(-1)
+        if weights.shape != (err2.shape[0],):
+            raise ValueError(
+                f"Expected {err2.shape[0]} sample weights, got {weights.shape}"
+            )
+        err2 = err2 * weights[:, None]
     return float(np.mean(err2))
 
 
@@ -3685,6 +3861,7 @@ def verification_metrics(
     labels: Sequence[str],
     parameter_names: Sequence[str],
     sparam_weights: dict[str, float] | None = None,
+    frequency_weights: str | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     label_weights = sparam_weights or {label: 1.0 for label in labels}
     normalized_label_weights = normalize_sparam_weights(labels, label_weights)
@@ -3697,6 +3874,14 @@ def verification_metrics(
     all_normalized_weights = []
     all_normalized_db_weights = []
     for truth, pred in zip(truth_blocks, pred_blocks):
+        raw_frequency_weights = frequency_weights_for_values(
+            truth.freq_hz,
+            frequency_weights,
+            require_all_rules_match=False,
+        )
+        normalized_frequency_weights, block_frequency_weight_mean = (
+            normalize_frequency_weights(raw_frequency_weights)
+        )
         base: dict[str, object] = {"source_index": truth.source_index}
         for name in parameter_names:
             base[name] = truth.params.get(name, "")
@@ -3715,12 +3900,14 @@ def verification_metrics(
             )
             all_abs_errors.append(abs_err)
             all_truth_magnitudes.append(truth_mag)
-            all_weights.append(np.full_like(abs_err, weight, dtype=float))
-            all_normalized_weights.append(np.full_like(abs_err, normalized_weight, dtype=float))
+            all_weights.append(raw_frequency_weights * weight)
+            all_normalized_weights.append(
+                normalized_frequency_weights * normalized_weight
+            )
             if db_err.size:
                 all_db_errors.append(db_err)
                 all_normalized_db_weights.append(
-                    np.full_like(db_err, normalized_weight, dtype=float)
+                    normalized_frequency_weights[db_mask] * normalized_weight
                 )
                 rmse_db: float | None = float(np.sqrt(np.mean(db_err**2)))
                 max_abs_db: float | None = float(np.max(np.abs(db_err)))
@@ -3734,6 +3921,9 @@ def verification_metrics(
                     "sparam": label,
                     "sparam_weight": weight,
                     "normalized_sparam_weight": normalized_weight,
+                    "frequency_weight_mean": block_frequency_weight_mean,
+                    "frequency_weight_min": float(np.min(raw_frequency_weights)),
+                    "frequency_weight_max": float(np.max(raw_frequency_weights)),
                     "rmse_abs": float(np.sqrt(np.mean(abs_err**2))),
                     "mean_abs": float(np.mean(abs_err)),
                     "max_abs": float(np.max(abs_err)),
@@ -3788,11 +3978,13 @@ def verification_metrics(
             ),
             "db_magnitude_floor": DB_MAG_FLOOR,
             "evm_definition": "sqrt(mean(|pred-truth|^2) / mean(|truth|^2))",
-            "weighted_evm_definition": "sqrt(sum(weight[Sij]*|pred-truth|^2) / sum(weight[Sij]*|truth|^2))",
+            "weighted_evm_definition": "sqrt(sum(weight[Sij]*weight[f]*|pred-truth|^2) / sum(weight[Sij]*weight[f]*|truth|^2))",
             "sparam_weights": {label: float(label_weights.get(label, 1.0)) for label in labels},
             "normalized_sparam_weights": normalized_label_weights,
             "sparam_weight_mean": weight_mean,
             "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training and scale-sensitive weighted RMSE/MAE metrics, so the average normalized weight is 1.0.",
+            "frequency_weights": frequency_weights,
+            "frequency_weight_normalization": "Frequency weights are normalized to mean 1 over each verification block before scale-sensitive weighted metrics are calculated.",
         }
     else:
         summary = {
@@ -5319,6 +5511,7 @@ def write_training_verification_artifacts(
     sparam_weights: dict[str, float] | None = None,
     y_z0: float = 50.0,
     title_context: str | None = None,
+    frequency_weights: str | None = None,
 ) -> dict[str, object]:
     write_mdif(out_dir / "predicted_verification.mdif", pred_blocks, labels)
     metric_rows, summary = verification_metrics(
@@ -5327,6 +5520,7 @@ def write_training_verification_artifacts(
         labels,
         parameter_names,
         sparam_weights=sparam_weights,
+        frequency_weights=frequency_weights,
     )
     write_csv(out_dir / "verification_metrics.csv", metric_rows)
     plot_paths = plot_worst_case_fits(

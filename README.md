@@ -530,6 +530,7 @@ self-contained Verilog-A and sampled ADS MDIF export commands.
 | <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | Random seed for holdout splitting and neural-network initialization. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss weights. Supports grouped selectors such as `diag`, `offdiag`, `row1`, `col2`, wildcards, and comma-separated explicit labels. Later rules override earlier rules. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional per-frequency loss weights. Select exact frequencies or inclusive ranges; later rules override earlier rules and weights are normalized to mean 1. | <nobr><code>--frequency-weights 'default=1;1GHz=5;2GHz:4GHz=3'</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | Name of the `VAR` used to split a combined MDIF. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--target-z0 FLOAT</code></nobr> | Reference impedance used only when `--output-domain y` converts S-parameters into Y-parameter training targets. Use the same value as the MDIF option line reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
 | <nobr><code>--train-values LIST</code></nobr> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
@@ -594,6 +595,37 @@ Available selectors:
 - Wildcards such as `S1*` or `S*1`
 - Explicit groups such as `S11,S22,S33,S44`
 
+#### Frequency weighting
+
+Use `--frequency-weights` with DNN, KBNN, or Neuro-TF training and sweep
+commands to prioritize particular frequencies or bands. Rules are separated by
+semicolons, applied left to right, and normalized over the positive-frequency
+training samples so their mean is 1.0. Zero Hz remains the separate
+data-derived DC point and is never part of the fitted loss.
+
+```bash
+--frequency-weights 'default=1;1GHz=5'
+--frequency-weights 'default=0.25;2GHz:4GHz=2'
+--frequency-weights 'all=1;900MHz,1GHz,1.1GHz=4;5GHz:8GHz=2'
+```
+
+Selectors accept engineering units understood by the MDIF parser. A single
+value matches that sampled frequency; `start:stop` matches an inclusive band;
+`all`, `default`, or `*` matches every fitted frequency. The normalized
+frequency weight multiplies the normalized S-parameter weight, so both options
+can be used together. Weighted verification metrics and weighted sweep
+selection metrics use the same combined priority.
+
+DNN and KBNN apply the weight directly to each neural-network sample. Neuro-TF
+applies it to the frequency-domain rational least-squares coefficient fit. For
+an integrated KBNN, the coarse DNN inherits `--frequency-weights`; use
+`--coarse-frequency-weights` when the coarse fit needs different priorities.
+The resulting saved weights and coefficients are used unchanged by the
+self-contained Verilog-A and sampled-MDIF exports. Native ADS ANN export
+re-trains through the ADS API, which does not expose per-sample loss weights;
+use the local Verilog-A or sampled-MDIF path when these frequency priorities
+must be preserved exactly.
+
 Useful selection metrics:
 
 - `evm_db`: EVM in dB
@@ -605,6 +637,9 @@ Useful selection metrics:
 - `passivity.violating_points`: number of sampled frequency points with singular value above 1
 - `rmse_abs`: global complex S-parameter RMSE
 - `rmse_db`: dB magnitude RMSE, ignoring near-zero magnitudes
+- `weighted_rmse_abs`, `weighted_evm_pct`, and the other `weighted_*`
+  variants: the same metrics using the configured S-parameter and frequency
+  weights
 - `weighted_evm_db`: S-parameter-weighted EVM in dB
 - `weighted_evm_pct`: S-parameter-weighted EVM as a percentage
 - `weighted_evm_rms`: S-parameter-weighted EVM ratio
@@ -666,6 +701,7 @@ transform do not rebuild the same training arrays.
 | <nobr><code>--seed INT</code></nobr> | Base random seed for holdout splitting, random candidate selection, initialization, and minibatch order. With the default `--trial-seed-mode fixed`, every trial uses this exact seed for apples-to-apples comparisons. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized when choosing the best trial. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
 | <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss and ranking weights used by every sweep trial. Use this with weighted selection metrics to rank by the same priorities used during training. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'all=0.2;S21=1;S12=0.8'</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency loss and weighted-ranking priorities used by every trial. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | Split `VAR` name for combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--target-z0 FLOAT</code></nobr> | Reference impedance used when `--output-domain y` converts S-parameter MDIF data to Y targets. Use the MDIF reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
 | <nobr><code>--train-values LIST</code></nobr> | Comma-separated training split values. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
@@ -1120,6 +1156,7 @@ model paths plus file hashes for later prediction and export.
 | <nobr><code>--coarse-seed INT</code></nobr> | Coarse-DNN random seed. Defaults to `--seed`. | <nobr><code>--coarse-seed 1234</code></nobr> |
 | <nobr><code>--coarse-worst-plots INT</code></nobr> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
 | <nobr><code>--coarse-sparam-weights SPEC</code></nobr> | Optional coarse-DNN loss weights. Defaults to the fine `--sparam-weights`. | <nobr><code>--coarse-sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
+| <nobr><code>--coarse-frequency-weights SPEC</code></nobr> | Optional coarse-DNN frequency loss weights. Defaults to the fine `--frequency-weights`. | <nobr><code>--coarse-frequency-weights 'default=1;1GHz=4'</code></nobr> |
 | <nobr><code>--debug</code></nobr> | Print common diagnostics plus KBNN data/loss diagnostics, show Python tracebacks for failed commands, and write `kbnn_training_debug.json`. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear}</code></nobr> | Frequency input transform. `log` uses `log10(freq_hz)` and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
@@ -1136,6 +1173,7 @@ model paths plus file hashes for later prediction and export.
 | <nobr><code>--progress-interval INT</code></nobr> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | Random seed for holdout splitting and network initialization. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss weights. Supports grouped selectors such as `diag`, `offdiag`, `row1`, `col2`, wildcards, and comma-separated explicit labels. Later rules override earlier rules. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional per-frequency loss weights. Exact frequencies and inclusive ranges are supported. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | `VAR` used to split combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--train-values LIST</code></nobr> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
@@ -1297,6 +1335,7 @@ of rebuilding them.
 | <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized to choose the best model. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | `VAR` used to split combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--sparam-weights SPEC</code></nobr> | Optional S-parameter loss and ranking weights used by every sweep trial. Use this with weighted selection metrics to rank by the same priorities used during training. Weights are normalized to mean 1 internally. | <nobr><code>--sparam-weights 'all=0.2;S21=1;S12=0.8'</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency loss and weighted-ranking priorities used by every trial. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
 | <nobr><code>--train-values LIST</code></nobr> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
 | <nobr><code>--trial-worst-plots INT</code></nobr> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
@@ -1768,6 +1807,7 @@ self-contained Verilog-A and sampled ADS MDIF export commands.
 | <nobr><code>--batch-size INT</code></nobr> | Number of training geometries per Adam update. The implementation clamps this to the number of available training blocks. Default: `64`. | <nobr><code>--batch-size 64</code></nobr> |
 | <nobr><code>--debug</code></nobr> | Print common diagnostics and show Python tracebacks for failed commands. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency weights used by the rational least-squares coefficient fit. Exact frequencies and inclusive ranges are supported. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | Comma-separated hidden layer sizes for the coefficient neural network. Default: `64,64`. | <nobr><code>--hidden-layers 64,64</code></nobr> |
 | <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fraction of blocks to reserve for verification when no split values are found in a combined MDIF. Default: `0.2`. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
 | <nobr><code>--learning-rate FLOAT</code></nobr> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
@@ -1824,6 +1864,8 @@ Useful selection metrics:
 - `passivity.violating_points`: number of sampled frequency points with singular value above 1
 - `rmse_abs`: global complex S-parameter RMSE
 - `rmse_db`: dB magnitude RMSE, ignoring near-zero magnitudes
+- `weighted_rmse_abs`, `weighted_evm_pct`, and the other `weighted_*`
+  variants: the same metrics using `--frequency-weights`
 
 Set `--mode grid` to exhaustively test all combinations, or keep the default
 `--mode random --max-trials N` for direct hyperparameter optimization over a
@@ -1858,6 +1900,7 @@ CSV/PDF; the CSV records how many samples were excluded for each setting.
 | <nobr><code>--jobs INT</code></nobr> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--learning-rates LIST</code></nobr> | Comma-separated Adam learning rates to try. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
+| <nobr><code>--frequency-weights SPEC</code></nobr> | Optional frequency priorities used by every rational/NN sweep trial and weighted verification metric. | <nobr><code>--frequency-weights 'default=1;2GHz:4GHz=3'</code></nobr> |
 | <nobr><code>--loss-interval INT</code></nobr> | Full train/verification loss check interval in epochs for each trial. Higher values can speed large sweeps because validation is scored less often. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
@@ -1874,7 +1917,7 @@ CSV/PDF; the CSV records how many samples were excluded for each setting.
 | <nobr><code>--require-passive</code></nobr> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
 | <nobr><code>--retrain-best</code></nobr> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | Base random seed for holdout splitting, random candidate selection, initialization, and minibatch order. With the default `--trial-seed-mode fixed`, every trial uses this exact seed for apples-to-apples comparisons. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
-| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized when choosing the best trial. Options: `evm_db`, `evm_pct`, `evm_rms`, `max_abs`, `max_abs_db`, `passivity.max_singular_value`, `passivity.violating_points`, `rmse_abs`, and `rmse_db`. Default: `rmse_abs`. | <nobr><code>--selection-metric evm_pct</code></nobr> |
+| <nobr><code>--selection-metric NAME</code></nobr> | Metric minimized when choosing the best trial. Includes unweighted error, passivity, and `weighted_*` metrics that apply `--frequency-weights`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_rmse_abs</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | Split `VAR` name for combined MDIF files. Default: `dataset`. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--train-values LIST</code></nobr> | Comma-separated training split values. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |

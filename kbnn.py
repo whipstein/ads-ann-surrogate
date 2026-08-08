@@ -53,6 +53,7 @@ from surrogate_common import (  # noqa: E402
     debug_traceback,
     extract_average_dc_resistance,
     frequency_feature_columns,
+    frequency_weights_from_blocks,
     infer_parameter_names,
     load_sweep_rows,
     infer_uniform_hidden_layout,
@@ -62,6 +63,7 @@ from surrogate_common import (  # noqa: E402
     metadata_hidden_layers,
     model_settings_title,
     mse,
+    normalize_frequency_weights,
     normalize_name,
     normalize_sparam_weights,
     output_weights_from_sparam_weights,
@@ -181,6 +183,10 @@ def coarse_dnn_train_namespace(args: argparse.Namespace, out_dir: Path) -> argpa
         sparam_weights=(
             getattr(args, "coarse_sparam_weights", None)
             or getattr(args, "sparam_weights", None)
+        ),
+        frequency_weights=(
+            getattr(args, "coarse_frequency_weights", None)
+            or getattr(args, "frequency_weights", None)
         ),
         debug=bool(getattr(args, "debug", False)),
         # The joint KBNN command owns CLI reporting. Suppress the standalone
@@ -1349,10 +1355,40 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
     sparam_weights = parse_sparam_weights(labels, getattr(args, "sparam_weights", None))
     normalized_sparam_weights = normalize_sparam_weights(labels, sparam_weights)
     output_weights = output_weights_from_sparam_weights(labels, sparam_weights)
+    frequency_weight_spec = getattr(args, "frequency_weights", None)
+    raw_frequency_weights = frequency_weights_from_blocks(
+        fit_train_fine,
+        frequency_weight_spec,
+    )
+    normalized_frequency_weights, frequency_weight_mean = (
+        normalize_frequency_weights(raw_frequency_weights)
+    )
+    if fit_verify_fine:
+        raw_verify_frequency_weights = frequency_weights_from_blocks(
+            fit_verify_fine,
+            frequency_weight_spec,
+            require_all_rules_match=False,
+        )
+        normalized_verify_frequency_weights, _ = normalize_frequency_weights(
+            raw_verify_frequency_weights,
+            mean=frequency_weight_mean,
+        )
+    else:
+        normalized_verify_frequency_weights = None
     progress_interval = progress_interval_from_args(args)
-    initial_train_loss = mse(mlp.predict(x_train_scaled), y_train_scaled, output_weights=output_weights)
+    initial_train_loss = mse(
+        mlp.predict(x_train_scaled),
+        y_train_scaled,
+        output_weights=output_weights,
+        sample_weights=normalized_frequency_weights,
+    )
     initial_verify_loss = (
-        mse(mlp.predict(x_verify_scaled), y_verify_scaled, output_weights=output_weights)
+        mse(
+            mlp.predict(x_verify_scaled),
+            y_verify_scaled,
+            output_weights=output_weights,
+            sample_weights=normalized_verify_frequency_weights,
+        )
         if x_verify_scaled is not None and y_verify_scaled is not None
         else None
     )
@@ -1367,6 +1403,8 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         patience=args.patience,
         seed=args.seed + 19,
         output_weights=output_weights,
+        sample_weights=normalized_frequency_weights,
+        val_sample_weights=normalized_verify_frequency_weights,
         loss_interval=getattr(args, "loss_interval", 1),
         progress_callback=make_training_progress_callback(
             getattr(args, "progress_label", "KBNN fit"),
@@ -1375,9 +1413,19 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         ),
         progress_interval=progress_interval,
     )
-    final_train_loss = mse(mlp.predict(x_train_scaled), y_train_scaled, output_weights=output_weights)
+    final_train_loss = mse(
+        mlp.predict(x_train_scaled),
+        y_train_scaled,
+        output_weights=output_weights,
+        sample_weights=normalized_frequency_weights,
+    )
     final_verify_loss = (
-        mse(mlp.predict(x_verify_scaled), y_verify_scaled, output_weights=output_weights)
+        mse(
+            mlp.predict(x_verify_scaled),
+            y_verify_scaled,
+            output_weights=output_weights,
+            sample_weights=normalized_verify_frequency_weights,
+        )
         if x_verify_scaled is not None and y_verify_scaled is not None
         else None
     )
@@ -1410,6 +1458,11 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         "normalized_sparam_weights": normalized_sparam_weights,
         "sparam_weight_mean": sparam_weight_mean(labels, sparam_weights),
         "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training, so the average normalized weight is 1.0.",
+        "frequency_weights": frequency_weight_spec,
+        "frequency_weight_mean": frequency_weight_mean,
+        "frequency_weight_min": float(np.min(raw_frequency_weights)),
+        "frequency_weight_max": float(np.max(raw_frequency_weights)),
+        "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples, so the average normalized weight is 1.0.",
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
         **dc_metadata,
@@ -1499,6 +1552,8 @@ def command_train(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "sparam_weights": metadata["sparam_weights"],
         "normalized_sparam_weights": metadata["normalized_sparam_weights"],
+        "frequency_weights": metadata["frequency_weights"],
+        "frequency_weight_mean": metadata["frequency_weight_mean"],
         "output_scaler_floor": metadata["output_scaler_floor"],
         "floored_output_columns": metadata["floored_output_columns"],
     }
@@ -1523,6 +1578,7 @@ def command_train(args: argparse.Namespace) -> int:
             parameter_names,
             max_worst_plots=getattr(args, "worst_plots", 6),
             sparam_weights=parse_sparam_weights(labels, getattr(args, "sparam_weights", None)),
+            frequency_weights=getattr(args, "frequency_weights", None),
             y_z0=50.0,
             title_context=plot_context,
         )
@@ -1556,6 +1612,8 @@ def command_train(args: argparse.Namespace) -> int:
             "sparam_weights": metadata["sparam_weights"],
             "normalized_sparam_weights": metadata["normalized_sparam_weights"],
             "sparam_weight_mean": metadata["sparam_weight_mean"],
+            "frequency_weights": metadata["frequency_weights"],
+            "frequency_weight_mean": metadata["frequency_weight_mean"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
@@ -1843,6 +1901,10 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         notes.append(
             "The package records S-parameter weights in the manifest. ADS ANN's documented Python API does not expose direct per-output loss weights, so the included ADS training script does not apply those weights."
         )
+    if model_metadata.get("frequency_weights"):
+        notes.append(
+            "The source model's frequency weights are recorded in the manifest but are not applied because the documented ADS ANN API does not expose per-sample loss weights."
+        )
     if target == "fine" and mode == "residual":
         notes.append(
             "The fine-target export is simpler to consume in ADS, but it does not preserve the residual delta target that usually gives the KBNN its sample-efficiency advantage."
@@ -1873,6 +1935,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             "ads_ann_target": target,
             "freq_transform": args.freq_transform,
             "sparam_weights": parse_sparam_weights(labels, getattr(args, "sparam_weights", None)),
+            "source_frequency_weights": model_metadata.get("frequency_weights"),
             "requested_hidden_layers": requested_hidden_layers,
             "ads_layout_note": (
                 "ADS ANN exposes a uniform hidden-layer width in the documented API. "
@@ -2126,6 +2189,7 @@ def namespace_for_trial(
         seed=trial_seed,
         worst_plots=plots,
         sparam_weights=args.sparam_weights,
+        frequency_weights=args.frequency_weights,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
     )
@@ -2227,6 +2291,7 @@ def command_sweep(args: argparse.Namespace) -> int:
             "coarse_seed",
             "coarse_worst_plots",
             "coarse_sparam_weights",
+            "coarse_frequency_weights",
         ):
             setattr(reproduction_args, name, getattr(args, name, None))
     reproduction_command = single_model_train_command(
@@ -2448,6 +2513,10 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         "--coarse-sparam-weights",
         help="Optional coarse-DNN S-parameter weights. Defaults to --sparam-weights.",
     )
+    coarse_fit.add_argument(
+        "--coarse-frequency-weights",
+        help="Optional coarse-DNN frequency weights. Defaults to --frequency-weights.",
+    )
     add_debug_argument(
         parser,
         (
@@ -2475,6 +2544,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sparam-weights",
         help="S-parameter loss weights. Examples: 'diag=1;offdiag=0.2' or 'S11,S22=1;S12,S21=0.1'. Later rules override earlier ones.",
     )
+    train.add_argument(
+        "--frequency-weights",
+        help="Frequency loss weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'. Exact frequencies and inclusive ranges are supported; later rules override earlier ones.",
+    )
     train.add_argument("--worst-plots", type=int, default=6)
     train.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
     train.set_defaults(func=command_train)
@@ -2501,6 +2574,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument(
         "--sparam-weights",
         help="S-parameter loss/selection weights. Examples: 'diag=1;offdiag=0.2' or 'all=0.2;S21=1'.",
+    )
+    sweep.add_argument(
+        "--frequency-weights",
+        help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
     )
     sweep.add_argument("--mode", choices=["grid", "random"], default="random")
     sweep.add_argument("--max-trials", type=int, default=24)

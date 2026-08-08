@@ -44,6 +44,7 @@ from surrogate_common import (  # noqa: E402
     csv_number,
     extract_average_dc_resistance,
     frequency_feature_columns,
+    frequency_weights_from_blocks,
     infer_complete_sparameter_ports,
     infer_parameter_names,
     load_sweep_rows,
@@ -54,6 +55,7 @@ from surrogate_common import (  # noqa: E402
     metadata_hidden_layers,
     model_settings_title,
     normalize_name,
+    normalize_frequency_weights,
     normalize_sparam_weights,
     output_weights_from_sparam_weights,
     parse_csv_set,
@@ -514,6 +516,26 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
     sparam_weights = parse_sparam_weights(labels, getattr(args, "sparam_weights", None))
     normalized_sparam_weights = normalize_sparam_weights(labels, sparam_weights)
     output_weights = output_weights_from_sparam_weights(labels, sparam_weights)
+    frequency_weight_spec = getattr(args, "frequency_weights", None)
+    raw_frequency_weights = frequency_weights_from_blocks(
+        fit_train_blocks,
+        frequency_weight_spec,
+    )
+    normalized_frequency_weights, frequency_weight_mean = (
+        normalize_frequency_weights(raw_frequency_weights)
+    )
+    if fit_verify_blocks:
+        raw_verify_frequency_weights = frequency_weights_from_blocks(
+            fit_verify_blocks,
+            frequency_weight_spec,
+            require_all_rules_match=False,
+        )
+        normalized_verify_frequency_weights, _ = normalize_frequency_weights(
+            raw_verify_frequency_weights,
+            mean=frequency_weight_mean,
+        )
+    else:
+        normalized_verify_frequency_weights = None
     progress_interval = progress_interval_from_args(args)
     history = mlp.train(
         x_train_scaled,
@@ -526,6 +548,8 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         patience=args.patience,
         seed=args.seed + 29,
         output_weights=output_weights,
+        sample_weights=normalized_frequency_weights,
+        val_sample_weights=normalized_verify_frequency_weights,
         loss_interval=getattr(args, "loss_interval", 1),
         progress_callback=make_training_progress_callback(
             getattr(args, "progress_label", "DNN fit"),
@@ -561,6 +585,11 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         "normalized_sparam_weights": normalized_sparam_weights,
         "sparam_weight_mean": sparam_weight_mean(labels, sparam_weights),
         "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training, so the average normalized weight is 1.0.",
+        "frequency_weights": frequency_weight_spec,
+        "frequency_weight_mean": frequency_weight_mean,
+        "frequency_weight_min": float(np.min(raw_frequency_weights)),
+        "frequency_weight_max": float(np.max(raw_frequency_weights)),
+        "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples, so the average normalized weight is 1.0.",
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
         **dc_metadata,
@@ -611,6 +640,8 @@ def command_train(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "sparam_weights": metadata["sparam_weights"],
         "normalized_sparam_weights": metadata["normalized_sparam_weights"],
+        "frequency_weights": metadata["frequency_weights"],
+        "frequency_weight_mean": metadata["frequency_weight_mean"],
         "output_scaler_floor": metadata["output_scaler_floor"],
         "floored_output_columns": metadata["floored_output_columns"],
     }
@@ -635,6 +666,7 @@ def command_train(args: argparse.Namespace) -> int:
             parameter_names,
             max_worst_plots=getattr(args, "worst_plots", 6),
             sparam_weights=parse_sparam_weights(labels, getattr(args, "sparam_weights", None)),
+            frequency_weights=getattr(args, "frequency_weights", None),
             y_z0=model.target_z0,
             title_context=plot_context,
         )
@@ -667,6 +699,8 @@ def command_train(args: argparse.Namespace) -> int:
             "sparam_weights": metadata["sparam_weights"],
             "normalized_sparam_weights": metadata["normalized_sparam_weights"],
             "sparam_weight_mean": metadata["sparam_weight_mean"],
+            "frequency_weights": metadata["frequency_weights"],
+            "frequency_weight_mean": metadata["frequency_weight_mean"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
             "export_commands": dict(export_commands),
@@ -841,6 +875,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             "verification_mdif": args.verification_mdif,
             "freq_transform": args.freq_transform,
             "sparam_weights": parse_sparam_weights(labels, getattr(args, "sparam_weights", None)),
+            "source_frequency_weights": model_metadata.get("frequency_weights"),
             "requested_hidden_layers": requested_hidden_layers,
             "ads_layout_note": (
                 "ADS ANN exposes a uniform hidden-layer width in the documented API. "
@@ -852,6 +887,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             "This export retrains the DNN in ADS ANN; it does not import NumPy model.npz weights.",
             "When --model-dir is supplied, metadata from that trained or optimized model is used to seed the ADS ANN architecture/settings.",
             "The package records S-parameter weights in the manifest. ADS ANN's documented Python API does not expose direct per-output loss weights, so the included ADS training script does not apply those weights.",
+            "Any source-model frequency weights are recorded in the manifest but are not applied because the documented ADS ANN API does not expose per-sample loss weights.",
             "The native ADS ANN output predicts fine S-parameter real/imaginary values directly.",
             "Zero-Hz rows are excluded from ADS ANN fitting. Use the self-contained Verilog-A or sampled-MDIF export when the distinct saved DC resistance is required.",
         ],
@@ -1020,6 +1056,7 @@ def namespace_for_trial(
         target_z0=args.target_z0,
         worst_plots=plots,
         sparam_weights=args.sparam_weights,
+        frequency_weights=args.frequency_weights,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
     )
@@ -1260,6 +1297,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sparam-weights",
         help="S-parameter loss weights. Examples: 'diag=1;offdiag=0.2' or 'S11,S22=1;S12,S21=0.1'. Later rules override earlier ones.",
     )
+    train.add_argument(
+        "--frequency-weights",
+        help="Frequency loss weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'. Exact frequencies and inclusive ranges are supported; later rules override earlier ones.",
+    )
     train.add_argument("--worst-plots", type=int, default=6)
     add_debug_argument(train)
     train.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
@@ -1279,6 +1320,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument(
         "--sparam-weights",
         help="S-parameter loss/selection weights. Examples: 'diag=1;offdiag=0.2' or 'all=0.2;S21=1'.",
+    )
+    sweep.add_argument(
+        "--frequency-weights",
+        help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
     )
     sweep.add_argument("--mode", choices=["grid", "random"], default="random")
     sweep.add_argument("--max-trials", type=int, default=24)

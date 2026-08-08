@@ -61,15 +61,33 @@ def fit_rational_coeffs(
     poles: np.ndarray,
     f_scale: float,
     ridge: float,
+    sample_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     basis = rational_basis(freq_hz, poles, f_scale)
+    weighted_values = np.asarray(values, dtype=complex)
+    if sample_weights is not None:
+        weights = np.asarray(sample_weights, dtype=float).reshape(-1)
+        if weights.shape != (basis.shape[0],):
+            raise ValueError(
+                f"Expected {basis.shape[0]} rational-fit frequency weights, got "
+                f"{weights.shape}"
+            )
+        if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
+            raise ValueError(
+                "Rational-fit frequency weights must be finite and non-negative"
+            )
+        root_weights = np.sqrt(weights)
+        basis = basis * root_weights[:, None]
+        weighted_values = weighted_values * root_weights
     if ridge > 0:
         reg = math.sqrt(ridge) * np.eye(basis.shape[1], dtype=complex)
-        rhs = np.concatenate([values, np.zeros(basis.shape[1], dtype=complex)])
+        rhs = np.concatenate(
+            [weighted_values, np.zeros(basis.shape[1], dtype=complex)]
+        )
         lhs = np.vstack([basis, reg])
     else:
         lhs = basis
-        rhs = values
+        rhs = weighted_values
     coeffs, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
     return coeffs
 
@@ -80,17 +98,36 @@ def fit_all_coefficients(
     poles: np.ndarray,
     f_scale: float,
     ridge: float,
+    frequency_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     rows = []
+    offset = 0
     for block in blocks:
+        end = offset + len(block.freq_hz)
+        block_weights = (
+            None
+            if frequency_weights is None
+            else np.asarray(frequency_weights, dtype=float)[offset:end]
+        )
         complex_coeffs = []
         for label in sparam_labels:
             coeffs = fit_rational_coeffs(
-                block.freq_hz, block.sparams[label], poles, f_scale, ridge
+                block.freq_hz,
+                block.sparams[label],
+                poles,
+                f_scale,
+                ridge,
+                sample_weights=block_weights,
             )
             complex_coeffs.append(coeffs)
         flat = np.concatenate(complex_coeffs)
         rows.append(np.concatenate([flat.real, flat.imag]))
+        offset = end
+    if frequency_weights is not None and offset != len(frequency_weights):
+        raise ValueError(
+            f"Expected {offset} rational-fit frequency weights, got "
+            f"{len(frequency_weights)}"
+        )
     return np.asarray(rows, dtype=float)
 
 
@@ -276,6 +313,7 @@ def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], 
         progress_label=f"Neuro-TF trial {trial_index}",
         seed=trial_seed,
         worst_plots=plots,
+        frequency_weights=args.frequency_weights,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
     )
@@ -384,16 +422,46 @@ def command_train(args: argparse.Namespace) -> int:
     dc_metadata = extract_average_dc_resistance(train_blocks, sparam_labels, z0=50.0)
     fit_train_blocks = positive_frequency_blocks(train_blocks)
     fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
+    frequency_weight_spec = getattr(args, "frequency_weights", None)
+    raw_frequency_weights = frequency_weights_from_blocks(
+        fit_train_blocks,
+        frequency_weight_spec,
+    )
+    normalized_frequency_weights, frequency_weight_mean = (
+        normalize_frequency_weights(raw_frequency_weights)
+    )
+    if fit_verify_blocks:
+        raw_verify_frequency_weights = frequency_weights_from_blocks(
+            fit_verify_blocks,
+            frequency_weight_spec,
+            require_all_rules_match=False,
+        )
+        normalized_verify_frequency_weights, _ = normalize_frequency_weights(
+            raw_verify_frequency_weights,
+            mean=frequency_weight_mean,
+        )
+    else:
+        normalized_verify_frequency_weights = None
     poles, f_scale = build_fixed_poles(fit_train_blocks, args.order, args.pole_damping)
     x_train = parameter_matrix(fit_train_blocks, parameter_names)
     y_train = fit_all_coefficients(
-        fit_train_blocks, sparam_labels, poles, f_scale, args.ridge
+        fit_train_blocks,
+        sparam_labels,
+        poles,
+        f_scale,
+        args.ridge,
+        frequency_weights=normalized_frequency_weights,
     )
 
     if fit_verify_blocks:
         x_verify = parameter_matrix(fit_verify_blocks, parameter_names)
         y_verify = fit_all_coefficients(
-            fit_verify_blocks, sparam_labels, poles, f_scale, args.ridge
+            fit_verify_blocks,
+            sparam_labels,
+            poles,
+            f_scale,
+            args.ridge,
+            frequency_weights=normalized_verify_frequency_weights,
         )
     else:
         x_verify = None
@@ -451,6 +519,11 @@ def command_train(args: argparse.Namespace) -> int:
         "split_var": args.split_var,
         "train_values": sorted(parse_csv_set(args.train_values)),
         "verify_values": sorted(parse_csv_set(args.verify_values)),
+        "frequency_weights": frequency_weight_spec,
+        "frequency_weight_mean": frequency_weight_mean,
+        "frequency_weight_min": float(np.min(raw_frequency_weights)),
+        "frequency_weight_max": float(np.max(raw_frequency_weights)),
+        "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples before weighted rational least squares.",
         **dc_metadata,
     }
     model.save(
@@ -480,6 +553,8 @@ def command_train(args: argparse.Namespace) -> int:
         "loss_interval": getattr(args, "loss_interval", 1),
         "progress_interval": progress_interval_from_args(args),
         "seed": args.seed,
+        "frequency_weights": metadata["frequency_weights"],
+        "frequency_weight_mean": metadata["frequency_weight_mean"],
     }
     plot_context = model_settings_title(
         "Neuro-TF",
@@ -501,6 +576,7 @@ def command_train(args: argparse.Namespace) -> int:
             sparam_labels,
             parameter_names,
             max_worst_plots=getattr(args, "worst_plots", 6),
+            frequency_weights=getattr(args, "frequency_weights", None),
             y_z0=50.0,
             title_context=plot_context,
         )
@@ -529,6 +605,8 @@ def command_train(args: argparse.Namespace) -> int:
             "sparameters": sparam_labels,
             "n_poles": args.order,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "frequency_weights": metadata["frequency_weights"],
+            "frequency_weight_mean": metadata["frequency_weight_mean"],
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
@@ -686,6 +764,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--epochs", type=int, default=2000)
     train.add_argument("--batch-size", type=int, default=64)
     train.add_argument("--learning-rate", type=float, default=2e-3)
+    train.add_argument(
+        "--frequency-weights",
+        help="Frequency loss weights for rational fitting, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'. Exact frequencies and inclusive ranges are supported; later rules override earlier ones.",
+    )
     train.add_argument("--loss-interval", type=int, default=1, help="Full train/validation loss check interval in epochs")
     train.add_argument(
         "--progress-interval",
@@ -723,6 +805,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument("--activation-options", default="tanh,relu")
     sweep.add_argument("--learning-rates", default="0.001,0.002,0.005")
+    sweep.add_argument(
+        "--frequency-weights",
+        help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
+    )
     sweep.add_argument("--jobs", type=int, default=1, help="Number of sweep trials to train in parallel")
     sweep.add_argument("--mode", choices=["grid", "random"], default="random")
     sweep.add_argument("--max-trials", type=int, default=24)
@@ -741,8 +827,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "evm_rms",
             "evm_pct",
             "evm_db",
+            "weighted_rmse_abs",
+            "weighted_max_abs",
+            "weighted_evm_rms",
+            "weighted_evm_pct",
+            "weighted_evm_db",
             "rmse_db",
             "max_abs_db",
+            "weighted_rmse_db",
+            "weighted_max_abs_db",
             "passivity.max_singular_value",
             "passivity.violating_points",
         ],
