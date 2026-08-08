@@ -321,7 +321,7 @@ A normal `train` run writes:
 - `training_history.csv` and `training_history.pdf` with train/verification
   loss history and convergence plots.
 - `training_summary.md` with a human-readable run summary and copyable export
-  commands using the fitted model's resolved paths.
+  commands using paths relative to the repository root.
 - `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
   and error views.
 - `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
@@ -1080,7 +1080,7 @@ model paths plus file hashes for later prediction and export.
 | <nobr><code>--coarse-batch-size INT</code></nobr> | Coarse-DNN batch size. Defaults to `--batch-size`. | <nobr><code>--coarse-batch-size 256</code></nobr> |
 | <nobr><code>--coarse-patience INT</code></nobr> | Coarse-DNN early-stopping patience. Defaults to `--patience`. | <nobr><code>--coarse-patience 200</code></nobr> |
 | <nobr><code>--coarse-loss-interval INT</code></nobr> | Coarse-DNN full-loss check interval. Defaults to `--loss-interval`. | <nobr><code>--coarse-loss-interval 5</code></nobr> |
-| <nobr><code>--coarse-progress-interval INT</code></nobr> | Coarse-DNN console progress interval. Uses one redrawable line on capable terminals; captured or `TERM=dumb` output suppresses intermediate updates and prints only the compact completion status. Defaults to `--progress-interval`. | <nobr><code>--coarse-progress-interval 25</code></nobr> |
+| <nobr><code>--coarse-progress-interval INT</code></nobr> | Coarse-DNN console progress interval. Updates redraw one stderr status line; the completed fit metrics replace that line when the coarse stage finishes. Defaults to `--progress-interval`. | <nobr><code>--coarse-progress-interval 25</code></nobr> |
 | <nobr><code>--coarse-seed INT</code></nobr> | Coarse-DNN random seed. Defaults to `--seed`. | <nobr><code>--coarse-seed 1234</code></nobr> |
 | <nobr><code>--coarse-worst-plots INT</code></nobr> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
 | <nobr><code>--coarse-sparam-weights SPEC</code></nobr> | Optional coarse-DNN loss weights. Defaults to the fine `--sparam-weights`. | <nobr><code>--coarse-sparam-weights 'diag=1;offdiag=0.2'</code></nobr> |

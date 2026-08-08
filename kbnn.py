@@ -74,6 +74,7 @@ from surrogate_common import (  # noqa: E402
     print_cli_error,
     read_mdif,
     read_model_metadata,
+    repository_relative_path,
     rerank_sweep_rows,
     run_sweep_command,
     single_model_train_command,
@@ -164,8 +165,6 @@ def coarse_dnn_train_namespace(args: argparse.Namespace, out_dir: Path) -> argpa
             else coarse_progress_interval
         ),
         progress_label="Coarse DNN fit",
-        progress_stream=sys.stdout,
-        progress_terminal_only=True,
         seed=args.seed if coarse_seed is None else coarse_seed,
         output_domain="s",
         target_z0=50.0,
@@ -209,6 +208,13 @@ def coarse_fit_status_line(model_dir: Path) -> str:
     )
 
 
+def finish_coarse_fit_status(model_dir: Path) -> None:
+    """Replace the live coarse progress line with its final metrics."""
+
+    sys.stderr.write(f"\r\033[2K{coarse_fit_status_line(model_dir)}\n")
+    sys.stderr.flush()
+
+
 def prepare_fitted_coarse_model(
     args: argparse.Namespace,
     output_root: Path,
@@ -232,7 +238,7 @@ def prepare_fitted_coarse_model(
     if status != 0:
         raise RuntimeError(f"Coarse DNN fitting failed with status {status}")
     if not getattr(prepared, "quiet", False):
-        print(coarse_fit_status_line(fitted_dir), flush=True)
+        finish_coarse_fit_status(fitted_dir)
     prepared.coarse_model_dir = str(fitted_dir)
     prepared.coarse_model_packaged = True
     return prepared
@@ -340,17 +346,18 @@ def write_composite_model_manifest(
     model: "KBNN",
 ) -> Path:
     resolved_model_dir = model_dir.expanduser().resolve()
+    repository_root = Path(__file__).resolve().parent
     metadata = kbnn_metadata(resolved_model_dir)
     coarse_identity = metadata.get("coarse_model")
     coarse_payload: dict[str, object] | None = None
     export_argv = [
-        sys.executable,
-        str(Path(__file__).resolve()),
+        Path(sys.executable).name or "python3",
+        repository_relative_path(Path(__file__), repository_root),
         "export-veriloga",
         "--model-dir",
-        str(resolved_model_dir),
+        repository_relative_path(resolved_model_dir, repository_root),
         "--out-dir",
-        str(resolved_model_dir / "veriloga"),
+        repository_relative_path(resolved_model_dir / "veriloga", repository_root),
     ]
     if isinstance(coarse_identity, dict):
         coarse_path = Path(str(coarse_identity.get("source_model_dir") or ""))
@@ -369,7 +376,12 @@ def write_composite_model_manifest(
             "training_summary": str(coarse_path / "training_summary.md"),
             "verification_summary": str(coarse_path / "verification_summary.json"),
         }
-        export_argv.extend(["--coarse-model-dir", str(coarse_path)])
+        export_argv.extend(
+            [
+                "--coarse-model-dir",
+                repository_relative_path(coarse_path, repository_root),
+            ]
+        )
     manifest = {
         "version": VERSION,
         "model_family": "composite_kbnn",

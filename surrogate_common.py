@@ -2784,20 +2784,9 @@ def make_training_progress_callback(
     label: str,
     epochs: int,
     progress_interval: int | None,
-    stream: object | None = None,
-    terminal_only: bool = False,
 ) -> Callable[[dict[str, object]], None] | None:
     if progress_interval is None or int(progress_interval) <= 0:
         return None
-    output = stream if stream is not None else sys.stderr
-    isatty = getattr(output, "isatty", None)
-    if terminal_only:
-        terminal_name = str(os.environ.get("TERM") or "").strip().lower()
-        redraw_supported = bool(isatty and isatty()) and terminal_name != "dumb"
-        if not redraw_supported:
-            return None
-    write = getattr(output, "write")
-    flush = getattr(output, "flush")
     total_epochs = max(1, int(epochs))
     start_time = time.monotonic()
 
@@ -2833,11 +2822,11 @@ def make_training_progress_callback(
         if event.get("stopped"):
             parts.append("early_stop")
         if is_final:
-            write("\r\033[2K")
-            flush()
+            sys.stderr.write("\r\033[2K")
+            sys.stderr.flush()
             return
-        write("\r\033[2K" + " ".join(parts))
-        flush()
+        sys.stderr.write("\r\033[2K" + " ".join(parts))
+        sys.stderr.flush()
 
     return callback
 
@@ -4972,6 +4961,15 @@ def shell_command(argv: Sequence[object]) -> str:
     return " ".join(shlex.quote(str(part)) for part in argv)
 
 
+def repository_relative_path(path: str | Path, repository_root: Path) -> str:
+    """Return a command path relative to the repository root."""
+
+    return os.path.relpath(
+        Path(path).expanduser().resolve(),
+        repository_root.expanduser().resolve(),
+    )
+
+
 def build_training_export_commands(
     script_path: Path,
     model_dir: Path,
@@ -4979,10 +4977,20 @@ def build_training_export_commands(
     *,
     include_veriloga: bool = False,
 ) -> list[tuple[str, str]]:
-    """Build standard export commands with fully resolved paths."""
+    """Build export commands whose paths are relative to the repository root."""
 
     resolved_script_path = script_path.resolve()
+    repository_root = resolved_script_path.parent
     resolved_model_dir = model_dir.resolve()
+    command_script_path = repository_relative_path(
+        resolved_script_path,
+        repository_root,
+    )
+    command_python = Path(sys.executable).name or "python3"
+    command_model_dir = repository_relative_path(
+        resolved_model_dir,
+        repository_root,
+    )
     commands: list[tuple[str, str]] = []
     if include_veriloga:
         commands.append(
@@ -4990,13 +4998,16 @@ def build_training_export_commands(
                 "Self-contained Verilog-A",
                 shell_command(
                     [
-                        sys.executable,
-                        resolved_script_path,
+                        command_python,
+                        command_script_path,
                         "export-veriloga",
                         "--model-dir",
-                        resolved_model_dir,
+                        command_model_dir,
                         "--out-dir",
-                        resolved_model_dir / "veriloga_export",
+                        repository_relative_path(
+                            resolved_model_dir / "veriloga_export",
+                            repository_root,
+                        ),
                     ]
                 ),
             )
@@ -5011,15 +5022,18 @@ def build_training_export_commands(
                 "Sampled ADS MDIF",
                 shell_command(
                     [
-                        sys.executable,
-                        resolved_script_path,
+                        command_python,
+                        command_script_path,
                         "export-ads-mdif",
                         "--model-dir",
-                        resolved_model_dir,
+                        command_model_dir,
                         "--out-dir",
-                        resolved_model_dir / "ads_mdif_export",
+                        repository_relative_path(
+                            resolved_model_dir / "ads_mdif_export",
+                            repository_root,
+                        ),
                         "--template-mdif",
-                        template_path,
+                        repository_relative_path(template_path, repository_root),
                     ]
                 ),
             )
@@ -5037,7 +5051,7 @@ def training_export_section(
     lines = [
         "## Export Model",
         "",
-        "Run any of these commands from any directory:",
+        "Run any of these commands from the repository root:",
         "",
     ]
     for label, command in export_commands:
