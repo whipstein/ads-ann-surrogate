@@ -134,8 +134,10 @@ simulation queues independently.
 Every geometry CSV also gets an automatic same-stem JSON file. For example,
 `geometries.csv` produces `geometries.json`. The JSON records the generation
 method, point and dataset counts, and each parameter's lower bound, upper bound,
-unit, base-unit bounds, and linear/log scale. Separate train/verification CSVs
-and targeted additional-point CSVs receive their own JSON files as well.
+unit, base-unit bounds, and linear/log scale. When `--write-split-files` is
+used, the one JSON describes the complete combined geometry; the separate
+train/verification CSVs do not receive duplicate JSON files. Targeted
+additional-point CSVs receive their own JSON files.
 
 ### Extending an Existing Parameter Range
 

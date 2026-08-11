@@ -625,15 +625,7 @@ def write_points_csv(
             split_rows = [row for row in rows if row.get(split_var) == split_value]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
-            split_metadata_path = write_geometry_metadata(
-                split_path,
-                parameters,
-                split_rows,
-                split_var,
-                generation_kind="generated",
-                method=method,
-            )
-            written.extend([split_path, split_metadata_path])
+            written.append(split_path)
     return written
 
 
@@ -807,16 +799,7 @@ def write_range_extension_csv(
             ]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
-            split_metadata_path = write_geometry_metadata(
-                split_path,
-                plan.overall_parameters,
-                split_rows,
-                split_var,
-                generation_kind="range_extension",
-                method=method,
-                extra=extension_metadata,
-            )
-            written.extend([split_path, split_metadata_path])
+            written.append(split_path)
     return written
 
 
