@@ -131,6 +131,52 @@ unit-cube coordinates. Add `--write-split-files` to also write separate
 `*_train.csv` and `*_verification.csv` files for tools that consume the two
 simulation queues independently.
 
+To extend one side of an existing design, keep the original bounds in
+`--parameter`, provide the new overall bounds with `--extend-range`, and pass
+the original CSV with `--existing-points`. This example changes only the upper
+`W` bound from `0.80mm` to `1.00mm`:
+
+```bash
+python3 generate_points.py \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --extend-range W=0.40mm:1.00mm \
+  --existing-points geometries.csv \
+  --out geometries_extended.csv
+```
+
+The new sampler covers only the added slab: `W=0.80mm:1.00mm` across the full
+original `L` range. The output contains the original rows first and the new
+rows afterward, with continued point/split sequences and normalized columns
+recomputed for the new overall range. The unchanged bound must exactly match
+the corresponding original bound. To extend the lower side instead, enter a
+lower new bound and retain the old upper bound. You may set `--out` to the same
+path as `--existing-points` for an in-place combined result; a separate output
+is safer until the new EM batch has been checked.
+
+When `--count` is omitted, the script prints and uses a density-based point
+recommendation. Let `r` be the added design-space volume divided by the old
+volume. For a one-variable linear extension this is the added width divided by
+the old width; log variables use log-width. The recommendation is:
+
+- Training: the greater of `ceil(old_training_points * r)` and `4*d`.
+- Verification: when a verification set exists, the greater of
+  `ceil(old_verification_points * r)` and `2*d`.
+
+Here, `d` is the number of geometry parameters. For example, extending one
+range by 50% from an 80-point, two-parameter design containing 64 training and
+16 verification points recommends 32 new training and 8 new verification
+points. This maintains roughly the original sampling density while ensuring
+basic coverage of the new boundary. It is a practical lower target, not a
+mathematical guarantee; after refitting, use `suggest-additional` if errors are
+still concentrated in the new slab. An explicit `--count` overrides the total,
+and the original train/verification ratio is retained unless
+`--verification-count` is also supplied.
+
+`--range-factor NAME=FACTOR` remains available when you want a new independent
+point set with a symmetrically wider range. It does not perform the one-sided
+append workflow.
+
 For expensive EM campaigns, treat each point as one geometry/process setting
 with a full frequency sweep. A practical initial design size is:
 
@@ -185,6 +231,58 @@ The suggested-point CSV uses `dataset=targeted` by default and includes the
 nearest high-error verification source, distance from existing points, and
 acquisition score. A companion `*_fit_error_regions.csv` file ranks the current
 verification points by the selected metric, which defaults to `evm_pct`.
+
+The explicit `generate` subcommand is optional; invoking `generate_points.py`
+without a subcommand uses it automatically.
+
+### Parameter Ranges
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--extend-range SPEC</code></nobr> | <code>generate</code> | Optional one-sided append workflow. Supplies the new overall bounds as <code>NAME=NEW_LOW:NEW_HIGH</code>; exactly one bound must match the original <code>--parameter</code> range and the other must move outward. Requires <code>--existing-points</code>. | <nobr><code>--extend-range W=0.40mm:1.00mm</code></nobr> |
+| <nobr><code>--parameter SPEC</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Required and repeatable. Defines an existing parameter as <code>NAME=LOW:HIGH[:linear\|log]</code>. Matching bound units are retained in the output. | <nobr><code>--parameter W=0.40mm:0.80mm</code></nobr> |
+| <nobr><code>--range-factor SPEC</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Optional and repeatable. Expands the named parameter's total span around its existing center. The finite factor must be greater than 1. | <nobr><code>--range-factor W=1.5</code></nobr> |
+
+### Sampling
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--candidate-method METHOD</code></nobr> | <code>suggest-additional</code> | Candidate-pool method: <code>halton</code>, <code>latin-hypercube</code>, <code>maximin-lhs</code>, or <code>sobol</code>. Default: <code>latin-hypercube</code>. | <nobr><code>--candidate-method sobol</code></nobr> |
+| <nobr><code>--lhs-candidates INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Candidate Latin hypercubes tried when using <code>maximin-lhs</code>. Default: <code>64</code>. | <nobr><code>--lhs-candidates 128</code></nobr> |
+| <nobr><code>--method METHOD</code></nobr> | <code>generate</code> | Repeat or comma-separate point-set methods. Choices: <code>halton</code>, <code>latin-hypercube</code>, <code>maximin-lhs</code>, and <code>sobol</code>. Default: <code>maximin-lhs</code>. | <nobr><code>--method sobol,maximin-lhs</code></nobr> |
+| <nobr><code>--no-scramble</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Disables Sobol scrambling, which is enabled by default. | <nobr><code>--no-scramble</code></nobr> |
+| <nobr><code>--seed INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Random seed used by randomized sampling methods. Default: <code>1234</code>. | <nobr><code>--seed 42</code></nobr> |
+| <nobr><code>--skip INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Non-negative number of leading Sobol or Halton points to skip. Default: <code>0</code>. | <nobr><code>--skip 64</code></nobr> |
+
+### Output and Dataset Splits
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked fit-error-region CSV. Default: <code>&lt;out&gt;_fit_error_regions.csv</code>. | <nobr><code>--analysis-out error_regions.csv</code></nobr> |
+| <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of new points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. | <nobr><code>--count 80</code></nobr> |
+| <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid. | <nobr><code>--existing-points geometries.csv</code></nobr> |
+| <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
+| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
+| <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
+| <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to suggested points. Default: <code>targeted</code>. | <nobr><code>--target-dataset train</code></nobr> |
+| <nobr><code>--verification-count INT</code></nobr> | <code>generate</code> | Number of new tail points labeled verification; must be smaller than <code>--count</code>. Default: <code>0</code>, or the original split ratio during a range extension. | <nobr><code>--verification-count 16</code></nobr> |
+| <nobr><code>--write-split-files</code></nobr> | <code>generate</code> | Also writes separate <code>*_train.csv</code> and, when applicable, <code>*_verification.csv</code> files. | <nobr><code>--write-split-files</code></nobr> |
+
+### Existing Input and Targeted Selection
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--bare-values MODE</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Interprets unitless values from existing input rows as <code>parameter-units</code> or <code>base-units</code>. Default: <code>parameter-units</code>. | <nobr><code>--bare-values base-units</code></nobr> |
+| <nobr><code>--candidate-count INT</code></nobr> | <code>suggest-additional</code> | Positive candidate-pool size. Default: the greater of 1000 and <code>count * candidate-factor</code>. | <nobr><code>--candidate-count 5000</code></nobr> |
+| <nobr><code>--candidate-factor INT</code></nobr> | <code>suggest-additional</code> | Positive candidate multiplier used when <code>--candidate-count</code> is omitted. Default: <code>200</code>. | <nobr><code>--candidate-factor 300</code></nobr> |
+| <nobr><code>--existing-mdif PATH</code></nobr> | <code>suggest-additional</code> | Repeatable MDIF containing previously simulated parameter points to avoid. | <nobr><code>--existing-mdif training.mdif</code></nobr> |
+| <nobr><code>--fit-dir PATH</code></nobr> | <code>suggest-additional</code> | Fit directory containing <code>verification_metrics.csv</code>. Ignored when <code>--verification-metrics</code> is given. | <nobr><code>--fit-dir outputs/dnn_model</code></nobr> |
+| <nobr><code>--focus-power FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative exponent applied to verification-error scores. Default: <code>1.0</code>. | <nobr><code>--focus-power 1.5</code></nobr> |
+| <nobr><code>--focus-radius FLOAT</code></nobr> | <code>suggest-additional</code> | Positive unit-cube radius around high-error verification points. Default: <code>0.25</code>. | <nobr><code>--focus-radius 0.2</code></nobr> |
+| <nobr><code>--metric NAME</code></nobr> | <code>suggest-additional</code> | Verification-metrics column used to target errors; <code>auto</code> selects a known available metric. Default: <code>evm_pct</code>. | <nobr><code>--metric auto</code></nobr> |
+| <nobr><code>--min-distance FLOAT</code></nobr> | <code>suggest-additional</code> | Rejects candidates closer than this non-negative normalized distance to existing or already suggested points. Default: <code>0.0</code>. | <nobr><code>--min-distance 0.05</code></nobr> |
+| <nobr><code>--novelty-power FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative exponent applied to distance from existing and suggested points. Default: <code>1.0</code>. | <nobr><code>--novelty-power 2</code></nobr> |
+| <nobr><code>--verification-metrics PATH</code></nobr> | <code>suggest-additional</code> | Direct path to <code>verification_metrics.csv</code>; overrides <code>--fit-dir</code>. | <nobr><code>--verification-metrics trial/verification_metrics.csv</code></nobr> |
 
 ## Quick Start
 

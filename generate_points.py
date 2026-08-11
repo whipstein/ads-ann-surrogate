@@ -57,6 +57,16 @@ class ParameterSpec:
     scale: str = "linear"
 
 
+@dataclass(frozen=True)
+class RangeExtensionPlan:
+    parameter_name: str
+    side: str
+    original_parameters: list[ParameterSpec]
+    overall_parameters: list[ParameterSpec]
+    sampling_parameters: list[ParameterSpec]
+    added_volume_ratio: float
+
+
 @dataclass
 class ErrorRegion:
     source_index: str
@@ -136,6 +146,174 @@ def parse_parameter_spec(raw: str) -> ParameterSpec:
 
     output_unit = lower_unit if lower_unit == upper_unit else ""
     return ParameterSpec(name=name, lower=lower, upper=upper, unit=output_unit, scale=scale)
+
+
+def parse_range_factor(raw: str) -> tuple[str, float]:
+    if "=" not in raw:
+        raise ValueError(f"Range factor must look like NAME=FACTOR, got {raw!r}")
+    name, factor_text = raw.split("=", 1)
+    name = name.strip()
+    if not name:
+        raise ValueError(f"Range factor is missing a parameter name: {raw!r}")
+    try:
+        factor = float(factor_text.strip())
+    except ValueError as exc:
+        raise ValueError(f"Range factor must be numeric in {raw!r}") from exc
+    if not math.isfinite(factor) or factor <= 1.0:
+        raise ValueError(f"Range factor must be finite and greater than 1 in {raw!r}")
+    return name, factor
+
+
+def apply_range_factors(
+    parameters: Sequence[ParameterSpec],
+    raw_factors: Sequence[str],
+) -> list[ParameterSpec]:
+    by_name: dict[str, ParameterSpec] = {}
+    for parameter in parameters:
+        if parameter.name in by_name:
+            raise ValueError(f"Parameter {parameter.name!r} was specified more than once")
+        by_name[parameter.name] = parameter
+
+    factors: dict[str, float] = {}
+    for raw in raw_factors:
+        name, factor = parse_range_factor(raw)
+        if name not in by_name:
+            raise ValueError(
+                f"Range factor refers to unknown parameter {name!r}; add it with --parameter first"
+            )
+        if name in factors:
+            raise ValueError(f"Range factor for parameter {name!r} was specified more than once")
+        factors[name] = factor
+
+    expanded: list[ParameterSpec] = []
+    for parameter in parameters:
+        factor = factors.get(parameter.name)
+        if factor is None:
+            expanded.append(parameter)
+            continue
+        if parameter.scale == "log":
+            lower = math.log(parameter.lower)
+            upper = math.log(parameter.upper)
+            center = 0.5 * (lower + upper)
+            half_span = 0.5 * (upper - lower) * factor
+            try:
+                new_lower = math.exp(center - half_span)
+                new_upper = math.exp(center + half_span)
+            except OverflowError as exc:
+                raise ValueError(
+                    f"Range factor for parameter {parameter.name!r} produces non-finite bounds"
+                ) from exc
+        else:
+            center = 0.5 * (parameter.lower + parameter.upper)
+            half_span = 0.5 * (parameter.upper - parameter.lower) * factor
+            new_lower = center - half_span
+            new_upper = center + half_span
+        if not math.isfinite(new_lower) or not math.isfinite(new_upper):
+            raise ValueError(
+                f"Range factor for parameter {parameter.name!r} produces non-finite bounds"
+            )
+        expanded.append(
+            ParameterSpec(
+                name=parameter.name,
+                lower=new_lower,
+                upper=new_upper,
+                unit=parameter.unit,
+                scale=parameter.scale,
+            )
+        )
+    return expanded
+
+
+def parameter_span(spec: ParameterSpec) -> float:
+    if spec.scale == "log":
+        return math.log(spec.upper) - math.log(spec.lower)
+    return spec.upper - spec.lower
+
+
+def build_range_extension_plan(
+    parameters: Sequence[ParameterSpec],
+    raw_extension: str,
+) -> RangeExtensionPlan:
+    by_name = {parameter.name: parameter for parameter in parameters}
+    if len(by_name) != len(parameters):
+        raise ValueError("Each --parameter name must be unique")
+
+    requested = parse_parameter_spec(raw_extension)
+    original = by_name.get(requested.name)
+    if original is None:
+        raise ValueError(
+            f"Range extension refers to unknown parameter {requested.name!r}; "
+            "add its original range with --parameter first"
+        )
+
+    extension_body = raw_extension.split("=", 1)[1]
+    extension_parts = [part.strip() for part in extension_body.split(":")]
+    explicit_scale = (
+        extension_parts[-1].lower()
+        if extension_parts and extension_parts[-1].lower() in {"linear", "log"}
+        else None
+    )
+    if explicit_scale is not None and explicit_scale != original.scale:
+        raise ValueError(
+            f"Range extension scale for {original.name!r} must remain {original.scale!r}"
+        )
+    requested = ParameterSpec(
+        name=requested.name,
+        lower=requested.lower,
+        upper=requested.upper,
+        unit=original.unit,
+        scale=original.scale,
+    )
+    if requested.scale == "log" and requested.lower <= 0.0:
+        raise ValueError(f"Extended log range for {requested.name!r} must remain positive")
+
+    lower_same = math.isclose(requested.lower, original.lower, rel_tol=1e-10, abs_tol=1e-18)
+    upper_same = math.isclose(requested.upper, original.upper, rel_tol=1e-10, abs_tol=1e-18)
+    lower_extension = requested.lower < original.lower and upper_same
+    upper_extension = lower_same and requested.upper > original.upper
+    if not lower_extension and not upper_extension:
+        raise ValueError(
+            f"--extend-range must keep one {original.name!r} bound unchanged and move "
+            "the other outward; the new range must contain the original range"
+        )
+
+    if lower_extension:
+        side = "lower"
+        slab = ParameterSpec(
+            original.name,
+            requested.lower,
+            original.lower,
+            original.unit,
+            original.scale,
+        )
+    else:
+        side = "upper"
+        slab = ParameterSpec(
+            original.name,
+            original.upper,
+            requested.upper,
+            original.unit,
+            original.scale,
+        )
+
+    overall_parameters: list[ParameterSpec] = []
+    sampling_parameters: list[ParameterSpec] = []
+    for parameter in parameters:
+        if parameter.name == original.name:
+            overall_parameters.append(requested)
+            sampling_parameters.append(slab)
+        else:
+            overall_parameters.append(parameter)
+            sampling_parameters.append(parameter)
+
+    return RangeExtensionPlan(
+        parameter_name=original.name,
+        side=side,
+        original_parameters=list(parameters),
+        overall_parameters=overall_parameters,
+        sampling_parameters=sampling_parameters,
+        added_volume_ratio=parameter_span(slab) / parameter_span(original),
+    )
 
 
 def format_value(value: float, unit: str) -> str:
@@ -375,6 +553,154 @@ def write_points_csv(
         split_values = ["train", "verification"] if verification_count else ["train"]
         for split_value in split_values:
             split_rows = [row for row in rows if row.get(split_var) == split_value]
+            split_path = split_output_path(path, split_value)
+            write_rows_csv(split_path, split_rows, fields)
+            written.append(split_path)
+    return written
+
+
+def read_csv_table(path: Path) -> tuple[list[str], list[dict[str, object]]]:
+    if not path.exists():
+        raise ValueError(f"Existing-points CSV does not exist: {path}")
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fields = list(reader.fieldnames or [])
+        rows = [dict(row) for row in reader]
+    if not fields:
+        raise ValueError(f"Existing-points CSV has no header: {path}")
+    if not rows:
+        raise ValueError(f"Existing-points CSV has no data rows: {path}")
+    return fields, rows
+
+
+def range_extension_recommendation(
+    rows: Sequence[dict[str, object]],
+    split_var: str,
+    dimensions: int,
+    added_volume_ratio: float,
+) -> tuple[int, int]:
+    def stable_ceil(value: float) -> int:
+        tolerance = 1e-12 * max(1.0, abs(value))
+        return int(math.ceil(value - tolerance))
+
+    verification_rows = sum(
+        str(lookup_row_value(row, split_var) or "train").strip().lower() == "verification"
+        for row in rows
+    )
+    training_rows = len(rows) - verification_rows
+    recommended_training = max(
+        stable_ceil(training_rows * added_volume_ratio),
+        4 * dimensions,
+    )
+    recommended_verification = 0
+    if verification_rows:
+        recommended_verification = max(
+            stable_ceil(verification_rows * added_volume_ratio),
+            2 * dimensions,
+        )
+    return recommended_training, recommended_verification
+
+
+def validate_existing_parameter_rows(
+    rows: Sequence[dict[str, object]],
+    parameters: Sequence[ParameterSpec],
+    bare_values: str,
+) -> None:
+    for row_index, row in enumerate(rows, start=2):
+        for parameter in parameters:
+            raw = lookup_row_value(row, parameter.name)
+            if raw is None or str(raw).strip() == "":
+                raise ValueError(
+                    f"Existing-points row {row_index} is missing parameter {parameter.name!r}"
+                )
+            try:
+                value = parse_observed_value(raw, parameter, bare_values=bare_values)
+                coordinate = unit_coordinate_for_value(value, parameter)
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Could not parse parameter {parameter.name!r} in existing-points "
+                    f"row {row_index}: {raw!r}"
+                ) from exc
+            if not math.isfinite(coordinate) or not -1e-9 <= coordinate <= 1.0 + 1e-9:
+                raise ValueError(
+                    f"Existing-points row {row_index} value {raw!r} for {parameter.name!r} "
+                    "is outside its original --parameter range"
+                )
+
+
+def write_range_extension_csv(
+    path: Path,
+    existing_fields: Sequence[str],
+    existing_rows: Sequence[dict[str, object]],
+    method: str,
+    unit_points: Sequence[Sequence[float]],
+    plan: RangeExtensionPlan,
+    verification_count: int,
+    split_var: str,
+    include_normalized: bool,
+    bare_values: str,
+    write_split_files: bool,
+) -> list[Path]:
+    rows = [dict(row) for row in existing_rows]
+    train_count = len(unit_points) - verification_count
+    for offset, point in enumerate(unit_points):
+        is_train = offset < train_count
+        row: dict[str, object] = {
+            split_var: "train" if is_train else "verification",
+            "method": f"range-extension-{method}",
+        }
+        for parameter, unit_value in zip(plan.sampling_parameters, point):
+            row[parameter.name] = format_value(
+                map_unit_point(unit_value, parameter),
+                parameter.unit,
+            )
+        rows.append(row)
+
+    normalized_fields = [f"u_{parameter.name}" for parameter in plan.overall_parameters]
+    include_any_normalized = include_normalized or any(
+        field in existing_fields for field in normalized_fields
+    )
+    split_counts: dict[str, int] = {}
+    for point_index, row in enumerate(rows, start=1):
+        split_value = str(lookup_row_value(row, split_var) or "train").strip() or "train"
+        if split_value.lower() in {"train", "verification"}:
+            split_value = split_value.lower()
+        row[split_var] = split_value
+        split_counts[split_value] = split_counts.get(split_value, 0) + 1
+        split_sequence = split_counts[split_value]
+        row["point_index"] = point_index
+        row["split_sequence"] = split_sequence
+        row["train_sequence"] = split_sequence if split_value.lower() == "train" else ""
+        row["verification_sequence"] = (
+            split_sequence if split_value.lower() == "verification" else ""
+        )
+        if include_any_normalized:
+            for parameter in plan.overall_parameters:
+                raw = lookup_row_value(row, parameter.name)
+                assert raw is not None
+                value = parse_observed_value(raw, parameter, bare_values=bare_values)
+                coordinate = unit_coordinate_for_value(value, parameter)
+                row[f"u_{parameter.name}"] = f"{coordinate:.16g}"
+
+    canonical_fields = [
+        "point_index",
+        split_var,
+        "split_sequence",
+        "train_sequence",
+        "verification_sequence",
+        "method",
+    ]
+    if include_any_normalized:
+        canonical_fields.extend(normalized_fields)
+    canonical_fields.extend(parameter.name for parameter in plan.overall_parameters)
+    fields = list(dict.fromkeys([*canonical_fields, *existing_fields]))
+    write_rows_csv(path, rows, fields)
+    written = [path]
+    if write_split_files:
+        for split_value in split_counts:
+            split_rows = [
+                row for row in rows if str(row.get(split_var, "")) == split_value
+            ]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
             written.append(split_path)
@@ -800,6 +1126,16 @@ def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="NAME=LOW:HIGH[:linear|log]",
         help="Repeat once per geometry/process variable, e.g. W=0.40mm:0.80mm or R=1:100:log.",
     )
+    parser.add_argument(
+        "--range-factor",
+        action="append",
+        default=[],
+        metavar="NAME=FACTOR",
+        help=(
+            "Increase an existing --parameter span around its center by this factor. "
+            "Repeat for multiple parameters, e.g. W=1.5."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234, help="Random seed for randomized methods.")
     parser.add_argument(
         "--lhs-candidates",
@@ -830,12 +1166,42 @@ def build_generate_parser() -> argparse.ArgumentParser:
         description="Generate geometry/process sample points for ADS surrogate extraction.",
     )
     add_parameter_arguments(parser)
-    parser.add_argument("--count", type=int, required=True, help="Total number of points to write.")
+    parser.add_argument(
+        "--bare-values",
+        choices=["parameter-units", "base-units"],
+        default="parameter-units",
+        help=(
+            "How to interpret unitless values in --existing-points. "
+            "Default: parameter-units."
+        ),
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        help=(
+            "Number of new points. Required for normal generation; a range extension "
+            "uses the density-based recommendation when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--existing-points",
+        help="Original geometry CSV to retain and append to when using --extend-range.",
+    )
+    parser.add_argument(
+        "--extend-range",
+        metavar="NAME=NEW_LOW:NEW_HIGH",
+        help=(
+            "Extend one parameter on one side, sample only the added slab, and append "
+            "the new points to --existing-points."
+        ),
+    )
     parser.add_argument(
         "--verification-count",
         type=int,
-        default=0,
-        help="Number of tail points labeled verification. Default: 0.",
+        help=(
+            "Number of new tail points labeled verification. Default: 0 normally; "
+            "a range extension preserves the original split ratio."
+        ),
     )
     parser.add_argument(
         "--method",
@@ -846,7 +1212,13 @@ def build_generate_parser() -> argparse.ArgumentParser:
             "latin-hypercube, sobol, halton. Default: maximin-lhs."
         ),
     )
-    parser.add_argument("--out", default="generated_points.csv", help="Output CSV path. Use {method} for multiple methods.")
+    parser.add_argument(
+        "--out",
+        help=(
+            "Output CSV path. Use {method} for multiple methods. Default: "
+            "generated_points.csv, or <existing>_extended.csv for a range extension."
+        ),
+    )
     parser.add_argument(
         "--write-split-files",
         action="store_true",
@@ -952,9 +1324,14 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_parameters_or_error(parser: argparse.ArgumentParser, args: argparse.Namespace) -> list[ParameterSpec]:
+def parse_parameters_or_error(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    apply_factors: bool = True,
+) -> list[ParameterSpec]:
     try:
-        return [parse_parameter_spec(raw) for raw in args.parameter]
+        parameters = [parse_parameter_spec(raw) for raw in args.parameter]
+        return apply_range_factors(parameters, args.range_factor if apply_factors else [])
     except ValueError as exc:
         parser.error(str(exc))
     raise AssertionError("unreachable")
@@ -968,12 +1345,102 @@ def validate_shared_sampling_args(parser: argparse.ArgumentParser, args: argpars
 
 
 def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    if args.count <= 0:
-        parser.error("--count must be positive")
-    if args.verification_count < 0 or args.verification_count >= args.count:
-        parser.error("--verification-count must be non-negative and smaller than --count")
     validate_shared_sampling_args(parser, args)
-    parameters = parse_parameters_or_error(parser, args)
+    extending = args.extend_range is not None
+    if extending != (args.existing_points is not None):
+        parser.error("--extend-range and --existing-points must be used together")
+    if extending and args.range_factor:
+        parser.error("--extend-range cannot be combined with --range-factor")
+    parameters = parse_parameters_or_error(parser, args, apply_factors=not extending)
+
+    extension_plan: RangeExtensionPlan | None = None
+    existing_fields: list[str] = []
+    existing_rows: list[dict[str, object]] = []
+    if extending:
+        try:
+            extension_plan = build_range_extension_plan(parameters, args.extend_range)
+            existing_fields, existing_rows = read_csv_table(Path(args.existing_points))
+            validate_existing_parameter_rows(
+                existing_rows,
+                extension_plan.original_parameters,
+                bare_values=args.bare_values,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        recommended_train, recommended_verification = range_extension_recommendation(
+            existing_rows,
+            args.split_var,
+            len(parameters),
+            extension_plan.added_volume_ratio,
+        )
+        recommended_total = recommended_train + recommended_verification
+        original_parameter = next(
+            parameter
+            for parameter in extension_plan.original_parameters
+            if parameter.name == extension_plan.parameter_name
+        )
+        overall_parameter = next(
+            parameter
+            for parameter in extension_plan.overall_parameters
+            if parameter.name == extension_plan.parameter_name
+        )
+        print(
+            f"extending {extension_plan.parameter_name} on the {extension_plan.side} side: "
+            f"{format_value(original_parameter.lower, original_parameter.unit)}:"
+            f"{format_value(original_parameter.upper, original_parameter.unit)} -> "
+            f"{format_value(overall_parameter.lower, overall_parameter.unit)}:"
+            f"{format_value(overall_parameter.upper, overall_parameter.unit)}"
+        )
+        print(
+            f"range extension adds {extension_plan.added_volume_ratio * 100.0:.1f}% "
+            "of the original transformed design-space volume"
+        )
+        print(
+            "point guidance: "
+            f"{recommended_total} new points "
+            f"({recommended_train} train, {recommended_verification} verification); "
+            "this preserves sampling density with minimum boundary coverage",
+            flush=True,
+        )
+        if args.count is None:
+            verification_count = (
+                recommended_verification
+                if args.verification_count is None
+                else args.verification_count
+            )
+            count = recommended_train + verification_count
+            print(f"using recommended --count {count}")
+        else:
+            count = args.count
+            if args.verification_count is None:
+                old_verification = sum(
+                    str(lookup_row_value(row, args.split_var) or "train").strip().lower()
+                    == "verification"
+                    for row in existing_rows
+                )
+                verification_count = int(round(count * old_verification / len(existing_rows)))
+                if count == 1:
+                    verification_count = 0
+                elif old_verification:
+                    verification_count = min(count - 1, max(1, verification_count))
+            else:
+                verification_count = args.verification_count
+            if count < recommended_total:
+                print(
+                    f"warning: --count {count} is below the recommended {recommended_total} "
+                    "points for this extension",
+                    file=sys.stderr,
+                )
+    else:
+        if args.count is None:
+            parser.error("--count is required unless --extend-range is used")
+        count = args.count
+        verification_count = args.verification_count or 0
+
+    if count <= 0:
+        parser.error("--count must be positive")
+    if verification_count < 0 or verification_count >= count:
+        parser.error("--verification-count must be non-negative and smaller than --count")
 
     methods = parse_methods(args.method) or ["maximin-lhs"]
     unknown = [method for method in methods if method not in VALID_METHODS]
@@ -981,12 +1448,21 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         parser.error("Unknown method(s): " + ", ".join(unknown))
 
     multiple_methods = len(methods) > 1
+    if args.out:
+        base_out_path = Path(args.out)
+    elif extending:
+        existing_path = Path(args.existing_points)
+        base_out_path = existing_path.with_name(
+            f"{existing_path.stem}_extended{existing_path.suffix or '.csv'}"
+        )
+    else:
+        base_out_path = Path("generated_points.csv")
     written_paths: list[Path] = []
     for offset, method in enumerate(methods):
         try:
             unit_points = generate_unit_points(
                 method,
-                count=args.count,
+                count=count,
                 dimensions=len(parameters),
                 seed=args.seed + offset,
                 lhs_candidates=args.lhs_candidates,
@@ -997,17 +1473,34 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
-        out_path = output_path_for_method(Path(args.out), method, multiple_methods)
-        written_paths.extend(write_points_csv(
-            out_path,
-            method,
-            unit_points,
-            parameters,
-            verification_count=args.verification_count,
-            split_var=args.split_var,
-            include_normalized=args.include_normalized,
-            write_split_files=args.write_split_files,
-        ))
+        out_path = output_path_for_method(base_out_path, method, multiple_methods)
+        if extension_plan is not None:
+            written_paths.extend(
+                write_range_extension_csv(
+                    out_path,
+                    existing_fields,
+                    existing_rows,
+                    method,
+                    unit_points,
+                    extension_plan,
+                    verification_count=verification_count,
+                    split_var=args.split_var,
+                    include_normalized=args.include_normalized,
+                    bare_values=args.bare_values,
+                    write_split_files=args.write_split_files,
+                )
+            )
+        else:
+            written_paths.extend(write_points_csv(
+                out_path,
+                method,
+                unit_points,
+                parameters,
+                verification_count=verification_count,
+                split_var=args.split_var,
+                include_normalized=args.include_normalized,
+                write_split_files=args.write_split_files,
+            ))
     for path in written_paths:
         print(f"wrote {path}")
     return 0
