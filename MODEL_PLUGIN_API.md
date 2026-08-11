@@ -136,18 +136,23 @@ fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks el
 ```
 
 Store `dc_metadata` in `metadata.json` and place
-`dc_equivalent_resistance_ohm` on the loaded model. `predict_blocks()` must use
-`apply_distinct_dc_response()` after forming its normal S-parameter values.
-This guarantees that zero-Hz input data cannot affect fitted weights or poles.
+`dc_equivalent_resistance_ohm` and `dc_resistance_source_kind` on the loaded
+model. `predict_blocks()` must use `apply_distinct_dc_response()` after forming
+its normal S-parameter values and pass both saved fields. This guarantees that
+zero-Hz input data cannot affect fitted weights or poles and that older
+fallback-derived models cannot supply DC.
 
-`extract_average_dc_resistance()` uses exact zero-Hz rows when every training
-block supplies one. It falls back to each block's lowest positive-frequency row
-only when the dataset contains no zero-Hz rows, and rejects mixed coverage.
+`extract_average_dc_resistance()` requires exactly one zero-Hz row in every
+training block. Missing or duplicate zero-Hz rows are errors. It never falls
+back to positive-frequency data, and invalid pairwise DC resistances are not
+silently discarded. Save `dc_resistance_source_kind=exact_zero_frequency` and
+require that value again before prediction at DC or direct Verilog-A export.
 
 `build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
 Direct Verilog-A writers must receive the saved
-`dc_equivalent_resistance_ohm`; the shared writers then stamp the distinct
-resistor topology at zero Hz and bypass the fitted response.
+`dc_equivalent_resistance_ohm` and `dc_resistance_source_kind`; the shared
+writers validate exact-DC provenance, stamp the distinct resistor topology at
+zero Hz, and bypass the fitted response.
 
 ## Training Command Contract
 

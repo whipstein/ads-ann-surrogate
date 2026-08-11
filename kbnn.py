@@ -1143,6 +1143,7 @@ class KBNN:
         include_coarse_input: bool,
         freq_transform: str,
         dc_equivalent_resistance_ohm: float | None = None,
+        dc_resistance_source_kind: str | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -1157,6 +1158,7 @@ class KBNN:
             if dc_equivalent_resistance_ohm is None
             else float(dc_equivalent_resistance_ohm)
         )
+        self.dc_resistance_source_kind = dc_resistance_source_kind
 
     def predict_blocks(
         self,
@@ -1194,6 +1196,7 @@ class KBNN:
                 fine.freq_hz,
                 self.sparam_labels,
                 self.dc_equivalent_resistance_ohm,
+                self.dc_resistance_source_kind,
                 z0=50.0,
             )
             sparams = {
@@ -1233,6 +1236,7 @@ class KBNN:
             "include_coarse_input": self.include_coarse_input,
             "freq_transform": self.freq_transform,
             "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
+            "dc_resistance_source_kind": self.dc_resistance_source_kind,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -1261,6 +1265,7 @@ class KBNN:
             include_coarse_input=bool(metadata["include_coarse_input"]),
             freq_transform=metadata["freq_transform"],
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
+            dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
         )
 
 
@@ -1441,6 +1446,7 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         dc_equivalent_resistance_ohm=float(
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
+        dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
     )
     metadata = {
         "training_blocks": len(train_fine),
@@ -2056,6 +2062,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         parameter_input_scales=parameter_input_scales,
         embedded_coarse_model=embedded_coarse_model,
         dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
+        dc_resistance_source_kind=source_metadata.get("dc_resistance_source_kind"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "knowledge_based_neural_network",

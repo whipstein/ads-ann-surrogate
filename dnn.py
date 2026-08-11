@@ -367,6 +367,7 @@ class DNN:
         output_domain: str = "s",
         target_z0: float = 50.0,
         dc_equivalent_resistance_ohm: float | None = None,
+        dc_resistance_source_kind: str | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -381,6 +382,7 @@ class DNN:
             if dc_equivalent_resistance_ohm is None
             else float(dc_equivalent_resistance_ohm)
         )
+        self.dc_resistance_source_kind = dc_resistance_source_kind
 
     def predict_blocks(self, blocks: Sequence[MDIFBlock]) -> list[MDIFBlock]:
         predicted = []
@@ -396,6 +398,7 @@ class DNN:
                 block.freq_hz,
                 self.sparam_labels,
                 self.dc_equivalent_resistance_ohm,
+                self.dc_resistance_source_kind,
                 z0=self.target_z0,
             )
             sparams = {label: values[:, idx] for idx, label in enumerate(self.sparam_labels)}
@@ -431,6 +434,7 @@ class DNN:
             "output_domain": self.output_domain,
             "target_z0": self.target_z0,
             "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
+            "dc_resistance_source_kind": self.dc_resistance_source_kind,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -459,6 +463,7 @@ class DNN:
             output_domain=metadata.get("output_domain", "s"),
             target_z0=float(metadata.get("target_z0", 50.0)),
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
+            dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
         )
 
 
@@ -570,6 +575,7 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         dc_equivalent_resistance_ohm=float(
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
+        dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
     )
     metadata = {
         "training_blocks": len(train_blocks),
@@ -963,6 +969,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         fold_input_scaler=fold_scalers,
         fold_output_scaler=fold_scalers,
         dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
+        dc_resistance_source_kind=source_metadata.get("dc_resistance_source_kind"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",

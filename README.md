@@ -131,6 +131,12 @@ unit-cube coordinates. Add `--write-split-files` to also write separate
 `*_train.csv` and `*_verification.csv` files for tools that consume the two
 simulation queues independently.
 
+Every geometry CSV also gets an automatic same-stem JSON file. For example,
+`geometries.csv` produces `geometries.json`. The JSON records the generation
+method, point and dataset counts, and each parameter's lower bound, upper bound,
+unit, base-unit bounds, and linear/log scale. Separate train/verification CSVs
+and targeted additional-point CSVs receive their own JSON files as well.
+
 ### Extending an Existing Parameter Range
 
 To extend one side of an existing design, keep the original bounds in
@@ -155,6 +161,11 @@ the corresponding original bound. To extend the lower side instead, enter a
 lower new bound and retain the old upper bound. You may set `--out` to the same
 path as `--existing-points` for an in-place combined result; a separate output
 is safer until the new EM batch has been checked.
+
+The extended geometry's JSON uses the new overall parameter ranges and also
+includes `range_extension` details containing the original ranges, the slab
+used to sample only the new points, the extended side, and the original and
+added point counts.
 
 #### How Many New Points to Add
 
@@ -267,7 +278,7 @@ without a subcommand uses it automatically.
 | <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of new points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. | <nobr><code>--count 80</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid. | <nobr><code>--existing-points geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
-| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
+| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges is written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to suggested points. Default: <code>targeted</code>. | <nobr><code>--target-dataset train</code></nobr> |
 | <nobr><code>--verification-count INT</code></nobr> | <code>generate</code> | Number of new tail points labeled verification; must be smaller than <code>--count</code>. Default: <code>0</code>, or the original split ratio during a range extension. | <nobr><code>--verification-count 16</code></nobr> |
@@ -468,15 +479,18 @@ equivalent resistance in `metadata.json` and reports it in
 `training_summary.md`. The corresponding real/imaginary S-point is stored under
 `dc_sparameters`. It is deliberately separate from the fitted response:
 
-1. If every training block contains an exact zero-Hz row, that S-matrix is
-   converted to Y using the model reference impedance. If no block contains
-   zero Hz, the lowest positive-frequency row is used as an explicit fallback.
-   Mixing blocks with and without zero-Hz rows is rejected.
+> **Exact DC data is required.** Every training block must contain exactly one
+> zero-Hz row. A missing or duplicate DC row stops training with an error. The
+> lowest positive frequency is never substituted for DC, and the RF fit is
+> never extrapolated to create DC.
+
+1. The exact zero-Hz S-matrix from every training block is converted to Y using
+   the model reference impedance.
 2. A one-amp balanced current is applied between each port pair with all other
    ports open; the real differential voltage gives that pair's equivalent
    resistance.
-3. The arithmetic mean of all positive, finite values is saved as
-   `dc_equivalent_resistance_ohm`.
+3. Every extracted pair value must be positive and finite. Their arithmetic
+   mean is saved as `dc_equivalent_resistance_ohm`.
 4. Zero-frequency rows are excluded from neural/rational fitting, so changing
    an input MDIF's DC samples cannot change the fitted weights or poles.
 
@@ -487,11 +501,13 @@ Verilog-A exports electrically disable the fitted-response stamps at DC and
 enable the resistor network instead; positive frequencies use the fitted
 response. The exporter selects DC or fitted Y coefficients before an
 unconditional current contribution, so `ddt()` is never placed in a conditional
-and the generated source remains legal for ADS Verilog-A.
-Existing saved models must be retrained to acquire this data-derived DC value.
+and the generated source remains legal for ADS Verilog-A. Export also verifies
+that the saved model records `dc_resistance_source_kind=exact_zero_frequency`;
+older models created from RF fallback data are rejected and must be retrained.
 
 For an integrated residual or prior-input KBNN, the coarse DNN and fine KBNN
-store their own independently extracted resistance values. The composite
+store their own independently extracted resistance values, so both fine and
+coarse training data must contain exact zero-Hz rows. The composite
 Verilog-A component uses the fine-data resistance and bypasses both networks at
 DC. Native ADS ANN retraining excludes zero-Hz rows, but its generated ANN alone
 does not implement the distinct resistor branch; use the direct Verilog-A or

@@ -571,6 +571,23 @@ def validate_dc_equivalent_resistance(
     return float(value)
 
 
+def validate_exact_dc_source_kind(
+    value: object,
+    *,
+    context: str = "model",
+) -> str:
+    """Require proof that DC came only from exact zero-frequency fitting rows."""
+
+    source_kind = str(value or "").strip()
+    if source_kind != "exact_zero_frequency":
+        raise ValueError(
+            f"{context} does not contain a DC response extracted exclusively from exact "
+            "zero-Hz fitting data. Retrain with exactly one zero-Hz row in every training "
+            "block. Lowest-positive-frequency fallback and RF extrapolation are not allowed."
+        )
+    return source_kind
+
+
 def _block_s_matrix(
     block: MDIFBlock,
     labels: Sequence[str],
@@ -605,13 +622,13 @@ def extract_average_dc_resistance(
 ) -> dict[str, object]:
     """Extract one distinct DC resistance from training data.
 
-    Each training block contributes one equivalent resistance for every port
-    pair. Exact zero-Hz rows are used when every block provides one. If the
-    dataset has no zero-Hz rows, each block's lowest positive-frequency row is
-    used as an explicit fallback. A balanced one-amp current is injected into
-    one port and removed from the other with all remaining ports open; the real
-    differential voltage is the equivalent resistance. Their arithmetic mean
-    becomes the model's parameter-independent DC point.
+    Each training block must contain exactly one zero-Hz row and contributes
+    one equivalent resistance for every port pair from that row only. A
+    balanced one-amp current is injected into one port and removed from the
+    other with all remaining ports open; the real differential voltage is the
+    equivalent resistance. Their arithmetic mean becomes the model's
+    parameter-independent DC point. Positive-frequency data is never used as a
+    fallback.
     """
 
     if not math.isfinite(float(z0)) or float(z0) <= 0.0:
@@ -623,32 +640,42 @@ def extract_average_dc_resistance(
         np.flatnonzero(np.asarray(block.freq_hz, dtype=float) == 0.0)
         for block in blocks
     ]
-    blocks_with_exact_dc = sum(indices.size > 0 for indices in exact_dc_by_block)
-    if 0 < blocks_with_exact_dc < len(blocks):
+    missing_dc_blocks = [
+        str(block.source_index)
+        for block, indices in zip(blocks, exact_dc_by_block)
+        if indices.size == 0
+    ]
+    duplicate_dc_blocks = [
+        str(block.source_index)
+        for block, indices in zip(blocks, exact_dc_by_block)
+        if indices.size > 1
+    ]
+    if missing_dc_blocks or duplicate_dc_blocks:
+        details: list[str] = []
+        if missing_dc_blocks:
+            details.append("missing DC in block(s): " + ", ".join(missing_dc_blocks))
+        if duplicate_dc_blocks:
+            details.append(
+                "multiple zero-Hz rows in block(s): " + ", ".join(duplicate_dc_blocks)
+            )
         raise ValueError(
-            "Training data has inconsistent exact-DC coverage: "
-            f"{blocks_with_exact_dc} of {len(blocks)} blocks contain a zero-Hz row. "
-            "Provide zero-Hz data for every training block or remove it from every block."
+            "DC extraction requires exactly one zero-Hz fitting-data row in every "
+            "training block; " + "; ".join(details) + ". Positive-frequency data "
+            "cannot be substituted for DC."
         )
-    use_exact_dc = blocks_with_exact_dc == len(blocks)
-    source_kind = "exact_zero_frequency" if use_exact_dc else "lowest_positive_fallback"
     resistances: list[float] = []
     frequencies: list[float] = []
     contributing_blocks: set[int] = set()
     pair_resistances: dict[str, list[float]] = {}
     for block_index, block in enumerate(blocks):
         freq = np.asarray(block.freq_hz, dtype=float)
-        if use_exact_dc:
-            frequency_index = int(exact_dc_by_block[block_index][0])
-        else:
-            positive_indices = np.flatnonzero(freq > 0.0)
-            if positive_indices.size == 0:
-                raise ValueError(
-                    f"MDIF block {block.source_index} has neither an exact zero-Hz row "
-                    "nor a positive-frequency row for DC resistance extraction"
-                )
-            frequency_index = int(positive_indices[np.argmin(freq[positive_indices])])
+        frequency_index = int(exact_dc_by_block[block_index][0])
         s_matrix = _block_s_matrix(block, labels, frequency_index, nports)
+        if not np.all(np.isfinite(s_matrix.real)) or not np.all(np.isfinite(s_matrix.imag)):
+            raise ValueError(
+                f"Training block {block.source_index} contains a non-finite S-parameter "
+                "at its zero-Hz DC point"
+            )
         y_matrix = _s_to_y_matrix(s_matrix, z0)
         z_matrix = np.linalg.pinv(y_matrix)
         if nports == 1:
@@ -670,7 +697,11 @@ def extract_average_dc_resistance(
                     block_resistances.append((f"p{first + 1}-p{second + 1}", resistance))
         for pair_name, resistance in block_resistances:
             if not math.isfinite(resistance) or resistance <= 0.0:
-                continue
+                raise ValueError(
+                    f"Training block {block.source_index} produces invalid DC equivalent "
+                    f"resistance {resistance!r} ohm for {pair_name}; DC extraction requires "
+                    "a positive finite value from every port pair"
+                )
             resistances.append(float(resistance))
             pair_resistances.setdefault(pair_name, []).append(float(resistance))
             frequencies.append(float(freq[frequency_index]))
@@ -693,23 +724,20 @@ def extract_average_dc_resistance(
         "dc_resistance_source_z0_ohm": float(z0),
         "dc_resistance_source_frequency_min_hz": float(min(frequencies)),
         "dc_resistance_source_frequency_max_hz": float(max(frequencies)),
-        "dc_resistance_source_kind": source_kind,
+        "dc_resistance_source_kind": "exact_zero_frequency",
         "dc_resistance_pair_means_ohm": pair_means,
         "dc_resistance_extraction": (
             "Arithmetic mean of positive pairwise open-port equivalent resistances "
             "computed by balanced current injection from each training block at exact "
             "zero Hz"
-            if use_exact_dc
-            else
-            "Arithmetic mean of positive pairwise open-port equivalent resistances "
-            "computed by balanced current injection from each training block at its "
-            "lowest positive frequency because the dataset contains no zero-Hz rows"
         ),
         "dc_response_topology": (
             "Parameter-independent equal-resistance complete graph whose equivalent "
             "resistance between any two ports equals dc_equivalent_resistance_ohm"
         ),
         "dc_is_separate_from_fitted_response": True,
+        "dc_requires_exact_zero_frequency": True,
+        "dc_rf_fallback_allowed": False,
         "dc_sparameters": {
             label: {
                 "real": float(value.real),
@@ -764,6 +792,7 @@ def apply_distinct_dc_response(
     freq_hz: np.ndarray,
     labels: Sequence[str],
     dc_equivalent_resistance_ohm: float | None,
+    dc_resistance_source_kind: object = None,
     *,
     z0: float = 50.0,
 ) -> np.ndarray:
@@ -772,6 +801,10 @@ def apply_distinct_dc_response(
     dc_mask = np.asarray(freq_hz, dtype=float) == 0.0
     if not np.any(dc_mask):
         return values
+    validate_exact_dc_source_kind(
+        dc_resistance_source_kind,
+        context="Saved surrogate model",
+    )
     resistance = validate_dc_equivalent_resistance(
         dc_equivalent_resistance_ohm,
         context="Saved surrogate model",
@@ -1898,13 +1931,15 @@ model-training unit".
 At an exact simulator frequency of zero, the fitted neural/rational contribution
 is electrically disabled. The module instead uses the fixed,
 parameter-independent equivalent resistance
-`{dc_equivalent_resistance_ohm:.17g} ohm` extracted from the training data. For
-a multiport, equal resistors form a complete graph sized so that the equivalent
-resistance measured between any two ports is that value. Positive frequencies
-use the fitted-response contribution. The module selects the DC or fitted Y
-coefficients before one unconditional current contribution, so the `ddt()`
-analog operator remains outside procedural conditionals and in a legal
-Verilog-A context.
+`{dc_equivalent_resistance_ohm:.17g} ohm` extracted exclusively from exact
+zero-Hz rows in the fitting data. Verilog-A export is rejected unless every
+training block supplied exactly one DC row; positive-frequency fallback and RF
+extrapolation are forbidden. For a multiport, equal resistors form a complete
+graph sized so that the equivalent resistance measured between any two ports is
+that value. Positive frequencies use only the fitted-response contribution.
+The module selects the DC or fitted Y coefficients before one unconditional
+current contribution, so the `ddt()` analog operator remains outside procedural
+conditionals and in a legal Verilog-A context.
 
 ## Implementation
 
@@ -1949,12 +1984,17 @@ def veriloga_module_text(
     fold_output_scaler: bool = False,
     embedded_coarse_model: dict[str, object] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
+    dc_resistance_source_kind: object = None,
 ) -> tuple[str, dict[str, object]]:
     output_domain = output_domain.lower().strip()
     if output_domain not in {"s", "y"}:
         raise ValueError("Verilog-A output_domain must be 's' or 'y'")
     if output_domain == "y" and (uses_coarse_inputs or adds_coarse_to_output):
         raise ValueError("Direct-Y Verilog-A export is currently supported only without coarse hooks")
+    dc_source_kind = validate_exact_dc_source_kind(
+        dc_resistance_source_kind,
+        context=f"{model_kind} Verilog-A export",
+    )
     dc_resistance = validate_dc_equivalent_resistance(
         dc_equivalent_resistance_ohm,
         context=f"{model_kind} model",
@@ -2477,11 +2517,14 @@ def veriloga_module_text(
         ),
         "implementation_note": implementation_note,
         "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_resistance_source_kind": dc_source_kind,
         "dc_response_topology": (
             "Parameter-independent equal-resistance complete graph; the fitted neural "
             "response is bypassed when simulator frequency is exactly zero"
         ),
         "dc_is_separate_from_fitted_response": True,
+        "dc_requires_exact_zero_frequency": True,
+        "dc_rf_fallback_allowed": False,
         "dc_sparameters": {
             label: {
                 "real": float(value.real),
@@ -2521,6 +2564,7 @@ def write_veriloga_package(
     fold_output_scaler: bool = False,
     embedded_coarse_model: dict[str, object] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
+    dc_resistance_source_kind: object = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -2551,6 +2595,7 @@ def write_veriloga_package(
         fold_output_scaler=fold_output_scaler,
         embedded_coarse_model=embedded_coarse_model,
         dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
+        dc_resistance_source_kind=dc_resistance_source_kind,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -2621,6 +2666,7 @@ def neurotf_veriloga_module_text(
     frequency_expression: str,
     parameter_input_scales: dict[str, float] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
+    dc_resistance_source_kind: object = None,
 ) -> tuple[str, dict[str, object]]:
     """Generate a direct Neuro-TF Verilog-A implementation."""
 
@@ -2630,6 +2676,10 @@ def neurotf_veriloga_module_text(
     n_coeffs = len(poles_array) + 1
     n_network_outputs = 2 * n_sparams * n_coeffs
     matrix_size = nports * nports
+    dc_source_kind = validate_exact_dc_source_kind(
+        dc_resistance_source_kind,
+        context="Neuro-TF Verilog-A export",
+    )
     dc_resistance = validate_dc_equivalent_resistance(
         dc_equivalent_resistance_ohm,
         context="Neuro-TF model",
@@ -2927,11 +2977,14 @@ def neurotf_veriloga_module_text(
             "it to a small-signal Y-matrix. Intended for AC/SP analyses."
         ),
         "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_resistance_source_kind": dc_source_kind,
         "dc_response_topology": (
             "Parameter-independent equal-resistance complete graph; the fitted "
             "coefficient network and rational response are bypassed at exactly zero Hz"
         ),
         "dc_is_separate_from_fitted_response": True,
+        "dc_requires_exact_zero_frequency": True,
+        "dc_rf_fallback_allowed": False,
         "dc_sparameters": {
             label: {
                 "real": float(value.real),
@@ -2965,6 +3018,7 @@ def write_neurotf_veriloga_package(
     frequency_expression: str = "$freq",
     parameter_input_scales: dict[str, float] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
+    dc_resistance_source_kind: object = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -2990,6 +3044,7 @@ def write_neurotf_veriloga_package(
         frequency_expression=frequency_expression,
         parameter_input_scales=parameter_input_scales,
         dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
+        dc_resistance_source_kind=dc_resistance_source_kind,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"

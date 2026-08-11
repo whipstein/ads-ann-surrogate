@@ -159,6 +159,7 @@ class NeuroTF:
         poles: np.ndarray,
         f_scale: float,
         dc_equivalent_resistance_ohm: float | None = None,
+        dc_resistance_source_kind: str | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -172,6 +173,7 @@ class NeuroTF:
             if dc_equivalent_resistance_ohm is None
             else float(dc_equivalent_resistance_ohm)
         )
+        self.dc_resistance_source_kind = dc_resistance_source_kind
 
     @property
     def n_coeffs(self) -> int:
@@ -194,6 +196,7 @@ class NeuroTF:
                 block.freq_hz,
                 self.sparam_labels,
                 self.dc_equivalent_resistance_ohm,
+                self.dc_resistance_source_kind,
                 z0=50.0,
             ).T
             sparams = {
@@ -234,6 +237,7 @@ class NeuroTF:
             "layer_sizes": self.mlp.layer_sizes,
             "activation": self.mlp.activation,
             "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
+            "dc_resistance_source_kind": self.dc_resistance_source_kind,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -263,6 +267,7 @@ class NeuroTF:
             poles=poles,
             f_scale=f_scale,
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
+            dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
         )
 
 
@@ -507,6 +512,7 @@ def command_train(args: argparse.Namespace) -> int:
         dc_equivalent_resistance_ohm=float(
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
+        dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
     )
 
     out_dir = Path(args.out_dir)
@@ -703,6 +709,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         frequency_expression=args.frequency_expression,
         parameter_input_scales=parameter_input_scales,
         dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
+        dc_resistance_source_kind=source_metadata.get("dc_resistance_source_kind"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "dc_resistance_source_kind": source_metadata.get(

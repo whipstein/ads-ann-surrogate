@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import random
 import re
@@ -483,6 +484,67 @@ def write_rows_csv(path: Path, rows: Sequence[dict[str, object]], fields: Sequen
         writer.writerows(rows)
 
 
+def geometry_metadata_path(path: Path) -> Path:
+    metadata_path = path.with_suffix(".json")
+    if metadata_path == path:
+        return path.with_name(f"{path.stem}_metadata.json")
+    return metadata_path
+
+
+def metadata_number(value: float) -> float:
+    return float(f"{value:.12g}")
+
+
+def parameter_range_metadata(parameter: ParameterSpec) -> dict[str, object]:
+    unit_scale = UNIT_SCALES.get(parameter.unit, 1.0)
+    return {
+        "name": parameter.name,
+        "range": {
+            "lower": metadata_number(parameter.lower / unit_scale),
+            "upper": metadata_number(parameter.upper / unit_scale),
+            "unit": parameter.unit,
+        },
+        "base_unit_range": {
+            "lower": metadata_number(parameter.lower),
+            "upper": metadata_number(parameter.upper),
+        },
+        "scale": parameter.scale,
+    }
+
+
+def write_geometry_metadata(
+    geometry_path: Path,
+    parameters: Sequence[ParameterSpec],
+    rows: Sequence[dict[str, object]],
+    split_var: str,
+    generation_kind: str,
+    method: str,
+    extra: dict[str, object] | None = None,
+) -> Path:
+    split_counts: dict[str, int] = {}
+    for row in rows:
+        split_value = str(row.get(split_var, "")).strip()
+        if split_value:
+            split_counts[split_value] = split_counts.get(split_value, 0) + 1
+
+    metadata: dict[str, object] = {
+        "schema_version": 1,
+        "geometry_file": geometry_path.name,
+        "generation_kind": generation_kind,
+        "method": method,
+        "point_count": len(rows),
+        "split_variable": split_var,
+        "split_counts": split_counts,
+        "parameters": [parameter_range_metadata(parameter) for parameter in parameters],
+    }
+    if extra:
+        metadata.update(extra)
+
+    metadata_path = geometry_metadata_path(geometry_path)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return metadata_path
+
+
 def generated_point_rows(
     method: str,
     unit_points: Sequence[Sequence[float]],
@@ -548,14 +610,30 @@ def write_points_csv(
         include_normalized,
     )
     write_rows_csv(path, rows, fields)
-    written = [path]
+    metadata_path = write_geometry_metadata(
+        path,
+        parameters,
+        rows,
+        split_var,
+        generation_kind="generated",
+        method=method,
+    )
+    written = [path, metadata_path]
     if write_split_files:
         split_values = ["train", "verification"] if verification_count else ["train"]
         for split_value in split_values:
             split_rows = [row for row in rows if row.get(split_var) == split_value]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
-            written.append(split_path)
+            split_metadata_path = write_geometry_metadata(
+                split_path,
+                parameters,
+                split_rows,
+                split_var,
+                generation_kind="generated",
+                method=method,
+            )
+            written.extend([split_path, split_metadata_path])
     return written
 
 
@@ -695,7 +773,33 @@ def write_range_extension_csv(
     canonical_fields.extend(parameter.name for parameter in plan.overall_parameters)
     fields = list(dict.fromkeys([*canonical_fields, *existing_fields]))
     write_rows_csv(path, rows, fields)
-    written = [path]
+    extension_metadata: dict[str, object] = {
+        "range_extension": {
+            "parameter": plan.parameter_name,
+            "side": plan.side,
+            "added_volume_ratio": metadata_number(plan.added_volume_ratio),
+            "original_point_count": len(existing_rows),
+            "added_point_count": len(unit_points),
+            "original_parameters": [
+                parameter_range_metadata(parameter)
+                for parameter in plan.original_parameters
+            ],
+            "new_point_sampling_parameters": [
+                parameter_range_metadata(parameter)
+                for parameter in plan.sampling_parameters
+            ],
+        }
+    }
+    metadata_path = write_geometry_metadata(
+        path,
+        plan.overall_parameters,
+        rows,
+        split_var,
+        generation_kind="range_extension",
+        method=method,
+        extra=extension_metadata,
+    )
+    written = [path, metadata_path]
     if write_split_files:
         for split_value in split_counts:
             split_rows = [
@@ -703,7 +807,16 @@ def write_range_extension_csv(
             ]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
-            written.append(split_path)
+            split_metadata_path = write_geometry_metadata(
+                split_path,
+                plan.overall_parameters,
+                split_rows,
+                split_var,
+                generation_kind="range_extension",
+                method=method,
+                extra=extension_metadata,
+            )
+            written.extend([split_path, split_metadata_path])
     return written
 
 
@@ -1065,7 +1178,7 @@ def write_suggested_points_csv(
     method: str,
     metric_name: str,
     include_normalized: bool,
-) -> None:
+) -> Path:
     fields = [
         "point_index",
         split_var,
@@ -1103,6 +1216,15 @@ def write_suggested_points_csv(
             row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
         rows.append(row)
     write_rows_csv(path, rows, fields)
+    return write_geometry_metadata(
+        path,
+        parameters,
+        rows,
+        split_var,
+        generation_kind="targeted_additional",
+        method=f"targeted-{method}",
+        extra={"analysis_metric": metric_name},
+    )
 
 
 def parse_methods(raw_methods: Sequence[str]) -> list[str]:
@@ -1215,8 +1337,9 @@ def build_generate_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         help=(
-            "Output CSV path. Use {method} for multiple methods. Default: "
-            "generated_points.csv, or <existing>_extended.csv for a range extension."
+            "Output CSV path; a same-stem parameter-range JSON is also written. "
+            "Use {method} for multiple methods. Default: generated_points.csv, "
+            "or <existing>_extended.csv for a range extension."
         ),
     )
     parser.add_argument(
@@ -1316,7 +1439,11 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         default="targeted",
         help="Dataset label assigned to suggested points. Default: targeted.",
     )
-    parser.add_argument("--out", default="targeted_additional_points.csv", help="Suggested-point CSV path.")
+    parser.add_argument(
+        "--out",
+        default="targeted_additional_points.csv",
+        help="Suggested-point CSV path; a same-stem parameter-range JSON is also written.",
+    )
     parser.add_argument(
         "--analysis-out",
         help="Ranked current-fit error-region CSV path. Default: <out>_fit_error_regions.csv.",
@@ -1593,7 +1720,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     out_path = Path(args.out)
     analysis_path = Path(args.analysis_out) if args.analysis_out else analysis_output_path(out_path)
     write_error_regions_csv(analysis_path, regions, parameters)
-    write_suggested_points_csv(
+    metadata_path = write_suggested_points_csv(
         out_path,
         suggestions,
         parameters,
@@ -1606,6 +1733,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(f"considered {len(existing_points)} existing point(s) and {candidate_count} candidate point(s)")
     print(f"wrote {out_path}")
+    print(f"wrote {metadata_path}")
     print(f"wrote {analysis_path}")
     return 0
 
