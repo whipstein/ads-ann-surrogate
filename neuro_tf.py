@@ -160,6 +160,7 @@ class NeuroTF:
         f_scale: float,
         dc_equivalent_resistance_ohm: float | None = None,
         dc_resistance_source_kind: str | None = None,
+        dc_port_resistances_ohm: dict[str, float] | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -174,6 +175,14 @@ class NeuroTF:
             else float(dc_equivalent_resistance_ohm)
         )
         self.dc_resistance_source_kind = dc_resistance_source_kind
+        self.dc_port_resistances_ohm = (
+            None
+            if dc_port_resistances_ohm is None
+            else {
+                str(path): float(resistance)
+                for path, resistance in dc_port_resistances_ohm.items()
+            }
+        )
 
     @property
     def n_coeffs(self) -> int:
@@ -197,6 +206,7 @@ class NeuroTF:
                 self.sparam_labels,
                 self.dc_equivalent_resistance_ohm,
                 self.dc_resistance_source_kind,
+                self.dc_port_resistances_ohm,
                 z0=50.0,
             ).T
             sparams = {
@@ -238,6 +248,7 @@ class NeuroTF:
             "activation": self.mlp.activation,
             "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": self.dc_resistance_source_kind,
+            "dc_port_resistances_ohm": self.dc_port_resistances_ohm,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -268,6 +279,7 @@ class NeuroTF:
             f_scale=f_scale,
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
             dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
+            dc_port_resistances_ohm=metadata.get("dc_port_resistances_ohm"),
         )
 
 
@@ -304,6 +316,7 @@ def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], 
         verify_values=args.verify_values,
         parameter_names=args.parameter_names,
         holdout_fraction=args.holdout_fraction,
+        dc_port_paths=getattr(args, "dc_port_paths", None),
         order=int(candidate["order"]),
         pole_damping=float(candidate["pole_damping"]),
         ridge=float(candidate["ridge"]),
@@ -424,7 +437,12 @@ def command_train(args: argparse.Namespace) -> int:
         split_var=args.split_var,
     )
     sparam_labels = common_sparameter_labels(split_data.all_blocks)
-    dc_metadata = extract_average_dc_resistance(train_blocks, sparam_labels, z0=50.0)
+    dc_metadata = extract_average_dc_resistance(
+        train_blocks,
+        sparam_labels,
+        z0=50.0,
+        port_paths=getattr(args, "dc_port_paths", None),
+    )
     fit_train_blocks = positive_frequency_blocks(train_blocks)
     fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
     frequency_weight_spec = getattr(args, "frequency_weights", None)
@@ -513,6 +531,7 @@ def command_train(args: argparse.Namespace) -> int:
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
         dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
+        dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
     )
 
     out_dir = Path(args.out_dir)
@@ -549,6 +568,8 @@ def command_train(args: argparse.Namespace) -> int:
         "f_scale": f_scale,
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+        "dc_port_paths": metadata["dc_port_paths"],
+        "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_resistance_filtering": {
@@ -630,7 +651,11 @@ def command_train(args: argparse.Namespace) -> int:
             "n_poles": args.order,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
-            "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
+            "dc_port_paths": metadata["dc_port_paths"],
+            "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
+            "dc_resistance_pair_means_ohm": metadata[
+                "dc_resistance_pair_means_ohm"
+            ],
             "frequency_weights": metadata["frequency_weights"],
             "frequency_weight_mean": metadata["frequency_weight_mean"],
             "export_commands": dict(export_commands),
@@ -661,11 +686,17 @@ def command_export_ads(args: argparse.Namespace) -> int:
         z0=50.0,
         open_threshold_ohm=args.dc_open_threshold,
         open_resistance_ohm=args.dc_open_resistance,
+        port_paths=args.dc_port_paths,
     )
     model.dc_equivalent_resistance_ohm = float(
         dc_metadata["dc_equivalent_resistance_ohm"]
     )
     model.dc_resistance_source_kind = str(dc_metadata["dc_resistance_source_kind"])
+    model.dc_port_resistances_ohm = (
+        dict(dc_metadata["dc_port_resistances_ohm"])
+        if isinstance(dc_metadata.get("dc_port_resistances_ohm"), dict)
+        else None
+    )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -697,7 +728,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         },
         extra_notes=[
             "The exported MDIF samples the fitted fixed-pole Neuro-TF response; ADS does not execute the neural network or rational basis directly.",
-            "Every exported block includes a zero-Hz point from the resolved passive exact-DC average resistance; the coefficient network and rational basis are bypassed there.",
+            "Every exported block includes a zero-Hz point from the selected passive exact-DC port paths; the coefficient network and rational basis are bypassed there.",
         ],
     )
     print(json.dumps({
@@ -707,6 +738,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "blocks": manifest["blocks"],
         "frequency_points_per_block": manifest["frequency_points_per_block"],
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_port_paths": dc_metadata.get("dc_port_paths"),
+        "dc_port_resistances_ohm": dc_metadata.get("dc_port_resistances_ohm"),
         "dc_ignored_nonpassive_count": dc_metadata.get(
             "dc_ignored_nonpassive_count"
         ),
@@ -732,6 +765,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         z0=args.z0,
         open_threshold_ohm=args.dc_open_threshold,
         open_resistance_ohm=args.dc_open_resistance,
+        port_paths=args.dc_port_paths,
     )
     manifest = write_neurotf_veriloga_package(
         out_dir=out_dir,
@@ -755,6 +789,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
+        dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "dc_resistance_source_kind": dc_metadata.get(
@@ -779,6 +814,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "f_scale": manifest["f_scale"],
         "fully_self_contained": manifest["fully_self_contained"],
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
+        "dc_port_paths": manifest.get("dc_port_paths"),
+        "dc_port_resistances_ohm": manifest.get("dc_port_resistances_ohm"),
         "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
         "dc_ignored_nonpassive_count": dc_metadata.get(
@@ -828,6 +865,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--parameter-names", help="Comma-separated geometry parameter VAR names")
     train.add_argument("--holdout-fraction", type=float, default=0.2)
+    add_dc_port_paths_argument(train)
     train.add_argument("--order", type=int, default=10, help="Number of fixed rational poles")
     train.add_argument("--pole-damping", type=float, default=0.18)
     train.add_argument("--ridge", type=float, default=1e-8, help="Least-squares ridge for TF fitting")
@@ -867,6 +905,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--verify-values", default="verify,verification,test,validation")
     sweep.add_argument("--parameter-names", help="Comma-separated geometry parameter VAR names")
     sweep.add_argument("--holdout-fraction", type=float, default=0.2)
+    add_dc_port_paths_argument(sweep)
     sweep.add_argument(
         "--orders",
         "--order",

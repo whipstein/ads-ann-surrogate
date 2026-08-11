@@ -36,6 +36,7 @@ from surrogate_common import (
     MDIFBlock,
     MLP,
     Standardizer,
+    add_dc_port_paths_argument,
     apply_distinct_dc_response,
     common_sparameter_labels,
     extract_average_dc_resistance,
@@ -121,8 +122,9 @@ The saved model directory should contain:
 - `metadata.json`
 - enough metadata to reconstruct `parameter_names`, `sparam_labels`, model
   dimensions, training domain, and export assumptions
-- `dc_equivalent_resistance_ohm`, `dc_sparameters`, and the accompanying DC
-  extraction metadata described below
+- `dc_port_paths`, `dc_port_resistances_ohm`, `dc_sparameters`, the aggregate
+  `dc_equivalent_resistance_ohm` summary, and the accompanying DC extraction
+  metadata described below
 
 ## Required Distinct DC Contract
 
@@ -130,36 +132,43 @@ Every model family must keep exact DC separate from its fitted frequency
 response. Before creating training features or rational coefficients:
 
 ```python
-dc_metadata = extract_average_dc_resistance(train_blocks, labels, z0=50.0)
+dc_metadata = extract_average_dc_resistance(
+    train_blocks,
+    labels,
+    z0=50.0,
+    port_paths=args.dc_port_paths,
+)
 fit_train_blocks = positive_frequency_blocks(train_blocks)
 fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
 ```
 
 Store `dc_metadata` in `metadata.json` and place
-`dc_equivalent_resistance_ohm` and `dc_resistance_source_kind` on the loaded
-model. `predict_blocks()` must use `apply_distinct_dc_response()` after forming
-its normal S-parameter values and pass both saved fields. This guarantees that
-zero-Hz input data cannot affect fitted weights or poles and that older
-fallback-derived models cannot supply DC.
+`dc_equivalent_resistance_ohm`, `dc_resistance_source_kind`, and
+`dc_port_resistances_ohm` on the loaded model. `predict_blocks()` must use
+`apply_distinct_dc_response()` after forming its normal S-parameter values and
+pass all three saved fields. This guarantees that zero-Hz input data cannot
+affect fitted weights or poles and that older fallback-derived models cannot
+supply DC.
 
 `extract_average_dc_resistance()` uses exact-zero-Hz rows only. It rejects
 non-passive S-matrices using the shared singular-value tolerance and ignores
 non-finite or electrically invalid DC rows. Blocks without DC are skipped, but
 extraction fails when no exact DC row exists or no usable passive row remains.
-Valid pairwise resistances are converted to conductances and those conductances
-are averaged. Open paths contribute zero conductance, so they cannot dominate a
-connected path merely because the finite open sentinel is large. The reciprocal
-of the mean conductance is used as the DC resistance; a result above the
+Only paths selected by `port_paths` are evaluated. Each selected path's valid
+resistances are converted to conductances and averaged independently. Open
+samples contribute zero conductance, so they cannot dominate a connected sample
+merely because the finite open sentinel is large. A selected path above the
 configured open threshold is replaced by the configured finite open resistance
-(defaults: `1e12` and `1e19` ohm). It never falls back to positive-frequency
-data.
+(defaults: `1e12` and `1e19` ohm). Undeclared paths remain unstamped and open.
+Extraction never falls back to positive-frequency data.
 
 `build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
 Direct Verilog-A writers must receive the saved
-`dc_equivalent_resistance_ohm` and `dc_resistance_source_kind`; the shared
-writers validate exact-DC provenance, stamp the distinct resistor topology at
-zero Hz, and bypass the fitted response. Export CLIs must expose the shared
-`--dc-mdif`, `--dc-open-threshold`, and `--dc-open-resistance` arguments and use
+`dc_equivalent_resistance_ohm`, `dc_resistance_source_kind`, and
+`dc_port_resistances_ohm`; the shared writers validate exact-DC provenance,
+stamp only the selected resistor paths at zero Hz, and bypass the fitted
+response. Export CLIs must expose the shared `--dc-mdif`, `--dc-port-paths`,
+`--dc-open-threshold`, and `--dc-open-resistance` arguments and use
 `resolve_export_dc_metadata()`. This lets an older RF model derive DC during
 export without changing or refitting its weights or poles.
 

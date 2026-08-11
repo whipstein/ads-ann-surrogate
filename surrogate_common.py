@@ -648,6 +648,156 @@ def _resistance_from_mean_conductance(
     return min(1.0 / mean_conductance, float(open_resistance_ohm))
 
 
+def parse_dc_port_paths(
+    spec: object,
+    nports: int,
+) -> list[tuple[int, int | None, str]]:
+    """Parse explicit DC paths into zero-based endpoints and canonical names.
+
+    Port-to-port paths accept forms such as ``1-2`` or ``p1-p2``. A shunt path
+    to the simulator reference accepts ``1-ground`` or ``p1-gnd``. When no
+    specification is supplied, the legacy default selects every port pair (or
+    port 1 to ground for a one-port model).
+    """
+
+    if nports <= 0:
+        raise ValueError("DC port-path parsing requires at least one port")
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        raw_paths = (
+            ["1-ground"]
+            if nports == 1
+            else [
+                f"{first + 1}-{second + 1}"
+                for first in range(nports)
+                for second in range(first + 1, nports)
+            ]
+        )
+    elif isinstance(spec, str):
+        raw_paths = [item.strip() for item in re.split(r"[,;]", spec) if item.strip()]
+    elif isinstance(spec, dict):
+        raw_paths = [str(item) for item in spec]
+    elif isinstance(spec, Sequence):
+        raw_paths = [str(item) for item in spec]
+    else:
+        raise ValueError(
+            "DC port paths must be a comma-separated string such as 1-2,3-4"
+        )
+    if not raw_paths:
+        raise ValueError("At least one viable DC port path must be specified")
+
+    parsed: list[tuple[int, int | None, str]] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        normalized = str(raw_path).strip().lower().replace("port", "p")
+        normalized = re.sub(r"\s+", "", normalized)
+        normalized = normalized.replace("ground", "gnd")
+        match = re.fullmatch(r"p?(\d+)(?:-|:|/)(?:p?(\d+)|(gnd|0))", normalized)
+        if match is None:
+            raise ValueError(
+                f"Invalid DC port path {raw_path!r}; use forms such as 1-2, "
+                "p3-p4, or 1-ground"
+            )
+        first_port = int(match.group(1))
+        second_text = match.group(2)
+        if first_port < 1 or first_port > nports:
+            raise ValueError(
+                f"DC port path {raw_path!r} references port {first_port}, but the "
+                f"model has ports 1 through {nports}"
+            )
+        first = first_port - 1
+        if second_text is None:
+            second = None
+            canonical = f"p{first_port}-ground"
+        else:
+            second_port = int(second_text)
+            if second_port < 1 or second_port > nports:
+                raise ValueError(
+                    f"DC port path {raw_path!r} references port {second_port}, but the "
+                    f"model has ports 1 through {nports}"
+                )
+            if second_port == first_port:
+                raise ValueError(f"DC port path {raw_path!r} connects a port to itself")
+            low, high = sorted((first_port, second_port))
+            first = low - 1
+            second = high - 1
+            canonical = f"p{low}-p{high}"
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        parsed.append((first, second, canonical))
+    return parsed
+
+
+def dc_port_path_spec(paths: Sequence[str]) -> str:
+    """Render canonical stored path names in a compact CLI form."""
+
+    return ",".join(str(path).replace("p", "") for path in paths)
+
+
+def validate_dc_port_resistances(
+    labels: Sequence[str],
+    values: object,
+    *,
+    context: str = "DC response",
+) -> dict[str, float] | None:
+    """Validate and canonicalize an optional per-path resistance mapping."""
+
+    if values is None:
+        return None
+    if not isinstance(values, dict) or not values:
+        raise ValueError(f"{context} must contain at least one DC port-path resistance")
+    nports = infer_complete_sparameter_ports(labels)
+    result: dict[str, float] = {}
+    for raw_path, raw_resistance in values.items():
+        parsed = parse_dc_port_paths([str(raw_path)], nports)
+        _, _, canonical = parsed[0]
+        result[canonical] = validate_dc_equivalent_resistance(
+            float(raw_resistance),
+            context=f"{context} path {canonical}",
+        )
+    return result
+
+
+def dc_conductance_matrix(
+    labels: Sequence[str],
+    dc_equivalent_resistance_ohm: float,
+    dc_port_resistances_ohm: object = None,
+) -> np.ndarray:
+    """Return the real DC conductance matrix for legacy or selected-path topology."""
+
+    resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context="DC response",
+    )
+    nports = infer_complete_sparameter_ports(labels)
+    y_matrix = np.zeros((nports, nports), dtype=float)
+    path_resistances = validate_dc_port_resistances(
+        labels,
+        dc_port_resistances_ohm,
+    )
+    if path_resistances is None:
+        if nports == 1:
+            y_matrix[0, 0] = 1.0 / resistance
+        else:
+            branch_conductance = 2.0 / (float(nports) * resistance)
+            for first in range(nports):
+                for second in range(first + 1, nports):
+                    y_matrix[first, first] += branch_conductance
+                    y_matrix[second, second] += branch_conductance
+                    y_matrix[first, second] -= branch_conductance
+                    y_matrix[second, first] -= branch_conductance
+        return y_matrix
+
+    for first, second, canonical in parse_dc_port_paths(path_resistances, nports):
+        conductance = 1.0 / path_resistances[canonical]
+        y_matrix[first, first] += conductance
+        if second is not None:
+            y_matrix[second, second] += conductance
+            y_matrix[first, second] -= conductance
+            y_matrix[second, first] -= conductance
+    return y_matrix
+
+
 def extract_average_dc_resistance(
     blocks: Sequence[MDIFBlock],
     labels: Sequence[str],
@@ -656,16 +806,18 @@ def extract_average_dc_resistance(
     open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
     open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
     passivity_tolerance: float = DEFAULT_DC_PASSIVITY_TOLERANCE,
+    port_paths: object = None,
 ) -> dict[str, object]:
     """Extract one distinct DC resistance from passive exact-DC data.
 
     Exact-zero rows are checked for S-matrix passivity before use. Passive rows
-    contribute one equivalent conductance for every port pair. Non-passive,
-    non-finite, and electrically invalid rows are ignored. Open paths contribute
-    zero conductance instead of a large resistance sentinel, so they cannot
-    numerically overwhelm connected paths. The reciprocal of the mean
-    conductance becomes the parameter-independent DC resistance. A result above
-    ``open_threshold_ohm`` is represented by ``open_resistance_ohm``.
+    contribute one equivalent conductance for every selected port path.
+    Non-passive, non-finite, and electrically invalid results are ignored. Open
+    samples contribute zero conductance instead of a large resistance sentinel,
+    so they cannot numerically overwhelm connected samples. Each path's
+    reciprocal mean conductance becomes its parameter-independent DC resistance.
+    A path above ``open_threshold_ohm`` is represented by
+    ``open_resistance_ohm``.
     Positive-frequency data is never used as a fallback.
     """
 
@@ -685,6 +837,7 @@ def extract_average_dc_resistance(
     if not blocks:
         raise ValueError("DC resistance extraction requires at least one data block")
     nports = infer_complete_sparameter_ports(labels)
+    selected_paths = parse_dc_port_paths(port_paths, nports)
     conductances: list[float] = []
     frequencies: list[float] = []
     contributing_blocks: set[int] = set()
@@ -726,30 +879,21 @@ def extract_average_dc_resistance(
                 continue
 
             block_resistances: list[tuple[str, float]] = []
-            pairs = [(0, 0)] if nports == 1 else [
-                (first, second)
-                for first in range(nports)
-                for second in range(first + 1, nports)
-            ]
-            invalid_row = False
-            for first, second in pairs:
+            for first, second, pair_name in selected_paths:
                 differential = np.zeros(nports, dtype=complex)
                 differential[first] = 1.0
-                pair_name = "p1-ground"
-                if nports > 1:
+                if second is not None:
                     differential[second] = -1.0
-                    pair_name = f"p{first + 1}-p{second + 1}"
                 resistance = _dc_pair_resistance_from_s(
                     s_matrix,
                     differential,
                     z0,
                 )
                 if math.isnan(resistance) or resistance <= 0.0:
-                    invalid_row = True
-                    break
+                    ignored_invalid_resistance_count += 1
+                    continue
                 block_resistances.append((pair_name, resistance))
-            if invalid_row or not block_resistances:
-                ignored_invalid_resistance_count += 1
+            if not block_resistances:
                 continue
             for pair_name, resistance in block_resistances:
                 is_open = (
@@ -773,8 +917,18 @@ def extract_average_dc_resistance(
             "No usable passive exact-DC point remains after filtering non-passive, "
             "non-finite, and electrically invalid DC rows"
         )
+    missing_selected_paths = [
+        canonical
+        for _, _, canonical in selected_paths
+        if canonical not in pair_conductances
+    ]
+    if missing_selected_paths:
+        raise ValueError(
+            "No usable passive exact-DC resistance was found for selected path(s): "
+            + ", ".join(missing_selected_paths)
+        )
     mean_conductance = float(np.mean(np.asarray(conductances, dtype=float)))
-    open_circuit_applied = (
+    aggregate_open_circuit_applied = (
         mean_conductance <= 0.0
         or mean_conductance < 1.0 / float(open_threshold_ohm)
     )
@@ -784,7 +938,9 @@ def extract_average_dc_resistance(
         else min(1.0 / mean_conductance, float(open_resistance_ohm))
     )
     resistance = (
-        float(open_resistance_ohm) if open_circuit_applied else raw_resistance
+        float(open_resistance_ohm)
+        if aggregate_open_circuit_applied
+        else raw_resistance
     )
     pair_means = {
         pair_name: _resistance_from_mean_conductance(
@@ -794,7 +950,17 @@ def extract_average_dc_resistance(
         )
         for pair_name, values in sorted(pair_conductances.items())
     }
-    dc_values = dc_sparameter_values(labels, resistance, z0=z0)
+    open_paths = [
+        pair_name
+        for pair_name, path_resistance in pair_means.items()
+        if path_resistance == float(open_resistance_ohm)
+    ]
+    dc_values = dc_sparameter_values(
+        labels,
+        resistance,
+        dc_port_resistances_ohm=pair_means,
+        z0=z0,
+    )
     return {
         "dc_equivalent_resistance_ohm": resistance,
         "dc_equivalent_resistance_raw_mean_ohm": raw_resistance,
@@ -810,21 +976,29 @@ def extract_average_dc_resistance(
         "dc_passivity_tolerance": float(passivity_tolerance),
         "dc_open_threshold_ohm": float(open_threshold_ohm),
         "dc_open_resistance_ohm": float(open_resistance_ohm),
-        "dc_open_circuit_applied": open_circuit_applied,
+        "dc_open_circuit_applied": bool(open_paths),
+        "dc_open_paths": open_paths,
+        "dc_open_path_count": len(open_paths),
+        "dc_aggregate_open_circuit_applied": aggregate_open_circuit_applied,
         "dc_resistance_source_z0_ohm": float(z0),
         "dc_resistance_source_frequency_min_hz": float(min(frequencies)),
         "dc_resistance_source_frequency_max_hz": float(max(frequencies)),
         "dc_resistance_source_kind": "exact_zero_frequency",
+        "dc_port_paths": [canonical for _, _, canonical in selected_paths],
+        "dc_port_path_spec": dc_port_path_spec(
+            [canonical for _, _, canonical in selected_paths]
+        ),
+        "dc_port_resistances_ohm": pair_means,
         "dc_resistance_pair_means_ohm": pair_means,
         "dc_resistance_extraction": (
-            "Reciprocal of the arithmetic mean of passive exact-zero-Hz pairwise "
-            "open-port conductances. Non-passive DC rows are ignored; open paths "
-            "contribute zero conductance, and final resistances above the configured "
-            "open threshold use the configured open-circuit resistance"
+            "Independent reciprocal arithmetic-mean conductance for each selected "
+            "exact-zero-Hz open-port path. Non-passive DC rows are ignored; open "
+            "samples contribute zero conductance, and path resistances above the "
+            "configured threshold use the configured open-circuit resistance"
         ),
         "dc_response_topology": (
-            "Parameter-independent equal-resistance complete graph whose equivalent "
-            "resistance between any two ports equals dc_equivalent_resistance_ohm"
+            "Parameter-independent selected-path resistor graph. Only paths declared "
+            "in dc_port_paths are connected; every undeclared path remains open"
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_requires_exact_zero_frequency": True,
@@ -847,18 +1021,25 @@ def resolve_export_dc_metadata(
     z0: float,
     open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
     open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
+    port_paths: object = None,
 ) -> dict[str, object]:
     """Resolve DC metadata without changing or refitting the RF model."""
 
     if dc_mdif:
         dc_path = Path(dc_mdif)
         blocks = read_mdif(dc_path)
+        selected_paths = (
+            port_paths
+            if port_paths is not None
+            else stored_metadata.get("dc_port_paths")
+        )
         metadata = extract_average_dc_resistance(
             blocks,
             labels,
             z0=z0,
             open_threshold_ohm=open_threshold_ohm,
             open_resistance_ohm=open_resistance_ohm,
+            port_paths=selected_paths,
         )
         metadata["dc_resistance_source_file"] = str(dc_path)
         metadata["dc_resistance_extracted_during_export"] = True
@@ -872,6 +1053,23 @@ def resolve_export_dc_metadata(
         stored_metadata.get("dc_equivalent_resistance_ohm"),
         context="Saved surrogate model",
     )
+    if port_paths is not None:
+        nports = infer_complete_sparameter_ports(labels)
+        requested = [item[2] for item in parse_dc_port_paths(port_paths, nports)]
+        stored_paths = stored_metadata.get("dc_port_paths")
+        if stored_paths is None:
+            raise ValueError(
+                "--dc-port-paths changes the saved DC topology. Supply --dc-mdif so "
+                "the selected path resistances can be extracted without refitting RF."
+            )
+        resolved_stored = [
+            item[2] for item in parse_dc_port_paths(stored_paths, nports)
+        ]
+        if set(requested) != set(resolved_stored):
+            raise ValueError(
+                "--dc-port-paths does not match the saved DC topology. Supply --dc-mdif "
+                "to extract the newly selected path resistances without refitting RF."
+            )
     return {
         key: value
         for key, value in stored_metadata.items()
@@ -889,13 +1087,14 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
             "resistance without refitting the RF model. Overrides saved DC metadata."
         ),
     )
+    add_dc_port_paths_argument(parser)
     parser.add_argument(
         "--dc-open-threshold",
         type=float,
         default=DEFAULT_DC_OPEN_THRESHOLD_OHM,
         help=(
-            "Conductance-averaged passive DC resistance above this value is treated "
-            "as open. "
+            "A selected path's conductance-averaged passive DC resistance above "
+            "this value is treated as open. "
             f"Default: {DEFAULT_DC_OPEN_THRESHOLD_OHM:g} ohm."
         ),
     )
@@ -910,30 +1109,34 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_dc_port_paths_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the explicit viable-DC-path selector to a CLI parser."""
+
+    parser.add_argument(
+        "--dc-port-paths",
+        help=(
+            "Comma-separated viable DC paths, for example 1-2,3-4. Only declared "
+            "paths are extracted and stamped; undeclared paths remain open. Use "
+            "1-ground for a port-to-reference path. Default: every port pair."
+        ),
+    )
+
+
 def dc_sparameter_values(
     labels: Sequence[str],
     dc_equivalent_resistance_ohm: float,
+    dc_port_resistances_ohm: object = None,
     *,
     z0: float = 50.0,
 ) -> np.ndarray:
     """Return the S-vector for the fixed DC resistor topology."""
 
-    resistance = validate_dc_equivalent_resistance(
-        dc_equivalent_resistance_ohm,
-        context="DC response",
-    )
     nports = infer_complete_sparameter_ports(labels)
-    y_matrix = np.zeros((nports, nports), dtype=complex)
-    if nports == 1:
-        y_matrix[0, 0] = 1.0 / resistance
-    else:
-        branch_conductance = 2.0 / (float(nports) * resistance)
-        for first in range(nports):
-            for second in range(first + 1, nports):
-                y_matrix[first, first] += branch_conductance
-                y_matrix[second, second] += branch_conductance
-                y_matrix[first, second] -= branch_conductance
-                y_matrix[second, first] -= branch_conductance
+    y_matrix = dc_conductance_matrix(
+        labels,
+        dc_equivalent_resistance_ohm,
+        dc_port_resistances_ohm,
+    ).astype(complex)
     identity = np.eye(nports, dtype=complex)
     normalized_y = float(z0) * y_matrix
     lhs = identity + normalized_y
@@ -955,6 +1158,7 @@ def apply_distinct_dc_response(
     labels: Sequence[str],
     dc_equivalent_resistance_ohm: float | None,
     dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
     *,
     z0: float = 50.0,
 ) -> np.ndarray:
@@ -972,7 +1176,12 @@ def apply_distinct_dc_response(
         context="Saved surrogate model",
     )
     result = np.asarray(values, dtype=complex).copy()
-    result[dc_mask, :] = dc_sparameter_values(labels, resistance, z0=z0)[None, :]
+    result[dc_mask, :] = dc_sparameter_values(
+        labels,
+        resistance,
+        dc_port_resistances_ohm=dc_port_resistances_ohm,
+        z0=z0,
+    )[None, :]
     return result
 
 
@@ -1892,26 +2101,32 @@ def _append_veriloga_dc_or_fitted_y_assignments(
     nports: int,
     fitted_real_by_flat: Sequence[str],
     fitted_imag_by_flat: Sequence[str],
+    dc_real_by_flat: Sequence[str] | None = None,
 ) -> None:
     """Select fixed DC or fitted Y coefficients without enclosing ``ddt``."""
 
     matrix_size = nports * nports
     if len(fitted_real_by_flat) != matrix_size or len(fitted_imag_by_flat) != matrix_size:
         raise ValueError("Selected Verilog-A Y coefficient dimensions are inconsistent")
+    if dc_real_by_flat is not None and len(dc_real_by_flat) != matrix_size:
+        raise ValueError("Selected Verilog-A DC coefficient dimensions are inconsistent")
     lines.append("    if (dc_operating_point != 0) begin")
     for row in range(nports):
         for col in range(nports):
             flat = row * nports + col
-            if nports == 1:
-                conductance_factor = 1.0
-            elif row == col:
-                conductance_factor = 2.0 * float(nports - 1) / float(nports)
+            if dc_real_by_flat is not None:
+                lines.append(f"      active_yr[{flat}] = {dc_real_by_flat[flat]};")
             else:
-                conductance_factor = -2.0 / float(nports)
-            lines.append(
-                f"      active_yr[{flat}] = ({veriloga_float(conductance_factor)})/"
-                "dc_equivalent_resistance_ohm;"
-            )
+                if nports == 1:
+                    conductance_factor = 1.0
+                elif row == col:
+                    conductance_factor = 2.0 * float(nports - 1) / float(nports)
+                else:
+                    conductance_factor = -2.0 / float(nports)
+                lines.append(
+                    f"      active_yr[{flat}] = ({veriloga_float(conductance_factor)})/"
+                    "dc_equivalent_resistance_ohm;"
+                )
             lines.append(f"      active_yi[{flat}] = 0.0;")
     lines.append("    end else begin")
     for flat in range(matrix_size):
@@ -1919,6 +2134,39 @@ def _append_veriloga_dc_or_fitted_y_assignments(
         lines.append(f"      active_yi[{flat}] = {fitted_imag_by_flat[flat]};")
     lines.append("    end")
     lines.append("")
+
+
+def _veriloga_dc_path_configuration(
+    labels: Sequence[str],
+    dc_port_resistances_ohm: object,
+) -> tuple[list[tuple[str, str, float]], list[str] | None]:
+    """Return Verilog-A path parameters and their flattened Y expressions."""
+
+    path_resistances = validate_dc_port_resistances(
+        labels,
+        dc_port_resistances_ohm,
+        context="Verilog-A DC topology",
+    )
+    if path_resistances is None:
+        return [], None
+    nports = infer_complete_sparameter_ports(labels)
+    parameter_rows: list[tuple[str, str, float]] = []
+    terms: list[list[str]] = [[] for _ in range(nports * nports)]
+    for first, second, canonical in parse_dc_port_paths(path_resistances, nports):
+        identifier = veriloga_identifier(
+            f"dc_resistance_{canonical}_ohm",
+            "dc_path_resistance_ohm",
+        )
+        resistance = path_resistances[canonical]
+        parameter_rows.append((canonical, identifier, resistance))
+        conductance = f"(1.0/{identifier})"
+        terms[first * nports + first].append(conductance)
+        if second is not None:
+            terms[second * nports + second].append(conductance)
+            terms[first * nports + second].append(f"(-1.0/{identifier})")
+            terms[second * nports + first].append(f"(-1.0/{identifier})")
+    expressions = [" + ".join(items) if items else "0.0" for items in terms]
+    return parameter_rows, expressions
 
 
 def _append_veriloga_port_stamps(
@@ -1963,6 +2211,7 @@ def _veriloga_readme(
     frequency_expression: str,
     z0: float,
     dc_equivalent_resistance_ohm: float,
+    dc_port_resistances_ohm: dict[str, float] | None,
     output_domain: str,
     folded_input_scaler: bool,
     folded_output_scaler: bool,
@@ -1994,6 +2243,20 @@ def _veriloga_readme(
         )
     else:
         scale_rows = "- No geometry/process parameters were exported."
+    if dc_port_resistances_ohm:
+        dc_path_rows = "\n".join(
+            f"- `{path}`: `{float(resistance):.17g} ohm`"
+            for path, resistance in dc_port_resistances_ohm.items()
+        )
+        dc_topology_text = (
+            "Only the explicitly selected paths below are stamped; every undeclared "
+            "port pair remains open at DC:\n\n" + dc_path_rows
+        )
+    else:
+        dc_topology_text = (
+            "This legacy model has no saved path selection. For a multiport, equal "
+            "resistors form a complete graph sized from the saved equivalent resistance."
+        )
     notes = "\n".join(f"- {note}" for note in (extra_notes or []))
     if notes:
         notes = "\n\nNotes:\n\n" + notes + "\n"
@@ -2091,14 +2354,15 @@ model-training unit".
 ## Distinct DC Point
 
 At an exact simulator frequency of zero, the fitted neural/rational contribution
-is electrically disabled. The module instead uses the fixed,
-parameter-independent equivalent resistance
-`{dc_equivalent_resistance_ohm:.17g} ohm` extracted exclusively from exact
-zero-Hz rows in the fitting data. Verilog-A export is rejected unless every
-training block supplied exactly one DC row; positive-frequency fallback and RF
-extrapolation are forbidden. For a multiport, equal resistors form a complete
-graph sized so that the equivalent resistance measured between any two ports is
-that value. Positive frequencies use only the fitted-response contribution.
+is electrically disabled. The module instead uses fixed, parameter-independent
+path resistances extracted exclusively from exact zero-Hz rows in the supplied
+DC data. The aggregate resistance summary is
+`{dc_equivalent_resistance_ohm:.17g} ohm`. Positive-frequency fallback and RF
+extrapolation are forbidden.
+
+{dc_topology_text}
+
+Positive frequencies use only the fitted-response contribution.
 The module selects the DC or fitted Y coefficients before one unconditional
 current contribution, so the `ddt()` analog operator remains outside procedural
 conditionals and in a legal Verilog-A context.
@@ -2147,6 +2411,7 @@ def veriloga_module_text(
     embedded_coarse_model: dict[str, object] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
 ) -> tuple[str, dict[str, object]]:
     output_domain = output_domain.lower().strip()
     if output_domain not in {"s", "y"}:
@@ -2160,6 +2425,15 @@ def veriloga_module_text(
     dc_resistance = validate_dc_equivalent_resistance(
         dc_equivalent_resistance_ohm,
         context=f"{model_kind} model",
+    )
+    dc_path_resistances = validate_dc_port_resistances(
+        sparam_labels,
+        dc_port_resistances_ohm,
+        context=f"{model_kind} model",
+    )
+    dc_parameter_rows, dc_real_by_flat = _veriloga_dc_path_configuration(
+        sparam_labels,
+        dc_path_resistances,
     )
     nports = infer_complete_sparameter_ports(sparam_labels)
     n_sparams = len(sparam_labels)
@@ -2348,8 +2622,14 @@ def veriloga_module_text(
         "",
         "  parameter integer clamp_frequency = 1;",
         "  parameter real min_frequency_hz = 1.0;",
-        f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)};",
+        f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)}; "
+        "// DC summary; selected path parameters below drive stamping when present",
     ]
+    for canonical, identifier, path_resistance in dc_parameter_rows:
+        lines.append(
+            f"  parameter real {identifier} = {veriloga_float(path_resistance)}; "
+            f"// selected DC path {canonical}"
+        )
     if output_domain == "s":
         lines.append(f"  parameter real z0 = {veriloga_float(z0)};")
         lines.append("  parameter real pivot_floor = 1.0e-24;")
@@ -2603,6 +2883,7 @@ def veriloga_module_text(
         nports,
         stamp_real,
         stamp_imag,
+        dc_real_by_flat,
     )
     _append_veriloga_port_stamps(
         lines,
@@ -2679,10 +2960,21 @@ def veriloga_module_text(
         ),
         "implementation_note": implementation_note,
         "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_port_paths": (
+            list(dc_path_resistances) if dc_path_resistances is not None else None
+        ),
+        "dc_port_resistances_ohm": dc_path_resistances,
+        "dc_port_parameter_identifiers": {
+            canonical: identifier
+            for canonical, identifier, _ in dc_parameter_rows
+        },
         "dc_resistance_source_kind": dc_source_kind,
         "dc_response_topology": (
-            "Parameter-independent equal-resistance complete graph; the fitted neural "
-            "response is bypassed when simulator frequency is exactly zero"
+            "Parameter-independent selected-path resistor graph; only declared paths "
+            "are connected and the fitted neural response is bypassed at zero Hz"
+            if dc_path_resistances is not None
+            else "Legacy parameter-independent equal-resistance complete graph; the "
+            "fitted neural response is bypassed at zero Hz"
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_requires_exact_zero_frequency": True,
@@ -2694,7 +2986,12 @@ def veriloga_module_text(
             }
             for label, value in zip(
                 sparam_labels,
-                dc_sparameter_values(sparam_labels, dc_resistance, z0=z0),
+                dc_sparameter_values(
+                    sparam_labels,
+                    dc_resistance,
+                    dc_port_resistances_ohm=dc_path_resistances,
+                    z0=z0,
+                ),
             )
         },
     }
@@ -2727,6 +3024,7 @@ def write_veriloga_package(
     embedded_coarse_model: dict[str, object] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -2758,6 +3056,7 @@ def write_veriloga_package(
         embedded_coarse_model=embedded_coarse_model,
         dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
         dc_resistance_source_kind=dc_resistance_source_kind,
+        dc_port_resistances_ohm=dc_port_resistances_ohm,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -2798,6 +3097,7 @@ def write_veriloga_package(
             dc_equivalent_resistance_ohm=float(
                 manifest["dc_equivalent_resistance_ohm"]
             ),
+            dc_port_resistances_ohm=manifest.get("dc_port_resistances_ohm"),
             output_domain=manifest["output_domain"],
             folded_input_scaler=bool(manifest["folded_input_scaler"]),
             folded_output_scaler=bool(manifest["folded_output_scaler"]),
@@ -2829,6 +3129,7 @@ def neurotf_veriloga_module_text(
     parameter_input_scales: dict[str, float] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
 ) -> tuple[str, dict[str, object]]:
     """Generate a direct Neuro-TF Verilog-A implementation."""
 
@@ -2845,6 +3146,15 @@ def neurotf_veriloga_module_text(
     dc_resistance = validate_dc_equivalent_resistance(
         dc_equivalent_resistance_ohm,
         context="Neuro-TF model",
+    )
+    dc_path_resistances = validate_dc_port_resistances(
+        sparam_labels,
+        dc_port_resistances_ohm,
+        context="Neuro-TF model",
+    )
+    dc_parameter_rows, dc_real_by_flat = _veriloga_dc_path_configuration(
+        sparam_labels,
+        dc_path_resistances,
     )
     if not parameter_names:
         raise ValueError("Neuro-TF Verilog-A export requires at least one model parameter")
@@ -2933,10 +3243,16 @@ def neurotf_veriloga_module_text(
         "",
         "  parameter integer clamp_frequency = 1;",
         "  parameter real min_frequency_hz = 1.0;",
-        f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)};",
+        f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)}; "
+        "// DC summary; selected path parameters below drive stamping when present",
         f"  parameter real z0 = {veriloga_float(z0)};",
         "  parameter real pivot_floor = 1.0e-24;",
     ]
+    for canonical, identifier, path_resistance in dc_parameter_rows:
+        lines.append(
+            f"  parameter real {identifier} = {veriloga_float(path_resistance)}; "
+            f"// selected DC path {canonical}"
+        )
     for name, ident, default in zip(parameter_names, param_ids, param_defaults):
         lines.append(
             f"  parameter real {ident} = {veriloga_float(default)}; "
@@ -3082,6 +3398,7 @@ def neurotf_veriloga_module_text(
         nports,
         [f"yr[{flat}]" for flat in range(matrix_size)],
         [f"yi[{flat}]" for flat in range(matrix_size)],
+        dc_real_by_flat,
     )
     _append_veriloga_port_stamps(
         lines,
@@ -3139,10 +3456,21 @@ def neurotf_veriloga_module_text(
             "it to a small-signal Y-matrix. Intended for AC/SP analyses."
         ),
         "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_port_paths": (
+            list(dc_path_resistances) if dc_path_resistances is not None else None
+        ),
+        "dc_port_resistances_ohm": dc_path_resistances,
+        "dc_port_parameter_identifiers": {
+            canonical: identifier
+            for canonical, identifier, _ in dc_parameter_rows
+        },
         "dc_resistance_source_kind": dc_source_kind,
         "dc_response_topology": (
-            "Parameter-independent equal-resistance complete graph; the fitted "
-            "coefficient network and rational response are bypassed at exactly zero Hz"
+            "Parameter-independent selected-path resistor graph; only declared paths "
+            "are connected and the fitted coefficient response is bypassed at zero Hz"
+            if dc_path_resistances is not None
+            else "Legacy parameter-independent equal-resistance complete graph; the "
+            "fitted coefficient response is bypassed at zero Hz"
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_requires_exact_zero_frequency": True,
@@ -3154,7 +3482,12 @@ def neurotf_veriloga_module_text(
             }
             for label, value in zip(
                 sparam_labels,
-                dc_sparameter_values(sparam_labels, dc_resistance, z0=z0),
+                dc_sparameter_values(
+                    sparam_labels,
+                    dc_resistance,
+                    dc_port_resistances_ohm=dc_path_resistances,
+                    z0=z0,
+                ),
             )
         },
     }
@@ -3181,6 +3514,7 @@ def write_neurotf_veriloga_package(
     parameter_input_scales: dict[str, float] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -3207,6 +3541,7 @@ def write_neurotf_veriloga_package(
         parameter_input_scales=parameter_input_scales,
         dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
         dc_resistance_source_kind=dc_resistance_source_kind,
+        dc_port_resistances_ohm=dc_port_resistances_ohm,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -3254,6 +3589,7 @@ def write_neurotf_veriloga_package(
             dc_equivalent_resistance_ohm=float(
                 manifest["dc_equivalent_resistance_ohm"]
             ),
+            dc_port_resistances_ohm=manifest.get("dc_port_resistances_ohm"),
             output_domain="s",
             folded_input_scaler=False,
             folded_output_scaler=False,
@@ -6272,6 +6608,20 @@ def build_training_export_commands(
         repository_root,
     )
     dc_path = Path(template_mdif).resolve() if template_mdif else None
+    dc_port_paths_spec: str | None = None
+    metadata_path = resolved_model_dir / "metadata.json"
+    if metadata_path.is_file():
+        try:
+            saved_metadata = json.loads(metadata_path.read_text())
+            saved_spec = saved_metadata.get("dc_port_path_spec")
+            if saved_spec:
+                dc_port_paths_spec = str(saved_spec)
+            elif saved_metadata.get("dc_port_paths"):
+                dc_port_paths_spec = dc_port_path_spec(
+                    [str(path) for path in saved_metadata["dc_port_paths"]]
+                )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            dc_port_paths_spec = None
     commands: list[tuple[str, str]] = []
     if include_veriloga:
         module_name, parameter_scale_spec = veriloga_command_defaults(
@@ -6302,6 +6652,8 @@ def build_training_export_commands(
             veriloga_argv.extend(
                 ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
             )
+        if dc_port_paths_spec:
+            veriloga_argv.extend(["--dc-port-paths", dc_port_paths_spec])
         commands.append(
             (
                 "Self-contained Verilog-A",
@@ -6335,6 +6687,8 @@ def build_training_export_commands(
             sampled_argv.extend(
                 ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
             )
+        if dc_port_paths_spec:
+            sampled_argv.extend(["--dc-port-paths", dc_port_paths_spec])
         commands.append(
             (
                 "Sampled ADS MDIF",

@@ -37,6 +37,7 @@ from surrogate_common import (  # noqa: E402
     MLP,
     Standardizer,
     add_dc_export_arguments,
+    add_dc_port_paths_argument,
     add_debug_argument,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
@@ -160,6 +161,7 @@ def coarse_dnn_train_namespace(args: argparse.Namespace, out_dir: Path) -> argpa
         verify_values=args.verify_values,
         parameter_names=args.parameter_names,
         holdout_fraction=args.holdout_fraction,
+        dc_port_paths=getattr(args, "dc_port_paths", None),
         freq_transform=getattr(args, "coarse_freq_transform", None) or args.freq_transform,
         hidden_layers=getattr(args, "coarse_hidden_layers", "64,64"),
         activation=getattr(args, "coarse_activation", "tanh"),
@@ -380,6 +382,10 @@ def write_composite_model_manifest(
         "--parameter-input-scales",
         parameter_scale_spec,
     ]
+    if metadata.get("dc_port_path_spec"):
+        export_argv.extend(
+            ["--dc-port-paths", str(metadata["dc_port_path_spec"])]
+        )
     if isinstance(coarse_identity, dict):
         coarse_path = Path(str(coarse_identity.get("source_model_dir") or ""))
         packaged_relative = coarse_identity.get("packaged_relative_model_dir")
@@ -399,6 +405,10 @@ def write_composite_model_manifest(
             "verification_summary": str(coarse_path / "verification_summary.json"),
             "dc_equivalent_resistance_ohm": coarse_metadata.get(
                 "dc_equivalent_resistance_ohm"
+            ),
+            "dc_port_paths": coarse_metadata.get("dc_port_paths"),
+            "dc_port_resistances_ohm": coarse_metadata.get(
+                "dc_port_resistances_ohm"
             ),
             "dc_is_separate_from_fitted_response": coarse_metadata.get(
                 "dc_is_separate_from_fitted_response",
@@ -429,6 +439,8 @@ def write_composite_model_manifest(
             "training_summary": str(resolved_model_dir / "training_summary.md"),
             "verification_summary": str(resolved_model_dir / "verification_summary.json"),
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_port_paths": metadata.get("dc_port_paths"),
+            "dc_port_resistances_ohm": model.dc_port_resistances_ohm,
             "dc_is_separate_from_fitted_response": True,
         },
         "coarse_model": coarse_payload,
@@ -1146,6 +1158,7 @@ class KBNN:
         freq_transform: str,
         dc_equivalent_resistance_ohm: float | None = None,
         dc_resistance_source_kind: str | None = None,
+        dc_port_resistances_ohm: dict[str, float] | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -1161,6 +1174,14 @@ class KBNN:
             else float(dc_equivalent_resistance_ohm)
         )
         self.dc_resistance_source_kind = dc_resistance_source_kind
+        self.dc_port_resistances_ohm = (
+            None
+            if dc_port_resistances_ohm is None
+            else {
+                str(path): float(resistance)
+                for path, resistance in dc_port_resistances_ohm.items()
+            }
+        )
 
     def predict_blocks(
         self,
@@ -1199,6 +1220,7 @@ class KBNN:
                 self.sparam_labels,
                 self.dc_equivalent_resistance_ohm,
                 self.dc_resistance_source_kind,
+                self.dc_port_resistances_ohm,
                 z0=50.0,
             )
             sparams = {
@@ -1239,6 +1261,7 @@ class KBNN:
             "freq_transform": self.freq_transform,
             "dc_equivalent_resistance_ohm": self.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": self.dc_resistance_source_kind,
+            "dc_port_resistances_ohm": self.dc_port_resistances_ohm,
             **metadata,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
@@ -1268,6 +1291,7 @@ class KBNN:
             freq_transform=metadata["freq_transform"],
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
             dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
+            dc_port_resistances_ohm=metadata.get("dc_port_resistances_ohm"),
         )
 
 
@@ -1301,7 +1325,12 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
 
     parameter_names = infer_parameter_names(all_fine, requested=args.parameter_names, split_var=args.split_var)
     labels = determine_labels(all_fine, None)
-    dc_metadata = extract_average_dc_resistance(train_fine, labels, z0=50.0)
+    dc_metadata = extract_average_dc_resistance(
+        train_fine,
+        labels,
+        z0=50.0,
+        port_paths=getattr(args, "dc_port_paths", None),
+    )
     fit_train_fine = positive_frequency_blocks(train_fine)
     fit_verify_fine = positive_frequency_blocks(verify_fine) if verify_fine else []
     coarse_identity: dict[str, object] | None = None
@@ -1449,6 +1478,7 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
         dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
+        dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
     )
     metadata = {
         "training_blocks": len(train_fine),
@@ -1546,6 +1576,8 @@ def command_train(args: argparse.Namespace) -> int:
         "freq_transform": model.freq_transform,
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+        "dc_port_paths": metadata["dc_port_paths"],
+        "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_resistance_filtering": {
@@ -1644,6 +1676,8 @@ def command_train(args: argparse.Namespace) -> int:
             "floored_output_columns": metadata["floored_output_columns"],
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+            "dc_port_paths": metadata["dc_port_paths"],
+            "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
             "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
@@ -1685,11 +1719,17 @@ def command_export_ads(args: argparse.Namespace) -> int:
         z0=50.0,
         open_threshold_ohm=args.dc_open_threshold,
         open_resistance_ohm=args.dc_open_resistance,
+        port_paths=args.dc_port_paths,
     )
     model.dc_equivalent_resistance_ohm = float(
         dc_metadata["dc_equivalent_resistance_ohm"]
     )
     model.dc_resistance_source_kind = str(dc_metadata["dc_resistance_source_kind"])
+    model.dc_port_resistances_ohm = (
+        dict(dc_metadata["dc_port_resistances_ohm"])
+        if isinstance(dc_metadata.get("dc_port_resistances_ohm"), dict)
+        else None
+    )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1714,14 +1754,15 @@ def command_export_ads(args: argparse.Namespace) -> int:
         )
         coarse_model.dc_equivalent_resistance_ohm = model.dc_equivalent_resistance_ohm
         coarse_model.dc_resistance_source_kind = model.dc_resistance_source_kind
+        coarse_model.dc_port_resistances_ohm = model.dc_port_resistances_ohm
         coarse = coarse_model.predict_blocks(blocks)
     pred_blocks = model.predict_blocks(blocks, coarse)
     write_mdif(out_dir / mdif_name, pred_blocks, model.sparam_labels)
 
     notes = []
     notes.append(
-        "Every exported block includes a zero-Hz point from the resolved passive "
-        "exact-DC average resistance; it bypasses both fitted networks."
+        "Every exported block includes a zero-Hz point from the selected passive "
+        "fine-data DC port paths; it bypasses both fitted networks."
     )
     if coarse_identity is not None:
         notes.append(
@@ -1755,6 +1796,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "blocks": manifest["blocks"],
         "frequency_points_per_block": manifest["frequency_points_per_block"],
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_port_paths": dc_metadata.get("dc_port_paths"),
+        "dc_port_resistances_ohm": dc_metadata.get("dc_port_resistances_ohm"),
         "dc_ignored_nonpassive_count": dc_metadata.get(
             "dc_ignored_nonpassive_count"
         ),
@@ -2026,6 +2069,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         z0=args.z0,
         open_threshold_ohm=args.dc_open_threshold,
         open_resistance_ohm=args.dc_open_resistance,
+        port_paths=args.dc_port_paths,
     )
     uses_coarse_inputs = bool(model.include_coarse_input or model.mode == "prior-input")
     adds_coarse_to_output = model.mode == "residual"
@@ -2064,7 +2108,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "This direct Verilog-A export embeds the saved local model.npz weights; it does not retrain in ADS ANN.",
         "The generated N-port is intended for S-parameter and small-signal AC simulation. It is not a causal transient model.",
         "The default frequency expression is $freq. If your ADS Verilog-A environment uses a different frequency variable, regenerate with --frequency-expression.",
-        "At exactly zero frequency, both the fine KBNN and embedded coarse DNN are bypassed and the fine-data average equivalent resistance is used instead.",
+        "At exactly zero frequency, both the fine KBNN and embedded coarse DNN are bypassed and only the selected fine-data DC port paths are stamped.",
     ]
     if coarse_model is not None:
         notes.append(
@@ -2112,6 +2156,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             dc_metadata["dc_equivalent_resistance_ohm"]
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
+        dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "knowledge_based_neural_network",
@@ -2151,6 +2196,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "fully_self_contained": manifest["fully_self_contained"],
         "requires_coarse_hooks": manifest["requires_coarse_hooks"],
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
+        "dc_port_paths": manifest.get("dc_port_paths"),
+        "dc_port_resistances_ohm": manifest.get("dc_port_resistances_ohm"),
         "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
         "dc_ignored_nonpassive_count": dc_metadata.get(
@@ -2253,6 +2300,7 @@ def namespace_for_trial(
         verify_values=args.verify_values,
         parameter_names=args.parameter_names,
         holdout_fraction=args.holdout_fraction,
+        dc_port_paths=getattr(args, "dc_port_paths", None),
         mode=str(candidate["mode"]),
         include_coarse_input=bool(candidate["include_coarse_input"]),
         freq_transform=str(candidate["freq_transform"]),
@@ -2564,6 +2612,7 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verify-values", default="verify,verification,test,validation")
     parser.add_argument("--parameter-names", help="Comma-separated geometry/process VAR names")
     parser.add_argument("--holdout-fraction", type=float, default=0.2)
+    add_dc_port_paths_argument(parser)
     parser.add_argument("--freq-transform", choices=["log", "linear"], default="log")
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=256)
