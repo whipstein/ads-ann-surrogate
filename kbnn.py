@@ -3138,8 +3138,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--parameter-input-scales",
         metavar="SCALE",
         help=(
-            "Optional positive scale applied to every ADS/base-unit instance parameter "
-            "before conversion to model-training units. Example: 1um"
+            "Common positive ADS-side denominator for every instance parameter: "
+            "model_value = instance_value / scale. Example: 1um"
         ),
     )
     add_dc_export_arguments(export_hb)
@@ -3169,8 +3169,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--parameter-input-scales",
         metavar="SCALE",
         help=(
-            "Optional positive scale applied to every ADS/base-unit instance parameter "
-            "before conversion to model-training units. Example: 1um"
+            "Common positive ADS-side denominator for every instance parameter: "
+            "model_value = instance_value / scale. Example: 1um"
         ),
     )
     export_va.add_argument(

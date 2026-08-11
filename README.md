@@ -614,6 +614,80 @@ For DNN models trained with `--output-domain y`, it stamps the predicted
 admittance relation directly. S-output DNNs, KBNNs, and Neuro-TFs use the wave
 relation directly and do not invert the S-matrix at runtime.
 
+### Reusing an ADS HB model at multiple parameter values
+
+The exported `.net` file contains one native ADS subnetwork definition. Load
+that definition once and call it any number of times:
+
+```text
+top-level HB testbench
+|- one NetlistInclude -> loads my_model_hb.net
+|- my_model_hb:X1     -> parameter set A
+|- my_model_hb:X2     -> parameter set B
+`- HB controller
+```
+
+Copy the complete export directory below the ADS workspace, for example
+`./hb_models/my_model_hb/`. On the top-level schematic containing the HB
+controller, place one `NetlistInclude` from the **Data Items** palette and set:
+
+```text
+IncludePath="./hb_models/my_model_hb"
+IncludeFiles[1]="my_model_hb.net"
+UsePreprocessor=yes
+```
+
+Use the generated filename and directory in place of the example. The include
+must be at the top simulation level because the file contains a `define`
+subnetwork declaration. Do not put the include in every model instance.
+`NetlistInclude` does not have electrical pins and receives no geometry or
+process parameters; it only makes the definition available to the simulator.
+
+Geometry/process parameters belong on each subnetwork call after its ordered
+electrical nodes. A two-port with parameters `W` and `L` can be called twice as:
+
+```text
+my_model_hb:X1 x1_p1 x1_p2 W=W_A L=L_A
+my_model_hb:X2 x2_p1 x2_p2 W=W_B L=L_B
+```
+
+`W_A`, `L_A`, `W_B`, and `L_B` may be top-level ADS `VAR` expressions or the
+values can be written directly. The call must use the sanitized names from
+`parameter_identifiers` in `ads_hb_manifest.json`; its node order is `p1`,
+`p2`, and so on from the opening `define` line of the generated `.net` file.
+Parameters omitted from a call use their generated defaults.
+
+The package includes `ADS_HB_INSTANCE_TEMPLATE.txt` with calls matching the
+actual module, port count, and parameter names. One direct integration method
+is to copy those calls into a second top-level `.net` fragment, replace its node
+labels with matching top-level schematic net labels, and list that fragment in
+the same `NetlistInclude` after the model definition, for example
+`IncludeFiles[2]="my_model_instances.net"`. These instances work but are
+visually hidden. For normal schematic reuse, create one custom ADS adapter
+component/symbol whose generated native ADS line has the same call form, expose
+the geometry parameters on it, and then place that symbol repeatedly. The
+export is already native ADS syntax, so do not import its `.net` file through a
+SPICE parser.
+
+The parameter scaling equation is:
+
+```text
+model_value = ADS_instance_parameter / input_scale_parameter
+```
+
+Pass the physical ADS-side value; do not pass a manually pre-scaled model
+value. For a model trained with dimensionless micron counts such as `W=10`,
+export with `--parameter-input-scales 1um` and pass `W=10um` on the instance.
+The generated `W_input_scale=1um` makes the embedded network receive `10`. If
+the MDIF value already parsed into SI, for example `W=0.40mm` became `0.0004`,
+export with scale `1.0` and pass `W=0.40mm`. Normally leave all generated
+`*_input_scale` parameters unchanged on every instance.
+
+For KBNN, the external call is identical: pass one set of geometry parameters
+per instance. The embedded fine and frozen coarse networks both receive the
+same converted model values internally; the coarse model is not instantiated
+or parameterized separately.
+
 ## Extending The Repository
 
 New model families can reuse the common support layer by following
@@ -1028,8 +1102,9 @@ python3 dnn.py export-ads-hb \
   --z0 50
 ```
 
-The package contains `<module>.net`, `ads_hb_manifest.json`, and
-`ADS_HB_README.md`. Include the netlist with an ADS `NetlistInclude`, then
+The package contains `<module>.net`, `ads_hb_manifest.json`,
+`ADS_HB_INSTANCE_TEMPLATE.txt`, and `ADS_HB_README.md`. Include the netlist
+with an ADS `NetlistInclude`, then
 instantiate `<module>:X1` with the electrical nodes and geometry parameters.
 ADS applies the embedded matrix independently to the fundamental, harmonics,
 and mixing products requested by the HB controller. The model is linear and
@@ -1202,7 +1277,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
 | <nobr><code>--no-fold-scalers</code></nobr> | <code>export-veriloga</code> | Debug option. Keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the first and final neural layers. Leaving this unset is faster. | <nobr><code>--no-fold-scalers</code></nobr> |
 | <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained model. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used as the denominator for every geometry/process parameter: `model_value = instance_value / scale`. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance. Direct-Y DNNs use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
@@ -1849,7 +1924,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
 | <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained fine and coarse networks. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used as the denominator for every geometry/process parameter before both the fine and coarse networks: `model_value = instance_value / scale`. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
@@ -2166,5 +2241,5 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |
 | <nobr><code>--parameter-grid SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Explicit grid for one model parameter. Repeat once per parameter; requires `--freqs`. | <nobr><code>--parameter-grid W=0.4mm:0.8mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional positive ADS/base-unit scale applied to every geometry/process parameter before it is fed to the trained coefficient network. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used as the denominator for every geometry/process parameter: `model_value = instance_value / scale`. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |

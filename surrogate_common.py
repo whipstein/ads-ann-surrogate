@@ -3845,6 +3845,42 @@ def _append_ads_hb_sdd(
         lines.append(f"  {token}{suffix}")
 
 
+def _ads_hb_instance_call(
+    module_name: str,
+    instance_name: str,
+    nports: int,
+    parameter_ids: Sequence[str],
+    value_suffix: str,
+) -> str:
+    nodes = " ".join(
+        f"{instance_name.lower()}_p{idx}" for idx in range(1, nports + 1)
+    )
+    call = f"{module_name}:{instance_name} {nodes}"
+    if parameter_ids:
+        call += " " + " ".join(
+            f"{identifier}={identifier}_{value_suffix}" for identifier in parameter_ids
+        )
+    return call
+
+
+def _ads_hb_instance_template(
+    module_name: str,
+    netlist_name: str,
+    nports: int,
+    parameter_ids: Sequence[str],
+) -> str:
+    call_a = _ads_hb_instance_call(module_name, "X1", nports, parameter_ids, "A")
+    call_b = _ads_hb_instance_call(module_name, "X2", nports, parameter_ids, "B")
+    return f"""; ADS HB instance-call template -- documentation only
+; Do not include this file unchanged. Copy the calls you need into a separate
+; top-level ADS netlist fragment after {netlist_name}, then replace the node
+; labels and parameter expressions. Values such as W_A may be top-level VARs.
+;
+; {call_a}
+; {call_b}
+"""
+
+
 def _ads_hb_readme(
     model_kind: str,
     module_name: str,
@@ -3855,20 +3891,29 @@ def _ads_hb_readme(
     parameter_ids: Sequence[str],
     parameter_scale_ids: Sequence[str],
     parameter_scales: Sequence[float],
+    parameter_instance_defaults: Sequence[float],
     response_domain: str,
     extra_notes: Sequence[str] | None = None,
 ) -> str:
     parameter_rows = "\n".join(
-        f"| `{source}` | `{identifier}` | `{scale_identifier}` | `{scale:.17g}` |"
-        for source, identifier, scale_identifier, scale in zip(
+        f"| `{source}` | `{identifier}` | `{default:.12g}` | "
+        f"`{scale_identifier}` | `{scale:.12g}` |"
+        for source, identifier, default, scale_identifier, scale in zip(
             parameter_names,
             parameter_ids,
+            parameter_instance_defaults,
             parameter_scale_ids,
             parameter_scales,
         )
     )
     if not parameter_rows:
-        parameter_rows = "| _(none)_ | _(none)_ | _(none)_ | _(none)_ |"
+        parameter_rows = "| _(none)_ | _(none)_ | _(none)_ | _(none)_ | _(none)_ |"
+    instance_a_call = _ads_hb_instance_call(
+        module_name, "X1", nports, parameter_ids, "A"
+    )
+    instance_b_call = _ads_hb_instance_call(
+        module_name, "X2", nports, parameter_ids, "B"
+    )
     notes = "\n".join(f"- {note}" for note in (extra_notes or []))
     if notes:
         notes = f"\n## Notes\n\n{notes}\n"
@@ -3885,35 +3930,108 @@ power dependent.
 
 - `{netlist_name}`: self-contained ADS simulator subnetwork
 - `{manifest_name}`: model contract and generation metadata
+- `ADS_HB_INSTANCE_TEMPLATE.txt`: copyable two-instance native ADS call example
 - `ADS_HB_README.md`: this file
 
 ## Use in ADS
 
-1. Copy this folder into the ADS workspace, keeping the files together.
-2. Place a `NetlistInclude` component and include `{netlist_name}` using a
-   relative path.
-3. Instantiate the subnetwork named `{module_name}` with {nports} electrical
-   pins. If a schematic symbol is desired, import the subnetwork netlist once
-   and generate a symbol for `{module_name}`.
-4. Set the instance geometry/process parameters listed below. The scale
-   parameters normally remain at their generated defaults.
+The include and the model instances have different jobs:
+
+```text
+top-level HB testbench
+|- NetlistInclude -> loads {netlist_name} once
+|- {module_name}:X1 -> geometry/process set A
+|- {module_name}:X2 -> geometry/process set B
+`- HB controller and the rest of the circuit
+```
+
+1. Copy this complete export directory under the ADS workspace, for example
+   `./hb_models/{module_name}/`.
+2. On the **top-level simulation schematic** that contains the HB controller,
+   place one `NetlistInclude` from the **Data Items** palette. Do not place one
+   in every model instance or inside an ordinary hierarchical wrapper because
+   this file contains a `define` subnetwork declaration.
+3. Configure the include approximately as follows; use **Browse** if the
+   installed ADS release formats the fields differently:
+
+   ```text
+   IncludePath="./hb_models/{module_name}"
+   IncludeFiles[1]="{netlist_name}"
+   UsePreprocessor=yes
+   ```
+
+   `IncludePath` is the directory and `IncludeFiles` contains the filename.
+   Keep the path relative for local simulation. A remote simulator must see the
+   same path or an equivalent archived/absolute path.
+4. Instantiate the subnetwork `{module_name}` as many times as needed. The
+   `NetlistInclude` receives **no geometry values**. Geometry/process values are
+   overrides on each subnetwork call, after the electrical nodes.
 5. Use the component in HB exactly as a passive S-parameter network. No input
    power parameter is present or required.
 
-The subnetwork's ADS netlist call has the form:
+`NetlistInclude` makes the subnetwork definition available to the simulator; it
+is not the electrical component instance. This export is a native ADS netlist
+package and does not contain an OpenAccess schematic symbol. For graphical
+schematic placement, create one {nports}-pin custom/adapter component in ADS
+whose generated ADS netlist line has the call format below. Expose the listed
+instance parameters on that component. The symbol can then be placed repeatedly
+while the single top-level include remains unchanged. Do not parse
+`{netlist_name}` as SPICE; its contents are already native ADS syntax.
+
+Two instances have the following native ADS call form. Replace the node names
+and the `_A`/`_B` variables with values or top-level ADS `VAR` expressions:
 
 ```text
-{module_name}:X1 {' '.join(f'net{idx}' for idx in range(1, nports + 1))}
+{instance_a_call}
+{instance_b_call}
 ```
+
+For a quick netlist-only hookup, label the corresponding top-level schematic
+nets, copy the calls from `ADS_HB_INSTANCE_TEMPLATE.txt` into a separate `.net`
+fragment, and add that fragment to the same top-level `NetlistInclude` **after**
+`{netlist_name}`, for example as
+`IncludeFiles[2]="my_model_instances.net"`. This creates electrically connected
+but visually hidden instances. A custom adapter symbol is preferable for a
+maintained schematic.
+
+The electrical node order is `p1` through `p{nports}`, matching the order in
+the first `define {module_name} (...)` line of `{netlist_name}`. Parameters that
+are omitted from a call use the generated defaults below.
 
 ### Instance parameters
 
-| Training VAR | Instance parameter | Input scale parameter | Default scale |
-| --- | --- | --- | ---: |
+| Training VAR | Instance parameter | Default instance value | Input scale parameter | Default scale |
+| --- | --- | ---: | --- | ---: |
 {parameter_rows}
 
-The training value used by the embedded network is
-`instance_parameter / input_scale_parameter`.
+### Exactly what value to pass
+
+The ADS-facing value and the trained-model value are related by:
+
+```text
+model_value = ADS_instance_parameter / input_scale_parameter
+```
+
+Pass the **physical ADS-side value**, including an ADS unit suffix when
+appropriate. Do not pre-divide it yourself.
+
+- If the MDIF trained on dimensionless micron counts such as `W=10`, export
+  with `--parameter-input-scales 1um`, leave `W_input_scale=1um`, and pass
+  `W=10um` on the instance. The embedded network receives `10`.
+- If the MDIF value already parsed to SI units, such as `W=0.40mm` becoming
+  `0.0004`, export with `--parameter-input-scales 1.0` and pass `W=0.40mm`.
+  The embedded network receives `0.0004`.
+
+Normally, override only the geometry/process parameters on each instance.
+Leave every `*_input_scale` parameter at its generated default; it describes
+the training-to-ADS unit convention and is not a geometry setting. The optional
+`z0` parameter for an S-domain model likewise defaults to the export reference
+impedance and normally remains unchanged.
+
+The exact sanitized parameter names, scales, and defaults are also recorded in
+`{manifest_name}` under `parameter_identifiers`,
+`parameter_scale_identifiers`, `parameter_input_scales`, and
+`parameter_instance_defaults`.
 
 ## DC and RF behavior
 
@@ -4148,6 +4266,10 @@ def write_ads_hb_mlp_package(
     netlist_name = f"{module_id}.net"
     manifest_name = "ads_hb_manifest.json"
     (out_dir / netlist_name).write_text("\n".join(lines))
+    instance_template_name = "ADS_HB_INSTANCE_TEMPLATE.txt"
+    (out_dir / instance_template_name).write_text(
+        _ads_hb_instance_template(module_id, netlist_name, nports, param_ids)
+    )
     manifest: dict[str, object] = {
         "format": "ads_hb_sdd_linear_multiport",
         "model_kind": model_kind,
@@ -4161,6 +4283,18 @@ def write_ads_hb_mlp_package(
             name: scale for name, scale in zip(parameter_names, param_scales)
         },
         "parameter_instance_defaults": param_defaults,
+        "instance_template_file": instance_template_name,
+        "instance_call_example": _ads_hb_instance_call(
+            module_id, "X1", nports, param_ids, "A"
+        ),
+        "parameter_value_relation": (
+            "model_value = ADS_instance_parameter / input_scale_parameter"
+        ),
+        "netlist_include_contract": {
+            "placement": "top-level simulation schematic",
+            "include_file": netlist_name,
+            "receives_instance_parameters": False,
+        },
         "sparam_labels": list(sparam_labels),
         "response_domain": response_domain,
         "z0": z0,
@@ -4204,6 +4338,7 @@ def write_ads_hb_mlp_package(
             parameter_ids=param_ids,
             parameter_scale_ids=scale_ids,
             parameter_scales=param_scales,
+            parameter_instance_defaults=param_defaults,
             response_domain=response_domain,
             extra_notes=extra_notes,
         )
@@ -4349,6 +4484,10 @@ def write_ads_hb_neurotf_package(
     netlist_name = f"{module_id}.net"
     manifest_name = "ads_hb_manifest.json"
     (out_dir / netlist_name).write_text("\n".join(lines))
+    instance_template_name = "ADS_HB_INSTANCE_TEMPLATE.txt"
+    (out_dir / instance_template_name).write_text(
+        _ads_hb_instance_template(module_id, netlist_name, nports, param_ids)
+    )
     manifest: dict[str, object] = {
         "format": "ads_hb_sdd_linear_multiport",
         "model_kind": "Neuro-TF",
@@ -4362,6 +4501,18 @@ def write_ads_hb_neurotf_package(
             name: scale for name, scale in zip(parameter_names, param_scales)
         },
         "parameter_instance_defaults": param_defaults,
+        "instance_template_file": instance_template_name,
+        "instance_call_example": _ads_hb_instance_call(
+            module_id, "X1", nports, param_ids, "A"
+        ),
+        "parameter_value_relation": (
+            "model_value = ADS_instance_parameter / input_scale_parameter"
+        ),
+        "netlist_include_contract": {
+            "placement": "top-level simulation schematic",
+            "include_file": netlist_name,
+            "receives_instance_parameters": False,
+        },
         "sparam_labels": list(sparam_labels),
         "response_domain": "s",
         "z0": z0,
@@ -4403,6 +4554,7 @@ def write_ads_hb_neurotf_package(
             parameter_ids=param_ids,
             parameter_scale_ids=scale_ids,
             parameter_scales=param_scales,
+            parameter_instance_defaults=param_defaults,
             response_domain="s",
             extra_notes=[
                 "The fixed-pole rational response is evaluated directly as a complex ADS expression.",
