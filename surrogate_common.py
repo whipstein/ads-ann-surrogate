@@ -3810,152 +3810,37 @@ def _append_ads_hb_sdd(
     port_ids: Sequence[str],
     response_names: Sequence[str],
     response_domain: str,
-    dc_conductance: np.ndarray | None = None,
+    z0: float,
 ) -> None:
     nports = len(port_ids)
     if len(response_names) != nports * nports:
         raise ValueError("ADS HB response matrix does not match the electrical port count")
     nodes = " ".join(f"{port} 0" for port in port_ids)
+    if response_domain != "s":
+        raise ValueError("ADS HB RF-only export requires S-domain response weights")
 
-    def append_tokens(tokens: Sequence[str]) -> None:
-        for idx, token in enumerate(tokens):
-            suffix = " \\" if idx < len(tokens) - 1 else ""
-            lines.append(f"  {token}{suffix}")
-
-    if response_domain != "y":
-        raise ValueError(
-            "ADS HB circuit stamping requires Y-domain response weights; "
-            "convert fitted S responses before creating the SDD"
-        )
-    dc_matrix = (
-        None
-        if dc_conductance is None
-        else np.asarray(dc_conductance, dtype=float)
-    )
-    if dc_matrix is not None and (
-        dc_matrix.shape != (nports, nports) or not np.all(np.isfinite(dc_matrix))
-    ):
-        raise ValueError("ADS HB DC conductance matrix is invalid")
-
-    # Explicit-current SDDs use ordinary nodal analysis and introduce no
-    # branch-current unknowns. Keep RF and DC in separate parallel branches:
-    # the RF branch is exactly open at zero frequency, while the DC branch is
-    # exactly open at every non-zero frequency.
-    rf_tokens = [f"SDD:{instance_name}_rf {nodes}"]
+    # Apply the fitted scattering matrix directly through
+    #   V - z0*I = S(f) * (V + z0*I).
+    # The response-name equations select the identity matrix at freq=0, which
+    # makes this branch an open circuit without introducing a DC model.
+    tokens = [f"SDD:{instance_name} {nodes}"]
     weight_index = 2
+    z0_text = veriloga_float(z0)
     for row in range(nports):
         port_number = row + 1
-        rf_tokens.append(f"I[{port_number},0]=0.0")
+        tokens.append(f"F[{port_number},0]=_v{port_number}-({z0_text})*_i{port_number}")
         for col in range(nports):
             control_number = col + 1
             response_name = response_names[row * nports + col]
-            rf_tokens.append(f"I[{port_number},{weight_index}]=_v{control_number}")
-            rf_tokens.append(
-                f"H[{weight_index}]=if (freq equals 0) then 0.0 "
-                f"else {response_name} endif"
+            tokens.append(
+                f"F[{port_number},{weight_index}]="
+                f"-(_v{control_number}+({z0_text})*_i{control_number})"
             )
+            tokens.append(f"H[{weight_index}]={response_name}")
             weight_index += 1
-    append_tokens(rf_tokens)
-    if dc_matrix is None:
-        return
-    lines.append("")
-
-    # Stamp DC as the extracted resistor graph itself, never as an S-matrix
-    # approximation and never through the fitted RF response. At RF every
-    # weight is zero, so this parallel branch contributes no current.
-    dc_tokens = [f"SDD:{instance_name}_dc {nodes}"]
-    weight_index = 2
-    for row in range(nports):
-        port_number = row + 1
-        dc_tokens.append(f"I[{port_number},0]=0.0")
-        for col in range(nports):
-            control_number = col + 1
-            conductance = veriloga_float(float(dc_matrix[row, col]))
-            dc_tokens.append(f"I[{port_number},{weight_index}]=_v{control_number}")
-            dc_tokens.append(
-                f"H[{weight_index}]=if (freq equals 0) then {conductance} else 0.0 endif"
-            )
-            weight_index += 1
-    append_tokens(dc_tokens)
-
-
-def _append_ads_hb_s_to_y_equations(
-    lines: list[str],
-    prefix: str,
-    s_response_names: Sequence[str],
-    nports: int,
-    z0: float,
-) -> list[str]:
-    """Append frequency-only equations for Y=(I+S)^-1(I-S)/z0.
-
-    The ADS SDD then remains an explicit voltage-controlled current device.
-    ``I+S`` and ``I-S`` commute because both are polynomials in the same S
-    matrix, so this solve is equivalent to the conventional right-side form.
-    """
-
-    matrix_size = nports * nports
-    if len(s_response_names) != matrix_size:
-        raise ValueError("ADS HB S-to-Y conversion matrix dimensions are inconsistent")
-    equation_prefix = _ads_hb_identifier(prefix, "hb_stoy")
-    a_names: list[list[str]] = [[""] * nports for _ in range(nports)]
-    b_names: list[list[str]] = [[""] * nports for _ in range(nports)]
-    for row in range(nports):
-        for col in range(nports):
-            s_name = s_response_names[row * nports + col]
-            a_name = f"{equation_prefix}_a0_{row}_{col}"
-            b_name = f"{equation_prefix}_b0_{row}_{col}"
-            if row == col:
-                lines.append(f"{a_name}=1.0+({s_name})")
-                lines.append(f"{b_name}=1.0-({s_name})")
-            else:
-                lines.append(f"{a_name}={s_name}")
-                lines.append(f"{b_name}=-({s_name})")
-            a_names[row][col] = a_name
-            b_names[row][col] = b_name
-
-    # Gauss-Jordan elimination is expressed through named scalar equations so
-    # ADS can share intermediate results across all matrix elements. For a
-    # passive finite-Y network, I+S and its elimination pivots are non-singular.
-    for pivot in range(nports):
-        stage = pivot + 1
-        pivot_name = a_names[pivot][pivot]
-        next_a: list[list[str]] = [[""] * nports for _ in range(nports)]
-        next_b: list[list[str]] = [[""] * nports for _ in range(nports)]
-        for col in range(nports):
-            a_name = f"{equation_prefix}_a{stage}_{pivot}_{col}"
-            b_name = f"{equation_prefix}_b{stage}_{pivot}_{col}"
-            lines.append(f"{a_name}=({a_names[pivot][col]})/({pivot_name})")
-            lines.append(f"{b_name}=({b_names[pivot][col]})/({pivot_name})")
-            next_a[pivot][col] = a_name
-            next_b[pivot][col] = b_name
-        for row in range(nports):
-            if row == pivot:
-                continue
-            factor = a_names[row][pivot]
-            for col in range(nports):
-                a_name = f"{equation_prefix}_a{stage}_{row}_{col}"
-                b_name = f"{equation_prefix}_b{stage}_{row}_{col}"
-                lines.append(
-                    f"{a_name}=({a_names[row][col]})-({factor})*"
-                    f"({next_a[pivot][col]})"
-                )
-                lines.append(
-                    f"{b_name}=({b_names[row][col]})-({factor})*"
-                    f"({next_b[pivot][col]})"
-                )
-                next_a[row][col] = a_name
-                next_b[row][col] = b_name
-        a_names = next_a
-        b_names = next_b
-
-    y_names: list[str] = []
-    z0_text = veriloga_float(z0)
-    for row in range(nports):
-        for col in range(nports):
-            name = f"{equation_prefix}_y_{row}_{col}"
-            lines.append(f"{name}=({b_names[row][col]})/({z0_text})")
-            y_names.append(name)
-    return y_names
+    for idx, token in enumerate(tokens):
+        suffix = " \\" if idx < len(tokens) - 1 else ""
+        lines.append(f"  {token}{suffix}")
 
 
 def _ads_hb_instance_call(
@@ -4137,43 +4022,30 @@ appropriate. Do not pre-divide it yourself.
 
 Normally, override only the geometry/process parameters on each instance.
 Leave every `*_input_scale` parameter at its generated default; it describes
-the training-to-ADS unit convention and is not a geometry setting. For an
-S-domain model, the `--z0` value is fixed into the generated S-to-Y conversion
-at export time and is recorded in the manifest.
+the training-to-ADS unit convention and is not a geometry setting. The `--z0`
+value is fixed into the generated S-wave relation at export time and is
+recorded in the manifest.
 
 The exact sanitized parameter names, scales, and defaults are also recorded in
 `{manifest_name}` under `parameter_identifiers`,
 `parameter_scale_identifiers`, `parameter_input_scales`, and
 `parameter_instance_defaults`.
 
-## DC and RF behavior
+## RF-only behavior
 
-The export contains two explicit-current SDD branches. At `freq=0`, the RF
-branch contributes exactly zero current and the DC branch directly stamps the
-separately extracted, parameter-independent conductance matrix. At every
-non-zero spectral frequency, the DC branch contributes exactly zero current and
-only the fitted RF surrogate is used. DC is never converted to S-parameters and
-never evaluated by the RF fit.
-
-Negative frequencies use the complex conjugate of the surrogate at the
-matching positive frequency, preserving the conjugate symmetry required for
-real voltage and current waveforms. The selection occurs only in SDD frequency
-weighting functions.
+This package intentionally contains no DC model, resistance extraction,
+admittance conversion, or separate DC branch. At `freq=0`, the SDD selects an
+identity S-matrix, which is an open circuit. At every positive frequency it
+uses only the fitted S-parameter surrogate. Negative frequencies use the
+complex conjugate at the matching positive frequency.
 
 ## Why this works in harmonic balance
 
-The model implements the linear multiport relation directly in the frequency
-domain as `I = Y(f) * V`. A direct-Y model supplies those weights immediately.
-For an S-domain model, generated frequency-only equations first calculate
-`Y = inverse(I + S) * (I - S) / Z0`; the circuit stamp is still explicit Y.
-ADS evaluates those weights independently at the fundamental, harmonics, and
-mixing frequencies requested by the HB controller.
-
-No electrical port uses an implicit SDD equation. This avoids the extra branch
-current and modified-nodal equation that ADS otherwise adds for every implicit
-port. A sampled `export-ads-mdif` model can still be faster when its parameter
-grid is practical because ADS does not need to evaluate the embedded neural
-network.
+The model applies the fitted matrix without an intermediate conversion:
+`V - Z0*I = S(f) * (V + Z0*I)`. ADS evaluates the S-matrix weights independently
+at the fundamental, harmonics, and mixing frequencies requested by the HB
+controller. This deliberately narrow implementation is intended first for
+direct RF S-parameter validation.
 
 This export targets ADS simulator expressions and the SDD netlist syntax. It
 does not require Python, MDIF, or the original model files during simulation.
@@ -4211,9 +4083,6 @@ def write_ads_hb_mlp_package(
     uses_coarse_inputs: bool = False,
     adds_coarse_to_output: bool = False,
     embedded_coarse_model: dict[str, object] | None = None,
-    dc_equivalent_resistance_ohm: float | None = None,
-    dc_resistance_source_kind: object = None,
-    dc_port_resistances_ohm: object = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -4221,10 +4090,11 @@ def write_ads_hb_mlp_package(
     """Write a self-contained, linear ADS SDD model for HB/AC/SP analyses."""
 
     response_domain = output_domain.strip().lower()
-    if response_domain not in {"s", "y"}:
-        raise ValueError("ADS HB output domain must be 's' or 'y'")
-    if response_domain == "y" and (uses_coarse_inputs or adds_coarse_to_output):
-        raise ValueError("Direct-Y ADS HB export does not support KBNN coarse hooks")
+    if response_domain != "s":
+        raise ValueError(
+            "ADS HB RF-only export requires a model trained with --output-domain s; "
+            "direct-Y models are intentionally unsupported in this reduced implementation"
+        )
     if not math.isfinite(z0) or z0 <= 0.0:
         raise ValueError("ADS HB reference impedance must be positive and finite")
     nports = infer_complete_sparameter_ports(sparam_labels)
@@ -4232,19 +4102,6 @@ def write_ads_hb_mlp_package(
     matrix_size = nports * nports
     if n_sparams != matrix_size:
         raise ValueError("ADS HB export requires a complete S-parameter matrix")
-    dc_source_kind = validate_exact_dc_source_kind(
-        dc_resistance_source_kind,
-        context=f"{model_kind} ADS HB export",
-    )
-    dc_resistance = validate_dc_equivalent_resistance(
-        dc_equivalent_resistance_ohm,
-        context=f"{model_kind} model",
-    )
-    dc_path_resistances = validate_dc_port_resistances(
-        sparam_labels,
-        dc_port_resistances_ohm,
-        context=f"{model_kind} model",
-    )
     module_id = _ads_hb_identifier(module_name, "surrogate_hb")
     prefix = _ads_hb_identifier(f"{module_id}_m", "hb_model")
     param_ids, scale_ids, param_scales, param_defaults, parameter_features = (
@@ -4336,40 +4193,27 @@ def write_ads_hb_mlp_package(
         lines.append(f"{fitted_name}=complex(({real_expression}),({imag_expression}))")
         fitted_response_names.append(fitted_name)
 
-    dc_matrix = dc_conductance_matrix(
-        sparam_labels,
-        dc_resistance,
-        dc_path_resistances,
-    )
     rf_response_names: list[str] = [""] * matrix_size
     for idx, label in enumerate(sparam_labels):
         row, col = sparam_indices(label) or (0, 0)
         flat = (row - 1) * nports + (col - 1)
         active_name = f"{prefix}_{label.lower()}"
+        zero_value = 1.0 if row == col else 0.0
         lines.append(
-            f"{active_name}=if (freq < 0) then conj({fitted_response_names[idx]}) "
-            f"else {fitted_response_names[idx]} endif"
+            f"{active_name}=if (freq equals 0) then "
+            f"complex({veriloga_float(zero_value)},0.0) "
+            f"else if (freq < 0) then conj({fitted_response_names[idx]}) "
+            f"else {fitted_response_names[idx]} endif endif"
         )
         rf_response_names[flat] = active_name
-    if response_domain == "s":
-        lines.append("")
-        rf_y_names = _append_ads_hb_s_to_y_equations(
-            lines,
-            f"{prefix}_stoy",
-            rf_response_names,
-            nports,
-            z0,
-        )
-    else:
-        rf_y_names = rf_response_names
     lines.append("")
     _append_ads_hb_sdd(
         lines,
         f"{module_id}_core",
         port_ids,
-        rf_y_names,
-        "y",
-        dc_conductance=dc_matrix,
+        rf_response_names,
+        "s",
+        z0,
     )
     lines.extend([f"end {module_id}", ""])
 
@@ -4382,7 +4226,7 @@ def write_ads_hb_mlp_package(
         _ads_hb_instance_template(module_id, netlist_name, nports, param_ids)
     )
     manifest: dict[str, object] = {
-        "format": "ads_hb_sdd_linear_multiport",
+        "format": "ads_hb_sdd_linear_sparameter_rf_only",
         "model_kind": model_kind,
         "module_name": module_id,
         "netlist_file": netlist_name,
@@ -4407,7 +4251,7 @@ def write_ads_hb_mlp_package(
             "receives_instance_parameters": False,
         },
         "sparam_labels": list(sparam_labels),
-        "response_domain": response_domain,
+        "response_domain": "s",
         "z0": z0,
         "linear": True,
         "power_dependent": False,
@@ -4419,22 +4263,16 @@ def write_ads_hb_mlp_package(
         "adds_coarse_to_output": bool(adds_coarse_to_output),
         "embedded_coarse_model": embedded_coarse_model is not None,
         "source_model_dir": source_model_dir,
-        "dc_equivalent_resistance_ohm": dc_resistance,
-        "dc_port_paths": list(dc_path_resistances) if dc_path_resistances is not None else None,
-        "dc_port_resistances_ohm": dc_path_resistances,
-        "dc_resistance_source_kind": dc_source_kind,
-        "dc_is_separate_from_fitted_response": True,
-        "dc_stamping_representation": "separate_explicit_conductance_sdd",
-        "rf_stamping_representation": "explicit_current_y_sdd",
-        "rf_source_conversion": (
-            "runtime_frequency_only_s_to_y" if response_domain == "s" else "none"
-        ),
-        "implicit_port_equations": False,
-        "supported_analyses": ["DC", "AC", "SP", "HB"],
+        "analysis_scope": "linear_rf_only",
+        "dc_model_included": False,
+        "zero_frequency_behavior": "open_circuit_identity_s_matrix",
+        "rf_stamping_representation": "direct_implicit_s_wave_sdd",
+        "rf_source_conversion": "none",
+        "implicit_port_equations": True,
+        "supported_analyses": ["AC", "SP", "HB"],
         "implementation_note": (
-            "Separate explicit-current SDD branches stamp the extracted DC conductance "
-            "and fitted RF admittance. S-output fits are converted to Y in frequency-only "
-            "equations before stamping; no implicit port-current unknowns are introduced."
+            "RF-only implementation: the fitted S-matrix directly weights the standard "
+            "wave relation. No DC extraction, DC stamp, or S-to-Y conversion is present."
         ),
         "reference_note": (
             "Generated against Keysight's documented ADS SDD frequency-weighting and "
@@ -4480,9 +4318,6 @@ def write_ads_hb_neurotf_package(
     f_scale: float,
     z0: float,
     parameter_input_scales: dict[str, float] | None = None,
-    dc_equivalent_resistance_ohm: float | None = None,
-    dc_resistance_source_kind: object = None,
-    dc_port_resistances_ohm: object = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -4501,19 +4336,6 @@ def write_ads_hb_neurotf_package(
             f"Neuro-TF ADS HB export expected {expected_outputs} coefficient outputs, "
             f"got {layer_sizes[-1]}"
         )
-    dc_source_kind = validate_exact_dc_source_kind(
-        dc_resistance_source_kind,
-        context="Neuro-TF ADS HB export",
-    )
-    dc_resistance = validate_dc_equivalent_resistance(
-        dc_equivalent_resistance_ohm,
-        context="Neuro-TF model",
-    )
-    dc_path_resistances = validate_dc_port_resistances(
-        sparam_labels,
-        dc_port_resistances_ohm,
-        context="Neuro-TF model",
-    )
     module_id = _ads_hb_identifier(module_name, "neuro_tf_hb")
     prefix = _ads_hb_identifier(f"{module_id}_m", "hb_model")
     param_ids, scale_ids, param_scales, param_defaults, parameter_features = (
@@ -4573,37 +4395,27 @@ def write_ads_hb_neurotf_package(
         lines.append(f"{fitted_name}=" + "+".join(terms))
         fitted_names.append(fitted_name)
 
-    dc_matrix = dc_conductance_matrix(
-        sparam_labels,
-        dc_resistance,
-        dc_path_resistances,
-    )
     active_names: list[str] = [""] * (nports * nports)
     for idx, label in enumerate(sparam_labels):
         row, col = sparam_indices(label) or (0, 0)
         flat = (row - 1) * nports + (col - 1)
         active_name = f"{prefix}_{label.lower()}"
+        zero_value = 1.0 if row == col else 0.0
         lines.append(
-            f"{active_name}=if (freq < 0) then conj({fitted_names[idx]}) "
-            f"else {fitted_names[idx]} endif"
+            f"{active_name}=if (freq equals 0) then "
+            f"complex({veriloga_float(zero_value)},0.0) "
+            f"else if (freq < 0) then conj({fitted_names[idx]}) "
+            f"else {fitted_names[idx]} endif endif"
         )
         active_names[flat] = active_name
-    lines.append("")
-    rf_y_names = _append_ads_hb_s_to_y_equations(
-        lines,
-        f"{prefix}_stoy",
-        active_names,
-        nports,
-        z0,
-    )
     lines.append("")
     _append_ads_hb_sdd(
         lines,
         f"{module_id}_core",
         port_ids,
-        rf_y_names,
-        "y",
-        dc_conductance=dc_matrix,
+        active_names,
+        "s",
+        z0,
     )
     lines.extend([f"end {module_id}", ""])
 
@@ -4616,7 +4428,7 @@ def write_ads_hb_neurotf_package(
         _ads_hb_instance_template(module_id, netlist_name, nports, param_ids)
     )
     manifest: dict[str, object] = {
-        "format": "ads_hb_sdd_linear_multiport",
+        "format": "ads_hb_sdd_linear_sparameter_rf_only",
         "model_kind": "Neuro-TF",
         "module_name": module_id,
         "netlist_file": netlist_name,
@@ -4652,20 +4464,17 @@ def write_ads_hb_neurotf_package(
         "negative_frequency_response": "conjugate_of_positive_frequency_surrogate",
         "fully_self_contained": True,
         "source_model_dir": source_model_dir,
-        "dc_equivalent_resistance_ohm": dc_resistance,
-        "dc_port_paths": list(dc_path_resistances) if dc_path_resistances is not None else None,
-        "dc_port_resistances_ohm": dc_path_resistances,
-        "dc_resistance_source_kind": dc_source_kind,
-        "dc_is_separate_from_fitted_response": True,
-        "dc_stamping_representation": "separate_explicit_conductance_sdd",
-        "rf_stamping_representation": "explicit_current_y_sdd",
-        "rf_source_conversion": "runtime_frequency_only_s_to_y",
-        "implicit_port_equations": False,
-        "supported_analyses": ["DC", "AC", "SP", "HB"],
+        "analysis_scope": "linear_rf_only",
+        "dc_model_included": False,
+        "zero_frequency_behavior": "open_circuit_identity_s_matrix",
+        "rf_stamping_representation": "direct_implicit_s_wave_sdd",
+        "rf_source_conversion": "none",
+        "implicit_port_equations": True,
+        "supported_analyses": ["AC", "SP", "HB"],
         "implementation_note": (
-            "The fixed-pole rational S-matrix is converted to admittance in frequency-only "
-            "equations. Separate explicit-current SDD branches stamp RF Y and exact DC "
-            "conductance without implicit port-current unknowns."
+            "RF-only implementation: the fixed-pole S-matrix directly weights the "
+            "standard wave relation. No DC extraction, DC stamp, or S-to-Y conversion "
+            "is present."
         ),
         "reference_note": (
             "Generated against Keysight's documented ADS SDD frequency-weighting and "
@@ -7697,10 +7506,14 @@ def build_training_export_commands(
     )
     dc_path = Path(template_mdif).resolve() if template_mdif else None
     dc_port_paths_spec: str | None = None
+    saved_output_domain = "s"
     metadata_path = resolved_model_dir / "metadata.json"
     if metadata_path.is_file():
         try:
             saved_metadata = json.loads(metadata_path.read_text())
+            saved_output_domain = str(
+                saved_metadata.get("output_domain", "s")
+            ).strip().lower()
             saved_spec = saved_metadata.get("dc_port_path_spec")
             if saved_spec:
                 dc_port_paths_spec = str(saved_spec)
@@ -7732,23 +7545,14 @@ def build_training_export_commands(
             hb_module_name,
             "--parameter-input-scales",
             parameter_scale_spec,
-            "--dc-open-threshold",
-            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
-            "--dc-open-resistance",
-            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
         ]
-        if dc_path is not None:
-            ads_hb_argv.extend(
-                ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
+        if saved_output_domain == "s":
+            commands.append(
+                (
+                    "RF-only ADS HB S-parameter network",
+                    shell_command(ads_hb_argv),
+                )
             )
-        if dc_port_paths_spec:
-            ads_hb_argv.extend(["--dc-port-paths", dc_port_paths_spec])
-        commands.append(
-            (
-                "Self-contained ADS HB passive network",
-                shell_command(ads_hb_argv),
-            )
-        )
         veriloga_argv = [
             command_python,
             command_script_path,

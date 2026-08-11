@@ -827,25 +827,15 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
 
 
 def command_export_ads_hb(args: argparse.Namespace) -> int:
-    """Export a fixed-pole Neuro-TF as a linear ADS HB subnetwork."""
+    """Export a fixed-pole Neuro-TF as an RF-only linear ADS SDD network."""
 
     model_dir = Path(args.model_dir)
     model = NeuroTF.load(model_dir)
-    source_metadata = read_model_metadata(str(model_dir))
     out_dir = Path(args.out_dir)
     module_name = args.module_name or f"{normalize_name(model_dir.name) or 'neuro_tf'}_hb"
     parameter_input_scales = parse_parameter_scale_spec(
         model.parameter_names,
         args.parameter_input_scales,
-    )
-    dc_metadata = resolve_export_dc_metadata(
-        source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=args.z0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
     )
     manifest = write_ads_hb_neurotf_package(
         out_dir=out_dir,
@@ -864,15 +854,9 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         f_scale=model.f_scale,
         z0=args.z0,
         parameter_input_scales=parameter_input_scales,
-        dc_equivalent_resistance_ohm=float(
-            dc_metadata["dc_equivalent_resistance_ohm"]
-        ),
-        dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
-        dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "neuro_transfer_function",
-            "dc_metadata": dc_metadata,
         },
     )
     print(
@@ -885,6 +869,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "n_poles": manifest["n_poles"],
                 "linear": manifest["linear"],
                 "power_dependent": manifest["power_dependent"],
+                "dc_model_included": manifest["dc_model_included"],
                 "supported_analyses": manifest["supported_analyses"],
             },
             indent=2,
@@ -1130,7 +1115,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     export_hb = sub.add_parser(
         "export-ads-hb",
-        help="Export a trained Neuro-TF as a self-contained linear ADS SDD network for harmonic balance",
+        help="Export a trained Neuro-TF as a self-contained RF-only linear ADS SDD network",
     )
     export_hb.add_argument(
         "--model-dir",
@@ -1160,7 +1145,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "model_value = instance_value / scale. Example: 1um"
         ),
     )
-    add_dc_export_arguments(export_hb)
     export_hb.set_defaults(func=command_export_ads_hb)
 
     export_va = sub.add_parser(
