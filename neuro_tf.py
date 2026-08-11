@@ -553,6 +553,10 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_resistance_filtering": {
             "raw_mean_ohm": metadata["dc_equivalent_resistance_raw_mean_ohm"],
+            "mean_conductance_siemens": metadata["dc_mean_conductance_siemens"],
+            "open_resistance_samples": metadata[
+                "dc_open_resistance_sample_count"
+            ],
             "dc_rows": metadata["dc_row_count"],
             "ignored_nonpassive": metadata["dc_ignored_nonpassive_count"],
             "ignored_nonfinite": metadata["dc_ignored_nonfinite_count"],

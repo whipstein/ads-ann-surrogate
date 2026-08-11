@@ -146,9 +146,13 @@ fallback-derived models cannot supply DC.
 non-passive S-matrices using the shared singular-value tolerance and ignores
 non-finite or electrically invalid DC rows. Blocks without DC are skipped, but
 extraction fails when no exact DC row exists or no usable passive row remains.
-Valid pairwise resistances are averaged. An average above the configured open
-threshold is replaced by the configured finite open resistance (defaults:
-`1e12` and `1e19` ohm). It never falls back to positive-frequency data.
+Valid pairwise resistances are converted to conductances and those conductances
+are averaged. Open paths contribute zero conductance, so they cannot dominate a
+connected path merely because the finite open sentinel is large. The reciprocal
+of the mean conductance is used as the DC resistance; a result above the
+configured open threshold is replaced by the configured finite open resistance
+(defaults: `1e12` and `1e19` ohm). It never falls back to positive-frequency
+data.
 
 `build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
 Direct Verilog-A writers must receive the saved

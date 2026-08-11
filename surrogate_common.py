@@ -631,6 +631,23 @@ def _dc_pair_resistance_from_s(
     return float(np.real(np.conjugate(differential_current) @ voltage))
 
 
+def _resistance_from_mean_conductance(
+    conductances: Sequence[float],
+    *,
+    open_threshold_ohm: float,
+    open_resistance_ohm: float,
+) -> float:
+    """Return a finite equivalent resistance from parallel-path samples."""
+
+    mean_conductance = float(np.mean(np.asarray(conductances, dtype=float)))
+    if (
+        mean_conductance <= 0.0
+        or mean_conductance < 1.0 / float(open_threshold_ohm)
+    ):
+        return float(open_resistance_ohm)
+    return min(1.0 / mean_conductance, float(open_resistance_ohm))
+
+
 def extract_average_dc_resistance(
     blocks: Sequence[MDIFBlock],
     labels: Sequence[str],
@@ -643,9 +660,11 @@ def extract_average_dc_resistance(
     """Extract one distinct DC resistance from passive exact-DC data.
 
     Exact-zero rows are checked for S-matrix passivity before use. Passive rows
-    contribute one equivalent resistance for every port pair. Non-passive,
-    non-finite, and electrically invalid rows are ignored. The arithmetic mean
-    becomes the parameter-independent DC point. An average above
+    contribute one equivalent conductance for every port pair. Non-passive,
+    non-finite, and electrically invalid rows are ignored. Open paths contribute
+    zero conductance instead of a large resistance sentinel, so they cannot
+    numerically overwhelm connected paths. The reciprocal of the mean
+    conductance becomes the parameter-independent DC resistance. A result above
     ``open_threshold_ohm`` is represented by ``open_resistance_ohm``.
     Positive-frequency data is never used as a fallback.
     """
@@ -666,15 +685,16 @@ def extract_average_dc_resistance(
     if not blocks:
         raise ValueError("DC resistance extraction requires at least one data block")
     nports = infer_complete_sparameter_ports(labels)
-    resistances: list[float] = []
+    conductances: list[float] = []
     frequencies: list[float] = []
     contributing_blocks: set[int] = set()
-    pair_resistances: dict[str, list[float]] = {}
+    pair_conductances: dict[str, list[float]] = {}
     dc_row_count = 0
     missing_dc_block_count = 0
     ignored_nonpassive_count = 0
     ignored_nonfinite_count = 0
     ignored_invalid_resistance_count = 0
+    open_resistance_sample_count = 0
     passivity_limit = 1.0 + float(passivity_tolerance)
     for block_index, block in enumerate(blocks):
         freq = np.asarray(block.freq_hz, dtype=float)
@@ -732,9 +752,15 @@ def extract_average_dc_resistance(
                 ignored_invalid_resistance_count += 1
                 continue
             for pair_name, resistance in block_resistances:
-                stored_resistance = min(float(resistance), float(open_resistance_ohm))
-                resistances.append(stored_resistance)
-                pair_resistances.setdefault(pair_name, []).append(stored_resistance)
+                is_open = (
+                    not math.isfinite(float(resistance))
+                    or float(resistance) > float(open_threshold_ohm)
+                )
+                conductance = 0.0 if is_open else 1.0 / float(resistance)
+                conductances.append(conductance)
+                pair_conductances.setdefault(pair_name, []).append(conductance)
+                if is_open:
+                    open_resistance_sample_count += 1
                 frequencies.append(float(freq[frequency_index]))
             contributing_blocks.add(block_index)
     if dc_row_count == 0:
@@ -742,29 +768,39 @@ def extract_average_dc_resistance(
             "DC extraction requires at least one exact zero-Hz data row. "
             "Positive-frequency data cannot be substituted for DC."
         )
-    if not resistances:
+    if not conductances:
         raise ValueError(
             "No usable passive exact-DC point remains after filtering non-passive, "
             "non-finite, and electrically invalid DC rows"
         )
-    raw_resistance = float(np.mean(np.asarray(resistances, dtype=float)))
-    open_circuit_applied = raw_resistance > float(open_threshold_ohm)
+    mean_conductance = float(np.mean(np.asarray(conductances, dtype=float)))
+    open_circuit_applied = (
+        mean_conductance <= 0.0
+        or mean_conductance < 1.0 / float(open_threshold_ohm)
+    )
+    raw_resistance = (
+        float(open_resistance_ohm)
+        if mean_conductance <= 0.0
+        else min(1.0 / mean_conductance, float(open_resistance_ohm))
+    )
     resistance = (
         float(open_resistance_ohm) if open_circuit_applied else raw_resistance
     )
     pair_means = {
-        pair_name: (
-            float(open_resistance_ohm)
-            if float(np.mean(np.asarray(values, dtype=float))) > float(open_threshold_ohm)
-            else float(np.mean(np.asarray(values, dtype=float)))
+        pair_name: _resistance_from_mean_conductance(
+            values,
+            open_threshold_ohm=float(open_threshold_ohm),
+            open_resistance_ohm=float(open_resistance_ohm),
         )
-        for pair_name, values in sorted(pair_resistances.items())
+        for pair_name, values in sorted(pair_conductances.items())
     }
     dc_values = dc_sparameter_values(labels, resistance, z0=z0)
     return {
         "dc_equivalent_resistance_ohm": resistance,
         "dc_equivalent_resistance_raw_mean_ohm": raw_resistance,
-        "dc_resistance_sample_count": len(resistances),
+        "dc_resistance_sample_count": len(conductances),
+        "dc_open_resistance_sample_count": open_resistance_sample_count,
+        "dc_mean_conductance_siemens": mean_conductance,
         "dc_resistance_block_count": len(contributing_blocks),
         "dc_row_count": dc_row_count,
         "dc_missing_block_count": missing_dc_block_count,
@@ -781,8 +817,9 @@ def extract_average_dc_resistance(
         "dc_resistance_source_kind": "exact_zero_frequency",
         "dc_resistance_pair_means_ohm": pair_means,
         "dc_resistance_extraction": (
-            "Arithmetic mean of passive exact-zero-Hz pairwise open-port equivalent "
-            "resistances. Non-passive DC rows are ignored; averages above the configured "
+            "Reciprocal of the arithmetic mean of passive exact-zero-Hz pairwise "
+            "open-port conductances. Non-passive DC rows are ignored; open paths "
+            "contribute zero conductance, and final resistances above the configured "
             "open threshold use the configured open-circuit resistance"
         ),
         "dc_response_topology": (
@@ -857,7 +894,8 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_DC_OPEN_THRESHOLD_OHM,
         help=(
-            "Average passive DC resistance above this value is treated as open. "
+            "Conductance-averaged passive DC resistance above this value is treated "
+            "as open. "
             f"Default: {DEFAULT_DC_OPEN_THRESHOLD_OHM:g} ohm."
         ),
     )
