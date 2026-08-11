@@ -131,6 +131,8 @@ unit-cube coordinates. Add `--write-split-files` to also write separate
 `*_train.csv` and `*_verification.csv` files for tools that consume the two
 simulation queues independently.
 
+### Extending an Existing Parameter Range
+
 To extend one side of an existing design, keep the original bounds in
 `--parameter`, provide the new overall bounds with `--extend-range`, and pass
 the original CSV with `--existing-points`. This example changes only the upper
@@ -154,14 +156,17 @@ lower new bound and retain the old upper bound. You may set `--out` to the same
 path as `--existing-points` for an in-place combined result; a separate output
 is safer until the new EM batch has been checked.
 
+#### How Many New Points to Add
+
 When `--count` is omitted, the script prints and uses a density-based point
 recommendation. Let `r` be the added design-space volume divided by the old
 volume. For a one-variable linear extension this is the added width divided by
-the old width; log variables use log-width. The recommendation is:
+the old width; log variables use log-width.
 
-- Training: the greater of `ceil(old_training_points * r)` and `4*d`.
-- Verification: when a verification set exists, the greater of
-  `ceil(old_verification_points * r)` and `2*d`.
+| New point group | Recommended count |
+| --- | --- |
+| Training | `max(ceil(old_training_points * r), 4*d)` |
+| Verification, when the original set contains verification points | `max(ceil(old_verification_points * r), 2*d)` |
 
 Here, `d` is the number of geometry parameters. For example, extending one
 range by 50% from an 80-point, two-parameter design containing 64 training and
