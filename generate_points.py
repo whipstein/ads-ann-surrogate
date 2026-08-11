@@ -317,8 +317,48 @@ def build_range_extension_plan(
     )
 
 
-def format_value(value: float, unit: str) -> str:
+def parameter_decimal_grid(
+    parameter: ParameterSpec,
+    decimal_places: int,
+) -> tuple[int, int, int]:
+    unit_scale = UNIT_SCALES.get(parameter.unit, 1.0)
+    decimal_scale = 10**decimal_places
+    lower_grid = parameter.lower / unit_scale * decimal_scale
+    upper_grid = parameter.upper / unit_scale * decimal_scale
+    lower_tolerance = 1e-12 * max(1.0, abs(lower_grid))
+    upper_tolerance = 1e-12 * max(1.0, abs(upper_grid))
+    first = math.ceil(lower_grid - lower_tolerance)
+    last = math.floor(upper_grid + upper_tolerance)
+    return first, last, decimal_scale
+
+
+def round_parameter_value(
+    value: float,
+    parameter: ParameterSpec,
+    decimal_places: int | None,
+) -> float:
+    if decimal_places is None:
+        return value
+    first, last, decimal_scale = parameter_decimal_grid(parameter, decimal_places)
+    unit_scale = UNIT_SCALES.get(parameter.unit, 1.0)
+    grid_value = round(value / unit_scale * decimal_scale)
+    grid_value = min(last, max(first, grid_value))
+    return grid_value / decimal_scale * unit_scale
+
+
+def format_value(
+    value: float,
+    unit: str,
+    decimal_places: int | None = None,
+) -> str:
     scale = UNIT_SCALES.get(unit, 1.0)
+    if decimal_places is not None:
+        text = f"{value / scale:.{decimal_places}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        if text == "-0":
+            text = "0"
+        return f"{text}{unit}"
     return f"{value / scale:.12g}{unit}"
 
 
@@ -520,6 +560,7 @@ def write_geometry_metadata(
     generation_kind: str,
     method: str,
     extra: dict[str, object] | None = None,
+    decimal_places: int | None = None,
 ) -> Path:
     split_counts: dict[str, int] = {}
     for row in rows:
@@ -537,6 +578,8 @@ def write_geometry_metadata(
         "split_counts": split_counts,
         "parameters": [parameter_range_metadata(parameter) for parameter in parameters],
     }
+    if decimal_places is not None:
+        metadata["decimal_places"] = decimal_places
     if extra:
         metadata.update(extra)
 
@@ -552,6 +595,7 @@ def generated_point_rows(
     verification_count: int,
     split_var: str,
     include_normalized: bool,
+    decimal_places: int | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     fields = [
         "point_index",
@@ -578,11 +622,28 @@ def generated_point_rows(
             "verification_sequence": "" if is_train else split_sequence,
             "method": method,
         }
+        rounded_values = [
+            round_parameter_value(
+                map_unit_point(unit_value, parameter),
+                parameter,
+                decimal_places,
+            )
+            for parameter, unit_value in zip(parameters, point)
+        ]
         if include_normalized:
-            for parameter, unit_value in zip(parameters, point):
+            for parameter, value, original_unit_value in zip(
+                parameters,
+                rounded_values,
+                point,
+            ):
+                unit_value = (
+                    original_unit_value
+                    if decimal_places is None
+                    else unit_coordinate_for_value(value, parameter)
+                )
                 row[f"u_{parameter.name}"] = f"{unit_value:.16g}"
-        for parameter, unit_value in zip(parameters, point):
-            row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
+        for parameter, value in zip(parameters, rounded_values):
+            row[parameter.name] = format_value(value, parameter.unit, decimal_places)
         rows.append(row)
     return rows, fields
 
@@ -600,6 +661,7 @@ def write_points_csv(
     split_var: str,
     include_normalized: bool,
     write_split_files: bool,
+    decimal_places: int | None = None,
 ) -> list[Path]:
     rows, fields = generated_point_rows(
         method,
@@ -608,6 +670,7 @@ def write_points_csv(
         verification_count,
         split_var,
         include_normalized,
+        decimal_places,
     )
     write_rows_csv(path, rows, fields)
     metadata_path = write_geometry_metadata(
@@ -617,6 +680,7 @@ def write_points_csv(
         split_var,
         generation_kind="generated",
         method=method,
+        decimal_places=decimal_places,
     )
     written = [path, metadata_path]
     if write_split_files:
@@ -710,6 +774,7 @@ def write_range_extension_csv(
     include_normalized: bool,
     bare_values: str,
     write_split_files: bool,
+    decimal_places: int | None = None,
 ) -> list[Path]:
     rows = [dict(row) for row in existing_rows]
     train_count = len(unit_points) - verification_count
@@ -720,9 +785,15 @@ def write_range_extension_csv(
             "method": f"range-extension-{method}",
         }
         for parameter, unit_value in zip(plan.sampling_parameters, point):
-            row[parameter.name] = format_value(
+            value = round_parameter_value(
                 map_unit_point(unit_value, parameter),
+                parameter,
+                decimal_places,
+            )
+            row[parameter.name] = format_value(
+                value,
                 parameter.unit,
+                decimal_places,
             )
         rows.append(row)
 
@@ -789,6 +860,7 @@ def write_range_extension_csv(
         split_var,
         generation_kind="range_extension",
         method=method,
+        decimal_places=decimal_places,
         extra=extension_metadata,
     )
     written = [path, metadata_path]
@@ -1161,6 +1233,7 @@ def write_suggested_points_csv(
     method: str,
     metric_name: str,
     include_normalized: bool,
+    decimal_places: int | None = None,
 ) -> Path:
     fields = [
         "point_index",
@@ -1192,11 +1265,28 @@ def write_suggested_points_csv(
             "distance_to_existing": f"{suggestion.distance_to_existing:.12g}",
             "acquisition_score": f"{suggestion.acquisition_score:.12g}",
         }
+        rounded_values = [
+            round_parameter_value(
+                map_unit_point(unit_value, parameter),
+                parameter,
+                decimal_places,
+            )
+            for parameter, unit_value in zip(parameters, suggestion.unit_point)
+        ]
         if include_normalized:
-            for parameter, unit_value in zip(parameters, suggestion.unit_point):
+            for parameter, value, original_unit_value in zip(
+                parameters,
+                rounded_values,
+                suggestion.unit_point,
+            ):
+                unit_value = (
+                    original_unit_value
+                    if decimal_places is None
+                    else unit_coordinate_for_value(value, parameter)
+                )
                 row[f"u_{parameter.name}"] = f"{unit_value:.16g}"
-        for parameter, unit_value in zip(parameters, suggestion.unit_point):
-            row[parameter.name] = format_value(map_unit_point(unit_value, parameter), parameter.unit)
+        for parameter, value in zip(parameters, rounded_values):
+            row[parameter.name] = format_value(value, parameter.unit, decimal_places)
         rows.append(row)
     write_rows_csv(path, rows, fields)
     return write_geometry_metadata(
@@ -1206,6 +1296,7 @@ def write_suggested_points_csv(
         split_var,
         generation_kind="targeted_additional",
         method=f"targeted-{method}",
+        decimal_places=decimal_places,
         extra={"analysis_metric": metric_name},
     )
 
@@ -1258,6 +1349,14 @@ def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
         "--split-var",
         default="dataset",
         help="CSV column used to label point groups. Default: dataset.",
+    )
+    parser.add_argument(
+        "--decimal-places",
+        type=int,
+        help=(
+            "Round generated parameter values to this many decimal places in their "
+            "declared units. Must be between 0 and 15."
+        ),
     )
     parser.add_argument(
         "--include-normalized",
@@ -1448,10 +1547,29 @@ def parse_parameters_or_error(
 
 
 def validate_shared_sampling_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.decimal_places is not None and not 0 <= args.decimal_places <= 15:
+        parser.error("--decimal-places must be between 0 and 15")
     if args.lhs_candidates <= 0:
         parser.error("--lhs-candidates must be positive")
     if args.skip < 0:
         parser.error("--skip must be non-negative")
+
+
+def validate_parameter_decimal_places(
+    parser: argparse.ArgumentParser,
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+) -> None:
+    if decimal_places is None:
+        return
+    for parameter in parameters:
+        first, last, _ = parameter_decimal_grid(parameter, decimal_places)
+        if first > last:
+            unit_label = parameter.unit or "base units"
+            parser.error(
+                f"--decimal-places {decimal_places} cannot represent any value inside "
+                f"the {parameter.name!r} range in {unit_label}; increase the precision"
+            )
 
 
 def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1462,6 +1580,7 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     if extending and args.range_factor:
         parser.error("--extend-range cannot be combined with --range-factor")
     parameters = parse_parameters_or_error(parser, args, apply_factors=not extending)
+    validate_parameter_decimal_places(parser, parameters, args.decimal_places)
 
     extension_plan: RangeExtensionPlan | None = None
     existing_fields: list[str] = []
@@ -1469,6 +1588,11 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     if extending:
         try:
             extension_plan = build_range_extension_plan(parameters, args.extend_range)
+            validate_parameter_decimal_places(
+                parser,
+                extension_plan.sampling_parameters,
+                args.decimal_places,
+            )
             existing_fields, existing_rows = read_csv_table(Path(args.existing_points))
             validate_existing_parameter_rows(
                 existing_rows,
@@ -1596,6 +1720,7 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                     verification_count=verification_count,
                     split_var=args.split_var,
                     include_normalized=args.include_normalized,
+                    decimal_places=args.decimal_places,
                     bare_values=args.bare_values,
                     write_split_files=args.write_split_files,
                 )
@@ -1609,6 +1734,7 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 verification_count=verification_count,
                 split_var=args.split_var,
                 include_normalized=args.include_normalized,
+                decimal_places=args.decimal_places,
                 write_split_files=args.write_split_files,
             ))
     for path in written_paths:
@@ -1645,6 +1771,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error("--min-distance must be non-negative")
     validate_shared_sampling_args(parser, args)
     parameters = parse_parameters_or_error(parser, args)
+    validate_parameter_decimal_places(parser, parameters, args.decimal_places)
 
     metrics_path = verification_metrics_path(args, parser)
     try:
@@ -1712,6 +1839,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         method=args.candidate_method,
         metric_name=metric_name,
         include_normalized=args.include_normalized,
+        decimal_places=args.decimal_places,
     )
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(f"considered {len(existing_points)} existing point(s) and {candidate_count} candidate point(s)")

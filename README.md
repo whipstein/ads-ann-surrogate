@@ -129,7 +129,11 @@ Each generated CSV contains `point_index`, `dataset`, `split_sequence`,
 parameter. Add `--include-normalized` when you also want the underlying
 unit-cube coordinates. Add `--write-split-files` to also write separate
 `*_train.csv` and `*_verification.csv` files for tools that consume the two
-simulation queues independently.
+simulation queues independently. Use `--decimal-places N` to round generated
+parameter values to at most `N` decimal places in each parameter's declared
+unit; normalized coordinates are recalculated from those rounded values. During
+a range extension, this applies to the newly appended points while the original
+CSV rows remain unchanged.
 
 Every geometry CSV also gets an automatic same-stem JSON file. For example,
 `geometries.csv` produces `geometries.json`. The JSON records the generation
@@ -278,6 +282,7 @@ without a subcommand uses it automatically.
 | --- | --- | --- | --- |
 | <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked fit-error-region CSV. Default: <code>&lt;out&gt;_fit_error_regions.csv</code>. | <nobr><code>--analysis-out error_regions.csv</code></nobr> |
 | <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of new points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. | <nobr><code>--count 80</code></nobr> |
+| <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid. | <nobr><code>--existing-points geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
 | <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges is written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
