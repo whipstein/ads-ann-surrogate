@@ -34,6 +34,9 @@ import numpy as np
 VERSION = "0.2.0-rc2"
 EPS = 1e-12
 DB_MAG_FLOOR = 1e-6
+DEFAULT_DC_OPEN_THRESHOLD_OHM = 1e12
+DEFAULT_DC_OPEN_RESISTANCE_OHM = 1e19
+DEFAULT_DC_PASSIVITY_TOLERANCE = 1e-6
 
 
 FREQ_UNITS = {
@@ -560,13 +563,13 @@ def validate_dc_equivalent_resistance(
     *,
     context: str = "model",
 ) -> float:
-    """Return a valid stored DC equivalent resistance or request a refit."""
+    """Return a valid stored DC equivalent resistance."""
 
     if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
         raise ValueError(
             f"{context} does not contain a valid data-derived DC equivalent resistance. "
-            "Retrain the model with this version before requesting a DC response or "
-            "Verilog-A export."
+            "For model export, provide exact-zero-frequency data with --dc-mdif; "
+            "the fitted RF model does not need to be retrained."
         )
     return float(value)
 
@@ -576,14 +579,15 @@ def validate_exact_dc_source_kind(
     *,
     context: str = "model",
 ) -> str:
-    """Require proof that DC came only from exact zero-frequency fitting rows."""
+    """Require proof that DC came only from exact zero-frequency data rows."""
 
     source_kind = str(value or "").strip()
     if source_kind != "exact_zero_frequency":
         raise ValueError(
             f"{context} does not contain a DC response extracted exclusively from exact "
-            "zero-Hz fitting data. Retrain with exactly one zero-Hz row in every training "
-            "block. Lowest-positive-frequency fallback and RF extrapolation are not allowed."
+            "zero-Hz data. For model export, provide that data with --dc-mdif; the fitted "
+            "RF model does not need to be retrained. Lowest-positive-frequency fallback "
+            "and RF extrapolation are not allowed."
         )
     return source_kind
 
@@ -604,14 +608,27 @@ def _block_s_matrix(
     return matrix
 
 
-def _s_to_y_matrix(s_matrix: np.ndarray, z0: float) -> np.ndarray:
+def _dc_pair_resistance_from_s(
+    s_matrix: np.ndarray,
+    differential_current: np.ndarray,
+    z0: float,
+) -> float:
+    """Return the open-port differential resistance, or infinity if disconnected."""
+
     identity = np.eye(s_matrix.shape[0], dtype=complex)
-    lhs = identity + s_matrix
-    rhs = identity - s_matrix
+    lhs = identity - s_matrix
+    rhs = float(z0) * (identity + s_matrix) @ differential_current
     try:
-        return np.linalg.solve(lhs.T, rhs.T).T / float(z0)
+        voltage = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
     except np.linalg.LinAlgError:
-        return rhs @ np.linalg.pinv(lhs) / float(z0)
+        return math.nan
+    residual = float(
+        np.linalg.norm(lhs @ voltage - rhs)
+        / max(np.linalg.norm(rhs), EPS)
+    )
+    if residual > 1e-7:
+        return math.inf
+    return float(np.real(np.conjugate(differential_current) @ voltage))
 
 
 def extract_average_dc_resistance(
@@ -619,117 +636,154 @@ def extract_average_dc_resistance(
     labels: Sequence[str],
     *,
     z0: float = 50.0,
+    open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
+    open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
+    passivity_tolerance: float = DEFAULT_DC_PASSIVITY_TOLERANCE,
 ) -> dict[str, object]:
-    """Extract one distinct DC resistance from training data.
+    """Extract one distinct DC resistance from passive exact-DC data.
 
-    Each training block must contain exactly one zero-Hz row and contributes
-    one equivalent resistance for every port pair from that row only. A
-    balanced one-amp current is injected into one port and removed from the
-    other with all remaining ports open; the real differential voltage is the
-    equivalent resistance. Their arithmetic mean becomes the model's
-    parameter-independent DC point. Positive-frequency data is never used as a
-    fallback.
+    Exact-zero rows are checked for S-matrix passivity before use. Passive rows
+    contribute one equivalent resistance for every port pair. Non-passive,
+    non-finite, and electrically invalid rows are ignored. The arithmetic mean
+    becomes the parameter-independent DC point. An average above
+    ``open_threshold_ohm`` is represented by ``open_resistance_ohm``.
+    Positive-frequency data is never used as a fallback.
     """
 
     if not math.isfinite(float(z0)) or float(z0) <= 0.0:
         raise ValueError("DC resistance extraction z0 must be positive and finite")
-    if not blocks:
-        raise ValueError("DC resistance extraction requires at least one training block")
-    nports = infer_complete_sparameter_ports(labels)
-    exact_dc_by_block = [
-        np.flatnonzero(np.asarray(block.freq_hz, dtype=float) == 0.0)
-        for block in blocks
-    ]
-    missing_dc_blocks = [
-        str(block.source_index)
-        for block, indices in zip(blocks, exact_dc_by_block)
-        if indices.size == 0
-    ]
-    duplicate_dc_blocks = [
-        str(block.source_index)
-        for block, indices in zip(blocks, exact_dc_by_block)
-        if indices.size > 1
-    ]
-    if missing_dc_blocks or duplicate_dc_blocks:
-        details: list[str] = []
-        if missing_dc_blocks:
-            details.append("missing DC in block(s): " + ", ".join(missing_dc_blocks))
-        if duplicate_dc_blocks:
-            details.append(
-                "multiple zero-Hz rows in block(s): " + ", ".join(duplicate_dc_blocks)
-            )
+    if not math.isfinite(float(open_threshold_ohm)) or float(open_threshold_ohm) <= 0.0:
+        raise ValueError("DC open-circuit threshold must be positive and finite")
+    if (
+        not math.isfinite(float(open_resistance_ohm))
+        or float(open_resistance_ohm) <= float(open_threshold_ohm)
+    ):
         raise ValueError(
-            "DC extraction requires exactly one zero-Hz fitting-data row in every "
-            "training block; " + "; ".join(details) + ". Positive-frequency data "
-            "cannot be substituted for DC."
+            "DC open-circuit resistance must be finite and greater than the threshold"
         )
+    if not math.isfinite(float(passivity_tolerance)) or float(passivity_tolerance) < 0.0:
+        raise ValueError("DC passivity tolerance must be non-negative and finite")
+    if not blocks:
+        raise ValueError("DC resistance extraction requires at least one data block")
+    nports = infer_complete_sparameter_ports(labels)
     resistances: list[float] = []
     frequencies: list[float] = []
     contributing_blocks: set[int] = set()
     pair_resistances: dict[str, list[float]] = {}
+    dc_row_count = 0
+    missing_dc_block_count = 0
+    ignored_nonpassive_count = 0
+    ignored_nonfinite_count = 0
+    ignored_invalid_resistance_count = 0
+    passivity_limit = 1.0 + float(passivity_tolerance)
     for block_index, block in enumerate(blocks):
         freq = np.asarray(block.freq_hz, dtype=float)
-        frequency_index = int(exact_dc_by_block[block_index][0])
-        s_matrix = _block_s_matrix(block, labels, frequency_index, nports)
-        if not np.all(np.isfinite(s_matrix.real)) or not np.all(np.isfinite(s_matrix.imag)):
-            raise ValueError(
-                f"Training block {block.source_index} contains a non-finite S-parameter "
-                "at its zero-Hz DC point"
-            )
-        y_matrix = _s_to_y_matrix(s_matrix, z0)
-        z_matrix = np.linalg.pinv(y_matrix)
-        if nports == 1:
-            block_resistances = [("p1-ground", float(np.real(z_matrix[0, 0])))]
-        else:
-            block_resistances = []
-            for first in range(nports):
-                for second in range(first + 1, nports):
-                    differential = np.zeros(nports, dtype=complex)
-                    differential[first] = 1.0
+        exact_dc_indices = np.flatnonzero(freq == 0.0)
+        if exact_dc_indices.size == 0:
+            missing_dc_block_count += 1
+            continue
+        for raw_frequency_index in exact_dc_indices:
+            frequency_index = int(raw_frequency_index)
+            dc_row_count += 1
+            try:
+                s_matrix = _block_s_matrix(block, labels, frequency_index, nports)
+            except (KeyError, ValueError):
+                ignored_nonfinite_count += 1
+                continue
+            if not np.all(np.isfinite(s_matrix.real)) or not np.all(np.isfinite(s_matrix.imag)):
+                ignored_nonfinite_count += 1
+                continue
+            try:
+                max_sigma = float(np.max(np.linalg.svd(s_matrix, compute_uv=False)))
+            except np.linalg.LinAlgError:
+                ignored_nonfinite_count += 1
+                continue
+            if not math.isfinite(max_sigma):
+                ignored_nonfinite_count += 1
+                continue
+            if max_sigma > passivity_limit:
+                ignored_nonpassive_count += 1
+                continue
+
+            block_resistances: list[tuple[str, float]] = []
+            pairs = [(0, 0)] if nports == 1 else [
+                (first, second)
+                for first in range(nports)
+                for second in range(first + 1, nports)
+            ]
+            invalid_row = False
+            for first, second in pairs:
+                differential = np.zeros(nports, dtype=complex)
+                differential[first] = 1.0
+                pair_name = "p1-ground"
+                if nports > 1:
                     differential[second] = -1.0
-                    resistance = float(
-                        np.real(
-                            np.conjugate(differential)
-                            @ z_matrix
-                            @ differential
-                        )
-                    )
-                    block_resistances.append((f"p{first + 1}-p{second + 1}", resistance))
-        for pair_name, resistance in block_resistances:
-            if not math.isfinite(resistance) or resistance <= 0.0:
-                raise ValueError(
-                    f"Training block {block.source_index} produces invalid DC equivalent "
-                    f"resistance {resistance!r} ohm for {pair_name}; DC extraction requires "
-                    "a positive finite value from every port pair"
+                    pair_name = f"p{first + 1}-p{second + 1}"
+                resistance = _dc_pair_resistance_from_s(
+                    s_matrix,
+                    differential,
+                    z0,
                 )
-            resistances.append(float(resistance))
-            pair_resistances.setdefault(pair_name, []).append(float(resistance))
-            frequencies.append(float(freq[frequency_index]))
+                if math.isnan(resistance) or resistance <= 0.0:
+                    invalid_row = True
+                    break
+                block_resistances.append((pair_name, resistance))
+            if invalid_row or not block_resistances:
+                ignored_invalid_resistance_count += 1
+                continue
+            for pair_name, resistance in block_resistances:
+                stored_resistance = min(float(resistance), float(open_resistance_ohm))
+                resistances.append(stored_resistance)
+                pair_resistances.setdefault(pair_name, []).append(stored_resistance)
+                frequencies.append(float(freq[frequency_index]))
             contributing_blocks.add(block_index)
+    if dc_row_count == 0:
+        raise ValueError(
+            "DC extraction requires at least one exact zero-Hz data row. "
+            "Positive-frequency data cannot be substituted for DC."
+        )
     if not resistances:
         raise ValueError(
-            "Could not extract a positive finite equivalent resistance from the "
-            "selected S-parameters in the training data"
+            "No usable passive exact-DC point remains after filtering non-passive, "
+            "non-finite, and electrically invalid DC rows"
         )
-    resistance = float(np.mean(np.asarray(resistances, dtype=float)))
+    raw_resistance = float(np.mean(np.asarray(resistances, dtype=float)))
+    open_circuit_applied = raw_resistance > float(open_threshold_ohm)
+    resistance = (
+        float(open_resistance_ohm) if open_circuit_applied else raw_resistance
+    )
     pair_means = {
-        pair_name: float(np.mean(np.asarray(values, dtype=float)))
+        pair_name: (
+            float(open_resistance_ohm)
+            if float(np.mean(np.asarray(values, dtype=float))) > float(open_threshold_ohm)
+            else float(np.mean(np.asarray(values, dtype=float)))
+        )
         for pair_name, values in sorted(pair_resistances.items())
     }
     dc_values = dc_sparameter_values(labels, resistance, z0=z0)
     return {
         "dc_equivalent_resistance_ohm": resistance,
+        "dc_equivalent_resistance_raw_mean_ohm": raw_resistance,
         "dc_resistance_sample_count": len(resistances),
         "dc_resistance_block_count": len(contributing_blocks),
+        "dc_row_count": dc_row_count,
+        "dc_missing_block_count": missing_dc_block_count,
+        "dc_ignored_nonpassive_count": ignored_nonpassive_count,
+        "dc_ignored_nonfinite_count": ignored_nonfinite_count,
+        "dc_ignored_invalid_resistance_count": ignored_invalid_resistance_count,
+        "dc_passivity_tolerance": float(passivity_tolerance),
+        "dc_open_threshold_ohm": float(open_threshold_ohm),
+        "dc_open_resistance_ohm": float(open_resistance_ohm),
+        "dc_open_circuit_applied": open_circuit_applied,
         "dc_resistance_source_z0_ohm": float(z0),
         "dc_resistance_source_frequency_min_hz": float(min(frequencies)),
         "dc_resistance_source_frequency_max_hz": float(max(frequencies)),
         "dc_resistance_source_kind": "exact_zero_frequency",
         "dc_resistance_pair_means_ohm": pair_means,
         "dc_resistance_extraction": (
-            "Arithmetic mean of positive pairwise open-port equivalent resistances "
-            "computed by balanced current injection from each training block at exact "
-            "zero Hz"
+            "Arithmetic mean of passive exact-zero-Hz pairwise open-port equivalent "
+            "resistances. Non-passive DC rows are ignored; averages above the configured "
+            "open threshold use the configured open-circuit resistance"
         ),
         "dc_response_topology": (
             "Parameter-independent equal-resistance complete graph whose equivalent "
@@ -746,6 +800,76 @@ def extract_average_dc_resistance(
             for label, value in zip(labels, dc_values)
         },
     }
+
+
+def resolve_export_dc_metadata(
+    stored_metadata: dict[str, object],
+    labels: Sequence[str],
+    *,
+    dc_mdif: str | Path | None,
+    z0: float,
+    open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
+    open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
+) -> dict[str, object]:
+    """Resolve DC metadata without changing or refitting the RF model."""
+
+    if dc_mdif:
+        dc_path = Path(dc_mdif)
+        blocks = read_mdif(dc_path)
+        metadata = extract_average_dc_resistance(
+            blocks,
+            labels,
+            z0=z0,
+            open_threshold_ohm=open_threshold_ohm,
+            open_resistance_ohm=open_resistance_ohm,
+        )
+        metadata["dc_resistance_source_file"] = str(dc_path)
+        metadata["dc_resistance_extracted_during_export"] = True
+        return metadata
+
+    validate_exact_dc_source_kind(
+        stored_metadata.get("dc_resistance_source_kind"),
+        context="Saved surrogate model",
+    )
+    validate_dc_equivalent_resistance(
+        stored_metadata.get("dc_equivalent_resistance_ohm"),
+        context="Saved surrogate model",
+    )
+    return {
+        key: value
+        for key, value in stored_metadata.items()
+        if str(key).startswith("dc_")
+    }
+
+
+def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add export-time exact-DC extraction controls."""
+
+    parser.add_argument(
+        "--dc-mdif",
+        help=(
+            "MDIF containing exact-zero-Hz S-parameter rows used to derive the DC "
+            "resistance without refitting the RF model. Overrides saved DC metadata."
+        ),
+    )
+    parser.add_argument(
+        "--dc-open-threshold",
+        type=float,
+        default=DEFAULT_DC_OPEN_THRESHOLD_OHM,
+        help=(
+            "Average passive DC resistance above this value is treated as open. "
+            f"Default: {DEFAULT_DC_OPEN_THRESHOLD_OHM:g} ohm."
+        ),
+    )
+    parser.add_argument(
+        "--dc-open-resistance",
+        type=float,
+        default=DEFAULT_DC_OPEN_RESISTANCE_OHM,
+        help=(
+            "Finite resistance used to represent an open DC path. "
+            f"Default: {DEFAULT_DC_OPEN_RESISTANCE_OHM:g} ohm."
+        ),
+    )
 
 
 def dc_sparameter_values(
@@ -6109,33 +6233,41 @@ def build_training_export_commands(
         resolved_model_dir,
         repository_root,
     )
+    dc_path = Path(template_mdif).resolve() if template_mdif else None
     commands: list[tuple[str, str]] = []
     if include_veriloga:
         module_name, parameter_scale_spec = veriloga_command_defaults(
             resolved_script_path,
             resolved_model_dir,
         )
+        veriloga_argv = [
+            command_python,
+            command_script_path,
+            "export-veriloga",
+            "--model-dir",
+            command_model_dir,
+            "--out-dir",
+            repository_relative_path(
+                resolved_model_dir / "veriloga_export",
+                repository_root,
+            ),
+            "--module-name",
+            module_name,
+            "--parameter-input-scales",
+            parameter_scale_spec,
+            "--dc-open-threshold",
+            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
+            "--dc-open-resistance",
+            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
+        ]
+        if dc_path is not None:
+            veriloga_argv.extend(
+                ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
+            )
         commands.append(
             (
                 "Self-contained Verilog-A",
-                shell_command(
-                    [
-                        command_python,
-                        command_script_path,
-                        "export-veriloga",
-                        "--model-dir",
-                        command_model_dir,
-                        "--out-dir",
-                        repository_relative_path(
-                            resolved_model_dir / "veriloga_export",
-                            repository_root,
-                        ),
-                        "--module-name",
-                        module_name,
-                        "--parameter-input-scales",
-                        parameter_scale_spec,
-                    ]
-                ),
+                shell_command(veriloga_argv),
             )
         )
     template_path = Path(template_mdif).resolve() if template_mdif else None
@@ -6143,25 +6275,32 @@ def build_training_export_commands(
         candidate = resolved_model_dir / "predicted_verification.mdif"
         template_path = candidate if candidate.exists() else None
     if template_path is not None:
+        sampled_argv = [
+            command_python,
+            command_script_path,
+            "export-ads-mdif",
+            "--model-dir",
+            command_model_dir,
+            "--out-dir",
+            repository_relative_path(
+                resolved_model_dir / "ads_mdif_export",
+                repository_root,
+            ),
+            "--template-mdif",
+            repository_relative_path(template_path, repository_root),
+            "--dc-open-threshold",
+            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
+            "--dc-open-resistance",
+            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
+        ]
+        if dc_path is not None:
+            sampled_argv.extend(
+                ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
+            )
         commands.append(
             (
                 "Sampled ADS MDIF",
-                shell_command(
-                    [
-                        command_python,
-                        command_script_path,
-                        "export-ads-mdif",
-                        "--model-dir",
-                        command_model_dir,
-                        "--out-dir",
-                        repository_relative_path(
-                            resolved_model_dir / "ads_mdif_export",
-                            repository_root,
-                        ),
-                        "--template-mdif",
-                        repository_relative_path(template_path, repository_root),
-                    ]
-                ),
+                shell_command(sampled_argv),
             )
         )
     return commands

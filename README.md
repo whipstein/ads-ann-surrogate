@@ -477,48 +477,64 @@ DNN package under `coarse_model/` and a `composite_model_manifest.json` that
 identifies and hashes both saved networks for later Verilog-A extraction.
 The reported Verilog-A commands include an explicit default module name and a
 single `--parameter-input-scales 1.0` value applied to every fitted parameter,
-making either value easy to edit before export.
+plus `--dc-open-threshold 1e12`, `--dc-open-resistance 1e19`, and the source
+`--dc-mdif` when available. These values are easy to edit before export.
 
 ### Distinct DC Point
 
-Every DNN, KBNN, and Neuro-TF fit now stores a parameter-independent DC
-equivalent resistance in `metadata.json` and reports it in
-`training_summary.md`. The corresponding real/imaginary S-point is stored under
-`dc_sparameters`. It is deliberately separate from the fitted response:
+DC is a parameter-independent resistance derived from exact-zero-frequency
+data; it is not a target of the DNN, KBNN, or Neuro-TF fit. Zero-Hz rows are
+removed before neural training and rational fitting, so changing DC data cannot
+change fitted weights or poles.
 
-> **Exact DC data is required.** Every training block must contain exactly one
-> zero-Hz row. A missing or duplicate DC row stops training with an error. The
-> lowest positive frequency is never substituted for DC, and the RF fit is
-> never extrapolated to create DC.
+1. Each finite exact-zero-Hz S-matrix is checked for passivity using its largest
+   singular value. Rows above `1 + 1e-6` are ignored.
+2. For each remaining S-matrix, the standard S-to-impedance relation is solved
+   for a one-amp balanced current between every port pair with the other ports
+   open. The real differential voltage gives the equivalent resistance; an
+   unsolvable disconnected path is treated as open.
+3. Non-finite or electrically invalid DC rows are also ignored. The valid
+   pairwise resistances are averaged into `dc_equivalent_resistance_ohm`.
+4. If the average exceeds `--dc-open-threshold` (default `1e12` ohm), the
+   exported resistance is set to `--dc-open-resistance` (default `1e19` ohm).
 
-1. The exact zero-Hz S-matrix from every training block is converted to Y using
-   the model reference impedance.
-2. A one-amp balanced current is applied between each port pair with all other
-   ports open; the real differential voltage gives that pair's equivalent
-   resistance.
-3. Every extracted pair value must be positive and finite. Their arithmetic
-   mean is saved as `dc_equivalent_resistance_ohm`.
-4. Zero-frequency rows are excluded from neural/rational fitting, so changing
-   an input MDIF's DC samples cannot change the fitted weights or poles.
+At least one exact-zero-Hz row and one usable passive result are required for DC
+extraction. Blocks without a DC row are skipped. The lowest positive frequency
+is never substituted, and the fitted RF response is never extrapolated to DC.
+The extraction metadata records the raw mean, filtered-row counts, threshold,
+and whether the open-circuit value was applied.
 
 At exactly zero Hz, prediction and sampled-MDIF export use an equal-resistance
-port network whose equivalent resistance between any two ports is the saved
+port network whose equivalent resistance between any two ports is the resolved
 average. Sampled ADS exports prepend this zero-Hz point automatically. Direct
 Verilog-A exports electrically disable the fitted-response stamps at DC and
 enable the resistor network instead; positive frequencies use the fitted
 response. The exporter selects DC or fitted Y coefficients before an
 unconditional current contribution, so `ddt()` is never placed in a conditional
 and the generated source remains legal for ADS Verilog-A. Export also verifies
-that the saved model records `dc_resistance_source_kind=exact_zero_frequency`;
-older models created from RF fallback data are rejected and must be retrained.
+that DC came from exact-zero-frequency data.
 
-For an integrated residual or prior-input KBNN, the coarse DNN and fine KBNN
-store their own independently extracted resistance values, so both fine and
-coarse training data must contain exact zero-Hz rows. The composite
-Verilog-A component uses the fine-data resistance and bypasses both networks at
-DC. Native ADS ANN retraining excludes zero-Hz rows, but its generated ANN alone
-does not implement the distinct resistor branch; use the direct Verilog-A or
-sampled-MDIF handoff when DC behavior is required.
+To export an older fitted model without retraining it, pass the original DC data
+directly to `export-veriloga` or `export-ads-mdif`:
+
+```bash
+python3 dnn.py export-veriloga \
+  --model-dir dnn_model \
+  --out-dir dnn_model/veriloga_export \
+  --dc-mdif training_with_dc.mdif \
+  --dc-open-threshold 1e12 \
+  --dc-open-resistance 1e19
+```
+
+`--dc-mdif` overrides any saved DC metadata for that export and does not modify
+or refit the RF model.
+
+For an integrated residual or prior-input KBNN, the composite Verilog-A
+component uses the passive DC resistance derived from the fine-data MDIF and
+bypasses both fine and coarse networks at zero Hz. The coarse model is not used
+to calculate this resistance. Native ADS ANN retraining excludes zero-Hz rows,
+but its generated ANN alone does not implement the distinct resistor branch;
+use the direct Verilog-A or sampled-MDIF handoff when DC behavior is required.
 
 Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
 per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
@@ -1025,6 +1041,7 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
+| <nobr><code>--dc-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Optional exact-zero-frequency S-parameter source used to derive DC during export without refitting the RF model. Overrides saved DC metadata. | <nobr><code>--dc-mdif train_with_dc.mdif</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-ann</code> | Input MDIF to inspect, fit, predict, or use as an ADS ANN retraining source, depending on the subcommand. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir dnn_model</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir dnn_model</code></nobr> |
@@ -1100,6 +1117,8 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
 | <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
+| <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Finite resistance used for an open DC path after export-time extraction. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
+| <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Average passive DC resistance above this value is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-veriloga</code> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
@@ -1630,6 +1649,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--coarse-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Recommended coarse source for `residual` and `prior-input`. Fits an S-domain DNN first and saves its complete outputs under `<out-dir>/coarse_model/`. Mutually exclusive with `--coarse-model-dir`. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
 | <nobr><code>--coarse-model-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Directory containing the frozen coarse DNN used by the KBNN. Training may create it from coarse MDIF data; prediction and export can use the packaged model or a validated relocated copy. | <nobr><code>--coarse-model-dir coarse_dnn_model</code></nobr> |
 | <nobr><code>--coarse-verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional separate coarse/prior verification MDIF. Use this with `--verification-mdif` when fine and coarse verification data are stored separately. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--dc-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Optional fine-data exact-zero-frequency S-parameter source used to derive composite DC during export without refitting either network. Overrides saved DC metadata. | <nobr><code>--dc-mdif fine_with_dc.mdif</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-ann</code> | Fine/target MDIF to inspect, fit, predict, or use as an ADS ANN retraining source, depending on the subcommand. | <nobr><code>--mdif fine_train_verify.mdif</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir kbnn_model</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir kbnn_model</code></nobr> |
@@ -1722,6 +1742,8 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
 | <nobr><code>--allow-coarse-hooks</code></nobr> | <code>export-veriloga</code> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
+| <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Finite resistance used for an open DC path after export-time extraction. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
+| <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Average passive fine-data DC resistance above this value is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-veriloga</code> | Optional Verilog-A module name. If omitted, the exporter derives one from the output directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
@@ -1953,6 +1975,7 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
+| <nobr><code>--dc-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Optional exact-zero-frequency S-parameter source used to derive DC during export without refitting the coefficient network. Overrides saved DC metadata. | <nobr><code>--dc-mdif train_with_dc.mdif</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code> | Input MDIF to inspect, fit, or predict, depending on the subcommand. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir neuro_tf_model</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir neuro_tf_model</code></nobr> |
@@ -2016,6 +2039,8 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
+| <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Finite resistance used for an open DC path after export-time extraction. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
+| <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-veriloga</code> | Average passive DC resistance above this value is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-veriloga</code> | Optional Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |

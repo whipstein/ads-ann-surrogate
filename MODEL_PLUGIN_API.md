@@ -142,17 +142,22 @@ its normal S-parameter values and pass both saved fields. This guarantees that
 zero-Hz input data cannot affect fitted weights or poles and that older
 fallback-derived models cannot supply DC.
 
-`extract_average_dc_resistance()` requires exactly one zero-Hz row in every
-training block. Missing or duplicate zero-Hz rows are errors. It never falls
-back to positive-frequency data, and invalid pairwise DC resistances are not
-silently discarded. Save `dc_resistance_source_kind=exact_zero_frequency` and
-require that value again before prediction at DC or direct Verilog-A export.
+`extract_average_dc_resistance()` uses exact-zero-Hz rows only. It rejects
+non-passive S-matrices using the shared singular-value tolerance and ignores
+non-finite or electrically invalid DC rows. Blocks without DC are skipped, but
+extraction fails when no exact DC row exists or no usable passive row remains.
+Valid pairwise resistances are averaged. An average above the configured open
+threshold is replaced by the configured finite open resistance (defaults:
+`1e12` and `1e19` ohm). It never falls back to positive-frequency data.
 
 `build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
 Direct Verilog-A writers must receive the saved
 `dc_equivalent_resistance_ohm` and `dc_resistance_source_kind`; the shared
 writers validate exact-DC provenance, stamp the distinct resistor topology at
-zero Hz, and bypass the fitted response.
+zero Hz, and bypass the fitted response. Export CLIs must expose the shared
+`--dc-mdif`, `--dc-open-threshold`, and `--dc-open-resistance` arguments and use
+`resolve_export_dc_metadata()`. This lets an older RF model derive DC during
+export without changing or refitting its weights or poles.
 
 ## Training Command Contract
 

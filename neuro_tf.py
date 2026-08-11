@@ -551,6 +551,18 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_resistance_filtering": {
+            "raw_mean_ohm": metadata["dc_equivalent_resistance_raw_mean_ohm"],
+            "dc_rows": metadata["dc_row_count"],
+            "ignored_nonpassive": metadata["dc_ignored_nonpassive_count"],
+            "ignored_nonfinite": metadata["dc_ignored_nonfinite_count"],
+            "ignored_invalid_resistance": metadata[
+                "dc_ignored_invalid_resistance_count"
+            ],
+            "open_threshold_ohm": metadata["dc_open_threshold_ohm"],
+            "open_resistance_ohm": metadata["dc_open_resistance_ohm"],
+            "open_circuit_applied": metadata["dc_open_circuit_applied"],
+        },
         "dc_is_separate_from_fitted_response": True,
         "hidden_layers": args.hidden_layers,
         "activation": mlp.activation,
@@ -637,6 +649,19 @@ def command_predict(args: argparse.Namespace) -> int:
 def command_export_ads(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = NeuroTF.load(model_dir)
+    source_metadata = read_model_metadata(str(model_dir))
+    dc_metadata = resolve_export_dc_metadata(
+        source_metadata,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=50.0,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
+    )
+    model.dc_equivalent_resistance_ohm = float(
+        dc_metadata["dc_equivalent_resistance_ohm"]
+    )
+    model.dc_resistance_source_kind = str(dc_metadata["dc_resistance_source_kind"])
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -663,11 +688,12 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "layer_sizes": model.mlp.layer_sizes,
             "representation": "fixed-pole rational transfer function",
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_metadata": dc_metadata,
             "dc_is_separate_from_fitted_response": True,
         },
         extra_notes=[
             "The exported MDIF samples the fitted fixed-pole Neuro-TF response; ADS does not execute the neural network or rational basis directly.",
-            "Every exported block includes a zero-Hz point from the saved average equivalent resistance; the coefficient network and rational basis are bypassed there.",
+            "Every exported block includes a zero-Hz point from the resolved passive exact-DC average resistance; the coefficient network and rational basis are bypassed there.",
         ],
     )
     print(json.dumps({
@@ -676,6 +702,11 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "manifest": str(out_dir / "ads_model_manifest.json"),
         "blocks": manifest["blocks"],
         "frequency_points_per_block": manifest["frequency_points_per_block"],
+        "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_ignored_nonpassive_count": dc_metadata.get(
+            "dc_ignored_nonpassive_count"
+        ),
+        "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
     }, indent=2))
     return 0
 
@@ -689,6 +720,14 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     parameter_input_scales = parse_parameter_scale_spec(
         model.parameter_names,
         args.parameter_input_scales,
+    )
+    dc_metadata = resolve_export_dc_metadata(
+        source_metadata,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=args.z0,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
     )
     manifest = write_neurotf_veriloga_package(
         out_dir=out_dir,
@@ -708,16 +747,19 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         z0=args.z0,
         frequency_expression=args.frequency_expression,
         parameter_input_scales=parameter_input_scales,
-        dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
-        dc_resistance_source_kind=source_metadata.get("dc_resistance_source_kind"),
+        dc_equivalent_resistance_ohm=float(
+            dc_metadata["dc_equivalent_resistance_ohm"]
+        ),
+        dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         source_model_dir=str(model_dir),
         extra_manifest={
-            "dc_resistance_source_kind": source_metadata.get(
+            "dc_resistance_source_kind": dc_metadata.get(
                 "dc_resistance_source_kind"
             ),
-            "dc_resistance_pair_means_ohm": source_metadata.get(
+            "dc_resistance_pair_means_ohm": dc_metadata.get(
                 "dc_resistance_pair_means_ohm"
             ),
+            "dc_metadata": dc_metadata,
         },
     )
     print(json.dumps({
@@ -735,6 +777,10 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
         "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
+        "dc_ignored_nonpassive_count": dc_metadata.get(
+            "dc_ignored_nonpassive_count"
+        ),
+        "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
     }, indent=2))
     return 0
 
@@ -969,6 +1015,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Frequency grid such as 1GHz:20GHz:401 or 1GHz,2GHz,4GHz. Required with --parameter-grid.",
     )
     export_ads.add_argument("--output-name", default="surrogate_ads.mdif", help="Output MDIF file name")
+    add_dc_export_arguments(export_ads)
     export_ads.set_defaults(func=command_export_ads)
 
     export_va = sub.add_parser(
@@ -1011,6 +1058,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "before conversion to model-training units. Example: 1um"
         ),
     )
+    add_dc_export_arguments(export_va)
     export_va.set_defaults(func=command_export_veriloga)
 
     inspect = sub.add_parser("inspect-mdif", help="Inspect parsed MDIF blocks")

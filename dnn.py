@@ -29,6 +29,7 @@ from surrogate_common import (  # noqa: E402
     MDIFBlock,
     MLP,
     Standardizer,
+    add_dc_export_arguments,
     add_debug_argument,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
@@ -75,6 +76,7 @@ from surrogate_common import (  # noqa: E402
     print_cli_error,
     read_mdif,
     read_model_metadata,
+    resolve_export_dc_metadata,
     rerank_sweep_rows,
     run_sweep_command,
     sparam_sort_key,
@@ -636,6 +638,18 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_resistance_filtering": {
+            "raw_mean_ohm": metadata["dc_equivalent_resistance_raw_mean_ohm"],
+            "dc_rows": metadata["dc_row_count"],
+            "ignored_nonpassive": metadata["dc_ignored_nonpassive_count"],
+            "ignored_nonfinite": metadata["dc_ignored_nonfinite_count"],
+            "ignored_invalid_resistance": metadata[
+                "dc_ignored_invalid_resistance_count"
+            ],
+            "open_threshold_ohm": metadata["dc_open_threshold_ohm"],
+            "open_resistance_ohm": metadata["dc_open_resistance_ohm"],
+            "open_circuit_applied": metadata["dc_open_circuit_applied"],
+        },
         "dc_is_separate_from_fitted_response": True,
         "hidden_layers": args.hidden_layers,
         "activation": model.mlp.activation,
@@ -733,6 +747,19 @@ def command_predict(args: argparse.Namespace) -> int:
 def command_export_ads(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = DNN.load(model_dir)
+    source_metadata = read_model_metadata(str(model_dir))
+    dc_metadata = resolve_export_dc_metadata(
+        source_metadata,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=model.target_z0,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
+    )
+    model.dc_equivalent_resistance_ohm = float(
+        dc_metadata["dc_equivalent_resistance_ohm"]
+    )
+    model.dc_resistance_source_kind = str(dc_metadata["dc_resistance_source_kind"])
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -759,11 +786,12 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "output_domain": model.output_domain,
             "target_z0": model.target_z0,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+            "dc_metadata": dc_metadata,
             "dc_is_separate_from_fitted_response": True,
         },
         extra_notes=[
-            "Every exported block includes a zero-Hz point from the saved average "
-            "equivalent resistance; it is not an extrapolation of the fitted DNN."
+            "Every exported block includes a zero-Hz point from the resolved passive "
+            "exact-DC average resistance; it is not an extrapolation of the fitted DNN."
         ],
     )
     print(json.dumps({
@@ -772,6 +800,11 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "manifest": str(out_dir / "ads_model_manifest.json"),
         "blocks": manifest["blocks"],
         "frequency_points_per_block": manifest["frequency_points_per_block"],
+        "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
+        "dc_ignored_nonpassive_count": dc_metadata.get(
+            "dc_ignored_nonpassive_count"
+        ),
+        "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
     }, indent=2))
     return 0
 
@@ -927,6 +960,14 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     )
     fold_scalers = not bool(getattr(args, "no_fold_scalers", False))
     export_z0 = float(model.target_z0 if model.output_domain == "y" else args.z0)
+    dc_metadata = resolve_export_dc_metadata(
+        source_metadata,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=export_z0,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
+    )
     if model.output_domain == "y" and not math.isclose(float(args.z0), export_z0, rel_tol=1e-12, abs_tol=1e-12):
         print(
             f"warning: direct-Y model was trained with target_z0={export_z0:g}; "
@@ -968,20 +1009,23 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         output_domain=model.output_domain,
         fold_input_scaler=fold_scalers,
         fold_output_scaler=fold_scalers,
-        dc_equivalent_resistance_ohm=model.dc_equivalent_resistance_ohm,
-        dc_resistance_source_kind=source_metadata.get("dc_resistance_source_kind"),
+        dc_equivalent_resistance_ohm=float(
+            dc_metadata["dc_equivalent_resistance_ohm"]
+        ),
+        dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",
             "fully_self_contained": True,
             "training_output_domain": model.output_domain,
             "training_target_z0": model.target_z0,
-            "dc_resistance_source_kind": source_metadata.get(
+            "dc_resistance_source_kind": dc_metadata.get(
                 "dc_resistance_source_kind"
             ),
-            "dc_resistance_pair_means_ohm": source_metadata.get(
+            "dc_resistance_pair_means_ohm": dc_metadata.get(
                 "dc_resistance_pair_means_ohm"
             ),
+            "dc_metadata": dc_metadata,
         },
         extra_notes=export_notes,
     )
@@ -1000,6 +1044,10 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
         "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
+        "dc_ignored_nonpassive_count": dc_metadata.get(
+            "dc_ignored_nonpassive_count"
+        ),
+        "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
     }, indent=2))
     return 0
 
@@ -1522,6 +1570,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Frequency grid such as 1GHz:20GHz:401 or 1GHz,2GHz,4GHz. Required with --parameter-grid.",
     )
     export_ads.add_argument("--output-name", default="surrogate_ads.mdif", help="Output MDIF file name")
+    add_dc_export_arguments(export_ads)
     export_ads.set_defaults(func=command_export_ads)
 
     export_ann = sub.add_parser(
@@ -1596,6 +1645,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Debug option: keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the neural layers",
     )
+    add_dc_export_arguments(export_va)
     export_va.set_defaults(func=command_export_veriloga)
 
     inspect = sub.add_parser("inspect-mdif", help="Inspect parsed MDIF blocks")
