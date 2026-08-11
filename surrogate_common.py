@@ -3608,6 +3608,810 @@ def write_neurotf_veriloga_package(
     return manifest
 
 
+def _ads_hb_activation(expression: str, activation: str | None) -> str:
+    """Return an ADS simulator-expression activation."""
+
+    if activation is None:
+        return expression
+    normalized = activation.strip().lower()
+    if normalized == "tanh":
+        return f"tanh({expression})"
+    if normalized == "relu":
+        return f"max(({expression}),0.0)"
+    raise ValueError(f"Unsupported ADS HB activation {activation!r}")
+
+
+ADS_HB_RESERVED = {
+    *{name.lower() for name in VERILOGA_RESERVED},
+    "freq",
+    "j",
+    "omega",
+    "pi",
+    "temp",
+    "time",
+    "z0",
+}
+
+
+def _ads_hb_identifier(name: str, fallback: str) -> str:
+    identifier = veriloga_identifier(name, fallback)
+    if identifier.lower() in ADS_HB_RESERVED:
+        identifier = f"{identifier}_p"
+    return identifier
+
+
+def _unique_ads_hb_identifiers(
+    names: Sequence[str],
+    fallback_prefix: str,
+    used_names: set[str] | None = None,
+) -> list[str]:
+    used = {value.lower() for value in (used_names or set())}
+    result: list[str] = []
+    for idx, name in enumerate(names):
+        base = _ads_hb_identifier(name, f"{fallback_prefix}{idx + 1}")
+        identifier = base
+        suffix = 2
+        while identifier.lower() in used:
+            identifier = f"{base}_{suffix}"
+            suffix += 1
+        used.add(identifier.lower())
+        result.append(identifier)
+    return result
+
+
+def _ads_hb_weighted_sum(
+    bias: float,
+    source_names: Sequence[str],
+    weights: np.ndarray,
+) -> str:
+    terms = [f"({veriloga_float(float(bias))})"]
+    for source_name, weight in zip(source_names, np.asarray(weights, dtype=float)):
+        if float(weight) == 0.0:
+            continue
+        terms.append(f"({veriloga_float(float(weight))})*({source_name})")
+    return "+".join(terms)
+
+
+def _append_ads_hb_mlp_equations(
+    lines: list[str],
+    prefix: str,
+    feature_expressions: Sequence[str],
+    activation: str,
+    layer_sizes: Sequence[int],
+    weights: Sequence[np.ndarray],
+    biases: Sequence[np.ndarray],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+) -> list[str]:
+    """Append shared ADS equations and return unscaled output expression names."""
+
+    numeric_weights = [np.asarray(value, dtype=float) for value in weights]
+    numeric_biases = [np.asarray(value, dtype=float) for value in biases]
+    x_mean_array = np.asarray(x_mean, dtype=float)
+    x_std_array = np.asarray(x_std, dtype=float)
+    y_mean_array = np.asarray(y_mean, dtype=float)
+    y_std_array = np.asarray(y_std, dtype=float)
+    sizes = [int(value) for value in layer_sizes]
+    if len(sizes) < 2 or len(numeric_weights) != len(sizes) - 1:
+        raise ValueError("ADS HB MLP weights and layer sizes are inconsistent")
+    if len(numeric_biases) != len(numeric_weights):
+        raise ValueError("ADS HB MLP weights and biases are inconsistent")
+    if sizes[0] != len(feature_expressions):
+        raise ValueError(
+            f"ADS HB MLP expects {sizes[0]} features, got {len(feature_expressions)}"
+        )
+    if x_mean_array.shape != (sizes[0],) or x_std_array.shape != (sizes[0],):
+        raise ValueError("ADS HB MLP input scaler dimensions are inconsistent")
+    if y_mean_array.shape != (sizes[-1],) or y_std_array.shape != (sizes[-1],):
+        raise ValueError("ADS HB MLP output scaler dimensions are inconsistent")
+    if np.any(x_std_array == 0.0):
+        raise ValueError("ADS HB MLP input scaler standard deviations must be non-zero")
+
+    source_names: list[str] = []
+    for idx, expression in enumerate(feature_expressions):
+        name = f"{prefix}_x{idx}"
+        lines.append(
+            f"{name}=(({expression})-({veriloga_float(float(x_mean_array[idx]))}))"
+            f"/({veriloga_float(float(x_std_array[idx]))})"
+        )
+        source_names.append(name)
+
+    for layer_idx, (weight, bias) in enumerate(zip(numeric_weights, numeric_biases)):
+        expected = (sizes[layer_idx], sizes[layer_idx + 1])
+        if weight.shape != expected or bias.shape != (sizes[layer_idx + 1],):
+            raise ValueError(
+                f"ADS HB MLP layer {layer_idx} has shapes {weight.shape}/{bias.shape}; "
+                f"expected {expected}/{(sizes[layer_idx + 1],)}"
+            )
+        dest_names: list[str] = []
+        hidden_activation = activation if layer_idx < len(numeric_weights) - 1 else None
+        for out_idx in range(sizes[layer_idx + 1]):
+            dest = f"{prefix}_l{layer_idx + 1}_{out_idx}"
+            expression = _ads_hb_weighted_sum(
+                float(bias[out_idx]),
+                source_names,
+                weight[:, out_idx],
+            )
+            lines.append(f"{dest}={_ads_hb_activation(expression, hidden_activation)}")
+            dest_names.append(dest)
+        source_names = dest_names
+
+    outputs: list[str] = []
+    for idx, source in enumerate(source_names):
+        name = f"{prefix}_out{idx}"
+        lines.append(
+            f"{name}=({source})*({veriloga_float(float(y_std_array[idx]))})+"
+            f"({veriloga_float(float(y_mean_array[idx]))})"
+        )
+        outputs.append(name)
+    return outputs
+
+
+def _ads_hb_frequency_features(freq_transform: str) -> list[str]:
+    safe_frequency = "max(abs(freq),1.0)"
+    if freq_transform == "log":
+        return [f"log10({safe_frequency})"]
+    if freq_transform == "linear":
+        return [safe_frequency]
+    if freq_transform == "log-linear":
+        return [f"log10({safe_frequency})", safe_frequency]
+    raise ValueError(f"Unsupported ADS HB frequency transform {freq_transform!r}")
+
+
+def _ads_hb_parameter_configuration(
+    parameter_names: Sequence[str],
+    x_mean: np.ndarray,
+    parameter_input_scales: dict[str, float] | None,
+) -> tuple[list[str], list[str], list[float], list[float], list[str]]:
+    scale_map = {
+        str(key): float(value) for key, value in (parameter_input_scales or {}).items()
+    }
+    unknown_scales = sorted(set(scale_map) - set(parameter_names))
+    if unknown_scales:
+        raise ValueError(
+            "Parameter input scales include names that are not model parameters: "
+            + ", ".join(unknown_scales)
+        )
+    used_names = {"z0", *(f"p{idx}" for idx in range(1, 100))}
+    param_ids = _unique_ads_hb_identifiers(
+        parameter_names,
+        "param",
+        used_names=used_names,
+    )
+    scale_ids = _unique_ads_hb_identifiers(
+        [f"{identifier}_input_scale" for identifier in param_ids],
+        "param_input_scale",
+        used_names={*used_names, *param_ids},
+    )
+    x_mean_array = np.asarray(x_mean, dtype=float)
+    scales: list[float] = []
+    model_defaults: list[float] = []
+    instance_defaults: list[float] = []
+    feature_expressions: list[str] = []
+    for idx, (name, identifier, scale_identifier) in enumerate(
+        zip(parameter_names, param_ids, scale_ids)
+    ):
+        scale = float(scale_map.get(name, 1.0))
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"Parameter input scale for {name!r} must be positive and finite")
+        model_default = float(x_mean_array[idx])
+        scales.append(scale)
+        model_defaults.append(model_default)
+        instance_defaults.append(model_default * scale)
+        feature_expressions.append(f"({identifier})/({scale_identifier})")
+    return param_ids, scale_ids, scales, instance_defaults, feature_expressions
+
+
+def _append_ads_hb_sdd(
+    lines: list[str],
+    instance_name: str,
+    port_ids: Sequence[str],
+    response_names: Sequence[str],
+    response_domain: str,
+    z0: float,
+) -> None:
+    nports = len(port_ids)
+    if len(response_names) != nports * nports:
+        raise ValueError("ADS HB response matrix does not match the electrical port count")
+    nodes = " ".join(f"{port} 0" for port in port_ids)
+    tokens = [f"SDD:{instance_name} {nodes}"]
+    weight_index = 2
+    for row in range(nports):
+        port_number = row + 1
+        if response_domain == "s":
+            tokens.append(
+                f"F[{port_number},0]=_v{port_number}-({veriloga_float(z0)})*_i{port_number}"
+            )
+        elif response_domain == "y":
+            tokens.append(f"F[{port_number},0]=_i{port_number}")
+        else:
+            raise ValueError(f"Unsupported ADS HB response domain {response_domain!r}")
+        for col in range(nports):
+            control_number = col + 1
+            if response_domain == "s":
+                formula = (
+                    f"-(_v{control_number}+({veriloga_float(z0)})*_i{control_number})"
+                )
+            else:
+                formula = f"-_v{control_number}"
+            response_name = response_names[row * nports + col]
+            tokens.append(f"F[{port_number},{weight_index}]={formula}")
+            tokens.append(f"H[{weight_index}]={response_name}")
+            weight_index += 1
+    for idx, token in enumerate(tokens):
+        suffix = " \\" if idx < len(tokens) - 1 else ""
+        lines.append(f"  {token}{suffix}")
+
+
+def _ads_hb_readme(
+    model_kind: str,
+    module_name: str,
+    netlist_name: str,
+    manifest_name: str,
+    nports: int,
+    parameter_names: Sequence[str],
+    parameter_ids: Sequence[str],
+    parameter_scale_ids: Sequence[str],
+    parameter_scales: Sequence[float],
+    response_domain: str,
+    extra_notes: Sequence[str] | None = None,
+) -> str:
+    parameter_rows = "\n".join(
+        f"| `{source}` | `{identifier}` | `{scale_identifier}` | `{scale:.17g}` |"
+        for source, identifier, scale_identifier, scale in zip(
+            parameter_names,
+            parameter_ids,
+            parameter_scale_ids,
+            parameter_scales,
+        )
+    )
+    if not parameter_rows:
+        parameter_rows = "| _(none)_ | _(none)_ | _(none)_ | _(none)_ |"
+    notes = "\n".join(f"- {note}" for note in (extra_notes or []))
+    if notes:
+        notes = f"\n## Notes\n\n{notes}\n"
+    return f"""# ADS Harmonic-Balance Passive Network
+
+This package contains a self-contained ADS Symbolically Defined Device (SDD)
+subnetwork for the trained {model_kind} passive structure. It is linear and
+power independent. ADS evaluates every complex {response_domain.upper()}-matrix
+weight at the frequency of each HB spectral component, so active devices around
+this network can compress normally without making the passive structure itself
+power dependent.
+
+## Files
+
+- `{netlist_name}`: self-contained ADS simulator subnetwork
+- `{manifest_name}`: model contract and generation metadata
+- `ADS_HB_README.md`: this file
+
+## Use in ADS
+
+1. Copy this folder into the ADS workspace, keeping the files together.
+2. Place a `NetlistInclude` component and include `{netlist_name}` using a
+   relative path.
+3. Instantiate the subnetwork named `{module_name}` with {nports} electrical
+   pins. If a schematic symbol is desired, import the subnetwork netlist once
+   and generate a symbol for `{module_name}`.
+4. Set the instance geometry/process parameters listed below. The scale
+   parameters normally remain at their generated defaults.
+5. Use the component in HB exactly as a passive S-parameter network. No input
+   power parameter is present or required.
+
+The subnetwork's ADS netlist call has the form:
+
+```text
+{module_name}:X1 {' '.join(f'net{idx}' for idx in range(1, nports + 1))}
+```
+
+### Instance parameters
+
+| Training VAR | Instance parameter | Input scale parameter | Default scale |
+| --- | --- | --- | ---: |
+{parameter_rows}
+
+The training value used by the embedded network is
+`instance_parameter / input_scale_parameter`.
+
+## DC and RF behavior
+
+At `freq=0`, the SDD uses only the separately extracted, parameter-independent
+DC network. At every positive spectral frequency it uses only the fitted RF
+surrogate. Negative frequencies use the complex conjugate of the surrogate at
+the matching positive frequency, preserving the conjugate symmetry required
+for real voltage and current waveforms. This selection occurs in an SDD
+frequency weighting function, not inside a Verilog-A analog-operator
+conditional.
+
+## Why this works in harmonic balance
+
+The model implements the linear multiport relation directly in the frequency
+domain. For an S-domain export it uses
+`V - Z0*I = S(f) * (V + Z0*I)`. For a direct-Y export it uses
+`I = Y(f) * V`. ADS evaluates those weights independently at the fundamental,
+harmonics, and mixing frequencies requested by the HB controller.
+
+This export targets ADS simulator expressions and the SDD netlist syntax. It
+does not require Python, MDIF, or the original model files during simulation.
+
+The implementation follows Keysight's ADS documentation for
+[SDD frequency weighting](https://edadownload.software.keysight.com/eedl/ads/2011/pdf/modbuild.pdf),
+[simulator expressions](https://edadownload.software.keysight.com/eedl/ads/2011_01/pdf/expsim.pdf),
+and [subnetwork/netlist syntax](https://edadownload.software.keysight.com/eedl/ads/2011_01/pdf/cktsim.pdf).
+
+Linear and power independent do not by themselves guarantee that an
+unconstrained neural fit is passive at every interpolated or extrapolated
+point. Validate the exported component over the complete HB frequency and
+parameter range, and use passivity-aware sweep selection when required.
+{notes}"""
+
+
+def write_ads_hb_mlp_package(
+    out_dir: Path,
+    model_kind: str,
+    module_name: str,
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+    freq_transform: str,
+    activation: str,
+    layer_sizes: Sequence[int],
+    weights: Sequence[np.ndarray],
+    biases: Sequence[np.ndarray],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+    z0: float,
+    parameter_input_scales: dict[str, float] | None = None,
+    output_domain: str = "s",
+    uses_coarse_inputs: bool = False,
+    adds_coarse_to_output: bool = False,
+    embedded_coarse_model: dict[str, object] | None = None,
+    dc_equivalent_resistance_ohm: float | None = None,
+    dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
+    source_model_dir: str | None = None,
+    extra_manifest: dict[str, object] | None = None,
+    extra_notes: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Write a self-contained, linear ADS SDD model for HB/AC/SP analyses."""
+
+    response_domain = output_domain.strip().lower()
+    if response_domain not in {"s", "y"}:
+        raise ValueError("ADS HB output domain must be 's' or 'y'")
+    if response_domain == "y" and (uses_coarse_inputs or adds_coarse_to_output):
+        raise ValueError("Direct-Y ADS HB export does not support KBNN coarse hooks")
+    if not math.isfinite(z0) or z0 <= 0.0:
+        raise ValueError("ADS HB reference impedance must be positive and finite")
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    n_sparams = len(sparam_labels)
+    matrix_size = nports * nports
+    if n_sparams != matrix_size:
+        raise ValueError("ADS HB export requires a complete S-parameter matrix")
+    dc_source_kind = validate_exact_dc_source_kind(
+        dc_resistance_source_kind,
+        context=f"{model_kind} ADS HB export",
+    )
+    dc_resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context=f"{model_kind} model",
+    )
+    dc_path_resistances = validate_dc_port_resistances(
+        sparam_labels,
+        dc_port_resistances_ohm,
+        context=f"{model_kind} model",
+    )
+    module_id = _ads_hb_identifier(module_name, "surrogate_hb")
+    prefix = _ads_hb_identifier(f"{module_id}_m", "hb_model")
+    param_ids, scale_ids, param_scales, param_defaults, parameter_features = (
+        _ads_hb_parameter_configuration(
+            parameter_names,
+            np.asarray(x_mean, dtype=float),
+            parameter_input_scales,
+        )
+    )
+    port_ids = [f"p{idx}" for idx in range(1, nports + 1)]
+    lines = [
+        "; Self-contained linear ADS SDD surrogate for harmonic balance",
+        "; Generated by ads-ann-surrogate",
+        f"define {module_id} ({' '.join(port_ids)})",
+    ]
+    parameter_tokens = [f"{identifier}={veriloga_float(default)}" for identifier, default in zip(param_ids, param_defaults)]
+    parameter_tokens.extend(
+        f"{scale_id}={veriloga_float(scale)}"
+        for scale_id, scale in zip(scale_ids, param_scales)
+    )
+    if response_domain == "s":
+        parameter_tokens.append(f"z0={veriloga_float(z0)}")
+    if parameter_tokens:
+        lines.append("parameters " + " ".join(parameter_tokens))
+    lines.append("")
+
+    coarse_outputs: list[str] | None = None
+    if embedded_coarse_model is not None:
+        coarse_parameter_names = [str(value) for value in embedded_coarse_model["parameter_names"]]  # type: ignore[index]
+        coarse_labels = [str(value) for value in embedded_coarse_model["sparam_labels"]]  # type: ignore[index]
+        if coarse_parameter_names != list(parameter_names) or coarse_labels != list(sparam_labels):
+            raise ValueError("Embedded coarse DNN parameters and S-parameter order must match the KBNN")
+        if str(embedded_coarse_model.get("output_domain", "s")).lower() != "s":
+            raise ValueError("Embedded coarse DNN must use the S output domain")
+        coarse_features = [
+            *parameter_features,
+            *_ads_hb_frequency_features(str(embedded_coarse_model["freq_transform"])),
+        ]
+        coarse_outputs = _append_ads_hb_mlp_equations(
+            lines,
+            f"{prefix}_coarse",
+            coarse_features,
+            str(embedded_coarse_model["activation"]),
+            embedded_coarse_model["layer_sizes"],  # type: ignore[arg-type]
+            embedded_coarse_model["weights"],  # type: ignore[arg-type]
+            embedded_coarse_model["biases"],  # type: ignore[arg-type]
+            np.asarray(embedded_coarse_model["x_mean"], dtype=float),
+            np.asarray(embedded_coarse_model["x_std"], dtype=float),
+            np.asarray(embedded_coarse_model["y_mean"], dtype=float),
+            np.asarray(embedded_coarse_model["y_std"], dtype=float),
+        )
+        lines.append("")
+    elif uses_coarse_inputs or adds_coarse_to_output:
+        raise ValueError(
+            "A self-contained residual/prior-input ADS HB export requires the frozen coarse DNN"
+        )
+
+    primary_features = [*parameter_features, *_ads_hb_frequency_features(freq_transform)]
+    if uses_coarse_inputs:
+        assert coarse_outputs is not None
+        primary_features.extend(coarse_outputs)
+    primary_outputs = _append_ads_hb_mlp_equations(
+        lines,
+        f"{prefix}_fine",
+        primary_features,
+        activation,
+        layer_sizes,
+        weights,
+        biases,
+        np.asarray(x_mean, dtype=float),
+        np.asarray(x_std, dtype=float),
+        np.asarray(y_mean, dtype=float),
+        np.asarray(y_std, dtype=float),
+    )
+    lines.append("")
+    if len(primary_outputs) != 2 * n_sparams:
+        raise ValueError("ADS HB neural output count does not match the response matrix")
+
+    fitted_response_names: list[str] = []
+    for idx, label in enumerate(sparam_labels):
+        real_name = primary_outputs[idx]
+        imag_name = primary_outputs[idx + n_sparams]
+        if adds_coarse_to_output:
+            assert coarse_outputs is not None
+            real_expression = f"({coarse_outputs[idx]})+({real_name})"
+            imag_expression = f"({coarse_outputs[idx + n_sparams]})+({imag_name})"
+        else:
+            real_expression = real_name
+            imag_expression = imag_name
+        fitted_name = f"{prefix}_rf_{label.lower()}"
+        lines.append(f"{fitted_name}=complex(({real_expression}),({imag_expression}))")
+        fitted_response_names.append(fitted_name)
+
+    active_response_names: list[str] = [""] * matrix_size
+    if response_domain == "s":
+        dc_values = dc_sparameter_values(
+            sparam_labels,
+            dc_resistance,
+            dc_port_resistances_ohm=dc_path_resistances,
+            z0=z0,
+        )
+        for idx, label in enumerate(sparam_labels):
+            row, col = sparam_indices(label) or (0, 0)
+            flat = (row - 1) * nports + (col - 1)
+            value = complex(dc_values[idx])
+            active_name = f"{prefix}_{label.lower()}"
+            lines.append(
+                f"{active_name}=if (freq equals 0) then "
+                f"complex({veriloga_float(value.real)},{veriloga_float(value.imag)}) "
+                f"else if (freq < 0) then conj({fitted_response_names[idx]}) "
+                f"else {fitted_response_names[idx]} endif endif"
+            )
+            active_response_names[flat] = active_name
+    else:
+        dc_matrix = dc_conductance_matrix(
+            sparam_labels,
+            dc_resistance,
+            dc_path_resistances,
+        )
+        for idx, label in enumerate(sparam_labels):
+            row, col = sparam_indices(label) or (0, 0)
+            flat = (row - 1) * nports + (col - 1)
+            active_name = f"{prefix}_{label.lower()}"
+            lines.append(
+                f"{active_name}=if (freq equals 0) then "
+                f"complex({veriloga_float(float(dc_matrix[row - 1, col - 1]))},0.0) "
+                f"else if (freq < 0) then conj({fitted_response_names[idx]}) "
+                f"else {fitted_response_names[idx]} endif endif"
+            )
+            active_response_names[flat] = active_name
+    lines.append("")
+    _append_ads_hb_sdd(
+        lines,
+        f"{module_id}_core",
+        port_ids,
+        active_response_names,
+        response_domain,
+        z0,
+    )
+    lines.extend([f"end {module_id}", ""])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    netlist_name = f"{module_id}.net"
+    manifest_name = "ads_hb_manifest.json"
+    (out_dir / netlist_name).write_text("\n".join(lines))
+    manifest: dict[str, object] = {
+        "format": "ads_hb_sdd_linear_multiport",
+        "model_kind": model_kind,
+        "module_name": module_id,
+        "netlist_file": netlist_name,
+        "nports": nports,
+        "parameter_names": list(parameter_names),
+        "parameter_identifiers": param_ids,
+        "parameter_scale_identifiers": scale_ids,
+        "parameter_input_scales": {
+            name: scale for name, scale in zip(parameter_names, param_scales)
+        },
+        "parameter_instance_defaults": param_defaults,
+        "sparam_labels": list(sparam_labels),
+        "response_domain": response_domain,
+        "z0": z0,
+        "linear": True,
+        "power_dependent": False,
+        "passivity_enforced_by_export": False,
+        "hb_frequency_weighted": True,
+        "negative_frequency_response": "conjugate_of_positive_frequency_surrogate",
+        "fully_self_contained": True,
+        "uses_coarse_inputs": bool(uses_coarse_inputs),
+        "adds_coarse_to_output": bool(adds_coarse_to_output),
+        "embedded_coarse_model": embedded_coarse_model is not None,
+        "source_model_dir": source_model_dir,
+        "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_port_paths": list(dc_path_resistances) if dc_path_resistances is not None else None,
+        "dc_port_resistances_ohm": dc_path_resistances,
+        "dc_resistance_source_kind": dc_source_kind,
+        "dc_is_separate_from_fitted_response": True,
+        "supported_analyses": ["DC", "AC", "SP", "HB"],
+        "implementation_note": (
+            "ADS SDD frequency weights implement the fitted linear multiport independently "
+            "at every HB spectral component. No power dependence or nonlinear compression "
+            "is introduced by the passive surrogate."
+        ),
+        "reference_note": (
+            "Generated against Keysight's documented ADS SDD frequency-weighting and "
+            "simulator-expression syntax; validate with the installed ADS release."
+        ),
+    }
+    if extra_manifest:
+        manifest.update(extra_manifest)
+    (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
+    (out_dir / "ADS_HB_README.md").write_text(
+        _ads_hb_readme(
+            model_kind=model_kind,
+            module_name=module_id,
+            netlist_name=netlist_name,
+            manifest_name=manifest_name,
+            nports=nports,
+            parameter_names=parameter_names,
+            parameter_ids=param_ids,
+            parameter_scale_ids=scale_ids,
+            parameter_scales=param_scales,
+            response_domain=response_domain,
+            extra_notes=extra_notes,
+        )
+    )
+    return manifest
+
+
+def write_ads_hb_neurotf_package(
+    out_dir: Path,
+    module_name: str,
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+    activation: str,
+    layer_sizes: Sequence[int],
+    weights: Sequence[np.ndarray],
+    biases: Sequence[np.ndarray],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+    poles: np.ndarray,
+    f_scale: float,
+    z0: float,
+    parameter_input_scales: dict[str, float] | None = None,
+    dc_equivalent_resistance_ohm: float | None = None,
+    dc_resistance_source_kind: object = None,
+    dc_port_resistances_ohm: object = None,
+    source_model_dir: str | None = None,
+    extra_manifest: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Write a fixed-pole Neuro-TF as a linear ADS SDD HB subnetwork."""
+
+    if not math.isfinite(z0) or z0 <= 0.0:
+        raise ValueError("ADS HB reference impedance must be positive and finite")
+    if not math.isfinite(f_scale) or f_scale <= 0.0:
+        raise ValueError("Neuro-TF ADS HB frequency scale must be positive and finite")
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    n_sparams = len(sparam_labels)
+    n_coeffs = len(poles) + 1
+    expected_outputs = 2 * n_sparams * n_coeffs
+    if int(layer_sizes[-1]) != expected_outputs:
+        raise ValueError(
+            f"Neuro-TF ADS HB export expected {expected_outputs} coefficient outputs, "
+            f"got {layer_sizes[-1]}"
+        )
+    dc_source_kind = validate_exact_dc_source_kind(
+        dc_resistance_source_kind,
+        context="Neuro-TF ADS HB export",
+    )
+    dc_resistance = validate_dc_equivalent_resistance(
+        dc_equivalent_resistance_ohm,
+        context="Neuro-TF model",
+    )
+    dc_path_resistances = validate_dc_port_resistances(
+        sparam_labels,
+        dc_port_resistances_ohm,
+        context="Neuro-TF model",
+    )
+    module_id = _ads_hb_identifier(module_name, "neuro_tf_hb")
+    prefix = _ads_hb_identifier(f"{module_id}_m", "hb_model")
+    param_ids, scale_ids, param_scales, param_defaults, parameter_features = (
+        _ads_hb_parameter_configuration(
+            parameter_names,
+            np.asarray(x_mean, dtype=float),
+            parameter_input_scales,
+        )
+    )
+    port_ids = [f"p{idx}" for idx in range(1, nports + 1)]
+    lines = [
+        "; Self-contained linear Neuro-TF ADS SDD surrogate for harmonic balance",
+        "; Generated by ads-ann-surrogate",
+        f"define {module_id} ({' '.join(port_ids)})",
+    ]
+    parameter_tokens = [f"{identifier}={veriloga_float(default)}" for identifier, default in zip(param_ids, param_defaults)]
+    parameter_tokens.extend(
+        f"{scale_id}={veriloga_float(scale)}"
+        for scale_id, scale in zip(scale_ids, param_scales)
+    )
+    parameter_tokens.append(f"z0={veriloga_float(z0)}")
+    lines.append("parameters " + " ".join(parameter_tokens))
+    lines.append("")
+    coefficient_outputs = _append_ads_hb_mlp_equations(
+        lines,
+        f"{prefix}_coeff",
+        parameter_features,
+        activation,
+        layer_sizes,
+        weights,
+        biases,
+        np.asarray(x_mean, dtype=float),
+        np.asarray(x_std, dtype=float),
+        np.asarray(y_mean, dtype=float),
+        np.asarray(y_std, dtype=float),
+    )
+    lines.append("")
+    coefficient_half = n_sparams * n_coeffs
+    fitted_names: list[str] = []
+    for sparam_idx, label in enumerate(sparam_labels):
+        terms: list[str] = []
+        for coeff_idx in range(n_coeffs):
+            real_idx = sparam_idx * n_coeffs + coeff_idx
+            imag_idx = coefficient_half + real_idx
+            coefficient = (
+                f"complex({coefficient_outputs[real_idx]},{coefficient_outputs[imag_idx]})"
+            )
+            if coeff_idx == 0:
+                terms.append(coefficient)
+            else:
+                pole = complex(np.asarray(poles, dtype=complex)[coeff_idx - 1])
+                denominator = (
+                    f"j*(abs(freq)/({veriloga_float(f_scale)}))-"
+                    f"complex({veriloga_float(pole.real)},{veriloga_float(pole.imag)})"
+                )
+                terms.append(f"({coefficient})/({denominator})")
+        fitted_name = f"{prefix}_rf_{label.lower()}"
+        lines.append(f"{fitted_name}=" + "+".join(terms))
+        fitted_names.append(fitted_name)
+
+    dc_values = dc_sparameter_values(
+        sparam_labels,
+        dc_resistance,
+        dc_port_resistances_ohm=dc_path_resistances,
+        z0=z0,
+    )
+    active_names: list[str] = [""] * (nports * nports)
+    for idx, label in enumerate(sparam_labels):
+        row, col = sparam_indices(label) or (0, 0)
+        flat = (row - 1) * nports + (col - 1)
+        value = complex(dc_values[idx])
+        active_name = f"{prefix}_{label.lower()}"
+        lines.append(
+            f"{active_name}=if (freq equals 0) then "
+            f"complex({veriloga_float(value.real)},{veriloga_float(value.imag)}) "
+            f"else if (freq < 0) then conj({fitted_names[idx]}) "
+            f"else {fitted_names[idx]} endif endif"
+        )
+        active_names[flat] = active_name
+    lines.append("")
+    _append_ads_hb_sdd(lines, f"{module_id}_core", port_ids, active_names, "s", z0)
+    lines.extend([f"end {module_id}", ""])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    netlist_name = f"{module_id}.net"
+    manifest_name = "ads_hb_manifest.json"
+    (out_dir / netlist_name).write_text("\n".join(lines))
+    manifest: dict[str, object] = {
+        "format": "ads_hb_sdd_linear_multiport",
+        "model_kind": "Neuro-TF",
+        "module_name": module_id,
+        "netlist_file": netlist_name,
+        "nports": nports,
+        "parameter_names": list(parameter_names),
+        "parameter_identifiers": param_ids,
+        "parameter_scale_identifiers": scale_ids,
+        "parameter_input_scales": {
+            name: scale for name, scale in zip(parameter_names, param_scales)
+        },
+        "parameter_instance_defaults": param_defaults,
+        "sparam_labels": list(sparam_labels),
+        "response_domain": "s",
+        "z0": z0,
+        "n_poles": len(poles),
+        "f_scale": f_scale,
+        "linear": True,
+        "power_dependent": False,
+        "passivity_enforced_by_export": False,
+        "hb_frequency_weighted": True,
+        "negative_frequency_response": "conjugate_of_positive_frequency_surrogate",
+        "fully_self_contained": True,
+        "source_model_dir": source_model_dir,
+        "dc_equivalent_resistance_ohm": dc_resistance,
+        "dc_port_paths": list(dc_path_resistances) if dc_path_resistances is not None else None,
+        "dc_port_resistances_ohm": dc_path_resistances,
+        "dc_resistance_source_kind": dc_source_kind,
+        "dc_is_separate_from_fitted_response": True,
+        "supported_analyses": ["DC", "AC", "SP", "HB"],
+        "implementation_note": (
+            "ADS SDD frequency weights evaluate the fixed-pole rational S-matrix at "
+            "every HB spectral component. The passive network remains linear."
+        ),
+        "reference_note": (
+            "Generated against Keysight's documented ADS SDD frequency-weighting and "
+            "simulator-expression syntax; validate with the installed ADS release."
+        ),
+    }
+    if extra_manifest:
+        manifest.update(extra_manifest)
+    (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
+    (out_dir / "ADS_HB_README.md").write_text(
+        _ads_hb_readme(
+            model_kind="Neuro-TF",
+            module_name=module_id,
+            netlist_name=netlist_name,
+            manifest_name=manifest_name,
+            nports=nports,
+            parameter_names=parameter_names,
+            parameter_ids=param_ids,
+            parameter_scale_ids=scale_ids,
+            parameter_scales=param_scales,
+            response_domain="s",
+            extra_notes=[
+                "The fixed-pole rational response is evaluated directly as a complex ADS expression.",
+            ],
+        )
+    )
+    return manifest
+
+
 def split_blocks(
     blocks: list[MDIFBlock],
     split_var: str,
@@ -6627,6 +7431,39 @@ def build_training_export_commands(
         module_name, parameter_scale_spec = veriloga_command_defaults(
             resolved_script_path,
             resolved_model_dir,
+        )
+        hb_module_name = f"{normalize_name(resolved_model_dir.name) or resolved_script_path.stem}_hb"
+        ads_hb_argv = [
+            command_python,
+            command_script_path,
+            "export-ads-hb",
+            "--model-dir",
+            command_model_dir,
+            "--out-dir",
+            repository_relative_path(
+                resolved_model_dir / "ads_hb_export",
+                repository_root,
+            ),
+            "--module-name",
+            hb_module_name,
+            "--parameter-input-scales",
+            parameter_scale_spec,
+            "--dc-open-threshold",
+            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
+            "--dc-open-resistance",
+            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
+        ]
+        if dc_path is not None:
+            ads_hb_argv.extend(
+                ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
+            )
+        if dc_port_paths_spec:
+            ads_hb_argv.extend(["--dc-port-paths", dc_port_paths_spec])
+        commands.append(
+            (
+                "Self-contained ADS HB passive network",
+                shell_command(ads_hb_argv),
+            )
         )
         veriloga_argv = [
             command_python,

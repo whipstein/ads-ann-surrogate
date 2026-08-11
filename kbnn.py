@@ -105,6 +105,7 @@ from surrogate_common import (  # noqa: E402
     write_sweep_markdown,
     write_training_markdown,
     update_training_export_commands,
+    write_ads_hb_mlp_package,
     write_veriloga_package,
 )
 from dnn import DNN, command_train as command_train_dnn, dnn_export_commands  # noqa: E402
@@ -382,8 +383,24 @@ def write_composite_model_manifest(
         "--parameter-input-scales",
         parameter_scale_spec,
     ]
+    ads_hb_export_argv = [
+        Path(sys.executable).name or "python3",
+        repository_relative_path(Path(__file__), repository_root),
+        "export-ads-hb",
+        "--model-dir",
+        repository_relative_path(resolved_model_dir, repository_root),
+        "--out-dir",
+        repository_relative_path(resolved_model_dir / "ads_hb", repository_root),
+        "--module-name",
+        f"{normalize_name(resolved_model_dir.name) or 'kbnn'}_hb",
+        "--parameter-input-scales",
+        parameter_scale_spec,
+    ]
     if metadata.get("dc_port_path_spec"):
         export_argv.extend(
+            ["--dc-port-paths", str(metadata["dc_port_path_spec"])]
+        )
+        ads_hb_export_argv.extend(
             ["--dc-port-paths", str(metadata["dc_port_path_spec"])]
         )
     if isinstance(coarse_identity, dict):
@@ -421,6 +438,12 @@ def write_composite_model_manifest(
                 repository_relative_path(coarse_path, repository_root),
             ]
         )
+        ads_hb_export_argv.extend(
+            [
+                "--coarse-model-dir",
+                repository_relative_path(coarse_path, repository_root),
+            ]
+        )
     manifest = {
         "version": VERSION,
         "model_family": "composite_kbnn",
@@ -446,6 +469,8 @@ def write_composite_model_manifest(
         "coarse_model": coarse_payload,
         "veriloga_ready": bool(model.mode == "plain" or coarse_payload is not None),
         "veriloga_export_command": shlex.join(export_argv),
+        "ads_hb_ready": bool(model.mode == "plain" or coarse_payload is not None),
+        "ads_hb_export_command": shlex.join(ads_hb_export_argv),
     }
     path = resolved_model_dir / COMPOSITE_MANIFEST_FILENAME
     path.write_text(json.dumps(manifest, indent=2))
@@ -2208,6 +2233,121 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_export_ads_hb(args: argparse.Namespace) -> int:
+    """Export the complete fine/coarse KBNN as a linear ADS HB subnetwork."""
+
+    model_dir = Path(args.model_dir)
+    model = KBNN.load(model_dir)
+    source_metadata = read_model_metadata(str(model_dir))
+    out_dir = Path(args.out_dir)
+    module_name = args.module_name or f"{normalize_name(model_dir.name) or 'kbnn'}_hb"
+    parameter_input_scales = parse_parameter_scale_spec(
+        model.parameter_names,
+        args.parameter_input_scales,
+    )
+    dc_metadata = resolve_export_dc_metadata(
+        source_metadata,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=args.z0,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
+        port_paths=args.dc_port_paths,
+    )
+    uses_coarse_inputs = bool(model.include_coarse_input or model.mode == "prior-input")
+    adds_coarse_to_output = model.mode == "residual"
+    needs_coarse_response = bool(uses_coarse_inputs or adds_coarse_to_output)
+    if args.coarse_model_dir and not needs_coarse_response:
+        raise ValueError(
+            "--coarse-model-dir is only valid for residual or prior-input KBNN models"
+        )
+
+    coarse_identity: dict[str, object] | None = None
+    embedded_coarse_model: dict[str, object] | None = None
+    if needs_coarse_response:
+        coarse_model, coarse_identity = load_matching_coarse_dnn(
+            model_dir,
+            model,
+            args.coarse_model_dir,
+        )
+        embedded_coarse_model = {
+            "source_model_dir": str(coarse_identity["source_model_dir"]),
+            "parameter_names": coarse_model.parameter_names,
+            "sparam_labels": coarse_model.sparam_labels,
+            "freq_transform": coarse_model.freq_transform,
+            "activation": coarse_model.mlp.activation,
+            "layer_sizes": coarse_model.mlp.layer_sizes,
+            "weights": coarse_model.mlp.weights,
+            "biases": coarse_model.mlp.biases,
+            "x_mean": np.asarray(coarse_model.x_scaler.mean, dtype=float),
+            "x_std": np.asarray(coarse_model.x_scaler.std, dtype=float),
+            "y_mean": np.asarray(coarse_model.y_scaler.mean, dtype=float),
+            "y_std": np.asarray(coarse_model.y_scaler.std, dtype=float),
+            "output_domain": coarse_model.output_domain,
+        }
+
+    manifest = write_ads_hb_mlp_package(
+        out_dir=out_dir,
+        model_kind="KBNN",
+        module_name=module_name,
+        parameter_names=model.parameter_names,
+        sparam_labels=model.sparam_labels,
+        freq_transform=model.freq_transform,
+        activation=model.mlp.activation,
+        layer_sizes=model.mlp.layer_sizes,
+        weights=model.mlp.weights,
+        biases=model.mlp.biases,
+        x_mean=np.asarray(model.x_scaler.mean, dtype=float),
+        x_std=np.asarray(model.x_scaler.std, dtype=float),
+        y_mean=np.asarray(model.y_scaler.mean, dtype=float),
+        y_std=np.asarray(model.y_scaler.std, dtype=float),
+        z0=args.z0,
+        parameter_input_scales=parameter_input_scales,
+        uses_coarse_inputs=uses_coarse_inputs,
+        adds_coarse_to_output=adds_coarse_to_output,
+        embedded_coarse_model=embedded_coarse_model,
+        dc_equivalent_resistance_ohm=float(
+            dc_metadata["dc_equivalent_resistance_ohm"]
+        ),
+        dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
+        dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
+        source_model_dir=str(model_dir),
+        extra_manifest={
+            "model_family": "knowledge_based_neural_network",
+            "mode": model.mode,
+            "include_coarse_input": model.include_coarse_input,
+            "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
+            "coarse_model": coarse_identity,
+            "coarse_model_match_verified": coarse_identity is not None,
+        },
+        extra_notes=[
+            "The saved fine KBNN and its exact frozen coarse DNN are embedded together.",
+            "The final reconstructed fine S-matrix is evaluated at each HB spectral frequency.",
+            "The passive network has no input-power parameter and introduces no compression.",
+        ],
+    )
+    print(
+        json.dumps(
+            {
+                "out_dir": str(out_dir),
+                "netlist": str(out_dir / str(manifest["netlist_file"])),
+                "manifest": str(out_dir / "ads_hb_manifest.json"),
+                "module_name": manifest["module_name"],
+                "mode": model.mode,
+                "embedded_coarse_model": manifest["embedded_coarse_model"],
+                "coarse_model_match_verified": manifest[
+                    "coarse_model_match_verified"
+                ],
+                "linear": manifest["linear"],
+                "power_dependent": manifest["power_dependent"],
+                "supported_analyses": manifest["supported_analyses"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def summary_metric(summary: dict[str, object], metric_name: str) -> float | None:
     if metric_name.startswith("passivity."):
         passivity = summary.get("passivity")
@@ -2978,6 +3118,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_ann.add_argument("--output-prefix", default="kbnn_ads_ann")
     export_ann.add_argument("--seed", type=int)
     export_ann.set_defaults(func=command_export_ads_ann)
+
+    export_hb = sub.add_parser(
+        "export-ads-hb",
+        help="Export the fitted fine/coarse KBNN as one self-contained linear ADS SDD network for harmonic balance",
+    )
+    export_hb.add_argument("--model-dir", required=True, help="Directory containing trained model.npz and metadata.json")
+    export_hb.add_argument(
+        "--coarse-model-dir",
+        help=(
+            "Matching frozen S-domain DNN used during KBNN training. Defaults to the "
+            "packaged or recorded training path; hashes must match."
+        ),
+    )
+    export_hb.add_argument("--out-dir", required=True, help="Output directory for the ADS HB package")
+    export_hb.add_argument("--module-name", help="ADS subnetwork name. Defaults to the model directory name plus _hb")
+    export_hb.add_argument("--z0", type=float, default=50.0, help="S-parameter reference impedance")
+    export_hb.add_argument(
+        "--parameter-input-scales",
+        metavar="SCALE",
+        help=(
+            "Optional positive scale applied to every ADS/base-unit instance parameter "
+            "before conversion to model-training units. Example: 1um"
+        ),
+    )
+    add_dc_export_arguments(export_hb)
+    export_hb.set_defaults(func=command_export_ads_hb)
 
     export_va = sub.add_parser(
         "export-veriloga",

@@ -163,7 +163,7 @@ configured open threshold is replaced by the configured finite open resistance
 Extraction never falls back to positive-frequency data.
 
 `build_ads_export_blocks()` automatically adds zero Hz to sampled exports.
-Direct Verilog-A writers must receive the saved
+Direct Verilog-A and ADS HB writers must receive the saved
 `dc_equivalent_resistance_ohm`, `dc_resistance_source_kind`, and
 `dc_port_resistances_ohm`; the shared writers validate exact-DC provenance,
 stamp only the selected resistor paths at zero Hz, and bypass the fitted
@@ -477,6 +477,7 @@ Optional commands normally include:
 - `export-ads-mdif`
 - `export-ads`
 - `export-ads-ann`
+- `export-ads-hb`
 - `export-veriloga`
 
 ## Shared Utilities Worth Reusing
@@ -521,9 +522,20 @@ Export helpers:
 - `build_ads_export_blocks(...)`
 - `write_ads_export_package(...)`
 - `write_ads_ann_package(...)`
+- `write_ads_hb_mlp_package(...)`
+- `write_ads_hb_neurotf_package(...)`
 - `write_veriloga_package(...)`
 
-### Composite Verilog-A Models
+The ADS HB writers generate a self-contained linear SDD subnetwork. They use
+frequency-domain weighting so ADS evaluates the fitted S- or Y-matrix at every
+HB spectral component. These exports must remain power independent: do not add
+input-power features, compression curves, or nonlinear amplitude terms for a
+passive structure. Exact DC is selected only at `freq=0`; positive frequencies
+use only the fitted RF response. Negative frequencies must use the complex
+conjugate of the fitted response evaluated at the corresponding positive
+frequency so the frequency weights preserve real-waveform symmetry.
+
+### Composite Verilog-A and ADS HB Models
 
 `write_veriloga_package(...)` accepts an optional `embedded_coarse_model`
 mapping for a model whose runtime calculation depends on a coarse response.
@@ -557,6 +569,11 @@ the coarse S-parameters and `adds_coarse_to_output=True` when it predicts a
 residual that must be added to them. A plugin should reject a missing embedded
 model by default whenever either flag is true, unless it deliberately exposes a
 legacy hook-based export mode.
+
+`write_ads_hb_mlp_package(...)` accepts the same embedded-coarse mapping and
+flags. Unlike the optional legacy Verilog-A hook mode, a residual or
+prior-input HB export must embed the matching frozen coarse DNN so that the
+subnetwork is self-contained and reproduces the actual fine-model fit.
 
 ## Artifact Expectations
 
