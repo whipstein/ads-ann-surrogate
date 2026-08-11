@@ -603,16 +603,20 @@ Choose the ADS handoff based on the level of simulator integration you need:
 | Export path | Commands | Use when |
 | --- | --- | --- |
 | Sampled MDIF | `export-ads-mdif` | You want the lowest-risk ADS integration. ADS interpolates a dense generated MDIF table using normal data-based components. |
-| Native ADS HB passive network | `export-ads-hb` | You need one integrated, linear, power-independent component whose fitted matrix is evaluated at every HB spectral frequency. |
+| Native ADS HB passive network | `export-ads-hb` | You need one integrated, linear, power-independent component whose fitted matrix is evaluated at every HB spectral frequency and explicitly stamped as admittance. |
 | Native ADS ANN package | `export-ads-ann` | You want ADS to retrain/extract the neural network and emit native ANN artifacts on a licensed ADS machine. |
 | Direct Verilog-A | `export-veriloga` | You want to embed local trained weights for S-parameter or small-signal AC analysis and validate them with the target ADS Verilog-A compiler. |
 
 Use `export-ads-hb` for harmonic balance. The generated SDD is a linear
 frequency-dependent multiport, just like an S-parameter file, but its response
 is calculated from the geometry-dependent surrogate instead of a fixed table.
-For DNN models trained with `--output-domain y`, it stamps the predicted
-admittance relation directly. S-output DNNs, KBNNs, and Neuro-TFs use the wave
-relation directly and do not invert the S-matrix at runtime.
+Every model type uses an explicit `I=Y(f)V` circuit stamp. DNN models trained
+with `--output-domain y` supply Y directly. S-output DNNs, KBNNs, and Neuro-TFs
+are converted to Y by generated frequency-only equations before the explicit
+stamp. The separately extracted DC conductance is a different parallel branch:
+the RF branch is open at DC and the DC branch is open at every RF frequency.
+This avoids the additional modified-nodal branch unknowns created by the former
+implicit S-wave implementation.
 
 ### Reusing an ADS HB model at multiple parameter values
 
@@ -1108,8 +1112,9 @@ with an ADS `NetlistInclude`, then
 instantiate `<module>:X1` with the electrical nodes and geometry parameters.
 ADS applies the embedded matrix independently to the fundamental, harmonics,
 and mixing products requested by the HB controller. The model is linear and
-power independent. Direct-Y DNNs use `I=Y(f)V`; S-output DNNs use the implicit
-wave relation without a runtime matrix inversion.
+power independent. Direct-Y DNNs use `I=Y(f)V` immediately; S-output DNNs are
+converted to Y in frequency-only equations and use the same explicit current
+stamp. DC is stamped separately from the fitted RF response.
 
 ### Direct Verilog-A Export
 
@@ -1713,7 +1718,9 @@ For residual and prior-input modes, export is refused unless the matching
 coarse model can be loaded and its saved hashes match. Both networks are then
 embedded in `<module>.net`: the coarse prediction is evaluated at the same HB
 spectral frequency as the fine network, and the final fine S-matrix drives the
-implicit wave relation. No external coarse hooks or power parameter remain.
+generated S-to-Y conversion followed by an explicit current stamp. The DC
+conductance is stamped by a separate branch, and no external coarse hooks,
+implicit port-current unknowns, or power parameter remain.
 
 ### Direct Verilog-A Export
 
@@ -2108,10 +2115,11 @@ python3 neuro_tf.py export-ads-hb \
   --z0 50
 ```
 
-The generated SDD evaluates the rational S-matrix at every HB spectral
-frequency and applies it through the implicit wave relation. It remains linear
-and power independent; the fixed poles provide the frequency dependence, not
-signal-amplitude dependence.
+The generated equations evaluate the rational S-matrix at every HB spectral
+frequency, convert it to Y, and apply it through an explicit current stamp. A
+separate explicit branch stamps DC conductance only at zero frequency. The
+model remains linear and power independent; the fixed poles provide the
+frequency dependence, not signal-amplitude dependence.
 
 ### Direct Verilog-A Export
 
