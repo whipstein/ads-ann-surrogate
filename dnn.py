@@ -1243,6 +1243,19 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = DNN.load(model_dir)
     source_metadata = read_model_metadata(str(model_dir))
+    direct_y_trial_dir = (
+        Path(args.direct_y_trial_model_dir)
+        if args.direct_y_trial_model_dir
+        else None
+    )
+    direct_y_trial = (
+        DNN.load(direct_y_trial_dir) if direct_y_trial_dir is not None else None
+    )
+    direct_y_trial_metadata = (
+        read_model_metadata(str(direct_y_trial_dir))
+        if direct_y_trial_dir is not None
+        else None
+    )
     out_dir = Path(args.out_dir)
     module_name = args.module_name or f"{normalize_name(model_dir.name) or 'dnn'}_hb"
     parameter_input_scales = parse_parameter_scale_spec(
@@ -1250,6 +1263,81 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         args.parameter_input_scales,
     )
     export_z0 = float(model.target_z0 if model.output_domain == "y" else args.z0)
+    direct_y_comparison: dict[str, object] | None = None
+    if direct_y_trial is not None:
+        if model.output_domain != "s":
+            raise ValueError(
+                "--direct-y-trial-model-dir requires an S-domain baseline model; "
+                "the selected baseline already stamps Y directly"
+            )
+        if direct_y_trial.output_domain != "y":
+            raise ValueError(
+                "--direct-y-trial-model-dir must contain a model trained with "
+                "--output-domain y"
+            )
+        if direct_y_trial.parameter_names != model.parameter_names:
+            raise ValueError(
+                "The direct-Y trial parameter names/order do not match the baseline"
+            )
+        if direct_y_trial.sparam_labels != model.sparam_labels:
+            raise ValueError(
+                "The direct-Y trial S-parameter labels/order do not match the baseline"
+            )
+        if direct_y_trial.freq_transform != model.freq_transform:
+            raise ValueError(
+                "The direct-Y trial frequency transform does not match the baseline"
+            )
+        if direct_y_trial.mlp.activation != model.mlp.activation:
+            raise ValueError(
+                "The direct-Y trial activation does not match the baseline"
+            )
+        if direct_y_trial.mlp.layer_sizes != model.mlp.layer_sizes:
+            raise ValueError(
+                "The direct-Y trial layer sizes do not match the baseline. Keep the "
+                "same architecture so this trial isolates the response domain."
+            )
+        if not math.isclose(
+            direct_y_trial.target_z0,
+            export_z0,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError(
+                "The direct-Y trial target_z0 does not match the baseline export "
+                f"reference impedance ({direct_y_trial.target_z0:g} versus "
+                f"{export_z0:g})"
+            )
+        comparison_fields = [
+            "training_blocks",
+            "verification_blocks",
+            "split_var",
+            "train_values",
+            "verify_values",
+            "normalized_sparam_weights",
+            "frequency_weights",
+        ]
+        training_metadata_differences = {
+            field: {
+                "baseline": source_metadata.get(field),
+                "direct_y_trial": direct_y_trial_metadata.get(field),
+            }
+            for field in comparison_fields
+            if direct_y_trial_metadata is not None
+            and field in source_metadata
+            and field in direct_y_trial_metadata
+            and source_metadata.get(field) != direct_y_trial_metadata.get(field)
+        }
+        direct_y_comparison = {
+            "baseline_output_domain": "s",
+            "trial_output_domain": "y",
+            "target_z0": export_z0,
+            "same_parameter_order": True,
+            "same_sparameter_order": True,
+            "same_frequency_transform": True,
+            "same_activation": True,
+            "same_layer_sizes": True,
+            "training_metadata_differences": training_metadata_differences,
+        }
     export_dc_model, dc_metadata = resolve_dnn_export_dc(
         model,
         source_metadata,
@@ -1263,6 +1351,18 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
             f"warning: direct-Y model was trained with target_z0={export_z0:g}; "
             "--z0 is ignored for direct-Y ADS HB stamping",
             file=sys.stderr,
+        )
+    default_notes = [
+        "The fitted RF response is evaluated at each HB spectral frequency.",
+        "The passive network has no input-power parameter and introduces no compression.",
+    ]
+    if direct_y_trial is not None:
+        default_notes.extend(
+            [
+                "The default S-domain implementation in this package is unchanged.",
+                "A separately trained direct-Y comparison package is exported beside this baseline.",
+                "The direct-Y trial reuses this baseline package's exact-DC model and differs only in its separately fitted RF response domain.",
+            ]
         )
     manifest = write_ads_hb_mlp_package(
         out_dir=out_dir,
@@ -1295,12 +1395,86 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
             "training_target_z0": model.target_z0,
             "dc_metadata": dc_metadata,
         },
-        extra_notes=[
-            "The fitted RF response is evaluated at each HB spectral frequency.",
-            "The passive network has no input-power parameter and introduces no compression.",
-        ],
-        emit_constant_outputs_trial=True,
+        extra_notes=default_notes,
     )
+    if direct_y_trial is not None:
+        assert direct_y_trial_dir is not None
+        assert direct_y_trial_metadata is not None
+        assert direct_y_comparison is not None
+        trial_module_name = f"{manifest['module_name']}_direct_y_trial"
+        trial_manifest = write_ads_hb_mlp_package(
+            out_dir=out_dir,
+            model_kind="DNN",
+            module_name=trial_module_name,
+            parameter_names=direct_y_trial.parameter_names,
+            sparam_labels=direct_y_trial.sparam_labels,
+            freq_transform=direct_y_trial.freq_transform,
+            activation=direct_y_trial.mlp.activation,
+            layer_sizes=direct_y_trial.mlp.layer_sizes,
+            weights=direct_y_trial.mlp.weights,
+            biases=direct_y_trial.mlp.biases,
+            x_mean=np.asarray(direct_y_trial.x_scaler.mean, dtype=float),
+            x_std=np.asarray(direct_y_trial.x_scaler.std, dtype=float),
+            y_mean=np.asarray(direct_y_trial.y_scaler.mean, dtype=float),
+            y_std=np.asarray(direct_y_trial.y_scaler.std, dtype=float),
+            z0=float(direct_y_trial.target_z0),
+            parameter_input_scales=parameter_input_scales,
+            output_domain="y",
+            dc_equivalent_resistance_ohm=float(
+                dc_metadata["dc_equivalent_resistance_ohm"]
+            ),
+            dc_resistance_source_kind=dc_metadata.get(
+                "dc_resistance_source_kind"
+            ),
+            dc_port_resistances_ohm=dc_metadata.get(
+                "dc_port_resistances_ohm"
+            ),
+            dc_model=(
+                export_dc_model.export_data()
+                if export_dc_model is not None
+                else None
+            ),
+            source_model_dir=str(direct_y_trial_dir),
+            extra_manifest={
+                "model_family": "direct_dnn",
+                "training_output_domain": "y",
+                "training_target_z0": direct_y_trial.target_z0,
+                "trial_parent_module_name": manifest["module_name"],
+                "trial_parent_model_dir": str(model_dir),
+                "trial_purpose": (
+                    "Compare a separately trained direct-Y RF DNN against the "
+                    "S-domain baseline without runtime RF S-to-Y conversion"
+                ),
+                "direct_y_comparison": direct_y_comparison,
+                "dc_metadata": dc_metadata,
+                "dc_source_model_dir": str(model_dir),
+            },
+            extra_notes=[
+                "Trial implementation: the RF DNN was trained directly against Y-parameters.",
+                "The trial stamps predicted RF admittance without the baseline runtime S-to-Y equation graph.",
+                "The baseline package's separately extracted exact-DC model is reused unchanged.",
+                f"The unchanged baseline remains `{manifest['netlist_file']}` with module `{manifest['module_name']}`.",
+            ],
+            artifact_variant="direct_y_trial",
+        )
+        trial_export = {
+            "kind": "direct_y_rf_dnn",
+            "status": "trial",
+            "module_name": trial_manifest["module_name"],
+            "netlist_file": trial_manifest["netlist_file"],
+            "manifest_file": trial_manifest["manifest_file"],
+            "readme_file": trial_manifest["readme_file"],
+            "instance_template_file": trial_manifest["instance_template_file"],
+            "response_domain": trial_manifest["response_domain"],
+            "rf_source_conversion": trial_manifest["rf_source_conversion"],
+            "sdd_dc_rf_topology": trial_manifest["sdd_dc_rf_topology"],
+            "source_model_dir": str(direct_y_trial_dir),
+            "direct_y_comparison": direct_y_comparison,
+        }
+        manifest["trial_exports"] = [trial_export]
+        (out_dir / str(manifest["manifest_file"])).write_text(
+            json.dumps(manifest, indent=2)
+        )
     print(
         json.dumps(
             {
@@ -1916,6 +2090,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Export a trained DNN as a self-contained linear ADS SDD network for harmonic balance",
     )
     export_hb.add_argument("--model-dir", required=True, help="Directory containing trained model.npz and metadata.json")
+    export_hb.add_argument(
+        "--direct-y-trial-model-dir",
+        help=(
+            "Optional separately trained direct-Y DNN with the same parameters, "
+            "S-parameter order, frequency transform, activation, layer sizes, and "
+            "target z0. Exports it beside the unchanged S-domain baseline as the "
+            "next ADS HB timing trial."
+        ),
+    )
     export_hb.add_argument("--out-dir", required=True, help="Output directory for the ADS HB package")
     export_hb.add_argument("--module-name", help="ADS subnetwork name. Defaults to the model directory name plus _hb")
     export_hb.add_argument("--z0", type=float, default=50.0, help="S-parameter reference impedance")

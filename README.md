@@ -670,14 +670,14 @@ the RF branch is open at DC and the DC branch is open at every RF frequency.
 This avoids the additional modified-nodal branch unknowns created by the former
 implicit S-wave implementation.
 
-DNN `export-ads-hb` also writes an automatic comparison trial while the default
-implementation remains unchanged. The trial replaces every MLP output whose
-saved output scale is exactly zero with its stored physical mean. When every
-output of the exact-DC MLP is constant, it also precomputes its complete DC Y
-matrix, removing both that MLP and its DC S-to-Y equation graph. The default and
-trial retain the same two-branch DC/RF SDD topology, nonconstant trained
-response, parameter scaling, and RF S-to-Y equations. The default manifest
-lists the trial files and the number of eligible outputs under `trial_exports`.
+DNN `export-ads-hb` can also write a direct-Y comparison trial while the
+S-domain baseline remains unchanged. Train the comparison DNN separately with
+`--output-domain y`, then pass its directory through
+`--direct-y-trial-model-dir`. The exporter requires matching parameters,
+S-parameter order, frequency transform, activation, layer sizes, and reference
+impedance. Both packages reuse the baseline's exact-DC model and two-branch SDD
+topology; only the RF model formulation changes. The default manifest lists the
+trial files and compatibility checks under `trial_exports`.
 
 ### Reusing an ADS HB model at multiple parameter values
 
@@ -1185,31 +1185,68 @@ $\mathbf I=\mathbf Y(f)\mathbf V$ immediately; S-output DNNs are
 converted to Y in frequency-only equations and use the same explicit current
 stamp. DC is stamped separately from the fitted RF response.
 
-The same command additionally writes these trial artifacts:
+The next timing trial requires a separate direct-Y fit. Start from the exact
+training command used for the S-domain baseline. Keep its MDIFs, split options,
+parameter and S-parameter order, frequency transform, activation, hidden layer
+sizes, weights, and seed. Change only the output directory and response domain,
+and set the reference impedance used by the MDIF:
 
-- `<module>_constant_outputs_trial.net`
-- `ads_hb_constant_outputs_trial_manifest.json`
-- `ADS_HB_CONSTANT_OUTPUTS_TRIAL_INSTANCE_TEMPLATE.txt`
-- `ADS_HB_CONSTANT_OUTPUTS_TRIAL_README.md`
+```bash
+python3 dnn.py train \
+  --mdif train_verify.mdif \
+  --out-dir dnn_model_direct_y_trial \
+  --parameter-names W,L \
+  --freq-transform log \
+  --hidden-layers 128,128,64 \
+  --activation tanh \
+  --output-domain y \
+  --target-z0 50 \
+  --seed 1234
+```
 
-The trial module is named `<module>_constant_outputs_trial`. A saved output is
-eligible only when its inverse-standardization scale is exactly zero; the
-trained model therefore already defines it as its stored mean for every input.
-The trial omits that output's final neural equation and scaling equation. If all
-exact-DC outputs are eligible, the exporter converts their fixed S matrix to Y
-once and emits the resulting constants, eliminating the entire DC MLP and DC
-S-to-Y graph. Partial constant DC models keep the shared hidden layers required
-by their nonconstant outputs.
+Then export the unchanged S-domain baseline and the separately trained trial
+together:
 
-This trial starts from the original two-SDD, explicit-scaler baseline. It does
-not include the slower combined-SDD or folded-scaler experiments. Inspect
-`constant_output_summary` and `dc_constant_matrix_precomputed` in its manifest;
-if no output has a zero scale, the trial intentionally provides no equation
-reduction. Because the module names are distinct, both definitions may be
-included in one workspace. For a fair timing comparison, run otherwise
-identical simulations with only the default or only the trial instance active.
-Compare DC, S-parameters, HB fundamental power, convergence behavior, and
-elapsed simulation time before promoting the trial.
+```bash
+python3 dnn.py export-ads-hb \
+  --model-dir dnn_model \
+  --direct-y-trial-model-dir dnn_model_direct_y_trial \
+  --out-dir dnn_ads_hb \
+  --module-name my_dnn_4port_hb \
+  --parameter-input-scales 1.0 \
+  --z0 50
+```
+
+In addition to the default package, this writes:
+
+- `<module>_direct_y_trial.net`
+- `ads_hb_direct_y_trial_manifest.json`
+- `ADS_HB_DIRECT_Y_TRIAL_INSTANCE_TEMPLATE.txt`
+- `ADS_HB_DIRECT_Y_TRIAL_README.md`
+
+The baseline learns $\widehat{\mathbf S}(\mathbf p,f)$ and evaluates
+
+$$
+\mathbf Y_{\mathrm{RF}}=
+\frac{1}{Z_0}
+(\mathbf I-\widehat{\mathbf S})
+(\mathbf I+\widehat{\mathbf S})^{-1}
+$$
+
+inside ADS at every RF spectral frequency. The trial instead learns
+$\widehat{\mathbf Y}(\mathbf p,f)$ and stamps that matrix directly. Consequently,
+the trial netlist has `response_domain: "y"` and `rf_source_conversion: "none"`.
+It deliberately retains the baseline two-SDD topology and explicit neural
+scalers, and it uses the baseline's exact-DC model rather than the DC model from
+the direct-Y directory. Earlier combined-SDD, scaler-folding, and
+constant-output trials are not stacked into it.
+
+This is a refitted formulation, not an algebraically identical weight
+transformation. Validate S-parameters, passivity, DC, HB fundamental power,
+convergence, and both cold- and warm-run timing. The export stops on architecture
+or impedance mismatch. Differences found in comparable training metadata are
+recorded under `direct_y_comparison.training_metadata_differences` so the timing
+trial does not silently combine unrelated fitting changes.
 
 ### Direct Verilog-A Export
 
@@ -1295,6 +1332,7 @@ the **Subcommands** column includes accepted command aliases.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--dc-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Exact-DC validation/override source. A mismatch or legacy model triggers a DC-only conductance fit for the export; RF is never refitted. | <nobr><code>--dc-mdif train_with_dc.mdif</code></nobr> |
+| <nobr><code>--direct-y-trial-model-dir PATH</code></nobr> | <code>export-ads-hb</code> | Optional separately trained direct-Y DNN used to emit the next ADS HB timing trial beside an unchanged S-domain baseline. Parameters, response order, frequency transform, activation, layer sizes, and reference impedance must match. | <nobr><code>--direct-y-trial-model-dir dnn_model_direct_y_trial</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | <code>inspect-mdif</code>, <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>predict</code>, <code>export-ads-ann</code> | Input MDIF to inspect, fit, predict, or use as an ADS ANN retraining source, depending on the subcommand. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
 | <nobr><code>--model-dir PATH</code></nobr> | <code>predict</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Directory containing the trained <code>model.npz</code> and <code>metadata.json</code> used for prediction or export. | <nobr><code>--model-dir dnn_model</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir dnn_model</code></nobr> |
