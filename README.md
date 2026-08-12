@@ -721,7 +721,9 @@ The parser starts a new solve when a printed frequency or input-power label
 changes, or when the Newton iteration counter resets. The reset fallback still
 produces correct aggregate solver-work comparisons when ADS does not print the
 adaptive Gain Compression power values. In that case, the frequency and power
-columns are intentionally blank.
+columns are intentionally blank. UTF-8, UTF-8-with-BOM, and UTF-16 Message
+Window exports are detected automatically, and wrapped multi-line table headers
+are accepted.
 
 For model $m$, the most useful normalized comparison in the summary is
 
@@ -740,7 +742,8 @@ If a particular ADS release uses different frequency or power wording, provide
 a release-specific regular expression with a named `value` group and optional
 `unit` group through `--frequency-regex` or `--power-regex`. Run `--help` for
 the exact syntax. A log that contains no recognized Newton/Krylov summary rows
-fails with an explicit request to enable status level 4 or 5.
+fails with an explicit request to enable status level 4 or 5 and prints the
+relevant candidate lines it found for release-specific diagnosis.
 
 ### Reusing an ADS HB model at multiple parameter values
 

@@ -28,14 +28,17 @@ NEWTON_ITERATION_RE = re.compile(r"^(?P<iteration>\d+)(?P<rebuild>\*)?$")
 NUMBER_WITH_UNIT_RE = re.compile(
     rf"^(?P<value>{NUMBER})(?P<unit>[A-Za-zµμ]*)$"
 )
-NEWTON_TABLE_RE = re.compile(
-    r"Newton\s+solver\s*:.*Linear\s+solver\s*:", re.IGNORECASE
-)
-NEWTON_COLUMNS_RE = re.compile(
-    r"\bIter\b.*\bKCL\s+residual\b.*\bIters\b.*\bResidual\b",
+NEWTON_HEADER_RE = re.compile(
+    r"(?:\bNewton(?:[-\s]+Raphson)?\s+solver\b|\bNewton\s+iteration\b)",
     re.IGNORECASE,
 )
-KRYLOV_TABLE_RE = re.compile(r"Krylov\s+solver\s*\(", re.IGNORECASE)
+NEWTON_COLUMNS_RE = re.compile(
+    r"(?=.*\bIter(?:ation)?s?\b)(?=.*\bResidual\b)",
+    re.IGNORECASE,
+)
+KRYLOV_HEADER_RE = re.compile(
+    r"\b(?:Krylov|GMRES|BiCGStab)\s+solver\b", re.IGNORECASE
+)
 SEPARATOR_RE = re.compile(r"^\s*[-=_]{3,}\s*$")
 FAILURE_RE = re.compile(
     r"(?:fail(?:ed|ure)?\s+(?:to\s+)?converge|did\s+not\s+converge|"
@@ -129,6 +132,7 @@ class ParseResult:
     solves: list[SolveRecord]
     unmatched_failure_messages: list[str]
     unmatched_retry_messages: list[str]
+    diagnostic_lines: list[str]
 
 
 def _optional_number(value: float | None) -> float | str:
@@ -210,15 +214,22 @@ def _current_amperes(value: float, unit: str) -> float:
 
 
 def _parse_newton_row(line: str, line_number: int) -> NewtonRecord | None:
-    tokens = line.strip().split()
+    tokens = [token.strip(",;:()[]{}|") for token in line.strip().split()]
     if len(tokens) < 4:
         return None
     iteration_match = NEWTON_ITERATION_RE.fullmatch(tokens[0])
     if iteration_match is None:
         return None
-    if re.fullmatch(r"\d+", tokens[-2]) is None:
-        return None
-    if re.fullmatch(NUMBER, tokens[-1]) is None:
+
+    linear_summary: tuple[int, float] | None = None
+    for index in range(len(tokens) - 2, 1, -1):
+        if (
+            re.fullmatch(r"\d+", tokens[index]) is not None
+            and re.fullmatch(NUMBER, tokens[index + 1]) is not None
+        ):
+            linear_summary = (int(tokens[index]), float(tokens[index + 1]))
+            break
+    if linear_summary is None:
         return None
 
     kcl_match = NUMBER_WITH_UNIT_RE.fullmatch(tokens[1])
@@ -235,8 +246,8 @@ def _parse_newton_row(line: str, line_number: int) -> NewtonRecord | None:
         kcl_residual_a=_current_amperes(
             float(kcl_match.group("value")), kcl_unit
         ),
-        krylov_iterations=int(tokens[-2]),
-        krylov_residual=float(tokens[-1]),
+        krylov_iterations=linear_summary[0],
+        krylov_residual=linear_summary[1],
     )
 
 
@@ -256,8 +267,11 @@ def parse_ads_status_text(
     solves: list[SolveRecord] = []
     current: SolveRecord | None = None
     in_newton_table = False
+    seen_newton_row = False
+    header_scan_remaining = 0
     unmatched_failures: list[str] = []
     unmatched_retries: list[str] = []
+    diagnostic_lines: list[str] = []
 
     def finish_current() -> None:
         nonlocal current
@@ -267,7 +281,7 @@ def parse_ads_status_text(
         current = None
 
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.rstrip()
+        line = raw_line.replace("\x00", "").rstrip()
         frequency_match = _match_value(
             line, custom_frequency, FREQUENCY_PATTERNS
         )
@@ -286,14 +300,26 @@ def parse_ads_status_text(
                 finish_current()
             active_power = (normalized, label)
 
-        if NEWTON_TABLE_RE.search(line):
+        if KRYLOV_HEADER_RE.search(line):
+            in_newton_table = False
+            seen_newton_row = False
+            header_scan_remaining = 0
+            if len(diagnostic_lines) < 24:
+                diagnostic_lines.append(f"{line_number}: {line.strip()}")
+            continue
+        if NEWTON_HEADER_RE.search(line):
             in_newton_table = True
+            seen_newton_row = False
+            header_scan_remaining = 20
+            if len(diagnostic_lines) < 24:
+                diagnostic_lines.append(f"{line_number}: {line.strip()}")
             continue
         if NEWTON_COLUMNS_RE.search(line):
             in_newton_table = True
-            continue
-        if KRYLOV_TABLE_RE.search(line):
-            in_newton_table = False
+            seen_newton_row = False
+            header_scan_remaining = 20
+            if len(diagnostic_lines) < 24:
+                diagnostic_lines.append(f"{line_number}: {line.strip()}")
             continue
 
         if in_newton_table:
@@ -325,8 +351,19 @@ def parse_ads_status_text(
                     )
                 current.newton.append(newton)
                 current.end_line = line_number
+                seen_newton_row = True
+                header_scan_remaining = 20
+                if len(diagnostic_lines) < 24:
+                    diagnostic_lines.append(f"{line_number}: {line.strip()}")
+                continue
+            if not seen_newton_row and header_scan_remaining > 0:
+                header_scan_remaining -= 1
+                if stripped and len(diagnostic_lines) < 24:
+                    diagnostic_lines.append(f"{line_number}: {line.strip()}")
                 continue
             in_newton_table = False
+            seen_newton_row = False
+            header_scan_remaining = 0
 
         if FAILURE_RE.search(line):
             message = line.strip()
@@ -350,6 +387,7 @@ def parse_ads_status_text(
         solves=solves,
         unmatched_failure_messages=unmatched_failures,
         unmatched_retry_messages=unmatched_retries,
+        diagnostic_lines=diagnostic_lines,
     )
 
 
@@ -428,7 +466,23 @@ def _read_log(path_text: str) -> tuple[str, str]:
     if path_text == "-":
         return sys.stdin.read(), "<stdin>"
     path = Path(path_text)
-    return path.read_text(encoding="utf-8", errors="replace"), str(path)
+    return _decode_log_bytes(path.read_bytes()), str(path)
+
+
+def _decode_log_bytes(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig")
+    if b"\x00" in data[:4096]:
+        even_nuls = data[0::2].count(0)
+        odd_nuls = data[1::2].count(0)
+        encoding = "utf-16-be" if even_nuls > odd_nuls else "utf-16-le"
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return data.decode("utf-8", errors="replace")
 
 
 def _print_summary(rows: Sequence[dict[str, object]]) -> None:
@@ -513,9 +567,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             power_regex=args.power_regex,
         )
         if not result.solves:
+            candidates = ""
+            if result.diagnostic_lines:
+                candidates = (
+                    "\nParser candidate lines (include these in a bug report):\n  "
+                    + "\n  ".join(result.diagnostic_lines)
+                )
             raise SystemExit(
                 f"No Newton/Krylov summary rows found in {source_file}. "
                 "Set the ADS Gain Compression Status level to 4 or 5."
+                f"{candidates}"
             )
         results.append(result)
 

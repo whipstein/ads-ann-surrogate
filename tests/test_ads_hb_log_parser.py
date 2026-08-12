@@ -70,6 +70,44 @@ Iter KCL residual Iters Residual
             [5, 9],
         )
 
+    def test_accepts_wrapped_header(self) -> None:
+        text = """
+Newton solver:
+Linear solver:
+Iter
+KCL residual
+Damp % Sol update
+Iters Residual
+------------------------------------
+1 2.0 mA 100.0 6 1.0e-3
+"""
+        result = PARSER.parse_ads_status_text(text, "trial", "trial.log")
+        self.assertEqual(len(result.solves), 1)
+        self.assertEqual(result.solves[0].newton[0].krylov_iterations, 6)
+
+    def test_reads_utf16_message_window_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ads_status.txt"
+            path.write_text(LEVEL5_LOG, encoding="utf-16")
+            text, source_file = PARSER._read_log(str(path))
+            result = PARSER.parse_ads_status_text(text, "baseline", source_file)
+            self.assertEqual(len(result.solves), 2)
+            self.assertEqual(
+                sum(
+                    row.krylov_iterations
+                    for solve in result.solves
+                    for row in solve.newton
+                ),
+                19,
+            )
+
+    def test_failure_lists_candidate_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "unsupported.log"
+            path.write_text("Newton solver:\ncustom columns\ncustom row\n")
+            with self.assertRaisesRegex(SystemExit, "Parser candidate lines"):
+                PARSER.main([str(path)])
+
     def test_cli_writes_comparison_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
