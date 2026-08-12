@@ -731,9 +731,11 @@ The report directory contains:
 
 The SVG plots are generated with the Python standard library and are referenced
 with relative paths inside `ads_hb_solver_report.md`, so the report directory is
-portable and the plots render inline in normal Markdown viewers. The first log
-is treated as the baseline for percentage-change tables; put the standard model
-first in the command.
+portable and the plots render inline in normal Markdown viewers. The image links
+include a content fingerprint so rerunning a report in the same directory does
+not leave a stale plot in the Markdown viewer's cache. The first log is treated
+as the baseline for percentage-change tables; put the standard model first in
+the command.
 
 #### ADS Resource usage timing
 

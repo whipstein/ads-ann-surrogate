@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import re
@@ -1275,7 +1276,13 @@ def _write_markdown_report(
     path: Path,
     results: Sequence[ParseResult],
     summary_rows: Sequence[dict[str, object]],
+    plot_hrefs: dict[str, str] | None = None,
 ) -> None:
+    plot_hrefs = plot_hrefs or {}
+
+    def plot_href(filename: str) -> str:
+        return plot_hrefs.get(filename, filename)
+
     baseline = summary_rows[0]
     summary_table = [
         [
@@ -1443,7 +1450,7 @@ def _write_markdown_report(
         "",
         "## Runtime",
         "",
-        "![Wall-clock runtime by model](runtime_comparison.svg)",
+        f"![ADS Resource usage timing by model]({plot_href('runtime_comparison.svg')})",
         "",
         _markdown_table(
             [
@@ -1481,19 +1488,19 @@ def _write_markdown_report(
         "",
         "## Total solver work",
         "",
-        "![Total Newton and Krylov iterations by model](solver_work_totals.svg)",
+        f"![Total Newton and Krylov iterations by model]({plot_href('solver_work_totals.svg')})",
         "",
         "Totals are affected by both work per solve and the number of adaptive Gain Compression solves.",
         "",
         "## Normalized Krylov work",
         "",
-        "![Krylov work statistics per HB solve](krylov_per_solve_statistics.svg)",
+        f"![Krylov work statistics per HB solve]({plot_href('krylov_per_solve_statistics.svg')})",
         "",
         "These statistics normalize for different numbers of adaptive HB solves.",
         "",
         "## Solve sequence",
         "",
-        "![Krylov iterations by detected HB solve](krylov_by_solve.svg)",
+        f"![Krylov iterations by detected HB solve]({plot_href('krylov_by_solve.svg')})",
         "",
         (
             "Solve indices represent execution order. They are directly comparable "
@@ -1599,7 +1606,19 @@ def _write_report_artifacts(
     _write_total_work_svg(out_dir / artifact_names[2], summary_rows)
     _write_krylov_statistics_svg(out_dir / artifact_names[3], summary_rows)
     _write_krylov_by_solve_svg(out_dir / artifact_names[4], results)
-    _write_markdown_report(out_dir / artifact_names[0], results, summary_rows)
+    plot_hrefs = {
+        name: (
+            f"{name}?v="
+            f"{hashlib.sha256((out_dir / name).read_bytes()).hexdigest()[:12]}"
+        )
+        for name in artifact_names[1:]
+    }
+    _write_markdown_report(
+        out_dir / artifact_names[0],
+        results,
+        summary_rows,
+        plot_hrefs,
+    )
     return artifact_names
 
 

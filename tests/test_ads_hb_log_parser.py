@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,26 @@ class AdsHbLogParserTests(unittest.TestCase):
             "Simulation stopwatch time", result.simulation_stopwatch_source
         )
         self.assertIn("Total CPU time", result.cpu_time_source)
+
+    def test_runtime_plot_uses_simulation_stopwatch_without_total(self) -> None:
+        simulation_only = RESOURCE_USAGE_LOG.replace(
+            "Total stopwatch time = 12.5 seconds.\n", ""
+        )
+        result = PARSER.parse_ads_status_text(
+            simulation_only,
+            model="baseline",
+            source_file="baseline.log",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runtime_comparison.svg"
+            PARSER._write_runtime_svg(
+                path,
+                [PARSER.summarize_result(result)],
+            )
+            plot = path.read_text()
+        self.assertNotIn("No ADS stopwatch timing", plot)
+        self.assertIn("Simulation stopwatch time", plot)
+        self.assertIn(">11.25 s</text>", plot)
 
     def test_prefers_total_time_and_rejects_stage_elapsed_as_total(self) -> None:
         without_footer = LEVEL5_LOG.replace(
@@ -199,6 +220,10 @@ Iters Residual
             )
             self.assertIn("| trial | +20.0% | +20.0% | +20.0% |", report)
             self.assertIn("runtime_comparison.svg", report)
+            self.assertRegex(
+                report,
+                re.compile(r"runtime_comparison\.svg\?v=[0-9a-f]{12}"),
+            )
             self.assertIn("solver_work_totals.svg", report)
             self.assertIn("krylov_per_solve_statistics.svg", report)
             self.assertIn("krylov_by_solve.svg", report)
