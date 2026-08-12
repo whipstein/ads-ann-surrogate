@@ -81,7 +81,7 @@ from surrogate_common import (  # noqa: E402
     print_cli_error,
     read_mdif,
     read_model_metadata,
-    resolve_export_dc_metadata,
+    resolve_export_dc_conductance_model,
     rerank_sweep_rows,
     run_sweep_command,
     sparam_sort_key,
@@ -669,6 +669,35 @@ def dnn_export_commands(
     )
 
 
+def resolve_dnn_export_dc(
+    model: DNN,
+    source_metadata: dict[str, object],
+    args: argparse.Namespace,
+    z0: float,
+) -> tuple[DCConductanceModel | None, dict[str, object]]:
+    return resolve_export_dc_conductance_model(
+        model.dc_model,
+        source_metadata,
+        model.parameter_names,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=z0,
+        port_paths=args.dc_port_paths,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
+        activation=(
+            model.dc_model.mlp.activation
+            if model.dc_model is not None
+            else model.mlp.activation
+        ),
+        hidden_layers=(
+            model.dc_model.mlp.layer_sizes[1:-1]
+            if model.dc_model is not None
+            else model.mlp.layer_sizes[1:-1]
+        ),
+    )
+
+
 def command_train(args: argparse.Namespace) -> int:
     model, verify_blocks, parameter_names, labels, history, dc_history, metadata = train_model(args)
     out_dir = Path(args.out_dir)
@@ -847,14 +876,11 @@ def command_export_ads(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = DNN.load(model_dir)
     source_metadata = read_model_metadata(str(model_dir))
-    dc_metadata = resolve_export_dc_metadata(
+    export_dc_model, dc_metadata = resolve_dnn_export_dc(
+        model,
         source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=model.target_z0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
+        args,
+        model.target_z0,
     )
     model.dc_equivalent_resistance_ohm = float(
         dc_metadata["dc_equivalent_resistance_ohm"]
@@ -865,8 +891,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         if isinstance(dc_metadata.get("dc_port_resistances_ohm"), dict)
         else None
     )
-    if args.dc_mdif:
-        model.dc_model = None
+    model.dc_model = export_dc_model
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -914,6 +939,11 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "dc_ignored_nonpassive_count"
         ),
         "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
+        "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+        "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
+        "dc_mdif_model_s_max_abs_error": dc_metadata.get(
+            "dc_mdif_model_s_max_abs_error"
+        ),
     }, indent=2))
     return 0
 
@@ -1069,14 +1099,11 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
     )
     fold_scalers = not bool(getattr(args, "no_fold_scalers", False))
     export_z0 = float(model.target_z0 if model.output_domain == "y" else args.z0)
-    dc_metadata = resolve_export_dc_metadata(
+    export_dc_model, dc_metadata = resolve_dnn_export_dc(
+        model,
         source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=export_z0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
+        args,
+        export_z0,
     )
     if model.output_domain == "y" and not math.isclose(float(args.z0), export_z0, rel_tol=1e-12, abs_tol=1e-12):
         print(
@@ -1124,11 +1151,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
-        dc_model=(
-            model.dc_model.export_data()
-            if model.dc_model is not None and not args.dc_mdif
-            else None
-        ),
+        dc_model=(export_dc_model.export_data() if export_dc_model is not None else None),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",
@@ -1166,6 +1189,11 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             "dc_ignored_nonpassive_count"
         ),
         "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
+        "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+        "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
+        "dc_mdif_model_s_max_abs_error": dc_metadata.get(
+            "dc_mdif_model_s_max_abs_error"
+        ),
     }, indent=2))
     return 0
 
@@ -1183,14 +1211,11 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         args.parameter_input_scales,
     )
     export_z0 = float(model.target_z0 if model.output_domain == "y" else args.z0)
-    dc_metadata = resolve_export_dc_metadata(
+    export_dc_model, dc_metadata = resolve_dnn_export_dc(
+        model,
         source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=export_z0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
+        args,
+        export_z0,
     )
     if model.output_domain == "y" and not math.isclose(
         float(args.z0), export_z0, rel_tol=1e-12, abs_tol=1e-12
@@ -1223,16 +1248,13 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
-        dc_model=(
-            model.dc_model.export_data()
-            if model.dc_model is not None and not args.dc_mdif
-            else None
-        ),
+        dc_model=(export_dc_model.export_data() if export_dc_model is not None else None),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",
             "training_output_domain": model.output_domain,
             "training_target_z0": model.target_z0,
+            "dc_metadata": dc_metadata,
         },
         extra_notes=[
             "The fitted RF response is evaluated at each HB spectral frequency.",
@@ -1249,6 +1271,11 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "linear": manifest["linear"],
                 "power_dependent": manifest["power_dependent"],
                 "supported_analyses": manifest["supported_analyses"],
+                "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+                "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
+                "dc_mdif_model_s_max_abs_error": dc_metadata.get(
+                    "dc_mdif_model_s_max_abs_error"
+                ),
             },
             indent=2,
         )

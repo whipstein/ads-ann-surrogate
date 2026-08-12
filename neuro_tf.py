@@ -423,6 +423,35 @@ def neurotf_export_commands(
     )
 
 
+def resolve_neurotf_export_dc(
+    model: NeuroTF,
+    source_metadata: dict[str, object],
+    args: argparse.Namespace,
+    z0: float,
+) -> tuple[DCConductanceModel | None, dict[str, object]]:
+    return resolve_export_dc_conductance_model(
+        model.dc_model,
+        source_metadata,
+        model.parameter_names,
+        model.sparam_labels,
+        dc_mdif=args.dc_mdif,
+        z0=z0,
+        port_paths=args.dc_port_paths,
+        open_threshold_ohm=args.dc_open_threshold,
+        open_resistance_ohm=args.dc_open_resistance,
+        activation=(
+            model.dc_model.mlp.activation
+            if model.dc_model is not None
+            else model.mlp.activation
+        ),
+        hidden_layers=(
+            model.dc_model.mlp.layer_sizes[1:-1]
+            if model.dc_model is not None
+            else model.mlp.layer_sizes[1:-1]
+        ),
+    )
+
+
 def command_train(args: argparse.Namespace) -> int:
     mdif_blocks = read_mdif(Path(args.mdif))
     if args.verification_mdif:
@@ -755,14 +784,11 @@ def command_export_ads(args: argparse.Namespace) -> int:
     model_dir = Path(args.model_dir)
     model = NeuroTF.load(model_dir)
     source_metadata = read_model_metadata(str(model_dir))
-    dc_metadata = resolve_export_dc_metadata(
+    export_dc_model, dc_metadata = resolve_neurotf_export_dc(
+        model,
         source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=50.0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
+        args,
+        50.0,
     )
     model.dc_equivalent_resistance_ohm = float(
         dc_metadata["dc_equivalent_resistance_ohm"]
@@ -773,8 +799,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         if isinstance(dc_metadata.get("dc_port_resistances_ohm"), dict)
         else None
     )
-    if args.dc_mdif:
-        model.dc_model = None
+    model.dc_model = export_dc_model
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -822,6 +847,10 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "dc_ignored_nonpassive_count"
         ),
         "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
+        "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+        "dc_mdif_model_s_max_abs_error": dc_metadata.get(
+            "dc_mdif_model_s_max_abs_error"
+        ),
     }, indent=2))
     return 0
 
@@ -836,14 +865,11 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         model.parameter_names,
         args.parameter_input_scales,
     )
-    dc_metadata = resolve_export_dc_metadata(
+    export_dc_model, dc_metadata = resolve_neurotf_export_dc(
+        model,
         source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=args.z0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
+        args,
+        args.z0,
     )
     manifest = write_neurotf_veriloga_package(
         out_dir=out_dir,
@@ -868,11 +894,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
-        dc_model=(
-            model.dc_model.export_data()
-            if model.dc_model is not None and not args.dc_mdif
-            else None
-        ),
+        dc_model=(export_dc_model.export_data() if export_dc_model is not None else None),
         source_model_dir=str(model_dir),
         extra_manifest={
             "dc_resistance_source_kind": dc_metadata.get(
@@ -905,6 +927,10 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             "dc_ignored_nonpassive_count"
         ),
         "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
+        "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+        "dc_mdif_model_s_max_abs_error": dc_metadata.get(
+            "dc_mdif_model_s_max_abs_error"
+        ),
     }, indent=2))
     return 0
 
@@ -921,14 +947,11 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         model.parameter_names,
         args.parameter_input_scales,
     )
-    dc_metadata = resolve_export_dc_metadata(
+    export_dc_model, dc_metadata = resolve_neurotf_export_dc(
+        model,
         source_metadata,
-        model.sparam_labels,
-        dc_mdif=args.dc_mdif,
-        z0=args.z0,
-        open_threshold_ohm=args.dc_open_threshold,
-        open_resistance_ohm=args.dc_open_resistance,
-        port_paths=args.dc_port_paths,
+        args,
+        args.z0,
     )
     manifest = write_ads_hb_neurotf_package(
         out_dir=out_dir,
@@ -952,11 +975,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
-        dc_model=(
-            model.dc_model.export_data()
-            if model.dc_model is not None and not args.dc_mdif
-            else None
-        ),
+        dc_model=(export_dc_model.export_data() if export_dc_model is not None else None),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "neuro_transfer_function",
@@ -974,6 +993,10 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "linear": manifest["linear"],
                 "power_dependent": manifest["power_dependent"],
                 "supported_analyses": manifest["supported_analyses"],
+                "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+                "dc_mdif_model_s_max_abs_error": dc_metadata.get(
+                    "dc_mdif_model_s_max_abs_error"
+                ),
             },
             indent=2,
         )

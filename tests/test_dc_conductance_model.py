@@ -12,7 +12,9 @@ from surrogate_common import (
     _y_matrix_to_s_matrix,
     extract_dc_conductance_samples,
     parse_dc_port_paths,
+    resolve_export_dc_conductance_model,
     train_dc_conductance_model,
+    write_mdif,
     write_ads_hb_mlp_package,
     write_veriloga_package,
 )
@@ -165,6 +167,95 @@ class DCConductanceModelTests(unittest.TestCase):
             self.assertIn("dc_g[0] = exp(", va_text)
             self.assertIn("active_yr[0] = dc_g[0]", va_text)
             self.assertTrue(va_manifest["dc_geometry_dependent"])
+
+    def test_export_dc_mdif_validates_and_keeps_saved_dynamic_model(self) -> None:
+        blocks = [
+            dc_block(1.0, [0.01], "1-2"),
+            dc_block(2.0, [0.01], "1-2"),
+        ]
+        model, _, metadata = train_dc_conductance_model(
+            blocks,
+            [],
+            ["W"],
+            LABELS_2,
+            hidden_layers=[2],
+            activation="tanh",
+            epochs=20,
+            batch_size=2,
+            learning_rate=0.01,
+            patience=10,
+            seed=7,
+            progress_interval=0,
+            port_paths="1-2",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "dc.mdif"
+            write_mdif(dc_mdif, blocks, LABELS_2)
+            resolved, export_metadata = resolve_export_dc_conductance_model(
+                model,
+                metadata,
+                ["W"],
+                LABELS_2,
+                dc_mdif=dc_mdif,
+                z0=50.0,
+                port_paths="1-2",
+                open_threshold_ohm=1.0e12,
+                open_resistance_ohm=1.0e19,
+                activation="tanh",
+                hidden_layers=[2],
+            )
+        self.assertIs(resolved, model)
+        self.assertEqual(
+            export_metadata["dc_mdif_action"],
+            "validated_saved_dc_model",
+        )
+        self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
+
+    def test_export_dc_mdif_fits_dc_only_model_for_legacy_model(self) -> None:
+        blocks = [
+            dc_block(1.0, [0.02], "1-2"),
+            dc_block(2.0, [0.02], "1-2"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "dc.mdif"
+            write_mdif(dc_mdif, blocks, LABELS_2)
+            resolved, export_metadata = resolve_export_dc_conductance_model(
+                None,
+                {},
+                ["W"],
+                LABELS_2,
+                dc_mdif=dc_mdif,
+                z0=50.0,
+                port_paths="1-2",
+                open_threshold_ohm=1.0e12,
+                open_resistance_ohm=1.0e19,
+                activation="tanh",
+                hidden_layers=[2],
+            )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(export_metadata["dc_mdif_action"], "fitted_dc_only_model")
+        self.assertTrue(export_metadata["dc_model_fitted_during_export"])
+        self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
+
+    def test_export_rejects_dc_topology_that_cannot_match_mdif(self) -> None:
+        blocks = [dc_block(1.0, [0.01, 0.02, 0.03], "1-2,1-3,2-3")]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "dc.mdif"
+            write_mdif(dc_mdif, blocks, LABELS_3)
+            with self.assertRaisesRegex(ValueError, "does not reproduce"):
+                resolve_export_dc_conductance_model(
+                    None,
+                    {},
+                    ["W"],
+                    LABELS_3,
+                    dc_mdif=dc_mdif,
+                    z0=50.0,
+                    port_paths="1-2",
+                    open_threshold_ohm=1.0e12,
+                    open_resistance_ohm=1.0e19,
+                    activation="tanh",
+                    hidden_layers=[2],
+                )
 
 
 if __name__ == "__main__":

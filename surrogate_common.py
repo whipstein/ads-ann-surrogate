@@ -37,6 +37,7 @@ DB_MAG_FLOOR = 1e-6
 DEFAULT_DC_OPEN_THRESHOLD_OHM = 1e12
 DEFAULT_DC_OPEN_RESISTANCE_OHM = 1e19
 DEFAULT_DC_PASSIVITY_TOLERANCE = 1e-6
+DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE = 1e-3
 
 
 FREQ_UNITS = {
@@ -1083,9 +1084,9 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dc-mdif",
         help=(
-            "Compatibility override for a legacy model: derive a static selected-path "
-            "network from exact-zero-Hz S-parameters without refitting RF. Newly "
-            "trained models normally use their saved geometry-dependent DC network."
+            "Exact-zero-Hz MDIF used to validate the saved geometry-dependent DC "
+            "network. If it does not match, or the saved model is legacy, fit a new "
+            "DC-only conductance network for this export without refitting RF."
         ),
     )
     add_dc_port_paths_argument(parser)
@@ -6386,6 +6387,216 @@ def train_dc_conductance_model(
     )
     model.metadata = dict(metadata)
     return model, history, metadata
+
+
+def validate_dc_model_against_mdif(
+    model: DCConductanceModel,
+    blocks: Sequence[MDIFBlock],
+) -> dict[str, object]:
+    """Compare a saved/export DC model directly with exact-DC MDIF rows."""
+
+    x_values, target_conductances, extraction = extract_dc_conductance_samples(
+        blocks,
+        model.parameter_names,
+        model.sparam_labels,
+        z0=model.z0,
+        port_paths=model.port_paths,
+        open_threshold_ohm=float(
+            model.metadata.get(
+                "dc_open_threshold_ohm",
+                DEFAULT_DC_OPEN_THRESHOLD_OHM,
+            )
+        ),
+        open_resistance_ohm=float(
+            model.metadata.get(
+                "dc_open_resistance_ohm",
+                DEFAULT_DC_OPEN_RESISTANCE_OHM,
+            )
+        ),
+    )
+    predicted_conductances = model.predict_conductances(x_values)
+    conductance_error = predicted_conductances - target_conductances
+
+    direct_errors: list[float] = []
+    passivity_limit = 1.0 + float(
+        model.metadata.get(
+            "dc_passivity_tolerance",
+            DEFAULT_DC_PASSIVITY_TOLERANCE,
+        )
+    )
+    nports = infer_complete_sparameter_ports(model.sparam_labels)
+    for block, parameter_row in zip(blocks, x_values):
+        predicted = model.predict_s_values(parameter_row)
+        for raw_index in np.flatnonzero(
+            np.asarray(block.freq_hz, dtype=float) == 0.0
+        ):
+            frequency_index = int(raw_index)
+            s_matrix = _block_s_matrix(
+                block,
+                model.sparam_labels,
+                frequency_index,
+                nports,
+            )
+            if not np.all(np.isfinite(s_matrix)):
+                continue
+            try:
+                max_sigma = float(np.max(np.linalg.svd(s_matrix, compute_uv=False)))
+            except np.linalg.LinAlgError:
+                continue
+            if not math.isfinite(max_sigma) or max_sigma > passivity_limit:
+                continue
+            measured = np.asarray(
+                [
+                    complex(block.sparams[label][frequency_index])
+                    for label in model.sparam_labels
+                ],
+                dtype=complex,
+            )
+            direct_errors.extend(np.abs(predicted - measured).tolist())
+    if not direct_errors:
+        raise ValueError("No usable passive exact-DC rows remain for export validation")
+    direct_error_array = np.asarray(direct_errors, dtype=float)
+    return {
+        "dc_mdif_validation_block_count": len(blocks),
+        "dc_mdif_model_conductance_rmse_siemens": float(
+            np.sqrt(np.mean(conductance_error**2))
+        ),
+        "dc_mdif_model_s_rmse": float(
+            np.sqrt(np.mean(direct_error_array**2))
+        ),
+        "dc_mdif_model_s_max_abs_error": float(np.max(direct_error_array)),
+        "dc_mdif_topology_s_rmse": extraction["dc_topology_s_rmse"],
+        "dc_mdif_topology_s_max_abs_error": extraction[
+            "dc_topology_s_max_abs_error"
+        ],
+    }
+
+
+def resolve_export_dc_conductance_model(
+    saved_model: DCConductanceModel | None,
+    stored_metadata: dict[str, object],
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    *,
+    dc_mdif: str | Path | None,
+    z0: float,
+    port_paths: object,
+    open_threshold_ohm: float,
+    open_resistance_ohm: float,
+    activation: str,
+    hidden_layers: Sequence[int],
+) -> tuple[DCConductanceModel | None, dict[str, object]]:
+    """Resolve dynamic DC for export without changing the fitted RF model.
+
+    A saved geometry-dependent DC model is used by default. If ``--dc-mdif``
+    is supplied, it is first checked against that saved model. A mismatching or
+    legacy model triggers a DC-only fit from the supplied MDIF; RF weights and
+    poles are never retrained.
+    """
+
+    requested_paths = port_paths
+    if requested_paths is None:
+        requested_paths = (
+            saved_model.port_paths
+            if saved_model is not None
+            else stored_metadata.get("dc_port_paths")
+        )
+    if saved_model is not None and dc_mdif is None:
+        nports = infer_complete_sparameter_ports(labels)
+        if port_paths is not None:
+            requested = [item[2] for item in parse_dc_port_paths(port_paths, nports)]
+            if requested != saved_model.port_paths:
+                raise ValueError(
+                    "--dc-port-paths does not match the saved geometry-dependent DC "
+                    "model. Supply --dc-mdif to fit the requested DC topology without "
+                    "refitting RF."
+                )
+        metadata = {
+            key: value
+            for key, value in stored_metadata.items()
+            if str(key).startswith("dc_")
+        }
+        return saved_model, metadata
+
+    if dc_mdif is not None:
+        dc_path = Path(dc_mdif)
+        blocks = read_mdif(dc_path)
+        if saved_model is not None:
+            saved_paths = list(saved_model.port_paths)
+            requested_canonical = [
+                item[2]
+                for item in parse_dc_port_paths(
+                    requested_paths,
+                    infer_complete_sparameter_ports(labels),
+                )
+            ]
+            if saved_paths == requested_canonical:
+                validation = validate_dc_model_against_mdif(saved_model, blocks)
+                if float(validation["dc_mdif_model_s_max_abs_error"]) <= 1.0e-4:
+                    metadata = {
+                        key: value
+                        for key, value in stored_metadata.items()
+                        if str(key).startswith("dc_")
+                    }
+                    metadata.update(validation)
+                    metadata["dc_resistance_source_file"] = str(dc_path)
+                    metadata["dc_mdif_action"] = "validated_saved_dc_model"
+                    return saved_model, metadata
+
+        resolved_hidden_layers = [int(value) for value in hidden_layers]
+        if not resolved_hidden_layers:
+            resolved_hidden_layers = [32, 32]
+        fitted_model, _, metadata = train_dc_conductance_model(
+            blocks,
+            [],
+            parameter_names,
+            labels,
+            hidden_layers=resolved_hidden_layers,
+            activation=activation,
+            epochs=4000,
+            batch_size=min(256, max(1, len(blocks))),
+            learning_rate=2.0e-3,
+            patience=400,
+            seed=1234,
+            loss_interval=5,
+            progress_interval=0,
+            progress_label="DC export fit",
+            z0=z0,
+            port_paths=requested_paths,
+            open_threshold_ohm=open_threshold_ohm,
+            open_resistance_ohm=open_resistance_ohm,
+        )
+        validation = validate_dc_model_against_mdif(fitted_model, blocks)
+        if (
+            float(validation["dc_mdif_model_s_max_abs_error"])
+            > DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE
+        ):
+            raise ValueError(
+                "The DC-only export model does not reproduce the supplied exact-DC "
+                "S-parameters closely enough: maximum absolute error is "
+                f"{float(validation['dc_mdif_model_s_max_abs_error']):.6g}, "
+                f"limit {DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE:.6g}. The declared "
+                "--dc-port-paths topology error is "
+                f"{float(validation['dc_mdif_topology_s_max_abs_error']):.6g}. "
+                "Check the selected DC paths and passive zero-Hz data; export was stopped."
+            )
+        metadata.update(validation)
+        metadata["dc_resistance_source_file"] = str(dc_path)
+        metadata["dc_model_fitted_during_export"] = True
+        metadata["dc_mdif_action"] = "fitted_dc_only_model"
+        fitted_model.metadata = dict(metadata)
+        return fitted_model, metadata
+
+    metadata = resolve_export_dc_metadata(
+        stored_metadata,
+        labels,
+        dc_mdif=None,
+        z0=z0,
+        open_threshold_ohm=open_threshold_ohm,
+        open_resistance_ohm=open_resistance_ohm,
+        port_paths=port_paths,
+    )
+    return None, metadata
 
 
 def mse(
