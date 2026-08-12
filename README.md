@@ -178,17 +178,17 @@ added point counts.
 #### How Many New Points to Add
 
 When `--count` is omitted, the script prints and uses a density-based point
-recommendation. Let `r` be the added design-space volume divided by the old
+recommendation. Let $r$ be the added design-space volume divided by the old
 volume. For a one-variable linear extension this is the added width divided by
-the old width; log variables use log-width.
+the old width; log variables use log-width. Let $d$ be the number of geometry
+parameters.
 
 | New point group | Recommended count |
 | --- | --- |
-| Training | `max(ceil(old_training_points * r), 4*d)` |
-| Verification, when the original set contains verification points | `max(ceil(old_verification_points * r), 2*d)` |
+| Training | $\max(\lceil n_{\mathrm{train,old}}r\rceil, 4d)$ |
+| Verification, when the original set contains verification points | $\max(\lceil n_{\mathrm{verify,old}}r\rceil, 2d)$ |
 
-Here, `d` is the number of geometry parameters. For example, extending one
-range by 50% from an 80-point, two-parameter design containing 64 training and
+For example, extending one range by 50% from an 80-point, two-parameter design containing 64 training and
 16 verification points recommends 32 new training and 8 new verification
 points. This maintains roughly the original sampling density while ensuring
 basic coverage of the new boundary. It is a practical lower target, not a
@@ -216,10 +216,10 @@ with a full frequency sweep. A practical initial design size is:
 For residual KBNN fits with a useful coarse model, start near the low-to-middle
 end of each range because the neural network is learning `fine - coarse`
 instead of the full response. A good staged workflow is to start with roughly
-`15*d` training points, with a minimum of about 30, and `4*d` to `6*d`
+$15d$ training points, with a minimum of about 30, and $4d$ to $6d$
 verification points, with a minimum of about 12. Keep the verification set
 fixed across model comparisons, then grow the training set in targeted batches
-of about `3*d` to `5*d` points using the current worst-fit regions.
+of about $3d$ to $5d$ points using the current worst-fit regions.
 
 To compare the current Sobol-style workflow with the recommended space-filling
 design, ask for both methods. The `{method}` placeholder is replaced in the
@@ -430,7 +430,13 @@ python3 dnn.py export-ads-hb \
   --parameter-input-scales 1.0
 ```
 
-The SDD implements `V - Z0*I = S(f)*(V + Z0*I)` and ADS evaluates the embedded
+The SDD implements
+
+$$
+\mathbf V-Z_0\mathbf I=\mathbf S(f)(\mathbf V+Z_0\mathbf I)
+$$
+
+and ADS evaluates the embedded
 surrogate independently at every HB spectral frequency. It has no input-power
 parameter and creates no compression; compression and harmonic generation come
 only from nonlinear devices elsewhere in the circuit. Negative-frequency
@@ -548,14 +554,15 @@ path graph but no source MDIF is available; it never silently presents that
 subset as a full-complex-S result.
 
 1. Each finite exact-zero-Hz S-matrix is checked for passivity using its largest
-   singular value. Rows above `1 + 1e-6` are ignored.
-2. With no path option, both components of every ordered Sij value are fitted
+   singular value. Rows above $1+10^{-6}$ are ignored.
+2. With no path option, both components of every ordered $S_{ij}$ value are fitted
    directly. No intermediate real-Y projection is used.
 3. With an explicit path option, the S matrix is converted to Y and all declared
    branches are solved together with a non-negative least-squares projection
    onto that resistor graph.
-4. In explicit-path mode, conductances below `1 / --dc-open-threshold` are represented by
-   `1 / --dc-open-resistance`. The natural logarithm of each positive branch
+4. In explicit-path mode, conductances below the reciprocal of
+   `--dc-open-threshold` are represented by the reciprocal of
+   `--dc-open-resistance`. The natural logarithm of each positive branch
    conductance is then fitted by a small geometry-only MLP.
 5. The saved diagnostics include the measured-S → extracted-Y → model-Y →
    reconstructed-S round-trip error, filtered-row counts, matrix/path errors,
@@ -588,7 +595,7 @@ placed in a conditional and the generated source remains legal for ADS
 Verilog-A. Export also verifies that DC came from exact-zero-frequency data.
 ADS HB exports make the same DC/RF separation in the SDD frequency weights:
 the geometry-dependent exact-DC matrix or explicit-path network is used only at
-`freq=0`, and the fitted RF surrogate is used only at non-zero spectral frequencies.
+$f=0$, and the fitted RF surrogate is used only at non-zero spectral frequencies.
 
 To export an older fitted model without retraining it, pass the original DC data
 directly to `export-veriloga`, `export-ads-hb`, or `export-ads-mdif`:
@@ -604,12 +611,12 @@ python3 dnn.py export-veriloga \
 ```
 
 `--dc-mdif` validates a saved geometry-dependent DC network directly against
-the supplied exact-DC rows. If it differs by more than `1e-4` in maximum
+the supplied exact-DC rows. If it differs by more than $10^{-4}$ in maximum
 absolute S-parameter error, or if the saved model is legacy, export fits a new
 DC-only full-complex-S or explicit-path network from that MDIF. This never changes
 or refits the RF model. The export manifest records `dc_mdif_action` plus the topology and final
 DC-model S-parameter errors. An explicit resistor-path export is rejected if its
-maximum absolute S-parameter error remains above `1e-3`, because that means the
+maximum absolute S-parameter error remains above $10^{-3}$, because that means the
 declared topology cannot reproduce the data. The unrestricted complex-S mode
 has no topology/projection mismatch: it receives a larger export-only network
 and convergence budget, and any remaining interpolation error is reported as
@@ -654,7 +661,8 @@ Choose the ADS handoff based on the level of simulator integration you need:
 Use `export-ads-hb` for harmonic balance. The generated SDD is a linear
 frequency-dependent multiport, just like an S-parameter file, but its response
 is calculated from the geometry-dependent surrogate instead of a fixed table.
-Every model type uses an explicit `I=Y(f)V` circuit stamp. DNN models trained
+Every model type uses the explicit circuit stamp
+$\mathbf I=\mathbf Y(f)\mathbf V$. DNN models trained
 with `--output-domain y` supply Y directly. S-output DNNs, KBNNs, and Neuro-TFs
 are converted to Y by generated frequency-only equations before the explicit
 stamp. The separately extracted DC conductance is a different parallel branch:
@@ -717,11 +725,12 @@ the geometry parameters on it, and then place that symbol repeatedly. The
 export is already native ADS syntax, so do not import its `.net` file through a
 SPICE parser.
 
-The parameter scaling equation is:
+The parameter scaling equation is
 
-```text
-model_value = ADS_instance_parameter / input_scale_parameter
-```
+$$
+p_{\mathrm{model}}=
+\frac{p_{\mathrm{ADS\ instance}}}{p_{\mathrm{input\ scale}}}.
+$$
 
 Pass the physical ADS-side value; do not pass a manually pre-scaled model
 value. For a model trained with dimensionless micron counts such as `W=10`,
@@ -757,9 +766,13 @@ a deep multilayer perceptron from parameterized S-parameter MDIF data.
 
 Model structure:
 
-```text
-geometry/process VARs + frequency features -> deep neural network -> S-parameters or Y-parameters
-```
+$$
+[\mathbf p,\boldsymbol\phi(f)]
+\xrightarrow{\mathrm{DNN}}
+\widehat{\mathbf S}(\mathbf p,f)
+\quad\text{or}\quad
+\widehat{\mathbf Y}(\mathbf p,f)
+$$
 
 The DNN treats frequency as an input and predicts real/imaginary response
 values directly. The default target is S-parameters. For direct Verilog-A use,
@@ -896,12 +909,12 @@ Examples:
 Available selectors:
 
 - `all` or `default`: every S-parameter
-- `diag`, `diagonal`, `return`, or `reflection`: `Sii`
-- `offdiag`, `off-diagonal`, or `transmission`: `Sij` where `i != j`
-- `upper`: all `Sij` where `i < j`
-- `lower`: all `Sij` where `i > j`
-- `rowN`, `outN`, or `outputN`: all `SNj`
-- `colN`, `columnN`, `inN`, or `inputN`: all `SiN`
+- `diag`, `diagonal`, `return`, or `reflection`: $S_{ii}$
+- `offdiag`, `off-diagonal`, or `transmission`: $S_{ij}$ where $i \ne j$
+- `upper`: all $S_{ij}$ where $i < j$
+- `lower`: all $S_{ij}$ where $i > j$
+- `rowN`, `outN`, or `outputN`: all $S_{Nj}$
+- `colN`, `columnN`, `inN`, or `inputN`: all $S_{iN}$
 - Wildcards such as `S1*` or `S*1`
 - Explicit groups such as `S11,S22,S33,S44`
 
@@ -1127,12 +1140,14 @@ Schematic use:
    `.inc` file. For an SDD or equation-based wrapper, use the generated
    `.equation` file as the ANN equation source/reference.
 2. Feed the wrapper inputs from the `input_columns` in `ads_ann_manifest.json`.
-   For example, `freq_log10_hz` means the wrapper must pass `log10(freq_hz)`.
+   For example, `freq_log10_hz` means the wrapper must pass
+   $\log_{10}(f_{\mathrm{Hz}})$.
 3. Interpret `output_columns` as the final fine S-parameters, with all real
    columns followed by the matching imaginary columns.
 4. Convert the final complex S-matrix to a circuit relation before driving the
-   schematic pins. For reference impedance `Z0`, use
-   `Y = (I - S) * inverse(I + S) / Z0`, then `Iport = Y * Vport`.
+   schematic pins. For reference impedance $Z_0$, use
+   $\mathbf Y=(\mathbf I-\mathbf S)(\mathbf I+\mathbf S)^{-1}/Z_0$, then
+   $\mathbf I_{\mathrm{port}}=\mathbf Y\mathbf V_{\mathrm{port}}$.
 5. Validate the wrapper in an S-parameter or AC simulation before circuit
    optimization.
 
@@ -1156,7 +1171,8 @@ with an ADS `NetlistInclude`, then
 instantiate `<module>:X1` with the electrical nodes and geometry parameters.
 ADS applies the embedded matrix independently to the fundamental, harmonics,
 and mixing products requested by the HB controller. The model is linear and
-power independent. Direct-Y DNNs use `I=Y(f)V` immediately; S-output DNNs are
+power independent. Direct-Y DNNs use
+$\mathbf I=\mathbf Y(f)\mathbf V$ immediately; S-output DNNs are
 converted to Y in frequency-only equations and use the same explicit current
 stamp. DC is stamped separately from the fitted RF response.
 
@@ -1191,7 +1207,8 @@ The export writes `<module>.va`, `veriloga_manifest.json`, and
 `VERILOGA_README.md`. The generated module evaluates the neural network at the
 simulator frequency and contributes the corresponding port currents. For
 S-output models it reconstructs the complex S-matrix and converts it to
-admittance with `Y = (I - S) * inverse(I + S) / Z0`. For Y-output models it
+admittance with
+$\mathbf Y=(\mathbf I-\mathbf S)(\mathbf I+\mathbf S)^{-1}/Z_0$. For Y-output models it
 stamps the predicted admittance directly. In both cases, the model must contain
 a complete square S-parameter matrix, such as all 16 terms for a four-port.
 
@@ -1273,7 +1290,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--batch-size INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of frequency-sample rows per Adam update. Default: `256`. | <nobr><code>--batch-size 256</code></nobr> |
 | <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable diagnostic output and command tracebacks. Sweeps also print the candidate list and retain failed-trial tracebacks; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses `log10(freq_hz)`, `linear` uses raw Hz, and `log-linear` uses both. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
+| <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses $\log_{10}(f_{\mathrm{Hz}})$, `linear` uses raw Hz, and `log-linear` uses both. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
 | <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. Default: `log,log-linear`. | <nobr><code>--freq-transforms log,log-linear</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `128,128,64`; sweep default: `64,64;128,128,64;128,128,128;256,128,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 128,128,64</code></nobr> |
 | <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
@@ -1320,13 +1337,13 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
-| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, both components of every ordered complex DC Sij value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
+| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, both components of every ordered complex DC $S_{ij}$ value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
 | <nobr><code>--no-fold-scalers</code></nobr> | <code>export-veriloga</code> | Debug option. Keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the first and final neural layers. Leaving this unset is faster. | <nobr><code>--no-fold-scalers</code></nobr> |
 | <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used as the denominator for every geometry/process parameter: `model_value = instance_value / scale`. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used for every geometry/process parameter: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance. Direct-Y DNNs use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
@@ -1339,11 +1356,20 @@ predictions of a frozen S-domain DNN previously fitted to the coarse response.
 
 Supported forms:
 
-```text
-plain        : NN(geometry, frequency) -> fine S
-residual     : coarse S + NN(geometry, frequency[, coarse S]) -> fine S
-prior-input  : NN(geometry, frequency, coarse S) -> fine S
-```
+$$
+\begin{aligned}
+\text{plain:}\quad
+\widehat{\mathbf s}_{\mathrm f}
+  &=n(\mathbf p,\boldsymbol\phi(f)),\\
+\text{residual:}\quad
+\widehat{\mathbf s}_{\mathrm f}
+  &=\mathbf c(\mathbf p,f)
+    +n(\mathbf p,\boldsymbol\phi(f)[,\mathbf c]),\\
+\text{prior-input:}\quad
+\widehat{\mathbf s}_{\mathrm f}
+  &=n(\mathbf p,\boldsymbol\phi(f),\mathbf c(\mathbf p,f)).
+\end{aligned}
+$$
 
 The default is `residual`, which is the classic knowledge-based difference
 method: the fitted coarse DNN carries most of the physics and the KBNN learns
@@ -1520,12 +1546,12 @@ Examples:
 Available selectors:
 
 - `all` or `default`: every S-parameter
-- `diag`, `diagonal`, `return`, or `reflection`: `Sii`
-- `offdiag`, `off-diagonal`, or `transmission`: `Sij` where `i != j`
-- `upper`: all `Sij` where `i < j`
-- `lower`: all `Sij` where `i > j`
-- `rowN`, `outN`, or `outputN`: all `SNj`
-- `colN`, `columnN`, `inN`, or `inputN`: all `SiN`
+- `diag`, `diagonal`, `return`, or `reflection`: $S_{ii}$
+- `offdiag`, `off-diagonal`, or `transmission`: $S_{ij}$ where $i \ne j$
+- `upper`: all $S_{ij}$ where $i < j$
+- `lower`: all $S_{ij}$ where $i > j$
+- `rowN`, `outN`, or `outputN`: all $S_{Nj}$
+- `colN`, `columnN`, `inN`, or `inputN`: all $S_{iN}$
 - Wildcards such as `S1*` or `S*1`
 - Explicit groups such as `S11,S22,S33,S44`
 
@@ -1680,7 +1706,8 @@ python3 kbnn.py export-ads-ann \
 
 The default `--ads-ann-target native` preserves the KBNN formulation. In
 `residual` mode the ADS ANN output is `delta_S*`, so the final response is
-`coarse_S* + delta_S*`. Use `--ads-ann-target fine` when you want ADS ANN to
+$\mathbf S_{\mathrm{fine}}=\mathbf S_{\mathrm{coarse}}+\Delta\mathbf S$.
+Use `--ads-ann-target fine` when you want ADS ANN to
 emit final fine S-parameter outputs directly; that is simpler to consume in ADS
 but does not preserve the residual target that usually reduces sample count.
 
@@ -1730,17 +1757,19 @@ Schematic use:
    `.inc` file. For an SDD or equation-based wrapper, use the generated
    `.equation` file as the ANN equation source/reference.
 2. Feed the wrapper inputs from the `input_columns` in `ads_ann_manifest.json`.
-   For example, `freq_log10_hz` means the wrapper must pass `log10(freq_hz)`.
+   For example, `freq_log10_hz` means the wrapper must pass
+   $\log_{10}(f_{\mathrm{Hz}})$.
    If coarse S-parameter columns are listed as inputs, the wrapper must evaluate
    or instantiate the coarse circuit response at the same parameter/frequency
    point and pass those values into the ANN.
 3. For `--ads-ann-target fine`, interpret `output_columns` as final fine
    S-parameters. For the default native residual export, interpret
    `output_columns` as `delta_S*` and reconstruct
-   `fine_Sij = coarse_Sij + delta_Sij`.
+   $S_{ij,\mathrm{fine}}=S_{ij,\mathrm{coarse}}+\Delta S_{ij}$.
 4. Convert the final complex S-matrix to a circuit relation before driving the
-   schematic pins. For reference impedance `Z0`, use
-   `Y = (I - S) * inverse(I + S) / Z0`, then `Iport = Y * Vport`.
+   schematic pins. For reference impedance $Z_0$, use
+   $\mathbf Y=(\mathbf I-\mathbf S)(\mathbf I+\mathbf S)^{-1}/Z_0$, then
+   $\mathbf I_{\mathrm{port}}=\mathbf Y\mathbf V_{\mathrm{port}}$.
 5. Validate the wrapper in an S-parameter or AC simulation before circuit
    optimization.
 
@@ -1808,7 +1837,8 @@ python3 kbnn.py export-veriloga \
 The export writes `<module>.va`, `veriloga_manifest.json`, and
 `VERILOGA_README.md`. The generated module evaluates the neural network at the
 simulator frequency, reconstructs the complex S-matrix, converts it to
-admittance with `Y = (I - S) * inverse(I + S) / Z0`, and contributes the
+admittance with
+$\mathbf Y=(\mathbf I-\mathbf S)(\mathbf I+\mathbf S)^{-1}/Z_0$, and contributes the
 corresponding port currents. The model must contain a complete square
 S-parameter matrix, such as all 16 terms for a four-port.
 
@@ -1919,7 +1949,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--coarse-worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
 | <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable KBNN data/loss diagnostics and tracebacks. Sweeps also print the candidate list and retain per-trial debug output; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs for one fit or each sweep candidate. Early stopping may finish sooner. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses `log10(freq_hz)` and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
+| <nobr><code>--freq-transform {log,linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses $\log_{10}(f_{\mathrm{Hz}})$ and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
 | <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. | <nobr><code>--freq-transforms log,linear</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `64,64`; sweep default: `32;64;64,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 64,64</code></nobr> |
 | <nobr><code>--include-coarse-input</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | In `residual` mode, append coarse real/imaginary S-parameters to the NN input vector. This can improve accuracy if the correction depends strongly on the coarse response. Forced on for `prior-input` and off for `plain`. | <nobr><code>--include-coarse-input</code></nobr> |
@@ -1927,7 +1957,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam step size. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
 | <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | KBNN formulation. `residual` learns `fine - fitted_coarse_dnn`; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
+| <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | KBNN formulation. `residual` learns $\mathbf S_{\mathrm{fine}}-\widehat{\mathbf S}_{\mathrm{coarse}}$; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
 | <nobr><code>--modes LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated KBNN model modes. The singular `--mode` accepts one train-compatible value; `--mode-options` remains an alias. Default: `plain,residual,prior-input`. | <nobr><code>--modes residual,prior-input</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience in epochs for each candidate. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
 | <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
@@ -1970,12 +2000,12 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--allow-coarse-hooks</code></nobr> | <code>export-veriloga</code> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open fine-data DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected fine-data branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
-| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted fine-data DC resistor paths. If omitted, both components of every ordered complex fine-data DC Sij value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
+| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted fine-data DC resistor paths. If omitted, both components of every ordered complex fine-data DC $S_{ij}$ value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
 | <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used as the denominator for every geometry/process parameter before both the fine and coarse networks: `model_value = instance_value / scale`. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used before both fine and coarse networks: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
@@ -1987,9 +2017,13 @@ surrogate from parameterized S-parameter MDIF data.
 
 Model structure:
 
-```text
-geometry/process VARs -> small neural network -> rational TF coefficients -> S-parameters
-```
+$$
+\mathbf p
+\xrightarrow{\mathrm{MLP}}
+\widehat{\mathbf C}(\mathbf p)
+\xrightarrow{\text{fixed-pole rational basis}}
+\widehat{\mathbf S}(\mathbf p,f)
+$$
 
 The rational transfer functions use fixed stable poles, so coefficient
 extraction for each geometry is linear least squares. The neural network then
@@ -2178,9 +2212,17 @@ python3 neuro_tf.py export-veriloga \
   --parameter-input-scales 1.0
 ```
 
-The generated module evaluates the neural coefficient map, constructs each
-S-parameter from `c0 + sum(c_k / (j*f/f_scale - pole_k))`, converts the complete
-S-matrix to Y, and stamps the small-signal port currents. It requires no Python
+The generated module evaluates the neural coefficient map and constructs each
+S-parameter as
+
+$$
+S_{ij}(\mathbf p,f)
+=c_{ij,0}(\mathbf p)
++\sum_k\frac{c_{ij,k}(\mathbf p)}{j f/f_{\mathrm{scale}}-p_k},
+$$
+
+then converts the complete S-matrix to Y and stamps the small-signal port
+currents. It requires no Python
 runtime or MDIF table in ADS. The package contains `<module>.va`,
 `veriloga_manifest.json`, and `VERILOGA_README.md`.
 
@@ -2288,10 +2330,926 @@ the **Subcommands** column includes accepted command aliases.
 | --- | --- | --- | --- |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
-| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, both components of every ordered complex DC Sij value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
+| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, both components of every ordered complex DC $S_{ij}$ value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |
 | <nobr><code>--parameter-grid SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Explicit grid for one model parameter. Repeat once per parameter; requires `--freqs`. | <nobr><code>--parameter-grid W=0.4mm:0.8mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used as the denominator for every geometry/process parameter: `model_value = instance_value / scale`. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used for every geometry/process parameter: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
+
+## Appendix A: Exact-DC Extraction and Export Method
+
+This appendix describes the complete exact-DC data path shared by DNN, KBNN,
+and Neuro-TF models. The DC model is intentionally independent of the RF model:
+it has its own samples, scaler, neural-network weights, training history,
+validation metrics, and saved files. An exact-zero-Hz MDIF row never contributes
+to the positive-frequency RF loss, while a positive-frequency row is never used
+as a substitute for DC.
+
+### A.1 End-to-end data flow
+
+For each geometry, the implementation follows this sequence:
+
+1. Split the MDIF blocks into training and verification geometries.
+2. Copy only rows with $f>0$ into the RF fitting data.
+3. Inspect rows with $f=0$ separately for DC extraction.
+4. Reject non-finite and non-passive zero-Hz matrices.
+5. Form one exact-DC target per usable geometry.
+6. Fit a geometry-only DC MLP independently from the RF network.
+7. Save the DC model as `dc_model.npz` and `dc_model.json`, with its optimizer
+   history in `dc_training_history.csv`.
+8. At prediction or export, select the DC model only at exactly zero Hz and the
+   RF model only at nonzero frequency.
+
+The same separation applies to all three model families. In particular, a KBNN
+extracts its DC target exclusively from the **fine-data MDIF**. Its fitted or
+integrated coarse model participates in the positive-frequency KBNN response,
+but does not supply, modify, or regularize the DC target.
+
+Frequency weights and S-parameter weights apply to RF fitting only. They do not
+change zero-Hz row selection, DC passivity filtering, or DC-model loss.
+
+### A.2 Selecting usable exact-DC samples
+
+The extractor requires a complete ordered N-port S-matrix ($S_{11}$ through
+$S_{NN}$) and the reference impedance $Z_0$ used by the command. It applies the
+following rules independently to each ACDATA block:
+
+- A DC row must have a numeric frequency exactly equal to `0.0` Hz. The lowest
+  positive frequency is not treated as DC and the RF model is not extrapolated.
+- Every DC-training block must contain at least one exact-zero-Hz row. Missing
+  rows are reported using one-based ACDATA block positions.
+- A verification block may omit DC. Such a block remains available for RF
+  verification but is excluded from DC verification.
+- Every element of the zero-Hz S-matrix must be finite.
+- The matrix must pass the singular-value test
+  $\max_k\sigma_k(\mathbf S)\leq 1+10^{-6}$. Rows that fail this test are considered
+  non-passive and are ignored.
+- If a block contains multiple usable zero-Hz rows, their complex S-matrices are
+  averaged component by component to create one DC target for that geometry.
+- A block with zero-Hz rows but no usable row is excluded from the DC data. The
+  fit fails only if no usable passive DC geometries remain. A training block
+  with no zero-Hz row at all remains an error because that usually indicates an
+  incomplete dataset rather than a deliberately filtered measurement.
+
+When `--dc-mdif` points to a combined training/verification MDIF, the exporter
+reuses the saved `--split-var`, `--train-values`, and `--verify-values` settings.
+Only the training split is eligible for export-time DC fitting; verification
+data is not silently added to the optimizer.
+
+### A.3 Default unrestricted full-complex-S extraction
+
+When `--dc-port-paths` is omitted, the extractor does not infer a resistor
+network. Instead, it preserves every ordered complex S-parameter directly. For
+an N-port model, the DC MLP has $2N^2$ outputs:
+
+```text
+S11.real, S12.real, ..., SNN.real,
+S11.imag, S12.imag, ..., SNN.imag
+```
+
+The matrices are flattened in row-major order. The real components are stored
+first and the imaginary components second. For example, a four-port DC model
+contains all 16 ordered S-parameters and therefore has 32 scalar outputs.
+
+Let $\mathbf p$ be the vector of geometry/process parameters. The model
+evaluates
+
+$$
+\begin{aligned}
+\widetilde{\mathbf p}
+  &=\frac{\mathbf p-\boldsymbol\mu_p}{\boldsymbol\sigma_p},\\
+\widetilde{\mathbf s}
+  &=\operatorname{MLP}(\widetilde{\mathbf p}),\\
+\mathbf s_{\mathrm{components}}
+  &=\widetilde{\mathbf s}\odot\boldsymbol\sigma_s+\boldsymbol\mu_s,\\
+\mathbf S_{\mathrm{DC}}
+  &=\operatorname{reshape}
+    (\mathbf s_{\mathrm{real}}+j\mathbf s_{\mathrm{imag}},N,N).
+\end{aligned}
+$$
+
+Input and output standardizers are fitted only from DC-training geometries. If
+an output component is constant across those geometries, its stored output
+scale is set to zero so the constant is reproduced exactly instead of depending
+on neural-network convergence.
+
+This default representation deliberately imposes none of the following:
+
+- reciprocity ($S_{ij}$ need not equal $S_{ji}$);
+- a real-only admittance approximation;
+- a resistor-graph topology;
+- a projection onto a subset of port paths.
+
+Consequently, `dc_port_paths: []` means **unrestricted full-S extraction**. It
+does not mean that no DC entries were created. The complete ordered entries are
+listed in `dc_sparameter_entries`, and their real/imaginary components are
+listed in `dc_matrix_entries`.
+
+When an electrical admittance representation is required, the predicted matrix
+is converted using
+
+$$
+\mathbf Y_{\mathrm{DC}}
+=\frac{1}{Z_0}
+(\mathbf I-\mathbf S_{\mathrm{DC}})
+(\mathbf I+\mathbf S_{\mathrm{DC}})^{-1}.
+$$
+
+The implementation solves the equivalent complex linear system rather than
+forming the inverse explicitly. A singular or nearly singular relation uses
+the exporter's guarded matrix-solve behavior.
+
+Passivity filtering is applied to the supplied zero-Hz rows, but the MLP itself
+is not a constrained passive-network fit. Interpolated geometries should
+therefore still be checked using the saved validation metrics or a sampled-MDIF
+comparison.
+
+### A.4 Explicit resistor-path extraction
+
+Supplying `--dc-port-paths` selects a different, intentionally restricted
+model. For example:
+
+```text
+--dc-port-paths 1-2,3-ground
+```
+
+declares one resistor between ports 1 and 2 and another from port 3 to the
+simulator reference. Undeclared DC paths remain open.
+
+For each usable exact-DC S-matrix, the extractor first computes
+
+$$
+\mathbf Y_{\mathrm{measured}}
+=\frac{1}{Z_0}
+(\mathbf I-\mathbf S_{\mathrm{DC}})
+(\mathbf I+\mathbf S_{\mathrm{DC}})^{-1}.
+$$
+
+It then takes the real symmetric target
+
+$$
+\mathbf Y_{\mathrm{target}}
+=\operatorname{Re}\!\left(
+\frac{\mathbf Y_{\mathrm{measured}}
+      +\mathbf Y_{\mathrm{measured}}^{\mathsf T}}{2}
+\right).
+$$
+
+and solves a non-negative least-squares problem for the declared branch
+conductances. A branch of conductance $g$ between ports $i$ and $j$ contributes
+$+g$ to $Y_{ii}$ and $Y_{jj}$, and $-g$ to $Y_{ij}$ and $Y_{ji}$. A
+port-to-ground branch contributes $+g$ only to its diagonal entry. This construction guarantees a
+real, reciprocal, non-negative resistor graph, but it cannot represent a
+general complex or nonreciprocal DC S-matrix.
+
+After projection:
+
+- conductance below the reciprocal of `--dc-open-threshold` is classified as open;
+- an open branch is represented by the reciprocal of `--dc-open-resistance` so the exported
+  model remains finite;
+- repeated usable zero-Hz rows in one block are averaged in conductance space;
+- the MLP fits the natural logarithm of each branch conductance, which preserves
+  positive conductance after interpolation;
+- constant path outputs use their stored mean exactly.
+
+The projected network is converted back to S and compared with the supplied
+matrix. `dc_topology_s_rmse` and `dc_topology_s_max_abs_error` quantify error
+introduced by the selected topology before considering neural interpolation.
+An explicit-path export stops when its final maximum absolute S error exceeds
+$10^{-3}$, because continuing would claim that the declared physical graph matches
+data it cannot reproduce.
+
+For a two-port `--dc-port-paths 1-2` model, the only available admittance is
+
+$$
+\mathbf Y_{\mathrm{DC}}
+=\begin{bmatrix}
+g & -g\\
+-g & g
+\end{bmatrix}.
+$$
+
+so it cannot independently reproduce all four ordered S-parameters. Use the
+default unrestricted mode unless this physical restriction is intentional.
+
+### A.5 DC fitting and saved artifacts
+
+Normal `train`, `sweep`, and `optimize` operations fit the DC MLP alongside the
+RF model, but the two optimizations remain numerically separate. The DC network
+uses the command's geometry parameter list, hidden-layer layout, activation,
+epoch count, batch size, learning rate, patience, seed, loss interval, and
+progress interval. It does not receive frequency, RF response samples, KBNN
+coarse responses, or RF loss weights as inputs.
+
+The model directory contains:
+
+| File | Purpose |
+| --- | --- |
+| `dc_model.npz` | DC input/output scalers and MLP weights and biases. |
+| `dc_model.json` | Representation, matrix/path ordering, reference impedance, extraction counts, fit metrics, and topology metadata. |
+| `dc_training_history.csv` | Independent DC training and verification loss history. |
+
+The RF model does not need to be refitted when only the DC representation is
+updated. This is why `--dc-mdif` can upgrade an older model during export.
+
+### A.6 Export-time validation and legacy upgrades
+
+Without `--dc-mdif`, a current saved `full_s_matrix` DC model is embedded or
+sampled directly. If a saved model uses the former lossy full-Y or automatically
+inferred path representation, the exporter requires the original MDIF so it can
+reconstruct information that is not present in the old saved model:
+
+```bash
+python3 dnn.py export-veriloga \
+  --model-dir dnn_model \
+  --out-dir dnn_model/veriloga_export \
+  --dc-mdif training_with_dc.mdif
+```
+
+When `--dc-mdif` is supplied, the exporter first validates a compatible saved
+DC model directly against every usable exact-zero-Hz training row. A maximum
+absolute S error at or below $10^{-4}$ reuses the saved model. Otherwise, only the
+DC network is fitted again; RF weights, poles, KBNN coarse models, and
+positive-frequency predictions remain unchanged.
+
+For an unrestricted export-only refit, the implementation uses two hidden
+layers whose width is at least $\max(64,4P,2L)$, where $P$ is the parameter
+count and $L$ is the S-parameter count, up to 8000 epochs, and early-stopping
+patience of 800.
+This larger budget is used because a full N-port model has $2N^2$ outputs.
+The preferred final maximum absolute S error is $10^{-3}$. Exceeding it sets
+`dc_mdif_match_within_tolerance: false` and records `dc_mdif_warning`, but does
+not stop an unrestricted export because every ordered complex component is
+still represented and no topology projection has discarded entries.
+
+For an explicit-path export-only refit, the implementation uses up to 4000
+epochs and patience of 400. Error above $10^{-3}$ stops the export because it
+indicates that the declared resistor graph cannot reproduce the data.
+
+The `dc_mdif_action` manifest value records whether the exporter used
+`validated_saved_dc_model` or `fitted_dc_only_model`.
+
+### A.7 Behavior of each export target
+
+#### Sampled ADS MDIF
+
+Each exported geometry receives an exact-zero-Hz row if its sampling grid does
+not already contain one. The DC MLP supplies every S-parameter on that row.
+Every positive-frequency row comes only from the RF surrogate. This format is
+the most direct way to compare the extracted DC S-matrix numerically with the
+source MDIF.
+
+#### ADS harmonic-balance network
+
+The generated SDD equations evaluate the geometry-only DC MLP at the
+zero-frequency spectral component. In unrestricted mode, the complete complex
+S matrix is converted to Y for the port-current equations. Positive spectral
+frequencies use the RF model, and negative-frequency weights use the conjugate
+of the corresponding positive-frequency response. The DC and RF models are
+therefore part of one instantiated ADS component without sharing fitted data.
+
+#### Verilog-A
+
+The generated module evaluates the DC MLP when the simulator frequency
+expression is exactly zero. In unrestricted mode it reconstructs
+$\mathbf S_{\mathrm{DC}}$, solves
+the complex S-to-Y relation, and selects that Y matrix before stamping port
+currents. At positive frequency it selects the RF-derived Y matrix instead.
+
+The current contribution is structurally unconditional:
+
+$$
+\mathbf I_{\mathrm{port}}
+\mathrel{+}=
+\operatorname{Re}(\mathbf Y)\mathbf V_{\mathrm{port}}
++\frac{\operatorname{Im}(\mathbf Y)}{\omega}
+\operatorname{ddt}(\mathbf V_{\mathrm{port}}).
+$$
+
+Only the coefficient selection is conditional. Keeping `ddt()` outside the
+frequency `if` statement avoids the ADS compiler error "Analog operators are
+forbidden in this context."
+
+The imaginary-admittance term is an AC/S-parameter representation, not a
+static DC conductance. At a true DC operating point `ddt(V)` is zero. If an
+exact-zero-Hz dataset contains a materially imaginary DC response, use the
+sampled MDIF or ADS HB export for a direct complex-S comparison and treat the
+Verilog-A DC-bias result as the real static network behavior.
+
+### A.8 Diagnostics recorded in reports and manifests
+
+The following fields are the primary audit trail for DC extraction:
+
+| Field | Meaning |
+| --- | --- |
+| `dc_model_representation` | `full_s_matrix` for unrestricted extraction or `path_conductance` for an explicit resistor graph. |
+| `dc_sparameter_entries` | Every ordered S-parameter represented by the unrestricted model. |
+| `dc_matrix_entries` | Ordered scalar outputs, including `.real` and `.imag`. |
+| `dc_port_paths` | Canonical explicit paths. An empty list is expected for unrestricted full-S extraction. |
+| `dc_usable_block_positions` | One-based source ACDATA positions used to form DC samples. |
+| `dc_missing_block_positions` | Training blocks with no exact-zero-Hz row. |
+| `dc_unusable_block_positions` | Blocks with zero-Hz rows but no finite passive row. |
+| `dc_ignored_nonpassive_count` | Exact-zero-Hz rows rejected by the singular-value passivity test. |
+| `dc_ignored_nonfinite_count` | Exact-zero-Hz rows rejected for non-finite data or an invalid matrix decomposition. |
+| `dc_model_train_s_max_abs_error` | Worst S-parameter error on fitted DC-training geometries. |
+| `dc_model_verify_s_max_abs_error` | Worst S-parameter error on usable DC-verification geometries. |
+| `dc_topology_s_max_abs_error` | Error caused by explicit resistor-graph projection before neural interpolation; zero for unrestricted full-S extraction. |
+| `dc_mdif_model_s_max_abs_error` | Direct error against usable exact-DC rows supplied through `--dc-mdif`. |
+| `dc_mdif_match_within_tolerance` | Whether export validation met the preferred final tolerance. |
+| `dc_mdif_warning` | Non-fatal unrestricted interpolation warning retained in the export manifest. |
+
+For unrestricted extraction, inspect `dc_sparameter_entries` and
+`dc_matrix_entries` first. For an explicit resistor model, inspect
+`dc_port_paths` and `dc_topology_s_max_abs_error` first. These distinguish
+neural interpolation error from a topology that is incapable of representing
+the supplied S-matrix.
+
+### A.9 Failure conditions and recommended response
+
+| Failure | Meaning | Recommended response |
+| --- | --- | --- |
+| Missing exact-zero-Hz training block | A training geometry has RF rows but no true DC row. | Add a `0 Hz` row for that geometry; do not substitute the lowest RF point. |
+| No usable passive exact-zero-Hz rows | Every available DC row was non-finite or failed passivity. | Correct the source data or provide a dataset with at least one passive DC geometry. |
+| Legacy lossy representation | The saved model predates full-complex-S extraction. | Re-export once with `--dc-mdif` pointing to the original training data. |
+| Explicit topology exceeds $10^{-3}$ | The selected resistor graph cannot reproduce the supplied matrix closely enough. | Correct `--dc-port-paths` or omit it to use unrestricted full-S extraction. |
+| Unrestricted fit exceeds $10^{-3}$ | The full-S MLP interpolation missed the preferred tolerance, but no matrix entries were discarded. | Review `dc_mdif_warning`, add DC geometries, or retrain with a larger/smoother parameter sampling plan; export is still produced. |
+| Incomplete `dc_model.npz` / `dc_model.json` pair | Only part of the saved DC model is present. | Restore both files or regenerate the model/export from the source MDIF. |
+
+## Appendix B: DNN, KBNN, and Neuro-TF Implementation
+
+This appendix documents the implementation in this repository, including the
+model equations, sample construction, optimization, persistence, and simulator
+translation. The names DNN, KBNN, and Neuro-TF describe broad families of
+methods in the literature; the equations below define the precise variants
+implemented here. Appendix A separately documents the exact-DC network that is
+attached to every family.
+
+### B.1 Shared data model and notation
+
+An MDIF ACDATA block represents one geometry or process point. Let
+
+- $\mathbf p=[p_1,\ldots,p_P]$ be the selected numeric geometry/process `VAR` values;
+- $f$ be frequency in Hz;
+- $\mathbf S(\mathbf p,f)$ be the complex N-port scattering matrix;
+- $L$ be the number of common ordered S-parameter labels ($L=N^2$ for the
+  complete matrices required by direct N-port export);
+- $\mathbf s(\mathbf p,f)$ be the row-major vector
+  $[S_{11},S_{12},\ldots,S_{NN}]$;
+- $\mathcal R(\mathbf v)=[\operatorname{Re}(\mathbf v),\operatorname{Im}(\mathbf v)]$
+  be the real-column representation of a complex vector, with all real entries
+  followed by all imaginary entries.
+
+The parser finds S-parameter labels common to all selected blocks, orders them
+by port indices, and infers numeric parameters common to the blocks unless
+`--parameter-names` fixes the names and order. Direct N-port exports require a
+complete matrix with contiguous port numbers.
+
+The split variable is evaluated per block, not per frequency row. Values named
+by `--train-values` and `--verify-values` select the two sets. If no explicit
+training values are found, a seeded random block holdout is used. Keeping an
+entire geometry in one split prevents different frequencies of the same
+geometry from leaking between training and verification.
+
+All three RF implementations retain only $f>0$ when constructing their RF
+training arrays. Exact DC is handled only by Appendix A's independent
+geometry-only model.
+
+### B.2 Shared neural-network engine
+
+Each learned map uses the same dense multilayer perceptron (MLP). For standardized
+input $\mathbf a_0$, hidden layer $\ell$ computes
+
+$$
+\begin{aligned}
+\mathbf z_\ell
+  &=\mathbf a_{\ell-1}\mathbf W_\ell+\mathbf b_\ell,\\
+\mathbf a_\ell
+  &=\varphi(\mathbf z_\ell).
+\end{aligned}
+$$
+
+and the final layer is linear. Supported hidden activations are `tanh` and
+ReLU. For layer fan-in $n_{\mathrm{in}}$ and fan-out $n_{\mathrm{out}}$,
+weights are initialized uniformly over
+
+$$
+\left[
+-\sqrt{\frac{6}{n_{\mathrm{in}}+n_{\mathrm{out}}}},
++\sqrt{\frac{6}{n_{\mathrm{in}}+n_{\mathrm{out}}}}
+\right]
+$$
+
+and biases start at zero. This is the Glorot/Xavier uniform initialization.
+
+Each input or target column is standardized as
+
+$$
+\widetilde x=\frac{x-\mu_{x,\mathrm{train}}}{\sigma_{x,\mathrm{train}}}
+$$
+
+using training data only. Predictions are inverse-transformed after the final
+linear layer. Near-constant direct-response output columns use the median
+standard deviation of the varying columns as a numerical floor; the original
+mean is retained.
+
+Training uses shuffled mini-batches and Adam with $\beta_1=0.9$,
+$\beta_2=0.999$, and $\epsilon=10^{-8}$. The implementation stores the parameters with the
+lowest checked verification loss and restores them after training. When no
+verification data exists, checked training loss is used. `--loss-interval`
+controls how often the complete datasets are evaluated, and `--patience` is
+the number of epochs since the best checked epoch before early stopping.
+
+For DNN and KBNN, the scaled-domain training objective is a weighted mean
+squared error. If sample $k$ is at frequency $f_k$, output column $q$ belongs to
+S-parameter $\ell(q)$, and $e_{kq}$ is the scaled prediction error, the reported
+objective is
+
+$$
+\mathcal L
+=\frac{1}{KQ}
+\sum_{k=1}^{K}\sum_{q=1}^{Q}
+w_f(f_k)\,w_s(\ell(q))\,e_{kq}^2.
+$$
+
+The same S-parameter weight is applied to the real and imaginary columns.
+Raw S-parameter weights are normalized to mean one over S-parameters. Raw
+frequency weights are normalized to mean one over RF training rows. This keeps
+the average gradient scale roughly unchanged when relative priorities change.
+Zero weights are permitted as long as at least one weight remains positive.
+
+Neuro-TF uses frequency weights in the per-geometry rational least-squares
+stage described below. Its neural coefficient map then uses unweighted scaled
+coefficient MSE; the coefficient targets have already changed in response to
+the frequency weighting.
+
+### B.3 DNN: direct response surrogate
+
+#### Architecture
+
+The DNN learns the RF response directly as a function of parameters and
+frequency:
+
+$$
+\begin{aligned}
+\mathbf x(\mathbf p,f)&=[\mathbf p,\boldsymbol\phi(f)],\\
+\mathcal R(\widehat{\mathbf r}(\mathbf p,f))
+&=\operatorname{inverse\_scale}\!\left(
+  \operatorname{MLP}(\operatorname{scale}(\mathbf x(\mathbf p,f)))
+  \right).
+\end{aligned}
+$$
+
+The frequency feature $\boldsymbol\phi(f)$ is selected by `--freq-transform`:
+
+| Transform | Feature columns |
+| --- | --- |
+| `log` | $[\log_{10}(\max(f,1\,\mathrm{Hz}))]$ |
+| `linear` | $[f]$ |
+| `log-linear` | $[\log_{10}(\max(f,1\,\mathrm{Hz})),f]$ |
+
+Because RF construction has already removed zero-Hz rows, the 1-Hz clamp is a
+numerical guard and does not create a fitted DC point.
+
+Each frequency row is one neural-training sample. A block containing $F$
+positive frequencies produces $F$ samples with the same parameter values and
+different frequency features. For an N-port S-domain model, the output layer
+has $2N^2$ values.
+
+#### S-domain and Y-domain targets
+
+With the default `--output-domain s`, the target is
+$\mathcal R(\mathbf s(\mathbf p,f))$. With
+`--output-domain y`, each complete S-matrix is converted before training:
+
+$$
+\mathbf Y
+=\frac{1}{Z_0}(\mathbf I-\mathbf S)(\mathbf I+\mathbf S)^{-1}
+$$
+
+and the target is the ordered real/imaginary Y vector. Prediction converts Y
+back to S with
+
+$$
+\mathbf S
+=(\mathbf I-Z_0\mathbf Y)(\mathbf I+Z_0\mathbf Y)^{-1}.
+$$
+
+The implementation solves the transposed matrix relation with `numpy.linalg.solve`
+and falls back to a pseudoinverse when the system is singular. A Y-domain
+model fixes its reference impedance through `--target-z0`; export must use the
+same value.
+
+#### Consequences
+
+The DNN has no rational frequency structure and no coarse prior. It can model
+arbitrary smooth response shapes represented by the data, but frequency and
+geometry interpolation are learned simultaneously. It therefore commonly
+needs more full-wave geometries than KBNN when a useful coarse model exists,
+and it offers less structural frequency regularization than Neuro-TF. No RF
+passivity or reciprocity constraint is embedded in the loss; these properties
+are measured on predictions and may be required during sweep selection.
+
+#### Persistence and inference
+
+`model.npz` stores input/output means and standard deviations plus every
+$\mathbf W_\ell$ and $\mathbf b_\ell$. `metadata.json` stores layer sizes, activation, parameter and
+S-parameter ordering, frequency transform, output domain, reference impedance,
+training configuration, and metrics. Prediction reconstructs the exact saved
+MLP and scalers; it does not retrain.
+
+### B.4 KBNN: fitted-coarse knowledge-based surrogate
+
+#### Coarse model contract
+
+This repository's KBNN uses a **frozen S-domain DNN** as prior knowledge. It
+does not feed raw coarse MDIF samples directly into fine fitting. When
+`--coarse-mdif` is provided, the command first trains a standalone coarse DNN,
+saves it under the KBNN output, reloads it, and evaluates it on the fine-model
+geometry/frequency grids. `--coarse-model-dir` reuses an already fitted DNN.
+
+The frozen coarse model must have the same parameter names and order, complete
+S-parameter labels and order, and S-domain output as the KBNN. Its model and
+metadata SHA-256 hashes are recorded. Prediction and self-contained export
+verify those hashes, preventing an accidentally different coarse model from
+being substituted after KBNN fitting.
+
+This design makes the KBNN optimize against the same fitted coarse
+response that will be embedded in the final Verilog-A or ADS HB component. It
+avoids training against exact coarse samples and later deploying a separately
+fitted approximation of those samples.
+
+#### Alignment
+
+During normal KBNN fitting, the frozen coarse DNN is evaluated directly at each
+fine geometry and each fine positive frequency. No raw coarse-MDIF frequency
+interpolation occurs in the fine-model optimizer. This is the
+deployment-matched path used by self-contained Verilog-A and ADS HB export.
+
+The separate native ADS ANN handoff can instead accept coarse MDIF response
+blocks. In that path, fine and coarse blocks are matched using the ordered
+parameter tuple rounded to 15 decimal places, and coarse responses are linearly
+interpolated onto the fine positive-frequency grid. If the lists already match
+one-to-one in parameter order, that fast path is used. Missing geometry matches
+are errors.
+
+#### Implemented modes
+
+Let $\mathbf c(\mathbf p,f)$ be the complex response predicted by the frozen
+coarse DNN, and let $n(\cdot)$ denote the KBNN MLP after scaling and inverse
+scaling.
+
+| Mode | MLP input | MLP target | Final prediction |
+| --- | --- | --- | --- |
+| `plain` | $[\mathbf p,\boldsymbol\phi(f)]$ | $\mathcal R(\mathbf s_{\mathrm{fine}})$ | $n(\mathbf p,f)$ |
+| `residual`, coarse input off | $[\mathbf p,\boldsymbol\phi(f)]$ | $\mathcal R(\mathbf s_{\mathrm{fine}}-\mathbf c)$ | $\mathbf c+n(\mathbf p,f)$ |
+| `residual`, coarse input on | $[\mathbf p,\boldsymbol\phi(f),\mathcal R(\mathbf c)]$ | $\mathcal R(\mathbf s_{\mathrm{fine}}-\mathbf c)$ | $\mathbf c+n(\mathbf p,f,\mathbf c)$ |
+| `prior-input` | $[\mathbf p,\boldsymbol\phi(f),\mathcal R(\mathbf c)]$ | $\mathcal R(\mathbf s_{\mathrm{fine}})$ | $n(\mathbf p,f,\mathbf c)$ |
+
+`prior-input` always enables coarse-response input. `plain` always disables
+it. Residual mode can optionally include the coarse response as input in
+addition to adding it at the output.
+
+The residual target is computed from the **fitted coarse DNN prediction**:
+
+$$
+\boldsymbol\Delta_{\mathrm{target}}(\mathbf p,f)
+=\mathbf s_{\mathrm{fine}}(\mathbf p,f)
+-\mathbf c_{\mathrm{fitted}}(\mathbf p,f).
+$$
+
+not from the original coarse MDIF value. Thus deployment evaluates
+
+$$
+\widehat{\mathbf s}(\mathbf p,f)
+=\mathbf c_{\mathrm{fitted}}(\mathbf p,f)
++\widehat{\boldsymbol\Delta}(\mathbf p,f).
+$$
+
+using exactly the same coarse-model definition used to create the training
+target.
+
+The KBNN output scaler is fitted to either fine S or delta S according to the
+mode. Real and imaginary values remain separate scalar outputs. Frequency and
+S-parameter weights are applied to the KBNN objective. When a coarse DNN is
+trained by the same command, it inherits those weights unless corresponding
+`--coarse-*` options override them.
+
+#### Coarse versus fine DC
+
+The frozen coarse DNN is evaluated only on positive-frequency fine grids during
+KBNN RF fitting. The KBNN's distinct DC model is extracted solely from exact
+zero-Hz rows in the fine-data MDIF. At zero Hz, the KBNN and coarse RF DNN are
+bypassed; Appendix A's fine-data DC model supplies the response.
+
+#### Persistence and self-contained export
+
+The fine KBNN MLP is saved in the standard `model.npz` and `metadata.json`
+files. A KBNN created from `--coarse-mdif` also packages the fitted coarse DNN
+and records its relative location and identity hashes. Direct Verilog-A and ADS
+HB export embed both evaluators when the mode requires coarse knowledge:
+
+1. evaluate the frozen coarse DNN from instance parameters and frequency;
+2. feed its complex response into the KBNN when configured;
+3. evaluate the fine or residual KBNN;
+4. add the coarse response for residual mode;
+5. convert the final complete S-matrix to Y and stamp the ports.
+
+Legacy editable coarse hooks are available only when explicitly requested and
+are not equivalent to the normal self-contained path.
+
+#### Relation to published KBNN methods
+
+Published KBNN and neuro-space-mapping work incorporates empirical,
+semi-analytical, equivalent-circuit, or other coarse knowledge into a neural
+model. This repository implements a pragmatic response-domain specialization:
+a fitted coarse S-parameter DNN is frozen and used as a residual baseline
+and/or prior input. It does not implement every internal knowledge neuron or
+input/output space-mapping topology described in the literature.
+
+### B.5 Neuro-TF: fixed-pole rational coefficient surrogate
+
+#### Two-stage construction
+
+Neuro-TF separates frequency representation from geometry interpolation:
+
+1. fit one rational response at every training geometry using a common fixed
+   pole set;
+2. train an MLP from geometry parameters to the real and imaginary rational
+   coefficients.
+
+This differs from the DNN, which treats every $(\mathbf p,f)$ row as a neural sample.
+A Neuro-TF geometry contributes one neural sample regardless of its frequency
+count.
+
+#### Frequency normalization and fixed poles
+
+From all positive training frequencies, the implementation computes
+
+$$
+\begin{aligned}
+f_{\mathrm{scale}}&=\sqrt{f_{\min}f_{\max}},\\
+x_{\min}&=\frac{f_{\min}}{f_{\mathrm{scale}}},\\
+x_{\max}&=\frac{f_{\max}}{f_{\mathrm{scale}}},\\
+s&=j\frac{f}{f_{\mathrm{scale}}}.
+\end{aligned}
+$$
+
+For $K$ requested poles, $\lfloor K/2\rfloor$ logarithmically spaced center
+frequencies cover $0.75x_{\min}$ through $1.25x_{\max}$. Each center $\omega_k$ produces a
+conjugate pair
+
+$$
+p_{k,\pm}=-d\,\omega_k\pm j\omega_k,
+$$
+
+where $d$ is the configured pole damping. If $K$ is odd, the last pole is the
+real negative pole
+
+$$
+p_{\mathrm{last}}=-\sqrt{x_{\min}x_{\max}}.
+$$
+
+Every pole has a negative real part for a positive damping value, giving a
+stable fixed basis. Poles are shared by all geometries and all S-parameters;
+the MLP predicts coefficients, not pole locations.
+
+#### Per-geometry coefficient extraction
+
+The rational basis is
+
+$$
+\mathbf B(f)=
+\left[1,\frac{1}{s-p_1},\ldots,\frac{1}{s-p_K}\right]
+$$
+
+and each ordered S-parameter is represented as
+
+$$
+S_{ij}(\mathbf p,f)
+=c_{ij,0}(\mathbf p)
++\sum_{k=1}^{K}
+\frac{c_{ij,k}(\mathbf p)}{j f/f_{\mathrm{scale}}-p_k}.
+$$
+
+For each geometry and S-parameter, coefficients solve the complex weighted
+ridge least-squares problem
+
+$$
+\widehat{\mathbf c}
+=\underset{\mathbf c}{\operatorname{arg\,min}}
+\left\|
+\mathbf W_f^{1/2}(\mathbf B\mathbf c-\mathbf s_{\mathrm{sample}})
+\right\|_2^2
++\lambda\|\mathbf c\|_2^2.
+$$
+
+using `numpy.linalg.lstsq`. The regularization is implemented by appending
+$\sqrt{\lambda}\mathbf I$ and a zero right-hand side. `--frequency-weights` therefore
+changes the extracted coefficient targets themselves. Coefficient extraction
+uses positive frequencies only.
+
+Each geometry's coefficient matrices are flattened by S-parameter, with the
+constant coefficient followed by its pole coefficients. All real coefficients
+are concatenated before all imaginary coefficients. For $L$ ordered
+S-parameters and $K$ poles, the neural target dimension is $2L(K+1)$.
+
+#### Geometry-to-coefficient MLP and evaluation
+
+The neural map is
+
+$$
+\mathcal R(\mathbf C(\mathbf p))
+=\operatorname{inverse\_scale}\!\left(
+\operatorname{MLP}(\operatorname{scale}(\mathbf p))
+\right).
+$$
+
+Frequency is not a neural input. At prediction, the coefficient row is
+unflattened and multiplied by the rational basis evaluated at each requested
+frequency. This makes evaluation on a new frequency grid inexpensive and keeps
+the geometry-to-network map lower dimensional than direct row-wise regression
+when many frequency samples are present.
+
+#### Important implementation boundaries
+
+- The pole set is generated once from the training band; this implementation
+  does not relocate poles with vector fitting.
+- Pole tracking across geometries is unnecessary because poles are fixed.
+- The common pole basis provides stable denominators, but arbitrary learned
+  complex coefficients do not by themselves guarantee passivity, reciprocity,
+  real-time conjugate symmetry, or a minimal realization.
+- Accuracy is determined jointly by rational order, pole damping, frequency
+  weighting, ridge regularization, geometry coverage, and MLP capacity.
+- Direct export evaluates the fixed-pole equation; it does not sample and
+  interpolate a hidden lookup table.
+
+#### Persistence and export
+
+In addition to the normal MLP arrays, `model.npz` stores the real and imaginary
+parts of every pole and $f_{\mathrm{scale}}$. `metadata.json` stores the pole count,
+coefficient count per S-parameter, damping, ridge value, and fit configuration.
+Verilog-A and ADS HB exports evaluate the coefficient MLP, reconstruct the
+rational S-matrix at simulator frequency, convert it to Y, and stamp the same
+N-port relation used by the other families.
+
+This repository's method is best described as a **fixed-pole pole-residue
+Neuro-TF variant**. It is inspired by combined neural-network/transfer-function
+modeling, but it is not the pole-relocation, pole-tracking, hybrid
+pole-residue/rational, or sensitivity-assisted algorithm from any one cited
+paper.
+
+### B.6 Prediction, validation, and model selection
+
+All family predictions are converted to complex S-parameters before common
+verification metrics are calculated. Per-block and aggregate outputs include
+complex-magnitude RMSE, mean and maximum absolute error, EVM, and magnitude-dB
+error where both magnitudes exceed the numerical floor. Weighted metrics
+combine normalized S-parameter and frequency weights.
+
+Passivity diagnostics reconstruct the complete S-matrix at each evaluated
+point and compute its largest singular value. A point is counted as violating
+when that value exceeds $1+10^{-6}$. This is a diagnostic and sweep-selection
+constraint, not a projection or enforcement step. `--require-passive`,
+`--max-passivity-violations`, and `--max-passivity-sigma` control whether a
+sweep trial is eligible for promotion.
+
+Sweep/optimize candidates vary the family-specific and shared hyperparameters,
+train each candidate, and rank completed trials using the selected verification
+metric. The chosen model is a saved trained trial unless `--retrain-best`
+requests another fit with the winning configuration.
+
+### B.7 Direct circuit implementation
+
+The direct Verilog-A and ADS HB generators do not invoke Python during ADS
+simulation. They serialize numeric scalers, weights, biases, and—where
+applicable—coarse-model data or rational poles into simulator equations.
+
+For an S-domain RF prediction, all model families ultimately use
+
+$$
+\begin{aligned}
+\mathbf Y(f)
+  &=\frac{1}{Z_0}
+    (\mathbf I-\mathbf S(f))(\mathbf I+\mathbf S(f))^{-1},\\
+\mathbf I_{\mathrm{port}}(f)
+  &=\mathbf Y(f)\mathbf V_{\mathrm{port}}(f).
+\end{aligned}
+$$
+
+The generated Verilog-A performs a complex Gauss-Jordan solve with partial
+pivot selection and a small pivot floor. The ADS HB package generates explicit
+SDD frequency-domain current equations. Negative-frequency HB weights are the
+complex conjugate of their matching positive-frequency response, as required
+for real-valued time-domain port voltages and currents.
+
+These are linear parameterized N-port models: parameters change the network,
+but RF response is not a function of incident power. They can participate in a
+harmonic-balance circuit because the simulator evaluates the linear network at
+each spectral frequency; the models do not create compression or new
+harmonics.
+
+Parameter input scaling is applied before the saved training standardization:
+
+$$
+\begin{aligned}
+p_{\mathrm{model}}
+  &=\frac{p_{\mathrm{ADS\ instance}}}{p_{\mathrm{input\ scale}}},\\
+\widetilde p
+  &=\frac{p_{\mathrm{model}}-\mu_{p,\mathrm{saved}}}
+          {\sigma_{p,\mathrm{saved}}}.
+\end{aligned}
+$$
+
+Thus scaling changes the ADS unit convention without changing the fitted model.
+
+### B.8 Model-family comparison
+
+| Property | DNN | KBNN | Neuro-TF |
+| --- | --- | --- | --- |
+| Neural input | Parameters plus frequency features | Parameters, frequency features, and optionally fitted coarse S | Parameters only |
+| Neural target | Complex S or Y at each RF row | Fine complex S or fine-minus-fitted-coarse complex S | Complex rational coefficients per geometry |
+| RF neural samples per geometry | Number of positive-frequency rows | Number of positive-frequency rows | One |
+| Frequency structure | Learned directly | Learned directly around coarse knowledge | Fixed stable pole basis |
+| Prior model | None | Frozen fitted S-domain DNN | Fixed rational basis |
+| Typical strength | Maximum response flexibility | Efficient correction when useful coarse data exists | Compact broadband frequency representation |
+| Main risk | Data demand and unconstrained frequency interpolation | Bias or error inherited from coarse model and mode choice | Insufficient pole order/basis placement or nonsmooth coefficient map |
+| RF passivity enforcement | None | None | None |
+| Exact DC | Separate Appendix A model | Separate fine-data Appendix A model | Separate Appendix A model |
+
+### B.9 References and implementation provenance
+
+The references below motivate the model families or specific numerical
+building blocks. They are not claims that this repository exactly reproduces
+every algorithm in those publications.
+
+1. F. Wang and Q.-J. Zhang, “Knowledge-based neural models for microwave
+   design,” *IEEE Transactions on Microwave Theory and Techniques*, vol. 45,
+   no. 12, pp. 2333–2343, 1997.
+   [doi:10.1109/22.643839](https://doi.org/10.1109/22.643839). Foundational
+   microwave KBNN motivation: incorporate empirical or analytical prior
+   knowledge into a neural model.
+2. H. Kabir, Q.-J. Zhang, M. Yu, L. Zhang, P. H. Aaen, and J. Wood, “Smart
+   modeling of microwave devices,” *IEEE Microwave Magazine*, vol. 11, no. 3,
+   pp. 105–118, 2010.
+   [doi:10.1109/MMM.2010.936079](https://doi.org/10.1109/MMM.2010.936079).
+   Overview of neural, knowledge-based, and neuro-space-mapping approaches for
+   microwave modeling.
+3. Y. Cao, G. Wang, and Q.-J. Zhang, “A new training approach for parametric
+   modeling of microwave passive components using combined neural networks and
+   transfer functions,” *IEEE Transactions on Microwave Theory and Techniques*,
+   vol. 57, no. 11, pp. 2727–2742, 2009.
+   [doi:10.1109/TMTT.2009.2032476](https://doi.org/10.1109/TMTT.2009.2032476).
+   Establishes the geometry-to-transfer-function-coefficient modeling concept.
+4. F. Feng, C. Zhang, J. Ma, and Q.-J. Zhang, “Parametric modeling of EM
+   behavior of microwave components using combined neural networks and
+   pole-residue-based transfer functions,” *IEEE Transactions on Microwave
+   Theory and Techniques*, vol. 64, no. 1, pp. 60–77, 2016.
+   [doi:10.1109/TMTT.2015.2504099](https://doi.org/10.1109/TMTT.2015.2504099).
+   Pole-residue Neuro-TF background and the motivation for smooth parametric
+   coefficient representations.
+5. B. Gustavsen and A. Semlyen, “Rational approximation of frequency domain
+   responses by vector fitting,” *IEEE Transactions on Power Delivery*, vol.
+   14, no. 3, pp. 1052–1061, 1999.
+   [doi:10.1109/61.772353](https://doi.org/10.1109/61.772353). General rational
+   frequency-response fitting background. This repository uses fixed poles and
+   linear ridge least squares rather than vector-fitting pole relocation.
+6. X. Glorot and Y. Bengio, “Understanding the difficulty of training deep
+   feedforward neural networks,” *Proceedings of AISTATS*, PMLR 9, pp. 249–256,
+   2010. [PMLR paper](https://proceedings.mlr.press/v9/glorot10a.html).
+   Source for the uniform fan-in/fan-out initialization used by the MLP.
+7. D. P. Kingma and J. Ba, “Adam: A method for stochastic optimization,”
+   *International Conference on Learning Representations*, 2015.
+   [arXiv:1412.6980](https://arxiv.org/abs/1412.6980). Optimizer implemented by
+   the shared MLP engine.
+8. Keysight Technologies, *Using Circuit Simulators*, ADS 2011 documentation,
+   sections on MDIF/S2PMDIF `VAR` declarations and ACDATA blocks.
+   [Keysight PDF](https://edadownload.software.keysight.com/eedl/ads/2011_01/pdf/cktsim.pdf).
+   Format reference for multidimensional MDIF small-signal data.
+9. Keysight Technologies, *User-Defined Models*, ADS documentation, sections
+   on SDD equations and harmonic-balance frequency-domain evaluation.
+   [Keysight PDF](https://edadownload.software.keysight.com/eedl/ads/2009u1/pdf/modbuild.pdf).
+   Background for the generated linear ADS HB SDD packages.
+10. Keysight Technologies, *Guide to Harmonic Balance Simulation in ADS*.
+    [Keysight PDF](https://edadownload.software.keysight.com/eedl/ads/2011/pdf/adshbapp.pdf).
+    Harmonic-balance frequency-domain simulation background.
+
+The native ADS ANN export additionally follows the installed ADS 2026 Update
+2.1 examples and API pages listed in each generated `ADS_ANN_README.md`, most
+notably `doc/ann/examples/inmemory_extraction.py`. Those installed product files
+are the version-specific reference for `keysight.ads.ann`; the local exporter
+records their paths in `ads_ann_manifest.json`.
+
+### B.10 Normative source-code map
+
+The documentation above is explanatory; the following repository files are the
+normative implementation:
+
+| Area | Source |
+| --- | --- |
+| DNN features, S/Y targets, training, persistence, and commands | [`dnn.py`](dnn.py) |
+| KBNN coarse fitting, identity checks, modes, targets, and composite export | [`kbnn.py`](kbnn.py) |
+| Fixed-pole construction, rational coefficient extraction, and Neuro-TF evaluation | [`neuro_tf.py`](neuro_tf.py) |
+| MDIF parsing, splitting, weighting, MLP/Adam, metrics, exact DC, and simulator generators | [`surrogate_common.py`](surrogate_common.py) |
+| DC and export regression coverage | [`tests/test_dc_conductance_model.py`](tests/test_dc_conductance_model.py) and [`tests/test_ads_hb_export.py`](tests/test_ads_hb_export.py) |
