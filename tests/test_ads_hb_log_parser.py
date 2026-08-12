@@ -1,8 +1,10 @@
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from xml.etree import ElementTree
 
 from de_generated_scripts import parse_ads_hb_solver_log as PARSER
 
@@ -134,6 +136,35 @@ Iters Residual
             self.assertTrue((output / "ads_hb_solver_points.csv").is_file())
             self.assertTrue((output / "ads_hb_solver_summary.csv").is_file())
             self.assertTrue((output / "ads_hb_solver_summary.json").is_file())
+            report = (output / "ads_hb_solver_report.md").read_text()
+            self.assertIn("# ADS HB Solver Comparison", report)
+            self.assertIn("| baseline | 2 | 4 | 19 |", report)
+            self.assertIn("solver_work_totals.svg", report)
+            self.assertIn("krylov_per_solve_statistics.svg", report)
+            self.assertIn("krylov_by_solve.svg", report)
+            self.assertIn("## Results by frequency", report)
+            for name in (
+                "solver_work_totals.svg",
+                "krylov_per_solve_statistics.svg",
+                "krylov_by_solve.svg",
+            ):
+                ElementTree.parse(output / name)
+            self.assertIn(
+                ">10.5</text>",
+                (output / "krylov_per_solve_statistics.svg").read_text(),
+            )
+            summary_json = json.loads(
+                (output / "ads_hb_solver_summary.json").read_text()
+            )
+            self.assertEqual(
+                summary_json["report_artifacts"],
+                [
+                    "ads_hb_solver_report.md",
+                    "solver_work_totals.svg",
+                    "krylov_per_solve_statistics.svg",
+                    "krylov_by_solve.svg",
+                ],
+            )
 
 
 if __name__ == "__main__":

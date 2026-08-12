@@ -715,7 +715,21 @@ The report directory contains:
 - `ads_hb_solver_summary.csv`: totals plus mean, median, 95th-percentile, and
   worst-case solver work for every model;
 - `ads_hb_solver_summary.json`: the same aggregate data and messages in a
-  machine-readable form.
+  machine-readable form;
+- `ads_hb_solver_report.md`: an easy-to-scan comparison report containing the
+  summary table, changes relative to the first model, per-frequency results,
+  highest-work solves, source coverage, and inline plots;
+- `solver_work_totals.svg`: total Newton and Krylov work by model;
+- `krylov_per_solve_statistics.svg`: mean, median, 95th-percentile, and maximum
+  Krylov work per detected HB solve;
+- `krylov_by_solve.svg`: solve-sequence comparison for finding localized
+  convergence-cost differences.
+
+The SVG plots are generated with the Python standard library and are referenced
+with relative paths inside `ads_hb_solver_report.md`, so the report directory is
+portable and the plots render inline in normal Markdown viewers. The first log
+is treated as the baseline for percentage-change tables; put the standard model
+first in the command.
 
 The parser starts a new solve when a printed frequency or input-power label
 changes, or when the Newton iteration counter resets. The reset fallback still

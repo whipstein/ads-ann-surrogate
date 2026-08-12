@@ -19,6 +19,7 @@ import re
 import statistics
 import sys
 from dataclasses import dataclass, field
+from html import escape as html_escape
 from pathlib import Path
 from typing import Iterable, Pattern, Sequence
 
@@ -65,6 +66,16 @@ POWER_PATTERNS = [
         rf"(?P<value>{NUMBER})\s*(?P<unit>dBm|dBW|mW|W)?\b",
         re.IGNORECASE,
     ),
+]
+
+PLOT_COLORS = [
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#000000",
 ]
 
 
@@ -462,6 +473,708 @@ def _write_csv(path: Path, rows: Sequence[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _metric_number(value: object) -> float:
+    if value == "" or value is None:
+        return 0.0
+    return float(value)
+
+
+def _format_number(value: object, digits: int = 3) -> str:
+    if value == "" or value is None:
+        return "—"
+    number = float(value)
+    if math.isfinite(number) and number.is_integer():
+        return str(int(number))
+    return f"{number:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def _format_axis_number(value: float) -> str:
+    if abs(value) >= 1.0e6:
+        return f"{value / 1.0e6:.2g}M"
+    if abs(value) >= 1.0e3:
+        return f"{value / 1.0e3:.2g}k"
+    if abs(value) >= 10.0:
+        return f"{value:.0f}"
+    if abs(value) >= 1.0:
+        return f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{value:.2g}"
+
+
+def _nice_axis_max(value: float) -> float:
+    if value <= 0.0:
+        return 1.0
+    target = value * 1.12
+    exponent = 10.0 ** math.floor(math.log10(target))
+    fraction = target / exponent
+    for nice in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if fraction <= nice:
+            return nice * exponent
+    return 10.0 * exponent
+
+
+def _short_label(value: object, limit: int = 18) -> str:
+    text = str(value)
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
+def _svg_text(
+    x: float,
+    y: float,
+    text: object,
+    *,
+    size: int = 13,
+    anchor: str = "middle",
+    weight: str = "normal",
+    fill: str = "#1f2937",
+    rotate: float | None = None,
+) -> str:
+    transform = f' transform="rotate({rotate:g} {x:.2f} {y:.2f})"' if rotate else ""
+    return (
+        f'<text x="{x:.2f}" y="{y:.2f}" text-anchor="{anchor}" '
+        f'font-family="Arial,Helvetica,sans-serif" font-size="{size}" '
+        f'font-weight="{weight}" fill="{fill}"{transform}>'
+        f"{html_escape(str(text))}</text>"
+    )
+
+
+def _svg_begin(width: int, height: int, title: str) -> list[str]:
+    return [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
+            f'aria-label="{html_escape(title, quote=True)}">'
+        ),
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        _svg_text(width / 2, 32, title, size=21, weight="bold"),
+    ]
+
+
+def _append_y_axis(
+    elements: list[str],
+    left: float,
+    top: float,
+    plot_width: float,
+    plot_height: float,
+    y_max: float,
+    y_label: str,
+) -> None:
+    for index in range(6):
+        value = y_max * index / 5.0
+        y = top + plot_height - plot_height * index / 5.0
+        elements.append(
+            f'<line x1="{left:.2f}" y1="{y:.2f}" '
+            f'x2="{left + plot_width:.2f}" y2="{y:.2f}" '
+            'stroke="#e5e7eb" stroke-width="1"/>'
+        )
+        elements.append(
+            _svg_text(
+                left - 9,
+                y + 4,
+                _format_axis_number(value),
+                size=11,
+                anchor="end",
+                fill="#4b5563",
+            )
+        )
+    elements.append(
+        f'<line x1="{left:.2f}" y1="{top:.2f}" x2="{left:.2f}" '
+        f'y2="{top + plot_height:.2f}" stroke="#6b7280"/>'
+    )
+    elements.append(
+        f'<line x1="{left:.2f}" y1="{top + plot_height:.2f}" '
+        f'x2="{left + plot_width:.2f}" y2="{top + plot_height:.2f}" '
+        'stroke="#6b7280"/>'
+    )
+    elements.append(
+        _svg_text(
+            left - 52,
+            top + plot_height / 2,
+            y_label,
+            size=12,
+            rotate=-90,
+        )
+    )
+
+
+def _write_total_work_svg(
+    path: Path, summary_rows: Sequence[dict[str, object]]
+) -> None:
+    width = 1040
+    height = 470
+    elements = _svg_begin(width, height, "Total solver work by model")
+    models = [str(row["model"]) for row in summary_rows]
+    panels = [
+        ("Total Newton iterations", "total_newton_iterations"),
+        ("Total Krylov iterations", "total_krylov_iterations"),
+    ]
+    panel_width = 490.0
+    for panel_index, (title, key) in enumerate(panels):
+        panel_x = 20.0 + panel_index * 515.0
+        left = panel_x + 72.0
+        top = 82.0
+        plot_width = panel_width - 100.0
+        plot_height = 285.0
+        values = [_metric_number(row[key]) for row in summary_rows]
+        y_max = _nice_axis_max(max(values, default=0.0))
+        elements.append(
+            _svg_text(panel_x + panel_width / 2, 63, title, size=16, weight="bold")
+        )
+        _append_y_axis(
+            elements,
+            left,
+            top,
+            plot_width,
+            plot_height,
+            y_max,
+            "Iterations",
+        )
+        group_width = plot_width / max(1, len(models))
+        bar_width = min(72.0, group_width * 0.58)
+        for index, (model, value) in enumerate(zip(models, values)):
+            x = left + group_width * (index + 0.5) - bar_width / 2.0
+            bar_height = plot_height * value / y_max
+            y = top + plot_height - bar_height
+            color = PLOT_COLORS[index % len(PLOT_COLORS)]
+            elements.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" '
+                f'height="{bar_height:.2f}" rx="3" fill="{color}"/>'
+            )
+            elements.append(
+                _svg_text(
+                    x + bar_width / 2,
+                    max(top + 12, y - 7),
+                    _format_number(value),
+                    size=11,
+                    weight="bold",
+                )
+            )
+            elements.append(
+                _svg_text(
+                    x + bar_width / 2,
+                    top + plot_height + 23,
+                    _short_label(model),
+                    size=11,
+                )
+            )
+    elements.append(
+        _svg_text(
+            width / 2,
+            451,
+            "Totals include every detected HB solve in each Gain Compression log.",
+            size=12,
+            fill="#4b5563",
+        )
+    )
+    elements.append("</svg>")
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_krylov_statistics_svg(
+    path: Path, summary_rows: Sequence[dict[str, object]]
+) -> None:
+    width = 1040
+    height = 500
+    elements = _svg_begin(width, height, "Krylov work per detected HB solve")
+    metrics = [
+        ("Mean", "mean_krylov_per_solve"),
+        ("Median", "median_krylov_per_solve"),
+        ("95th percentile", "p95_krylov_per_solve"),
+        ("Maximum", "max_krylov_per_solve"),
+    ]
+    left = 82.0
+    top = 86.0
+    plot_width = 920.0
+    plot_height = 310.0
+    values = [
+        _metric_number(row[key]) for _, key in metrics for row in summary_rows
+    ]
+    y_max = _nice_axis_max(max(values, default=0.0))
+    _append_y_axis(
+        elements,
+        left,
+        top,
+        plot_width,
+        plot_height,
+        y_max,
+        "Krylov iterations / solve",
+    )
+    group_width = plot_width / len(metrics)
+    model_count = max(1, len(summary_rows))
+    bar_width = min(46.0, group_width * 0.72 / model_count)
+    for metric_index, (metric_label, key) in enumerate(metrics):
+        group_center = left + group_width * (metric_index + 0.5)
+        total_bar_width = bar_width * model_count
+        for model_index, row in enumerate(summary_rows):
+            value = _metric_number(row[key])
+            x = group_center - total_bar_width / 2.0 + model_index * bar_width
+            bar_height = plot_height * value / y_max
+            y = top + plot_height - bar_height
+            color = PLOT_COLORS[model_index % len(PLOT_COLORS)]
+            elements.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width - 2:.2f}" '
+                f'height="{bar_height:.2f}" rx="2" fill="{color}"/>'
+            )
+            if len(summary_rows) <= 4:
+                elements.append(
+                    _svg_text(
+                        x + (bar_width - 2) / 2,
+                        max(top + 11, y - 6),
+                        _format_number(value),
+                        size=10,
+                    )
+                )
+        elements.append(
+            _svg_text(
+                group_center,
+                top + plot_height + 24,
+                metric_label,
+                size=12,
+            )
+        )
+    legend_y = 466.0
+    legend_width = min(190.0, 850.0 / max(1, len(summary_rows)))
+    legend_start = width / 2.0 - legend_width * len(summary_rows) / 2.0
+    for index, row in enumerate(summary_rows):
+        x = legend_start + index * legend_width
+        color = PLOT_COLORS[index % len(PLOT_COLORS)]
+        elements.append(
+            f'<rect x="{x:.2f}" y="{legend_y - 11:.2f}" width="14" '
+            f'height="14" rx="2" fill="{color}"/>'
+        )
+        elements.append(
+            _svg_text(
+                x + 20,
+                legend_y,
+                _short_label(row["model"]),
+                size=11,
+                anchor="start",
+            )
+        )
+    elements.append("</svg>")
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_krylov_by_solve_svg(path: Path, results: Sequence[ParseResult]) -> None:
+    width = 1040
+    height = 520
+    elements = _svg_begin(width, height, "Krylov iterations by HB solve sequence")
+    left = 82.0
+    top = 90.0
+    plot_width = 920.0
+    plot_height = 330.0
+    all_values = [
+        sum(row.krylov_iterations for row in solve.newton)
+        for result in results
+        for solve in result.solves
+    ]
+    max_solves = max((len(result.solves) for result in results), default=1)
+    y_max = _nice_axis_max(max(all_values, default=0.0))
+    _append_y_axis(
+        elements,
+        left,
+        top,
+        plot_width,
+        plot_height,
+        y_max,
+        "Krylov iterations",
+    )
+    tick_step = max(1, math.ceil(max_solves / 10))
+    x_ticks = list(range(1, max_solves + 1, tick_step))
+    if x_ticks[-1] != max_solves:
+        x_ticks.append(max_solves)
+    for solve_index in x_ticks:
+        x = (
+            left + plot_width / 2.0
+            if max_solves == 1
+            else left + plot_width * (solve_index - 1) / (max_solves - 1)
+        )
+        elements.append(
+            f'<line x1="{x:.2f}" y1="{top:.2f}" x2="{x:.2f}" '
+            f'y2="{top + plot_height:.2f}" stroke="#f3f4f6"/>'
+        )
+        elements.append(
+            _svg_text(x, top + plot_height + 22, solve_index, size=11)
+        )
+    elements.append(
+        _svg_text(
+            left + plot_width / 2,
+            top + plot_height + 48,
+            "Detected HB solve sequence",
+            size=12,
+        )
+    )
+    for model_index, result in enumerate(results):
+        color = PLOT_COLORS[model_index % len(PLOT_COLORS)]
+        points: list[tuple[float, float]] = []
+        for solve in result.solves:
+            value = sum(row.krylov_iterations for row in solve.newton)
+            x = (
+                left + plot_width / 2.0
+                if max_solves == 1
+                else left + plot_width * (solve.solve_index - 1) / (max_solves - 1)
+            )
+            y = top + plot_height - plot_height * value / y_max
+            points.append((x, y))
+        if len(points) > 1:
+            path_data = " ".join(
+                f"{'M' if index == 0 else 'L'} {x:.2f} {y:.2f}"
+                for index, (x, y) in enumerate(points)
+            )
+            elements.append(
+                f'<path d="{path_data}" fill="none" stroke="{color}" '
+                'stroke-width="2.4" stroke-linejoin="round"/>'
+            )
+        for x, y in points:
+            elements.append(
+                f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4" fill="{color}" '
+                'stroke="#ffffff" stroke-width="1.2"/>'
+            )
+    legend_y = 497.0
+    legend_width = min(190.0, 850.0 / max(1, len(results)))
+    legend_start = width / 2.0 - legend_width * len(results) / 2.0
+    for index, result in enumerate(results):
+        x = legend_start + index * legend_width
+        color = PLOT_COLORS[index % len(PLOT_COLORS)]
+        elements.append(
+            f'<line x1="{x:.2f}" y1="{legend_y - 5:.2f}" '
+            f'x2="{x + 17:.2f}" y2="{legend_y - 5:.2f}" '
+            f'stroke="{color}" stroke-width="3"/>'
+        )
+        elements.append(
+            f'<circle cx="{x + 8.5:.2f}" cy="{legend_y - 5:.2f}" r="3.5" '
+            f'fill="{color}"/>'
+        )
+        elements.append(
+            _svg_text(
+                x + 23,
+                legend_y,
+                _short_label(result.model),
+                size=11,
+                anchor="start",
+            )
+        )
+    elements.append("</svg>")
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _markdown_escape(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", "<br>")
+
+
+def _markdown_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
+    lines = [
+        "| " + " | ".join(_markdown_escape(value) for value in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines.extend(
+        "| " + " | ".join(_markdown_escape(value) for value in row) + " |"
+        for row in rows
+    )
+    return "\n".join(lines)
+
+
+def _percent_change(value: object, reference: object) -> str:
+    current = _metric_number(value)
+    baseline = _metric_number(reference)
+    if baseline == 0.0:
+        return "—" if current == 0.0 else "n/a"
+    change = 100.0 * (current / baseline - 1.0)
+    return f"{change:+.1f}%"
+
+
+def _format_frequency(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if abs(value) >= 1.0e9:
+        return f"{value / 1.0e9:.6g} GHz"
+    if abs(value) >= 1.0e6:
+        return f"{value / 1.0e6:.6g} MHz"
+    if abs(value) >= 1.0e3:
+        return f"{value / 1.0e3:.6g} kHz"
+    return f"{value:.6g} Hz"
+
+
+def _frequency_summary(results: Sequence[ParseResult]) -> list[list[object]]:
+    groups: dict[tuple[str, float], list[SolveRecord]] = {}
+    model_order = {result.model: index for index, result in enumerate(results)}
+    for result in results:
+        for solve in result.solves:
+            if solve.frequency_hz is not None:
+                groups.setdefault((result.model, solve.frequency_hz), []).append(solve)
+    rows: list[list[object]] = []
+    for (model, frequency), solves in sorted(
+        groups.items(), key=lambda item: (model_order[item[0][0]], item[0][1])
+    ):
+        newton_total = sum(len(solve.newton) for solve in solves)
+        krylov_total = sum(
+            row.krylov_iterations for solve in solves for row in solve.newton
+        )
+        rows.append(
+            [
+                model,
+                _format_frequency(frequency),
+                len(solves),
+                newton_total,
+                krylov_total,
+                _format_number(krylov_total / len(solves)),
+            ]
+        )
+    return rows
+
+
+def _write_markdown_report(
+    path: Path,
+    results: Sequence[ParseResult],
+    summary_rows: Sequence[dict[str, object]],
+) -> None:
+    baseline = summary_rows[0]
+    summary_table = [
+        [
+            row["model"],
+            row["solve_count"],
+            row["total_newton_iterations"],
+            row["total_krylov_iterations"],
+            _format_number(row["mean_krylov_per_solve"]),
+            _format_number(row["median_krylov_per_solve"]),
+            _format_number(row["p95_krylov_per_solve"]),
+            _format_number(row["max_krylov_per_solve"]),
+            f"{row['failure_solve_count']} / {row['retry_solve_count']}",
+        ]
+        for row in summary_rows
+    ]
+    relative_table = [
+        [
+            row["model"],
+            _percent_change(
+                row["total_newton_iterations"], baseline["total_newton_iterations"]
+            ),
+            _percent_change(
+                row["total_krylov_iterations"], baseline["total_krylov_iterations"]
+            ),
+            _percent_change(
+                row["mean_krylov_per_solve"], baseline["mean_krylov_per_solve"]
+            ),
+            int(row["solve_count"]) - int(baseline["solve_count"]),
+        ]
+        for row in summary_rows
+    ]
+    worst_solves = sorted(
+        (
+            (
+                sum(row.krylov_iterations for row in solve.newton),
+                result,
+                solve,
+            )
+            for result in results
+            for solve in result.solves
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )[:12]
+    worst_table = [
+        [
+            result.model,
+            solve.solve_index,
+            _format_frequency(solve.frequency_hz),
+            (
+                f"{solve.input_power_dbm:.4g} dBm"
+                if solve.input_power_dbm is not None
+                else "—"
+            ),
+            len(solve.newton),
+            krylov_total,
+            f"{solve.newton[-1].krylov_residual:.3e}",
+            "yes" if solve.warnings else "no",
+        ]
+        for krylov_total, result, solve in worst_solves
+    ]
+    source_table = [
+        [
+            result.model,
+            result.source_file,
+            len(result.solves),
+            sum(solve.frequency_hz is not None for solve in result.solves),
+            sum(solve.input_power_dbm is not None for solve in result.solves),
+        ]
+        for result in results
+    ]
+    frequency_rows = _frequency_summary(results)
+    message_rows = [
+        [
+            result.model,
+            solve.solve_index,
+            " | ".join([*solve.warnings, *solve.retry_messages]),
+        ]
+        for result in results
+        for solve in result.solves
+        if solve.warnings or solve.retry_messages
+    ]
+    for result in results:
+        for message in result.unmatched_failure_messages:
+            message_rows.append([result.model, "unassigned", message])
+        for message in result.unmatched_retry_messages:
+            message_rows.append([result.model, "unassigned", message])
+
+    lines = [
+        "# ADS HB Solver Comparison",
+        "",
+        (
+            "This report compares the Newton/Krylov work parsed from ADS Gain "
+            "Compression or harmonic-balance Status/Summary logs. Lower solver "
+            "work is generally favorable, but elapsed simulation time remains the "
+            "final performance measure."
+        ),
+        "",
+        "## Summary",
+        "",
+        _markdown_table(
+            [
+                "Model",
+                "HB solves",
+                "Newton total",
+                "Krylov total",
+                "Krylov/solve mean",
+                "Median",
+                "P95",
+                "Maximum",
+                "Failures / retries",
+            ],
+            summary_table,
+        ),
+        "",
+        f"The first model, **{_markdown_escape(baseline['model'])}**, is the comparison reference.",
+        "",
+        _markdown_table(
+            [
+                "Model",
+                "Δ Newton total",
+                "Δ Krylov total",
+                "Δ mean Krylov/solve",
+                "Δ HB solves",
+            ],
+            relative_table,
+        ),
+        "",
+        "## Total solver work",
+        "",
+        "![Total Newton and Krylov iterations by model](solver_work_totals.svg)",
+        "",
+        "Totals are affected by both work per solve and the number of adaptive Gain Compression solves.",
+        "",
+        "## Normalized Krylov work",
+        "",
+        "![Krylov work statistics per HB solve](krylov_per_solve_statistics.svg)",
+        "",
+        "These statistics normalize for different numbers of adaptive HB solves.",
+        "",
+        "## Solve sequence",
+        "",
+        "![Krylov iterations by detected HB solve](krylov_by_solve.svg)",
+        "",
+        (
+            "Solve indices represent execution order. They are directly comparable "
+            "only when the models followed the same frequency and power-point sequence."
+        ),
+        "",
+    ]
+    if frequency_rows:
+        lines.extend(
+            [
+                "## Results by frequency",
+                "",
+                _markdown_table(
+                    [
+                        "Model",
+                        "Frequency",
+                        "HB solves",
+                        "Newton total",
+                        "Krylov total",
+                        "Mean Krylov/solve",
+                    ],
+                    frequency_rows,
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Highest-work solves",
+            "",
+            _markdown_table(
+                [
+                    "Model",
+                    "Solve",
+                    "Frequency",
+                    "Input power",
+                    "Newton",
+                    "Krylov",
+                    "Final Krylov residual",
+                    "Failure",
+                ],
+                worst_table,
+            ),
+            "",
+            "## Source coverage",
+            "",
+            _markdown_table(
+                [
+                    "Model",
+                    "Source log",
+                    "HB solves",
+                    "Frequency-labelled",
+                    "Power-labelled",
+                ],
+                source_table,
+            ),
+            "",
+        ]
+    )
+    if message_rows:
+        lines.extend(
+            [
+                "## Solver messages",
+                "",
+                _markdown_table(["Model", "Solve", "Message"], message_rows),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Interpretation notes",
+            "",
+            "- `Krylov total` is the sum of the linear-solver iteration count on every parsed Newton summary row.",
+            "- `HB solves` is detected from frequency/power changes or a reset of the Newton counter.",
+            "- Gain Compression chooses power points adaptively, so compare both totals and per-solve statistics.",
+            "- Use identical StatusLevel, initial-guess policy, solver settings, circuit, and sweep configuration.",
+            "- Compare cold and warm wall-clock runs separately; this report does not infer time from iteration count.",
+            "",
+            "Machine-readable details are available in `ads_hb_solver_points.csv`, "
+            "`ads_hb_solver_summary.csv`, and `ads_hb_solver_summary.json`.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_report_artifacts(
+    out_dir: Path,
+    results: Sequence[ParseResult],
+    summary_rows: Sequence[dict[str, object]],
+) -> list[str]:
+    artifact_names = [
+        "ads_hb_solver_report.md",
+        "solver_work_totals.svg",
+        "krylov_per_solve_statistics.svg",
+        "krylov_by_solve.svg",
+    ]
+    _write_total_work_svg(out_dir / artifact_names[1], summary_rows)
+    _write_krylov_statistics_svg(out_dir / artifact_names[2], summary_rows)
+    _write_krylov_by_solve_svg(out_dir / artifact_names[3], results)
+    _write_markdown_report(out_dir / artifact_names[0], results, summary_rows)
+    return artifact_names
+
+
 def _read_log(path_text: str) -> tuple[str, str]:
     if path_text == "-":
         return sys.stdin.read(), "<stdin>"
@@ -556,6 +1269,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     labels = args.labels or [
         "stdin" if value == "-" else Path(value).stem for value in args.logs
     ]
+    if len(set(labels)) != len(labels):
+        raise SystemExit("Model labels must be unique")
     results: list[ParseResult] = []
     for path_text, label in zip(args.logs, labels):
         text, source_file = _read_log(path_text)
@@ -588,10 +1303,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary_rows = [summarize_result(result) for result in results]
     _write_csv(out_dir / "ads_hb_solver_points.csv", point_rows)
     _write_csv(out_dir / "ads_hb_solver_summary.csv", summary_rows)
+    report_artifacts = _write_report_artifacts(out_dir, results, summary_rows)
     (out_dir / "ads_hb_solver_summary.json").write_text(
         json.dumps(
             {
                 "summaries": summary_rows,
+                "report_artifacts": report_artifacts,
                 "unmatched_messages": [
                     {
                         "model": result.model,
@@ -610,6 +1327,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nPoint details: {out_dir / 'ads_hb_solver_points.csv'}")
     print(f"Summary CSV:  {out_dir / 'ads_hb_solver_summary.csv'}")
     print(f"Summary JSON: {out_dir / 'ads_hb_solver_summary.json'}")
+    print(f"Markdown:     {out_dir / 'ads_hb_solver_report.md'}")
+    print(
+        "Plots:        "
+        + ", ".join(str(out_dir / name) for name in report_artifacts[1:])
+    )
     return 0
 
 
