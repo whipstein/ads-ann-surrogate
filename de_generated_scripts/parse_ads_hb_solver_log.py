@@ -25,6 +25,8 @@ from typing import Iterable, Pattern, Sequence
 
 
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+DURATION_UNIT = r"(?:sec(?:ond)?s?|min(?:ute)?s?|hours?|hrs?|ms|us|µs|μs|ns|s|h)"
+DURATION_TEXT = rf"(?:\d+:\d{{2}}(?::\d{{2}}(?:\.\d+)?)?|{NUMBER}\s*{DURATION_UNIT}?)"
 NEWTON_ITERATION_RE = re.compile(r"^(?P<iteration>\d+)(?P<rebuild>\*)?$")
 NUMBER_WITH_UNIT_RE = re.compile(
     rf"^(?P<value>{NUMBER})(?P<unit>[A-Za-zµμ]*)$"
@@ -48,6 +50,25 @@ FAILURE_RE = re.compile(
 )
 RETRY_RE = re.compile(
     r"(?:retry|re-try|continuation|source\s+stepping|arc[- ]length)",
+    re.IGNORECASE,
+)
+WALL_TIME_RE = re.compile(
+    rf"(?P<label>(?:(?:total|overall)\s+time|(?:(?:total|overall)\s+)?"
+    rf"(?:elapsed(?:\s+wall(?:[- ]?clock)?)?|wall(?:[- ]?clock)?|clock|real|simulation|run)"
+    rf"\s+time))\s*(?:\([^)]*\)|\[[^]]*\])?\s*[:=]\s*"
+    rf"(?P<duration>{DURATION_TEXT})",
+    re.IGNORECASE,
+)
+CPU_TIME_RE = re.compile(
+    rf"(?P<label>(?:(?:total|overall)\s+)?(?:cpu|user|processor)\s+time)"
+    rf"\s*(?:\([^)]*\)|\[[^]]*\])?\s*[:=]\s*(?P<duration>{DURATION_TEXT})",
+    re.IGNORECASE,
+)
+CPU_ELAPSED_PAIR_RE = re.compile(
+    rf"(?P<label>(?:(?:total|overall)\s+)?cpu\s*/\s*"
+    rf"(?:elapsed|wall(?:[- ]?clock)?)\s+time)"
+    rf"\s*(?:\([^)]*\)|\[[^]]*\])?\s*[:=]\s*"
+    rf"(?P<cpu>{DURATION_TEXT})\s*(?:/|,)\s*(?P<wall>{DURATION_TEXT})",
     re.IGNORECASE,
 )
 
@@ -87,6 +108,15 @@ class NewtonRecord:
     kcl_residual_a: float
     krylov_iterations: int
     krylov_residual: float
+
+
+@dataclass
+class TimingSample:
+    kind: str
+    seconds: float
+    score: int
+    line_number: int
+    source_text: str
 
 
 @dataclass
@@ -144,6 +174,10 @@ class ParseResult:
     unmatched_failure_messages: list[str]
     unmatched_retry_messages: list[str]
     diagnostic_lines: list[str]
+    wall_clock_seconds: float | None
+    cpu_time_seconds: float | None
+    wall_clock_source: str
+    cpu_time_source: str
 
 
 def _optional_number(value: float | None) -> float | str:
@@ -224,6 +258,120 @@ def _current_amperes(value: float, unit: str) -> float:
     return value * multipliers[normalized]
 
 
+def _duration_seconds(text: str) -> float:
+    value = text.strip().replace("μ", "u").replace("µ", "u")
+    if ":" in value:
+        parts = [float(part) for part in value.split(":")]
+        if len(parts) == 3:
+            return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60.0 + parts[1]
+        raise ValueError(f"Unsupported clock duration {text!r}")
+    match = re.fullmatch(
+        rf"(?P<value>{NUMBER})\s*(?P<unit>{DURATION_UNIT})?",
+        value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError(f"Unsupported duration {text!r}")
+    number = float(match.group("value"))
+    unit = (match.group("unit") or "s").lower()
+    multipliers = {
+        "ns": 1.0e-9,
+        "us": 1.0e-6,
+        "ms": 1.0e-3,
+        "s": 1.0,
+        "sec": 1.0,
+        "secs": 1.0,
+        "second": 1.0,
+        "seconds": 1.0,
+        "min": 60.0,
+        "mins": 60.0,
+        "minute": 60.0,
+        "minutes": 60.0,
+        "h": 3600.0,
+        "hr": 3600.0,
+        "hrs": 3600.0,
+        "hour": 3600.0,
+        "hours": 3600.0,
+    }
+    return number * multipliers[unit]
+
+
+def _timing_score(label: str, line: str, match_start: int) -> int:
+    lowered_label = label.lower()
+    lowered_line = line.lower()
+    score = 10
+    if "total" in lowered_label or "overall" in lowered_label:
+        score += 100
+    if "simulation" in lowered_label or "simulation finished" in lowered_line:
+        score += 70
+    if "elapsed" in lowered_label or "wall" in lowered_label:
+        score += 20
+    if any(word in lowered_label for word in ("cpu", "user", "processor")):
+        score += 20
+    prefix = line[:match_start]
+    if not re.search(r"[A-Za-z0-9]", prefix):
+        score += 10
+    if re.search(r"\b(?:start|begin|current|end)\b", prefix, re.IGNORECASE):
+        score -= 80
+    return score
+
+
+def _timing_samples_from_line(line: str, line_number: int) -> list[TimingSample]:
+    samples: list[TimingSample] = []
+    paired_spans: list[tuple[int, int]] = []
+    for match in CPU_ELAPSED_PAIR_RE.finditer(line):
+        paired_spans.append(match.span())
+        score = _timing_score(match.group("label"), line, match.start())
+        samples.extend(
+            [
+                TimingSample(
+                    kind="cpu",
+                    seconds=_duration_seconds(match.group("cpu")),
+                    score=score,
+                    line_number=line_number,
+                    source_text=line.strip(),
+                ),
+                TimingSample(
+                    kind="wall",
+                    seconds=_duration_seconds(match.group("wall")),
+                    score=score,
+                    line_number=line_number,
+                    source_text=line.strip(),
+                ),
+            ]
+        )
+
+    def overlaps_pair(start: int, end: int) -> bool:
+        return any(start < pair_end and end > pair_start for pair_start, pair_end in paired_spans)
+
+    for kind, pattern in (("wall", WALL_TIME_RE), ("cpu", CPU_TIME_RE)):
+        for match in pattern.finditer(line):
+            if overlaps_pair(*match.span()):
+                continue
+            samples.append(
+                TimingSample(
+                    kind=kind,
+                    seconds=_duration_seconds(match.group("duration")),
+                    score=_timing_score(match.group("label"), line, match.start()),
+                    line_number=line_number,
+                    source_text=line.strip(),
+                )
+            )
+    return samples
+
+
+def _select_timing_sample(
+    samples: Sequence[TimingSample], kind: str
+) -> TimingSample | None:
+    matching = [sample for sample in samples if sample.kind == kind]
+    matching = [sample for sample in matching if sample.score >= 40]
+    if not matching:
+        return None
+    return max(matching, key=lambda sample: (sample.score, sample.line_number))
+
+
 def _parse_newton_row(line: str, line_number: int) -> NewtonRecord | None:
     tokens = [token.strip(",;:()[]{}|") for token in line.strip().split()]
     if len(tokens) < 4:
@@ -283,6 +431,7 @@ def parse_ads_status_text(
     unmatched_failures: list[str] = []
     unmatched_retries: list[str] = []
     diagnostic_lines: list[str] = []
+    timing_samples: list[TimingSample] = []
 
     def finish_current() -> None:
         nonlocal current
@@ -293,6 +442,7 @@ def parse_ads_status_text(
 
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.replace("\x00", "").rstrip()
+        timing_samples.extend(_timing_samples_from_line(line, line_number))
         frequency_match = _match_value(
             line, custom_frequency, FREQUENCY_PATTERNS
         )
@@ -392,6 +542,8 @@ def parse_ads_status_text(
                 current.end_line = line_number
 
     finish_current()
+    wall_timing = _select_timing_sample(timing_samples, "wall")
+    cpu_timing = _select_timing_sample(timing_samples, "cpu")
     return ParseResult(
         model=model,
         source_file=source_file,
@@ -399,6 +551,10 @@ def parse_ads_status_text(
         unmatched_failure_messages=unmatched_failures,
         unmatched_retry_messages=unmatched_retries,
         diagnostic_lines=diagnostic_lines,
+        wall_clock_seconds=(wall_timing.seconds if wall_timing else None),
+        cpu_time_seconds=(cpu_timing.seconds if cpu_timing else None),
+        wall_clock_source=(wall_timing.source_text if wall_timing else ""),
+        cpu_time_source=(cpu_timing.source_text if cpu_timing else ""),
     )
 
 
@@ -427,6 +583,20 @@ def summarize_result(result: ParseResult) -> dict[str, object]:
         ),
         "total_newton_iterations": total_newton,
         "total_krylov_iterations": total_krylov,
+        "wall_clock_seconds": _optional_number(result.wall_clock_seconds),
+        "wall_clock_per_solve_seconds": (
+            result.wall_clock_seconds / len(result.solves)
+            if result.wall_clock_seconds is not None and result.solves
+            else ""
+        ),
+        "cpu_time_seconds": _optional_number(result.cpu_time_seconds),
+        "cpu_time_per_solve_seconds": (
+            result.cpu_time_seconds / len(result.solves)
+            if result.cpu_time_seconds is not None and result.solves
+            else ""
+        ),
+        "wall_clock_source": result.wall_clock_source,
+        "cpu_time_source": result.cpu_time_source,
         "mean_newton_per_solve": _mean_or_blank(point_newton),
         "mean_krylov_per_solve": _mean_or_blank(point_krylov),
         "median_krylov_per_solve": _median_or_blank(point_krylov),
@@ -498,6 +668,21 @@ def _format_axis_number(value: float) -> str:
     if abs(value) >= 1.0:
         return f"{value:.1f}".rstrip("0").rstrip(".")
     return f"{value:.2g}"
+
+
+def _format_duration(value: object) -> str:
+    if value == "" or value is None:
+        return "—"
+    seconds = float(value)
+    if seconds < 60.0:
+        formatted = f"{seconds:.3f}".rstrip("0").rstrip(".")
+        return f"{formatted} s"
+    hours = int(seconds // 3600.0)
+    minutes = int((seconds - hours * 3600.0) // 60.0)
+    remainder = seconds - hours * 3600.0 - minutes * 60.0
+    if hours:
+        return f"{hours}h {minutes}m {remainder:.1f}s"
+    return f"{minutes}m {remainder:.1f}s"
 
 
 def _nice_axis_max(value: float) -> float:
@@ -662,6 +847,120 @@ def _write_total_work_svg(
             width / 2,
             451,
             "Totals include every detected HB solve in each Gain Compression log.",
+            size=12,
+            fill="#4b5563",
+        )
+    )
+    elements.append("</svg>")
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
+def _write_runtime_svg(
+    path: Path, summary_rows: Sequence[dict[str, object]]
+) -> None:
+    width = 1040
+    height = 470
+    elements = _svg_begin(width, height, "Wall-clock runtime comparison")
+    available = any(row["wall_clock_seconds"] != "" for row in summary_rows)
+    if not available:
+        elements.extend(
+            [
+                _svg_text(
+                    width / 2,
+                    210,
+                    "No wall-clock timing was found in the supplied logs.",
+                    size=18,
+                    weight="bold",
+                    fill="#9a3412",
+                ),
+                _svg_text(
+                    width / 2,
+                    246,
+                    "Enable ADS event timing or pass --wall-clock-seconds.",
+                    size=15,
+                    fill="#4b5563",
+                ),
+                "</svg>",
+            ]
+        )
+        path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+        return
+
+    models = [str(row["model"]) for row in summary_rows]
+    panels = [
+        ("Total wall clock", "wall_clock_seconds"),
+        ("Wall clock per HB solve", "wall_clock_per_solve_seconds"),
+    ]
+    panel_width = 490.0
+    for panel_index, (title, key) in enumerate(panels):
+        panel_x = 20.0 + panel_index * 515.0
+        left = panel_x + 72.0
+        top = 82.0
+        plot_width = panel_width - 100.0
+        plot_height = 285.0
+        raw_values = [row[key] for row in summary_rows]
+        numeric_values = [
+            _metric_number(value) for value in raw_values if value != ""
+        ]
+        y_max = _nice_axis_max(max(numeric_values, default=0.0))
+        elements.append(
+            _svg_text(panel_x + panel_width / 2, 63, title, size=16, weight="bold")
+        )
+        _append_y_axis(
+            elements,
+            left,
+            top,
+            plot_width,
+            plot_height,
+            y_max,
+            "Seconds",
+        )
+        group_width = plot_width / max(1, len(models))
+        bar_width = min(72.0, group_width * 0.58)
+        for index, (model, raw_value) in enumerate(zip(models, raw_values)):
+            x = left + group_width * (index + 0.5) - bar_width / 2.0
+            color = PLOT_COLORS[index % len(PLOT_COLORS)]
+            if raw_value != "":
+                value = _metric_number(raw_value)
+                bar_height = plot_height * value / y_max
+                y = top + plot_height - bar_height
+                elements.append(
+                    f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" '
+                    f'height="{bar_height:.2f}" rx="3" fill="{color}"/>'
+                )
+                elements.append(
+                    _svg_text(
+                        x + bar_width / 2,
+                        max(top + 12, y - 7),
+                        _format_duration(value),
+                        size=11,
+                        weight="bold",
+                    )
+                )
+            else:
+                elements.append(
+                    _svg_text(
+                        x + bar_width / 2,
+                        top + plot_height - 9,
+                        "n/a",
+                        size=12,
+                        weight="bold",
+                        fill="#9a3412",
+                    )
+                )
+            elements.append(
+                _svg_text(
+                    x + bar_width / 2,
+                    top + plot_height + 23,
+                    _short_label(model),
+                    size=11,
+                )
+            )
+    elements.append(
+        _svg_text(
+            width / 2,
+            451,
+            "Per-solve time is total wall clock divided by detected HB solves.",
             size=12,
             fill="#4b5563",
         )
@@ -933,6 +1232,9 @@ def _write_markdown_report(
         [
             row["model"],
             row["solve_count"],
+            _format_duration(row["wall_clock_seconds"]),
+            _format_duration(row["wall_clock_per_solve_seconds"]),
+            _format_duration(row["cpu_time_seconds"]),
             row["total_newton_iterations"],
             row["total_krylov_iterations"],
             _format_number(row["mean_krylov_per_solve"]),
@@ -946,6 +1248,13 @@ def _write_markdown_report(
     relative_table = [
         [
             row["model"],
+            _percent_change(
+                row["wall_clock_seconds"], baseline["wall_clock_seconds"]
+            ),
+            _percent_change(
+                row["wall_clock_per_solve_seconds"],
+                baseline["wall_clock_per_solve_seconds"],
+            ),
             _percent_change(
                 row["total_newton_iterations"], baseline["total_newton_iterations"]
             ),
@@ -999,6 +1308,19 @@ def _write_markdown_report(
         ]
         for result in results
     ]
+    timing_source_table = [
+        [
+            result.model,
+            _format_duration(result.wall_clock_seconds),
+            result.wall_clock_source or "not found",
+            _format_duration(result.cpu_time_seconds),
+            result.cpu_time_source or "not found",
+        ]
+        for result in results
+    ]
+    missing_wall_models = [
+        result.model for result in results if result.wall_clock_seconds is None
+    ]
     frequency_rows = _frequency_summary(results)
     message_rows = [
         [
@@ -1032,6 +1354,9 @@ def _write_markdown_report(
             [
                 "Model",
                 "HB solves",
+                "Wall clock",
+                "Wall/solve",
+                "CPU time",
                 "Newton total",
                 "Krylov total",
                 "Krylov/solve mean",
@@ -1048,12 +1373,43 @@ def _write_markdown_report(
         _markdown_table(
             [
                 "Model",
+                "Δ wall clock",
+                "Δ wall/solve",
                 "Δ Newton total",
                 "Δ Krylov total",
                 "Δ mean Krylov/solve",
                 "Δ HB solves",
             ],
             relative_table,
+        ),
+        "",
+        "## Runtime",
+        "",
+        "![Wall-clock runtime by model](runtime_comparison.svg)",
+        "",
+        _markdown_table(
+            ["Model", "Wall clock", "Wall source", "CPU time", "CPU source"],
+            timing_source_table,
+        ),
+        "",
+        *(
+            [
+                (
+                    "> **Timing unavailable for "
+                    + ", ".join(_markdown_escape(model) for model in missing_wall_models)
+                    + ".** The supplied log did not contain a recognized wall-clock "
+                    "total. Enable ADS event timing or pass `--wall-clock-seconds` "
+                    "for each log."
+                ),
+                "",
+            ]
+            if missing_wall_models
+            else []
+        ),
+        (
+            "Wall time per solve is derived by dividing the complete logged wall "
+            "clock by the number of detected HB solves; it is not a separately "
+            "measured point time."
         ),
         "",
         "## Total solver work",
@@ -1147,7 +1503,9 @@ def _write_markdown_report(
             "- `HB solves` is detected from frequency/power changes or a reset of the Newton counter.",
             "- Gain Compression chooses power points adaptively, so compare both totals and per-solve statistics.",
             "- Use identical StatusLevel, initial-guess policy, solver settings, circuit, and sweep configuration.",
-            "- Compare cold and warm wall-clock runs separately; this report does not infer time from iteration count.",
+            "- `Wall clock` is parsed from the selected total elapsed/simulation-time line or supplied explicitly; it is never inferred from iteration count.",
+            "- CPU time can exceed wall time when ADS uses multiple cores, so wall clock is the primary end-to-end comparison.",
+            "- Compare cold and warm wall-clock runs separately.",
             "",
             "Machine-readable details are available in `ads_hb_solver_points.csv`, "
             "`ads_hb_solver_summary.csv`, and `ads_hb_solver_summary.json`.",
@@ -1164,13 +1522,15 @@ def _write_report_artifacts(
 ) -> list[str]:
     artifact_names = [
         "ads_hb_solver_report.md",
+        "runtime_comparison.svg",
         "solver_work_totals.svg",
         "krylov_per_solve_statistics.svg",
         "krylov_by_solve.svg",
     ]
-    _write_total_work_svg(out_dir / artifact_names[1], summary_rows)
-    _write_krylov_statistics_svg(out_dir / artifact_names[2], summary_rows)
-    _write_krylov_by_solve_svg(out_dir / artifact_names[3], results)
+    _write_runtime_svg(out_dir / artifact_names[1], summary_rows)
+    _write_total_work_svg(out_dir / artifact_names[2], summary_rows)
+    _write_krylov_statistics_svg(out_dir / artifact_names[3], summary_rows)
+    _write_krylov_by_solve_svg(out_dir / artifact_names[4], results)
     _write_markdown_report(out_dir / artifact_names[0], results, summary_rows)
     return artifact_names
 
@@ -1202,6 +1562,7 @@ def _print_summary(rows: Sequence[dict[str, object]]) -> None:
     headers = [
         "model",
         "solve_count",
+        "wall_clock_seconds",
         "total_newton_iterations",
         "total_krylov_iterations",
         "mean_krylov_per_solve",
@@ -1256,6 +1617,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and optional (?P<unit>...)."
         ),
     )
+    parser.add_argument(
+        "--wall-clock-seconds",
+        "--elapsed-seconds",
+        dest="wall_clock_seconds",
+        type=float,
+        nargs="+",
+        metavar="SECONDS",
+        help=(
+            "Optional measured wall-clock seconds in the same order as LOG. "
+            "Overrides timing parsed from each log."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-time-seconds",
+        type=float,
+        nargs="+",
+        metavar="SECONDS",
+        help=(
+            "Optional CPU seconds in the same order as LOG. Overrides CPU timing "
+            "parsed from each log."
+        ),
+    )
     return parser
 
 
@@ -1271,8 +1654,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     if len(set(labels)) != len(labels):
         raise SystemExit("Model labels must be unique")
+    for option, values in (
+        ("--wall-clock-seconds", args.wall_clock_seconds),
+        ("--cpu-time-seconds", args.cpu_time_seconds),
+    ):
+        if values is not None and len(values) != len(args.logs):
+            raise SystemExit(f"{option} must provide exactly one value for each LOG")
+        if values is not None and any(value < 0.0 for value in values):
+            raise SystemExit(f"{option} values must be non-negative")
     results: list[ParseResult] = []
-    for path_text, label in zip(args.logs, labels):
+    for log_index, (path_text, label) in enumerate(zip(args.logs, labels)):
         text, source_file = _read_log(path_text)
         result = parse_ads_status_text(
             text,
@@ -1293,6 +1684,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "Set the ADS Gain Compression Status level to 4 or 5."
                 f"{candidates}"
             )
+        if args.wall_clock_seconds is not None:
+            result.wall_clock_seconds = args.wall_clock_seconds[log_index]
+            result.wall_clock_source = "CLI --wall-clock-seconds"
+        if args.cpu_time_seconds is not None:
+            result.cpu_time_seconds = args.cpu_time_seconds[log_index]
+            result.cpu_time_source = "CLI --cpu-time-seconds"
         results.append(result)
 
     out_dir = Path(args.out_dir)

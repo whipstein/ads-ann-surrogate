@@ -713,12 +713,16 @@ The report directory contains:
   frequency and input power when ADS printed them, Newton count, total Krylov
   count, final residuals, line numbers, and convergence/retry messages;
 - `ads_hb_solver_summary.csv`: totals plus mean, median, 95th-percentile, and
-  worst-case solver work for every model;
+  worst-case solver work, total wall clock, wall clock per detected solve, and
+  CPU time for every model;
 - `ads_hb_solver_summary.json`: the same aggregate data and messages in a
   machine-readable form;
 - `ads_hb_solver_report.md`: an easy-to-scan comparison report containing the
-  summary table, changes relative to the first model, per-frequency results,
-  highest-work solves, source coverage, and inline plots;
+  runtime and solver-work summary tables, changes relative to the first model,
+  per-frequency results, highest-work solves, source coverage, and inline
+  plots;
+- `runtime_comparison.svg`: total wall clock and derived wall clock per detected
+  HB solve;
 - `solver_work_totals.svg`: total Newton and Krylov work by model;
 - `krylov_per_solve_statistics.svg`: mean, median, 95th-percentile, and maximum
   Krylov work per detected HB solve;
@@ -730,6 +734,47 @@ with relative paths inside `ads_hb_solver_report.md`, so the report directory is
 portable and the plots render inline in normal Markdown viewers. The first log
 is treated as the baseline for percentage-change tables; put the standard model
 first in the command.
+
+#### Wall-clock and CPU timing
+
+The parser recognizes common ADS footer labels such as `Total elapsed time`,
+`Total simulation time`, `Wall clock time`, `CPU time`, and paired
+`CPU/Elapsed time` values. Clock-form durations such as `0:24:52` are converted
+to seconds. The selected source line is included in the Markdown report and the
+summary outputs so an ambiguous timing match is visible rather than silent.
+
+If ADS does not print timing, enable its diagnostic event recording before
+starting ADS, then display that recording in the simulation log:
+
+1. set `ADSSIM_ENABLE_DEBUG_EVENTS=Y` in the environment or the applicable
+   `hpeesofsim.cfg` before ADS starts;
+2. place an Options controller, expose **Display > Other**, and set
+   `Other=ResourceUsage=2`;
+3. use the same event settings for every model being timed.
+
+Keysight documents that the event log includes elapsed and CPU time for license
+acquisition, netlist parsing, simulation, and matrix-solver steps, and that its
+recording system is disabled by default in releases using the newer event
+subsystem. See the [Keysight circuit-simulator documentation](https://edadownload.software.keysight.com/eedl/ads/2011/pdf/cktsim.pdf)
+and [ADS diagnostic-event release note](https://docs.keysight.com/download/attachments/4403386/Advanced%20Design%20System%202017%20Release%20Notes_RC1.pdf?api=v2).
+
+For logs without an embedded total, supply independently measured times in log
+order. These values override parsed timing:
+
+```bash
+python3 de_generated_scripts/parse_ads_hb_solver_log.py \
+  baseline_status.log trial_status.log \
+  --labels baseline trial \
+  --wall-clock-seconds 123.4 118.9 \
+  --cpu-time-seconds 211.2 205.7 \
+  --out-dir hb_solver_comparison
+```
+
+The report never estimates runtime from iteration counts. `Wall/solve` is only
+the total wall clock divided by the number of detected HB solves. Use wall clock
+as the primary end-to-end comparison and treat CPU time as supporting context,
+especially for multi-core runs. Diagnostic event recording can add overhead to
+very short sweeps, so benchmark every model with identical logging settings.
 
 The parser starts a new solve when a printed frequency or input-power label
 changes, or when the Newton iteration counter resets. The reset fallback still

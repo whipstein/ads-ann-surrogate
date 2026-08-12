@@ -32,6 +32,8 @@ Iter KCL residual Damp % Sol update    Iters Residual
 Newton solver:                         Linear solver:
 Iter KCL residual Damp % Sol update    Iters Residual
 2    5.000 nA    100.0                 4     7.000e-04
+Total elapsed time: 12.5 seconds
+Total CPU time: 18.75 seconds
 """
 
 
@@ -52,6 +54,31 @@ class AdsHbLogParserTests(unittest.TestCase):
         self.assertTrue(first.newton[-1].jacobian_rebuilt)
         self.assertEqual(second.input_power_dbm, -10.0)
         self.assertEqual(sum(row.krylov_iterations for row in second.newton), 11)
+        self.assertEqual(result.wall_clock_seconds, 12.5)
+        self.assertEqual(result.cpu_time_seconds, 18.75)
+        self.assertIn("Total elapsed time", result.wall_clock_source)
+
+    def test_parses_paired_cpu_elapsed_clock_duration(self) -> None:
+        text = LEVEL5_LOG.replace(
+            "Total elapsed time: 12.5 seconds\nTotal CPU time: 18.75 seconds",
+            "Total CPU/Elapsed time: 95.0 s / 0:01:02.5",
+        )
+        result = PARSER.parse_ads_status_text(text, "trial", "trial.log")
+        self.assertEqual(result.wall_clock_seconds, 62.5)
+        self.assertEqual(result.cpu_time_seconds, 95.0)
+
+    def test_prefers_total_time_and_rejects_stage_elapsed_as_total(self) -> None:
+        without_footer = LEVEL5_LOG.replace(
+            "Total elapsed time: 12.5 seconds\nTotal CPU time: 18.75 seconds",
+            "Matrix solver elapsed time: 3.5 seconds",
+        )
+        result = PARSER.parse_ads_status_text(
+            without_footer, "trial", "trial.log"
+        )
+        self.assertIsNone(result.wall_clock_seconds)
+        with_total = without_footer + "\nTotal time: 0:01:05.5\n"
+        result = PARSER.parse_ads_status_text(with_total, "trial", "trial.log")
+        self.assertEqual(result.wall_clock_seconds, 65.5)
 
     def test_newton_counter_reset_splits_unlabelled_solves(self) -> None:
         text = """
@@ -117,7 +144,10 @@ Iters Residual
             second = root / "trial.log"
             output = root / "report"
             first.write_text(LEVEL5_LOG)
-            second.write_text(LEVEL5_LOG.replace("7     2.000e-03", "9     2.000e-03"))
+            second.write_text(
+                LEVEL5_LOG.replace("7     2.000e-03", "9     2.000e-03")
+                .replace("12.5 seconds", "15.0 seconds")
+            )
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     PARSER.main(
@@ -138,12 +168,18 @@ Iters Residual
             self.assertTrue((output / "ads_hb_solver_summary.json").is_file())
             report = (output / "ads_hb_solver_report.md").read_text()
             self.assertIn("# ADS HB Solver Comparison", report)
-            self.assertIn("| baseline | 2 | 4 | 19 |", report)
+            self.assertIn(
+                "| baseline | 2 | 12.5 s | 6.25 s | 18.75 s | 4 | 19 |",
+                report,
+            )
+            self.assertIn("| trial | +20.0% | +20.0% |", report)
+            self.assertIn("runtime_comparison.svg", report)
             self.assertIn("solver_work_totals.svg", report)
             self.assertIn("krylov_per_solve_statistics.svg", report)
             self.assertIn("krylov_by_solve.svg", report)
             self.assertIn("## Results by frequency", report)
             for name in (
+                "runtime_comparison.svg",
                 "solver_work_totals.svg",
                 "krylov_per_solve_statistics.svg",
                 "krylov_by_solve.svg",
@@ -160,11 +196,43 @@ Iters Residual
                 summary_json["report_artifacts"],
                 [
                     "ads_hb_solver_report.md",
+                    "runtime_comparison.svg",
                     "solver_work_totals.svg",
                     "krylov_per_solve_statistics.svg",
                     "krylov_by_solve.svg",
                 ],
             )
+            self.assertEqual(
+                summary_json["summaries"][0]["wall_clock_seconds"], 12.5
+            )
+
+    def test_cli_timing_override_replaces_log_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log = root / "baseline.log"
+            output = root / "report"
+            log.write_text(LEVEL5_LOG)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    PARSER.main(
+                        [
+                            str(log),
+                            "--wall-clock-seconds",
+                            "9.25",
+                            "--cpu-time-seconds",
+                            "14.5",
+                            "--out-dir",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
+            summary = json.loads(
+                (output / "ads_hb_solver_summary.json").read_text()
+            )["summaries"][0]
+            self.assertEqual(summary["wall_clock_seconds"], 9.25)
+            self.assertEqual(summary["cpu_time_seconds"], 14.5)
+            self.assertEqual(summary["wall_clock_source"], "CLI --wall-clock-seconds")
 
 
 if __name__ == "__main__":
