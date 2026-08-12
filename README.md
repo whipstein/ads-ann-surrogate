@@ -494,8 +494,8 @@ script with ADS Python on the ADS machine to produce the native `.inc`, `.c`,
 A normal `train` run writes:
 
 - `model.npz` and `metadata.json` with the trained RF model state and assumptions.
-- `dc_model.npz` and `dc_model.json` with the separate geometry-to-DC-
-  conductance network and its extraction diagnostics.
+- `dc_model.npz` and `dc_model.json` with the separate geometry-to-DC model
+  and its extraction diagnostics.
 - `predicted_verification.mdif` for held-out verification blocks.
 - `verification_metrics.csv` with per-block and per-S-parameter errors,
   including EVM.
@@ -503,7 +503,7 @@ A normal `train` run writes:
 - `training_history.csv` and `training_history.pdf` with train/verification
   loss history and convergence plots.
 - `dc_training_history.csv` and `dc_training_history.pdf` with convergence of
-  the independent geometry-only DC conductance network.
+  the independent geometry-only DC model.
 - `training_summary.md` with a human-readable run summary and copyable export
   commands using paths relative to the repository root.
 - `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
@@ -523,8 +523,8 @@ values are easy to edit before export.
 
 ### Distinct DC Point
 
-DC is a separate, geometry-dependent selected-path conductance network derived
-only from the actual exact-zero-frequency S-matrix in each fitted MDIF block.
+DC is a separate, geometry-dependent model derived only from the actual
+exact-zero-frequency S-matrix in each fitted MDIF block.
 It is not a target of the RF DNN, KBNN, or Neuro-TF. Zero-Hz rows are removed
 before RF neural training and rational fitting, so changing DC data cannot
 change RF weights, poles, sweep ranking, or the positive-frequency response.
@@ -532,28 +532,29 @@ change RF weights, poles, sweep ranking, or the positive-frequency response.
 Declare the only viable DC connections with `--dc-port-paths`. For example,
 `--dc-port-paths 1-2,3-4` extracts and stamps independent paths between ports
 1–2 and 3–4. Every undeclared path remains open at DC. Use `1-ground` for a
-port-to-simulator-reference path. Omitting the option uses a generic complete
-passive resistor graph: every port pair plus every port-to-ground path. For a
-two-port model this is `1-2,1-ground,2-ground`.
-When `--dc-mdif` is supplied without `--dc-port-paths`, this generic topology is
-also used to upgrade an older saved model that only had the former pair-only
-default. Repeat an explicit `--dc-port-paths` value when a restricted topology
-is intentional.
+port-to-simulator-reference path. Omitting the option instead fits every ordered
+entry of the full real DC Y matrix: `Y11`, `Y12`, …, `YNN`. This represents all
+`Sij` entries without imposing resistor-graph or reciprocity constraints.
+When `--dc-mdif` is supplied without `--dc-port-paths`, this full-matrix mode is
+also used to upgrade an older saved path-only DC model. Repeat an explicit
+`--dc-port-paths` value when a restricted resistor topology is intentional.
+Export stops with upgrade guidance if an older model saved the former automatic
+path graph but no source MDIF is available; it never silently presents that
+subset as a full-matrix result.
 
 1. Each finite exact-zero-Hz S-matrix is checked for passivity using its largest
    singular value. Rows above `1 + 1e-6` are ignored.
 2. Each usable S-matrix is converted to its full Y-matrix at the configured
    reference impedance.
-3. All declared branches are solved together with a non-negative least-squares
-   projection of that Y-matrix onto the selected resistor graph. Solving the
-   graph jointly avoids double-counting alternate paths in shared-node or loop
-   topologies.
-4. Conductances below `1 / --dc-open-threshold` are represented by
+3. With no path option, every ordered real Y entry is fitted directly. With an
+   explicit path option, all declared branches are instead solved together with
+   a non-negative least-squares projection onto that resistor graph.
+4. In explicit-path mode, conductances below `1 / --dc-open-threshold` are represented by
    `1 / --dc-open-resistance`. The natural logarithm of each positive branch
    conductance is then fitted by a small geometry-only MLP.
-5. The saved diagnostics include the measured-S → extracted-Y → selected-path-Y
-   → reconstructed-S round-trip error, filtered-row counts, fitted-path errors,
-   and train/verification conductance errors.
+5. The saved diagnostics include the measured-S → extracted-Y → model-Y →
+   reconstructed-S round-trip error, filtered-row counts, matrix/path errors,
+   and train/verification errors.
 
 The DC MLP reuses the command's hidden-layer layout, activation, epoch, batch,
 learning-rate, patience, seed, and progress settings, but it has its own scaler,
@@ -573,7 +574,7 @@ predicted DC point and all RF points, while `verification_summary.json` reports
 the DC network's own train/verification round-trip errors separately.
 
 At exactly zero Hz, prediction and sampled-MDIF export evaluate only the saved
-geometry-to-conductance network and selected resistor graph. Sampled ADS exports
+geometry-to-DC model. Sampled ADS exports
 prepend this zero-Hz point automatically. Direct Verilog-A exports embed the DC
 MLP and electrically enable its branch matrix only at zero frequency. Positive
 frequencies use the RF model. The exporter selects DC or fitted Y
@@ -581,8 +582,8 @@ coefficients before an unconditional current contribution, so `ddt()` is never
 placed in a conditional and the generated source remains legal for ADS
 Verilog-A. Export also verifies that DC came from exact-zero-frequency data.
 ADS HB exports make the same DC/RF separation in the SDD frequency weights:
-the geometry-dependent exact-DC resistor network is used only at `freq=0`, and
-the fitted RF surrogate is used only at non-zero spectral frequencies.
+the geometry-dependent exact-DC matrix or explicit-path network is used only at
+`freq=0`, and the fitted RF surrogate is used only at non-zero spectral frequencies.
 
 To export an older fitted model without retraining it, pass the original DC data
 directly to `export-veriloga`, `export-ads-hb`, or `export-ads-mdif`:
@@ -600,11 +601,11 @@ python3 dnn.py export-veriloga \
 `--dc-mdif` validates a saved geometry-dependent DC network directly against
 the supplied exact-DC rows. If it differs by more than `1e-4` in maximum
 absolute S-parameter error, or if the saved model is legacy, export fits a new
-DC-only conductance network from that MDIF. This never changes or refits the RF
-model. The export manifest records `dc_mdif_action` plus the topology and final
+DC-only full-matrix or explicit-path network from that MDIF. This never changes
+or refits the RF model. The export manifest records `dc_mdif_action` plus the topology and final
 DC-model S-parameter errors. Export is rejected if the resulting DC network's
 maximum absolute S-parameter error remains above `1e-3`; this usually means the
-selected resistor graph cannot represent the passive DC data.
+selected DC representation cannot reproduce the passive DC data.
 For a combined training/verification MDIF, export reuses the fitted model's
 `--split-var`, `--train-values`, and `--verify-values` metadata and fits or
 validates DC from the training split only. Verification blocks are never added
@@ -1311,7 +1312,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
-| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Comma-separated viable DC paths. Each declared path is extracted and stamped independently; undeclared paths remain open. Use `1-ground` for a reference path. Default: every port pair plus every port-to-ground path. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
+| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, every ordered entry of the full real DC Y matrix is fitted. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
@@ -1961,7 +1962,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--allow-coarse-hooks</code></nobr> | <code>export-veriloga</code> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open fine-data DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected fine-data branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
-| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Comma-separated viable fine-data DC paths. Each declared path is extracted and stamped independently; undeclared paths remain open. Use `1-ground` for a reference path. Default: every port pair plus every port-to-ground path. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
+| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted fine-data DC resistor paths. If omitted, every ordered entry of the full real DC Y matrix is fitted. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
@@ -2279,7 +2280,7 @@ the **Subcommands** column includes accepted command aliases.
 | --- | --- | --- | --- |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
-| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Comma-separated viable DC paths. Each declared path is extracted and stamped independently; undeclared paths remain open. Use `1-ground` for a reference path. Default: every port pair plus every port-to-ground path. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
+| <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, every ordered entry of the full real DC Y matrix is fitted. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
 | <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_neuro_tf_4port</code></nobr> |

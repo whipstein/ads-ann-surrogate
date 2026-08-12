@@ -721,12 +721,17 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
         "dc_port_paths": metadata["dc_port_paths"],
+        "dc_matrix_entries": metadata.get("dc_matrix_entries", []),
         "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
         "dc_model_kind": metadata["dc_model_kind"],
+        "dc_model_representation": metadata.get("dc_model_representation"),
         "dc_model_layer_sizes": metadata["dc_model_layer_sizes"],
-        "dc_model_train_log_rmse": metadata["dc_model_train_log_rmse"],
+        "dc_model_train_log_rmse": metadata.get("dc_model_train_log_rmse"),
+        "dc_model_train_y_rmse_siemens": metadata.get(
+            "dc_model_train_y_rmse_siemens"
+        ),
         "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
         "dc_model_train_s_max_abs_error": metadata["dc_model_train_s_max_abs_error"],
         "dc_topology_s_rmse": metadata["dc_topology_s_rmse"],
@@ -845,6 +850,7 @@ def command_train(args: argparse.Namespace) -> int:
             "dc_model_kind": metadata["dc_model_kind"],
             "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
             "dc_port_paths": metadata["dc_port_paths"],
+            "dc_matrix_entries": metadata.get("dc_matrix_entries", []),
             "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
             "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
             "layer_sizes": model.mlp.layer_sizes,
@@ -934,6 +940,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "frequency_points_per_block": manifest["frequency_points_per_block"],
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_port_paths": dc_metadata.get("dc_port_paths"),
+        "dc_matrix_entries": dc_metadata.get("dc_matrix_entries"),
+        "dc_model_kind": dc_metadata.get("dc_model_kind"),
         "dc_port_resistances_ohm": dc_metadata.get("dc_port_resistances_ohm"),
         "dc_ignored_nonpassive_count": dc_metadata.get(
             "dc_ignored_nonpassive_count"
@@ -1189,6 +1197,8 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "folded_output_scaler": manifest["folded_output_scaler"],
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
         "dc_port_paths": manifest.get("dc_port_paths"),
+        "dc_matrix_entries": manifest.get("dc_matrix_entries"),
+        "dc_model_kind": manifest.get("dc_model_kind"),
         "dc_port_resistances_ohm": manifest.get("dc_port_resistances_ohm"),
         "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
         "dc_resistance_pair_means_ohm": manifest["dc_resistance_pair_means_ohm"],
@@ -1285,6 +1295,8 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "linear": manifest["linear"],
                 "power_dependent": manifest["power_dependent"],
                 "supported_analyses": manifest["supported_analyses"],
+                "dc_matrix_entries": manifest.get("dc_matrix_entries"),
+                "dc_model_kind": manifest.get("dc_model_kind"),
                 "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
                 "dc_mdif_training_blocks": dc_metadata.get(
                     "dc_mdif_training_block_count"
