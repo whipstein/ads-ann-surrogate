@@ -161,6 +161,7 @@ class NeuroTF:
         dc_equivalent_resistance_ohm: float | None = None,
         dc_resistance_source_kind: str | None = None,
         dc_port_resistances_ohm: dict[str, float] | None = None,
+        dc_model: DCConductanceModel | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -183,6 +184,7 @@ class NeuroTF:
                 for path, resistance in dc_port_resistances_ohm.items()
             }
         )
+        self.dc_model = dc_model
 
     @property
     def n_coeffs(self) -> int:
@@ -200,15 +202,21 @@ class NeuroTF:
         for block, row in zip(blocks, coeff_rows):
             coeffs = unflatten_coefficients(row, len(self.sparam_labels), self.n_coeffs)
             values_by_label = evaluate_coefficients(coeffs, block.freq_hz, self.poles, self.f_scale)
-            values_by_label = apply_distinct_dc_response(
-                values_by_label.T,
-                block.freq_hz,
-                self.sparam_labels,
-                self.dc_equivalent_resistance_ohm,
-                self.dc_resistance_source_kind,
-                self.dc_port_resistances_ohm,
-                z0=50.0,
-            ).T
+            row_values = values_by_label.T
+            dc_mask = np.asarray(block.freq_hz, dtype=float) == 0.0
+            if self.dc_model is not None and np.any(dc_mask):
+                row_values[dc_mask, :] = self.dc_model.predict_block_s_values(block)[None, :]
+            else:
+                row_values = apply_distinct_dc_response(
+                    row_values,
+                    block.freq_hz,
+                    self.sparam_labels,
+                    self.dc_equivalent_resistance_ohm,
+                    self.dc_resistance_source_kind,
+                    self.dc_port_resistances_ohm,
+                    z0=50.0,
+                )
+            values_by_label = row_values.T
             sparams = {
                 label: values_by_label[idx, :]
                 for idx, label in enumerate(self.sparam_labels)
@@ -238,6 +246,8 @@ class NeuroTF:
             arrays[f"W{idx}"] = weight
             arrays[f"b{idx}"] = bias
         np.savez_compressed(out_dir / "model.npz", **arrays)
+        if self.dc_model is not None:
+            self.dc_model.save(out_dir)
         combined_metadata = {
             "version": VERSION,
             "parameter_names": self.parameter_names,
@@ -280,6 +290,7 @@ class NeuroTF:
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
             dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
             dc_port_resistances_ohm=metadata.get("dc_port_resistances_ohm"),
+            dc_model=DCConductanceModel.load_optional(model_dir),
         )
 
 
@@ -317,6 +328,8 @@ def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], 
         parameter_names=args.parameter_names,
         holdout_fraction=args.holdout_fraction,
         dc_port_paths=getattr(args, "dc_port_paths", None),
+        dc_open_threshold=args.dc_open_threshold,
+        dc_open_resistance=args.dc_open_resistance,
         order=int(candidate["order"]),
         pole_damping=float(candidate["pole_damping"]),
         ridge=float(candidate["ridge"]),
@@ -437,11 +450,31 @@ def command_train(args: argparse.Namespace) -> int:
         split_var=args.split_var,
     )
     sparam_labels = common_sparameter_labels(split_data.all_blocks)
-    dc_metadata = extract_average_dc_resistance(
+    hidden_layers = parse_hidden_layers(args.hidden_layers)
+    progress_interval = progress_interval_from_args(args)
+    dc_model, dc_history, dc_metadata = train_dc_conductance_model(
         train_blocks,
+        verify_blocks,
+        parameter_names,
         sparam_labels,
+        hidden_layers=hidden_layers,
+        activation=args.activation,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        patience=args.patience,
+        seed=args.seed,
+        loss_interval=getattr(args, "loss_interval", 1),
+        progress_interval=progress_interval,
+        progress_label=f"{getattr(args, 'progress_label', 'Neuro-TF fit')} DC",
         z0=50.0,
         port_paths=getattr(args, "dc_port_paths", None),
+        open_threshold_ohm=float(
+            getattr(args, "dc_open_threshold", DEFAULT_DC_OPEN_THRESHOLD_OHM)
+        ),
+        open_resistance_ohm=float(
+            getattr(args, "dc_open_resistance", DEFAULT_DC_OPEN_RESISTANCE_OHM)
+        ),
     )
     fit_train_blocks = positive_frequency_blocks(train_blocks)
     fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
@@ -497,10 +530,8 @@ def command_train(args: argparse.Namespace) -> int:
     x_verify_scaled = x_scaler.transform(x_verify) if x_verify is not None else None
     y_verify_scaled = y_scaler.transform(y_verify) if y_verify is not None else None
 
-    hidden_layers = parse_hidden_layers(args.hidden_layers)
     layer_sizes = [x_train.shape[1], *hidden_layers, y_train.shape[1]]
     mlp = MLP(layer_sizes, activation=args.activation, seed=args.seed)
-    progress_interval = progress_interval_from_args(args)
     history = mlp.train(
         x_train_scaled,
         y_train_scaled,
@@ -532,6 +563,7 @@ def command_train(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
         dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
+        dc_model=dc_model,
     )
 
     out_dir = Path(args.out_dir)
@@ -550,10 +582,16 @@ def command_train(args: argparse.Namespace) -> int:
         "frequency_weight_max": float(np.max(raw_frequency_weights)),
         "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples before weighted rational least squares.",
         **dc_metadata,
+        "dc_model_history_rows": len(dc_history),
     }
     model.save(
         out_dir,
         metadata=metadata,
+    )
+    write_history(
+        out_dir / "dc_training_history.csv",
+        dc_history,
+        plot_title="Separate exact-DC conductance model performance vs epoch",
     )
     training_config = {
         "training_blocks": len(train_blocks),
@@ -572,6 +610,13 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_model_kind": metadata["dc_model_kind"],
+        "dc_model_layer_sizes": metadata["dc_model_layer_sizes"],
+        "dc_model_train_log_rmse": metadata["dc_model_train_log_rmse"],
+        "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
+        "dc_model_train_s_max_abs_error": metadata["dc_model_train_s_max_abs_error"],
+        "dc_topology_s_rmse": metadata["dc_topology_s_rmse"],
+        "dc_topology_s_max_abs_error": metadata["dc_topology_s_max_abs_error"],
         "dc_resistance_filtering": {
             "raw_mean_ohm": metadata["dc_equivalent_resistance_raw_mean_ohm"],
             "mean_conductance_siemens": metadata["dc_mean_conductance_siemens"],
@@ -614,16 +659,45 @@ def command_train(args: argparse.Namespace) -> int:
 
     if verify_blocks:
         pred_blocks = model.predict_blocks(verify_blocks)
+        rf_verify_blocks = positive_frequency_blocks(
+            verify_blocks,
+            purpose="RF verification",
+        )
+        rf_pred_blocks = positive_frequency_blocks(
+            pred_blocks,
+            purpose="RF verification",
+        )
         summary = write_training_verification_artifacts(
             out_dir,
-            verify_blocks,
-            pred_blocks,
+            rf_verify_blocks,
+            rf_pred_blocks,
             sparam_labels,
             parameter_names,
             max_worst_plots=getattr(args, "worst_plots", 6),
             frequency_weights=getattr(args, "frequency_weights", None),
             y_z0=50.0,
             title_context=plot_context,
+        )
+        write_mdif(
+            out_dir / "predicted_verification.mdif",
+            pred_blocks,
+            sparam_labels,
+        )
+        summary.update(
+            {
+                "verification_frequency_scope": "positive_frequency_rf_only",
+                "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
+                "dc_model_train_s_max_abs_error": metadata[
+                    "dc_model_train_s_max_abs_error"
+                ],
+                "dc_model_verify_s_rmse": metadata.get("dc_model_verify_s_rmse"),
+                "dc_model_verify_s_max_abs_error": metadata.get(
+                    "dc_model_verify_s_max_abs_error"
+                ),
+            }
+        )
+        (out_dir / "verification_summary.json").write_text(
+            json.dumps(summary, indent=2)
         )
     else:
         summary = {"warning": "No verification blocks were available"}
@@ -651,6 +725,8 @@ def command_train(args: argparse.Namespace) -> int:
             "n_poles": args.order,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+            "dc_model_kind": metadata["dc_model_kind"],
+            "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
             "dc_port_paths": metadata["dc_port_paths"],
             "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
             "dc_resistance_pair_means_ohm": metadata[
@@ -697,6 +773,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
         if isinstance(dc_metadata.get("dc_port_resistances_ohm"), dict)
         else None
     )
+    if args.dc_mdif:
+        model.dc_model = None
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -790,6 +868,11 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
+        dc_model=(
+            model.dc_model.export_data()
+            if model.dc_model is not None and not args.dc_mdif
+            else None
+        ),
         source_model_dir=str(model_dir),
         extra_manifest={
             "dc_resistance_source_kind": dc_metadata.get(
@@ -869,6 +952,11 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
+        dc_model=(
+            model.dc_model.export_data()
+            if model.dc_model is not None and not args.dc_mdif
+            else None
+        ),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "neuro_transfer_function",
@@ -932,7 +1020,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--parameter-names", help="Comma-separated geometry parameter VAR names")
     train.add_argument("--holdout-fraction", type=float, default=0.2)
-    add_dc_port_paths_argument(train)
+    add_dc_fitting_arguments(train)
     train.add_argument("--order", type=int, default=10, help="Number of fixed rational poles")
     train.add_argument("--pole-damping", type=float, default=0.18)
     train.add_argument("--ridge", type=float, default=1e-8, help="Least-squares ridge for TF fitting")
@@ -972,7 +1060,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--verify-values", default="verify,verification,test,validation")
     sweep.add_argument("--parameter-names", help="Comma-separated geometry parameter VAR names")
     sweep.add_argument("--holdout-fraction", type=float, default=0.2)
-    add_dc_port_paths_argument(sweep)
+    add_dc_fitting_arguments(sweep)
     sweep.add_argument(
         "--orders",
         "--order",

@@ -1083,18 +1083,25 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dc-mdif",
         help=(
-            "MDIF containing exact-zero-Hz S-parameter rows used to derive the DC "
-            "resistance without refitting the RF model. Overrides saved DC metadata."
+            "Compatibility override for a legacy model: derive a static selected-path "
+            "network from exact-zero-Hz S-parameters without refitting RF. Newly "
+            "trained models normally use their saved geometry-dependent DC network."
         ),
     )
     add_dc_port_paths_argument(parser)
+    add_dc_threshold_arguments(parser)
+
+
+def add_dc_threshold_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the selected-path open-circuit threshold controls."""
+
     parser.add_argument(
         "--dc-open-threshold",
         type=float,
         default=DEFAULT_DC_OPEN_THRESHOLD_OHM,
         help=(
-            "A selected path's conductance-averaged passive DC resistance above "
-            "this value is treated as open. "
+            "A selected path conductance below the reciprocal of this resistance "
+            "is treated as open. "
             f"Default: {DEFAULT_DC_OPEN_THRESHOLD_OHM:g} ohm."
         ),
     )
@@ -1107,6 +1114,13 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
             f"Default: {DEFAULT_DC_OPEN_RESISTANCE_OHM:g} ohm."
         ),
     )
+
+
+def add_dc_fitting_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add all exact-DC controls used during model fitting."""
+
+    add_dc_port_paths_argument(parser)
+    add_dc_threshold_arguments(parser)
 
 
 def add_dc_port_paths_argument(parser: argparse.ArgumentParser) -> None:
@@ -2354,9 +2368,10 @@ model-training unit".
 ## Distinct DC Point
 
 At an exact simulator frequency of zero, the fitted neural/rational contribution
-is electrically disabled. The module instead uses fixed, parameter-independent
-path resistances extracted exclusively from exact zero-Hz rows in the supplied
-DC data. The aggregate resistance summary is
+is electrically disabled. Current models instead evaluate their embedded
+geometry-only conductance network, extracted exclusively from exact zero-Hz
+rows. Legacy models use their saved fixed path resistances. The aggregate
+resistance summary is
 `{dc_equivalent_resistance_ohm:.17g} ohm`. Positive-frequency fallback and RF
 extrapolation are forbidden.
 
@@ -2386,6 +2401,105 @@ with `--frequency-expression` and the expression supported by that simulator.
 """
 
 
+def _validated_dc_model_export(
+    dc_model: dict[str, object] | None,
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+) -> dict[str, object] | None:
+    if dc_model is None:
+        return None
+    if [str(value) for value in dc_model["parameter_names"]] != list(parameter_names):  # type: ignore[index]
+        raise ValueError("DC model parameters do not match the exported RF model")
+    if [str(value) for value in dc_model["sparam_labels"]] != list(sparam_labels):  # type: ignore[index]
+        raise ValueError("DC model S-parameter order does not match the RF model")
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    paths = parse_dc_port_paths(dc_model["port_paths"], nports)
+    layer_sizes = [int(value) for value in dc_model["layer_sizes"]]  # type: ignore[index]
+    weights = [np.asarray(value, dtype=float) for value in dc_model["weights"]]  # type: ignore[index]
+    biases = [np.asarray(value, dtype=float) for value in dc_model["biases"]]  # type: ignore[index]
+    x_mean = np.asarray(dc_model["x_mean"], dtype=float)
+    x_std = np.asarray(dc_model["x_std"], dtype=float)
+    y_mean = np.asarray(dc_model["y_mean"], dtype=float)
+    y_std = np.asarray(dc_model["y_std"], dtype=float)
+    if layer_sizes[0] != len(parameter_names) or layer_sizes[-1] != len(paths):
+        raise ValueError("DC model dimensions do not match parameters and selected paths")
+    if len(weights) != len(biases) or len(weights) != len(layer_sizes) - 1:
+        raise ValueError("DC model layers are inconsistent")
+    if x_mean.shape != (layer_sizes[0],) or x_std.shape != (layer_sizes[0],):
+        raise ValueError("DC model input scaler is inconsistent")
+    if y_mean.shape != (layer_sizes[-1],) or y_std.shape != (layer_sizes[-1],):
+        raise ValueError("DC model output scaler is inconsistent")
+    return {
+        **dc_model,
+        "paths_parsed": paths,
+        "layer_sizes": layer_sizes,
+        "weights": weights,
+        "biases": biases,
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "y_mean": y_mean,
+        "y_std": y_std,
+    }
+
+
+def _veriloga_dc_matrix_expressions(
+    nports: int,
+    paths: Sequence[tuple[int, int | None, str]],
+    conductance_expressions: Sequence[str],
+) -> list[str]:
+    terms: list[list[str]] = [[] for _ in range(nports * nports)]
+    for (first, second, _), expression in zip(paths, conductance_expressions):
+        terms[first * nports + first].append(expression)
+        if second is not None:
+            terms[second * nports + second].append(expression)
+            terms[first * nports + second].append(f"-({expression})")
+            terms[second * nports + first].append(f"-({expression})")
+    return [" + ".join(values) if values else "0.0" for values in terms]
+
+
+def _dc_export_default_s_values(
+    dc_model_data: dict[str, object],
+    sparam_labels: Sequence[str],
+    z0: float,
+) -> np.ndarray:
+    """Evaluate exported DC data at its mean geometry for manifest diagnostics."""
+
+    activation = str(dc_model_data["activation"])
+    values = np.zeros((1, len(dc_model_data["x_mean"])), dtype=float)  # type: ignore[arg-type]
+    weights = dc_model_data["weights"]
+    biases = dc_model_data["biases"]
+    assert isinstance(weights, list) and isinstance(biases, list)
+    for layer_idx, (weight, bias) in enumerate(zip(weights, biases)):
+        values = values @ np.asarray(weight, dtype=float) + np.asarray(bias, dtype=float)
+        if layer_idx < len(weights) - 1:
+            values = np.tanh(values) if activation == "tanh" else np.maximum(values, 0.0)
+    log_conductance = (
+        values * np.asarray(dc_model_data["y_std"], dtype=float)
+        + np.asarray(dc_model_data["y_mean"], dtype=float)
+    )
+    conductances = np.exp(
+        np.clip(
+            log_conductance[0],
+            float(dc_model_data["log_conductance_min"]),
+            float(dc_model_data["log_conductance_max"]),
+        )
+    )
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    y_matrix = _dc_matrix_from_path_conductances(
+        nports,
+        dc_model_data["paths_parsed"],  # type: ignore[arg-type]
+        conductances,
+    ).astype(complex)
+    s_matrix = _y_matrix_to_s_matrix(y_matrix, z0)
+    return np.asarray(
+        [
+            s_matrix[(sparam_indices(label) or (0, 0))[0] - 1, (sparam_indices(label) or (0, 0))[1] - 1]
+            for label in sparam_labels
+        ],
+        dtype=complex,
+    )
+
+
 def veriloga_module_text(
     model_kind: str,
     module_name: str,
@@ -2412,6 +2526,7 @@ def veriloga_module_text(
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
     dc_port_resistances_ohm: object = None,
+    dc_model: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
     output_domain = output_domain.lower().strip()
     if output_domain not in {"s", "y"}:
@@ -2434,6 +2549,11 @@ def veriloga_module_text(
     dc_parameter_rows, dc_real_by_flat = _veriloga_dc_path_configuration(
         sparam_labels,
         dc_path_resistances,
+    )
+    dc_model_data = _validated_dc_model_export(
+        dc_model,
+        parameter_names,
+        sparam_labels,
     )
     nports = infer_complete_sparameter_ports(sparam_labels)
     n_sparams = len(sparam_labels)
@@ -2625,11 +2745,12 @@ def veriloga_module_text(
         f"  parameter real dc_equivalent_resistance_ohm = {veriloga_float(dc_resistance)}; "
         "// DC summary; selected path parameters below drive stamping when present",
     ]
-    for canonical, identifier, path_resistance in dc_parameter_rows:
-        lines.append(
-            f"  parameter real {identifier} = {veriloga_float(path_resistance)}; "
-            f"// selected DC path {canonical}"
-        )
+    if dc_model_data is None:
+        for canonical, identifier, path_resistance in dc_parameter_rows:
+            lines.append(
+                f"  parameter real {identifier} = {veriloga_float(path_resistance)}; "
+                f"// selected DC path {canonical}"
+            )
     if output_domain == "s":
         lines.append(f"  parameter real z0 = {veriloga_float(z0)};")
         lines.append("  parameter real pivot_floor = 1.0e-24;")
@@ -2731,6 +2852,13 @@ def veriloga_module_text(
     )
     for layer_idx, size in enumerate(layer_sizes):
         lines.append(f"  real l{layer_idx} [0:{size - 1}];")
+    if dc_model_data is not None:
+        dc_layer_sizes = dc_model_data["layer_sizes"]
+        assert isinstance(dc_layer_sizes, list)
+        lines.append(f"  real dc_log_g [0:{len(dc_model_data['paths_parsed']) - 1}];")  # type: ignore[arg-type]
+        lines.append(f"  real dc_g [0:{len(dc_model_data['paths_parsed']) - 1}];")  # type: ignore[arg-type]
+        for layer_idx, size in enumerate(dc_layer_sizes):
+            lines.append(f"  real dc_l{layer_idx} [0:{size - 1}];")
 
     lines.extend(["", "  analog begin"])
     lines.append(f"    freq_hz = {frequency_expression};")
@@ -2738,6 +2866,55 @@ def veriloga_module_text(
     lines.append("    if (clamp_frequency != 0 && freq_hz < min_frequency_hz) freq_hz = min_frequency_hz;")
     lines.append("    freq_log10_hz = log(freq_hz)/log(10.0);")
     lines.append("")
+
+    if dc_model_data is not None:
+        dc_x_mean = np.asarray(dc_model_data["x_mean"], dtype=float)
+        dc_x_std = np.asarray(dc_model_data["x_std"], dtype=float)
+        for idx, (ident, scale_ident) in enumerate(zip(param_ids, scale_ids)):
+            expression = f"({ident})/({scale_ident})"
+            lines.append(
+                f"    dc_l0[{idx}] = (({expression}) - "
+                f"({veriloga_float(float(dc_x_mean[idx]))}))"
+                f"/({veriloga_float(float(dc_x_std[idx]))});"
+            )
+        dc_weights = dc_model_data["weights"]
+        dc_biases = dc_model_data["biases"]
+        assert isinstance(dc_weights, list) and isinstance(dc_biases, list)
+        for layer_idx, (dc_weight, dc_bias) in enumerate(zip(dc_weights, dc_biases)):
+            hidden_activation = (
+                str(dc_model_data["activation"])
+                if layer_idx < len(dc_weights) - 1
+                else None
+            )
+            _veriloga_layer_assignments(
+                lines,
+                source=f"dc_l{layer_idx}",
+                dest=f"dc_l{layer_idx + 1}",
+                weight=np.asarray(dc_weight, dtype=float),
+                bias=np.asarray(dc_bias, dtype=float),
+                activation=hidden_activation,
+            )
+        dc_final_layer = f"dc_l{len(dc_model_data['layer_sizes']) - 1}"  # type: ignore[arg-type]
+        dc_y_mean = np.asarray(dc_model_data["y_mean"], dtype=float)
+        dc_y_std = np.asarray(dc_model_data["y_std"], dtype=float)
+        dc_log_min = veriloga_float(float(dc_model_data["log_conductance_min"]))
+        dc_log_max = veriloga_float(float(dc_model_data["log_conductance_max"]))
+        for idx in range(len(dc_y_mean)):
+            lines.append(
+                f"    dc_log_g[{idx}] = {dc_final_layer}[{idx}]*"
+                f"({veriloga_float(float(dc_y_std[idx]))}) + "
+                f"({veriloga_float(float(dc_y_mean[idx]))});"
+            )
+            lines.append(
+                f"    dc_g[{idx}] = exp(min(max(dc_log_g[{idx}], {dc_log_min}), "
+                f"{dc_log_max}));"
+            )
+        dc_real_by_flat = _veriloga_dc_matrix_expressions(
+            nports,
+            dc_model_data["paths_parsed"],  # type: ignore[arg-type]
+            [f"dc_g[{idx}]" for idx in range(len(dc_y_mean))],
+        )
+        lines.append("")
 
     if coarse_embedded:
         lines.append("    // Self-contained coarse S-parameter DNN.")
@@ -2967,11 +3144,21 @@ def veriloga_module_text(
         "dc_port_parameter_identifiers": {
             canonical: identifier
             for canonical, identifier, _ in dc_parameter_rows
-        },
+        } if dc_model_data is None else {},
         "dc_resistance_source_kind": dc_source_kind,
+        "dc_model_kind": (
+            str(dc_model_data.get("kind")) if dc_model_data is not None else None
+        ),
+        "dc_geometry_dependent": dc_model_data is not None,
+        "dc_model_metadata": (
+            dc_model_data.get("metadata") if dc_model_data is not None else None
+        ),
         "dc_response_topology": (
-            "Parameter-independent selected-path resistor graph; only declared paths "
-            "are connected and the fitted neural response is bypassed at zero Hz"
+            "Geometry-dependent selected-path conductance graph; only declared paths "
+            "are connected and the fitted RF response is bypassed at zero Hz"
+            if dc_model_data is not None
+            else "Parameter-independent selected-path resistor graph; only declared "
+            "paths are connected and the fitted neural response is bypassed at zero Hz"
             if dc_path_resistances is not None
             else "Legacy parameter-independent equal-resistance complete graph; the "
             "fitted neural response is bypassed at zero Hz"
@@ -2979,6 +3166,9 @@ def veriloga_module_text(
         "dc_is_separate_from_fitted_response": True,
         "dc_requires_exact_zero_frequency": True,
         "dc_rf_fallback_allowed": False,
+        "dc_sparameters_geometry": (
+            "parameter_model_defaults" if dc_model_data is not None else "static_legacy"
+        ),
         "dc_sparameters": {
             label: {
                 "real": float(value.real),
@@ -2986,11 +3176,19 @@ def veriloga_module_text(
             }
             for label, value in zip(
                 sparam_labels,
-                dc_sparameter_values(
-                    sparam_labels,
-                    dc_resistance,
-                    dc_port_resistances_ohm=dc_path_resistances,
-                    z0=z0,
+                (
+                    _dc_export_default_s_values(
+                        dc_model_data,
+                        sparam_labels,
+                        z0,
+                    )
+                    if dc_model_data is not None
+                    else dc_sparameter_values(
+                        sparam_labels,
+                        dc_resistance,
+                        dc_port_resistances_ohm=dc_path_resistances,
+                        z0=z0,
+                    )
                 ),
             )
         },
@@ -3025,6 +3223,7 @@ def write_veriloga_package(
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
     dc_port_resistances_ohm: object = None,
+    dc_model: dict[str, object] | None = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -3057,6 +3256,7 @@ def write_veriloga_package(
         dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
         dc_resistance_source_kind=dc_resistance_source_kind,
         dc_port_resistances_ohm=dc_port_resistances_ohm,
+        dc_model=dc_model,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -3130,6 +3330,7 @@ def neurotf_veriloga_module_text(
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
     dc_port_resistances_ohm: object = None,
+    dc_model: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Generate a direct Neuro-TF Verilog-A implementation."""
 
@@ -3155,6 +3356,11 @@ def neurotf_veriloga_module_text(
     dc_parameter_rows, dc_real_by_flat = _veriloga_dc_path_configuration(
         sparam_labels,
         dc_path_resistances,
+    )
+    dc_model_data = _validated_dc_model_export(
+        dc_model,
+        parameter_names,
+        sparam_labels,
     )
     if not parameter_names:
         raise ValueError("Neuro-TF Verilog-A export requires at least one model parameter")
@@ -3248,11 +3454,12 @@ def neurotf_veriloga_module_text(
         f"  parameter real z0 = {veriloga_float(z0)};",
         "  parameter real pivot_floor = 1.0e-24;",
     ]
-    for canonical, identifier, path_resistance in dc_parameter_rows:
-        lines.append(
-            f"  parameter real {identifier} = {veriloga_float(path_resistance)}; "
-            f"// selected DC path {canonical}"
-        )
+    if dc_model_data is None:
+        for canonical, identifier, path_resistance in dc_parameter_rows:
+            lines.append(
+                f"  parameter real {identifier} = {veriloga_float(path_resistance)}; "
+                f"// selected DC path {canonical}"
+            )
     for name, ident, default in zip(parameter_names, param_ids, param_defaults):
         lines.append(
             f"  parameter real {ident} = {veriloga_float(default)}; "
@@ -3315,6 +3522,14 @@ def neurotf_veriloga_module_text(
     )
     for layer_idx, size in enumerate(layer_sizes):
         lines.append(f"  real l{layer_idx} [0:{size - 1}];")
+    if dc_model_data is not None:
+        dc_layer_sizes = dc_model_data["layer_sizes"]
+        assert isinstance(dc_layer_sizes, list)
+        dc_path_count = len(dc_model_data["paths_parsed"])  # type: ignore[arg-type]
+        lines.append(f"  real dc_log_g [0:{dc_path_count - 1}];")
+        lines.append(f"  real dc_g [0:{dc_path_count - 1}];")
+        for layer_idx, size in enumerate(dc_layer_sizes):
+            lines.append(f"  real dc_l{layer_idx} [0:{size - 1}];")
 
     lines.extend(["", "  analog begin"])
     lines.append(f"    freq_hz = {frequency_expression};")
@@ -3325,6 +3540,53 @@ def neurotf_veriloga_module_text(
     )
     lines.append(f"    normalized_frequency = freq_hz/({veriloga_float(float(f_scale))});")
     lines.append("")
+    if dc_model_data is not None:
+        dc_x_mean = np.asarray(dc_model_data["x_mean"], dtype=float)
+        dc_x_std = np.asarray(dc_model_data["x_std"], dtype=float)
+        for idx, (ident, scale_ident) in enumerate(zip(param_ids, scale_ids)):
+            lines.append(
+                f"    dc_l0[{idx}] = ((({ident})/({scale_ident})) - "
+                f"({veriloga_float(float(dc_x_mean[idx]))}))"
+                f"/({veriloga_float(float(dc_x_std[idx]))});"
+            )
+        dc_weights = dc_model_data["weights"]
+        dc_biases = dc_model_data["biases"]
+        assert isinstance(dc_weights, list) and isinstance(dc_biases, list)
+        for layer_idx, (dc_weight, dc_bias) in enumerate(zip(dc_weights, dc_biases)):
+            hidden_activation = (
+                str(dc_model_data["activation"])
+                if layer_idx < len(dc_weights) - 1
+                else None
+            )
+            _veriloga_layer_assignments(
+                lines,
+                source=f"dc_l{layer_idx}",
+                dest=f"dc_l{layer_idx + 1}",
+                weight=np.asarray(dc_weight, dtype=float),
+                bias=np.asarray(dc_bias, dtype=float),
+                activation=hidden_activation,
+            )
+        dc_final_layer = f"dc_l{len(dc_model_data['layer_sizes']) - 1}"  # type: ignore[arg-type]
+        dc_y_mean = np.asarray(dc_model_data["y_mean"], dtype=float)
+        dc_y_std = np.asarray(dc_model_data["y_std"], dtype=float)
+        dc_log_min = veriloga_float(float(dc_model_data["log_conductance_min"]))
+        dc_log_max = veriloga_float(float(dc_model_data["log_conductance_max"]))
+        for idx in range(len(dc_y_mean)):
+            lines.append(
+                f"    dc_log_g[{idx}] = {dc_final_layer}[{idx}]*"
+                f"({veriloga_float(float(dc_y_std[idx]))}) + "
+                f"({veriloga_float(float(dc_y_mean[idx]))});"
+            )
+            lines.append(
+                f"    dc_g[{idx}] = exp(min(max(dc_log_g[{idx}], {dc_log_min}), "
+                f"{dc_log_max}));"
+            )
+        dc_real_by_flat = _veriloga_dc_matrix_expressions(
+            nports,
+            dc_model_data["paths_parsed"],  # type: ignore[arg-type]
+            [f"dc_g[{idx}]" for idx in range(len(dc_y_mean))],
+        )
+        lines.append("")
     for idx, (ident, scale_ident) in enumerate(zip(param_ids, scale_ids)):
         lines.append(
             f"    l0[{idx}] = ((({ident})/({scale_ident})) - "
@@ -3463,11 +3725,21 @@ def neurotf_veriloga_module_text(
         "dc_port_parameter_identifiers": {
             canonical: identifier
             for canonical, identifier, _ in dc_parameter_rows
-        },
+        } if dc_model_data is None else {},
         "dc_resistance_source_kind": dc_source_kind,
+        "dc_model_kind": (
+            str(dc_model_data.get("kind")) if dc_model_data is not None else None
+        ),
+        "dc_geometry_dependent": dc_model_data is not None,
+        "dc_model_metadata": (
+            dc_model_data.get("metadata") if dc_model_data is not None else None
+        ),
         "dc_response_topology": (
-            "Parameter-independent selected-path resistor graph; only declared paths "
+            "Geometry-dependent selected-path conductance graph; only declared paths "
             "are connected and the fitted coefficient response is bypassed at zero Hz"
+            if dc_model_data is not None
+            else "Parameter-independent selected-path resistor graph; only declared "
+            "paths are connected and the fitted coefficient response is bypassed at zero Hz"
             if dc_path_resistances is not None
             else "Legacy parameter-independent equal-resistance complete graph; the "
             "fitted coefficient response is bypassed at zero Hz"
@@ -3475,6 +3747,9 @@ def neurotf_veriloga_module_text(
         "dc_is_separate_from_fitted_response": True,
         "dc_requires_exact_zero_frequency": True,
         "dc_rf_fallback_allowed": False,
+        "dc_sparameters_geometry": (
+            "parameter_model_defaults" if dc_model_data is not None else "static_legacy"
+        ),
         "dc_sparameters": {
             label: {
                 "real": float(value.real),
@@ -3482,11 +3757,19 @@ def neurotf_veriloga_module_text(
             }
             for label, value in zip(
                 sparam_labels,
-                dc_sparameter_values(
-                    sparam_labels,
-                    dc_resistance,
-                    dc_port_resistances_ohm=dc_path_resistances,
-                    z0=z0,
+                (
+                    _dc_export_default_s_values(
+                        dc_model_data,
+                        sparam_labels,
+                        z0,
+                    )
+                    if dc_model_data is not None
+                    else dc_sparameter_values(
+                        sparam_labels,
+                        dc_resistance,
+                        dc_port_resistances_ohm=dc_path_resistances,
+                        z0=z0,
+                    )
                 ),
             )
         },
@@ -3515,6 +3798,7 @@ def write_neurotf_veriloga_package(
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
     dc_port_resistances_ohm: object = None,
+    dc_model: dict[str, object] | None = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -3542,6 +3826,7 @@ def write_neurotf_veriloga_package(
         dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
         dc_resistance_source_kind=dc_resistance_source_kind,
         dc_port_resistances_ohm=dc_port_resistances_ohm,
+        dc_model=dc_model,
     )
     va_name = f"{module_id}.va"
     manifest_name = "veriloga_manifest.json"
@@ -3811,6 +4096,7 @@ def _append_ads_hb_sdd(
     response_names: Sequence[str],
     response_domain: str,
     dc_conductance: np.ndarray | None = None,
+    dc_conductance_names: Sequence[str] | None = None,
 ) -> None:
     nports = len(port_ids)
     if len(response_names) != nports * nports:
@@ -3836,6 +4122,10 @@ def _append_ads_hb_sdd(
         dc_matrix.shape != (nports, nports) or not np.all(np.isfinite(dc_matrix))
     ):
         raise ValueError("ADS HB DC conductance matrix is invalid")
+    if dc_conductance_names is not None and len(dc_conductance_names) != nports * nports:
+        raise ValueError("ADS HB dynamic DC conductance matrix has invalid dimensions")
+    if dc_matrix is not None and dc_conductance_names is not None:
+        raise ValueError("ADS HB DC stamping must use either static values or expressions")
 
     # Explicit-current SDDs use ordinary nodal analysis and introduce no
     # branch-current unknowns. Keep RF and DC in separate parallel branches:
@@ -3856,7 +4146,7 @@ def _append_ads_hb_sdd(
             )
             weight_index += 1
     append_tokens(rf_tokens)
-    if dc_matrix is None:
+    if dc_matrix is None and dc_conductance_names is None:
         return
     lines.append("")
 
@@ -3870,13 +4160,70 @@ def _append_ads_hb_sdd(
         dc_tokens.append(f"I[{port_number},0]=0.0")
         for col in range(nports):
             control_number = col + 1
-            conductance = veriloga_float(float(dc_matrix[row, col]))
+            conductance = (
+                str(dc_conductance_names[row * nports + col])
+                if dc_conductance_names is not None
+                else veriloga_float(float(dc_matrix[row, col]))
+            )
             dc_tokens.append(f"I[{port_number},{weight_index}]=_v{control_number}")
             dc_tokens.append(
                 f"H[{weight_index}]=if (freq equals 0) then {conductance} else 0.0 endif"
             )
             weight_index += 1
     append_tokens(dc_tokens)
+
+
+def _append_ads_hb_dc_conductance_model(
+    lines: list[str],
+    prefix: str,
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+    parameter_features: Sequence[str],
+    dc_model: dict[str, object],
+) -> list[str]:
+    """Append a geometry-only DC MLP and return row-major Y expressions."""
+
+    if [str(value) for value in dc_model["parameter_names"]] != list(parameter_names):  # type: ignore[index]
+        raise ValueError("DC model parameters do not match the exported RF model")
+    if [str(value) for value in dc_model["sparam_labels"]] != list(sparam_labels):  # type: ignore[index]
+        raise ValueError("DC model S-parameter order does not match the RF model")
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    paths = parse_dc_port_paths(dc_model["port_paths"], nports)
+    log_outputs = _append_ads_hb_mlp_equations(
+        lines,
+        f"{prefix}_net",
+        parameter_features,
+        str(dc_model["activation"]),
+        dc_model["layer_sizes"],  # type: ignore[arg-type]
+        dc_model["weights"],  # type: ignore[arg-type]
+        dc_model["biases"],  # type: ignore[arg-type]
+        np.asarray(dc_model["x_mean"], dtype=float),
+        np.asarray(dc_model["x_std"], dtype=float),
+        np.asarray(dc_model["y_mean"], dtype=float),
+        np.asarray(dc_model["y_std"], dtype=float),
+    )
+    if len(log_outputs) != len(paths):
+        raise ValueError("DC model output count does not match selected path count")
+    log_min = veriloga_float(float(dc_model["log_conductance_min"]))
+    log_max = veriloga_float(float(dc_model["log_conductance_max"]))
+    conductance_names: list[str] = []
+    for idx, output_name in enumerate(log_outputs):
+        name = f"{prefix}_g{idx}"
+        lines.append(f"{name}=exp(min(max({output_name},{log_min}),{log_max}))")
+        conductance_names.append(name)
+    entry_terms: list[list[str]] = [[] for _ in range(nports * nports)]
+    for (first, second, _), conductance_name in zip(paths, conductance_names):
+        entry_terms[first * nports + first].append(conductance_name)
+        if second is not None:
+            entry_terms[second * nports + second].append(conductance_name)
+            entry_terms[first * nports + second].append(f"-({conductance_name})")
+            entry_terms[second * nports + first].append(f"-({conductance_name})")
+    matrix_names: list[str] = []
+    for flat, terms in enumerate(entry_terms):
+        name = f"{prefix}_y{flat}"
+        lines.append(f"{name}=" + ("+".join(terms) if terms else "0.0"))
+        matrix_names.append(name)
+    return matrix_names
 
 
 def _append_ads_hb_s_to_y_equations(
@@ -4150,7 +4497,8 @@ The exact sanitized parameter names, scales, and defaults are also recorded in
 
 The export contains two explicit-current SDD branches. At `freq=0`, the RF
 branch contributes exactly zero current and the DC branch directly stamps the
-separately extracted, parameter-independent conductance matrix. At every
+separately extracted conductance matrix. For current models this matrix is
+evaluated from geometry only; legacy models use a fixed matrix. At every
 non-zero spectral frequency, the DC branch contributes exactly zero current and
 only the fitted RF surrogate is used. DC is never converted to S-parameters and
 never evaluated by the RF fit.
@@ -4214,6 +4562,7 @@ def write_ads_hb_mlp_package(
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
     dc_port_resistances_ohm: object = None,
+    dc_model: dict[str, object] | None = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
@@ -4336,11 +4685,25 @@ def write_ads_hb_mlp_package(
         lines.append(f"{fitted_name}=complex(({real_expression}),({imag_expression}))")
         fitted_response_names.append(fitted_name)
 
-    dc_matrix = dc_conductance_matrix(
-        sparam_labels,
-        dc_resistance,
-        dc_path_resistances,
-    )
+    dc_matrix = None
+    dc_matrix_names = None
+    if dc_model is not None:
+        lines.append("")
+        lines.append("; Geometry-dependent exact-DC conductance surrogate")
+        dc_matrix_names = _append_ads_hb_dc_conductance_model(
+            lines,
+            f"{prefix}_dc",
+            parameter_names,
+            sparam_labels,
+            parameter_features,
+            dc_model,
+        )
+    else:
+        dc_matrix = dc_conductance_matrix(
+            sparam_labels,
+            dc_resistance,
+            dc_path_resistances,
+        )
     rf_response_names: list[str] = [""] * matrix_size
     for idx, label in enumerate(sparam_labels):
         row, col = sparam_indices(label) or (0, 0)
@@ -4370,6 +4733,7 @@ def write_ads_hb_mlp_package(
         rf_y_names,
         "y",
         dc_conductance=dc_matrix,
+        dc_conductance_names=dc_matrix_names,
     )
     lines.extend([f"end {module_id}", ""])
 
@@ -4423,6 +4787,13 @@ def write_ads_hb_mlp_package(
         "dc_port_paths": list(dc_path_resistances) if dc_path_resistances is not None else None,
         "dc_port_resistances_ohm": dc_path_resistances,
         "dc_resistance_source_kind": dc_source_kind,
+        "dc_model_kind": (
+            str(dc_model.get("kind")) if dc_model is not None else None
+        ),
+        "dc_geometry_dependent": dc_model is not None,
+        "dc_model_metadata": (
+            dc_model.get("metadata") if dc_model is not None else None
+        ),
         "dc_is_separate_from_fitted_response": True,
         "dc_stamping_representation": "separate_explicit_conductance_sdd",
         "rf_stamping_representation": "explicit_current_y_sdd",
@@ -4483,6 +4854,7 @@ def write_ads_hb_neurotf_package(
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
     dc_port_resistances_ohm: object = None,
+    dc_model: dict[str, object] | None = None,
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -4573,11 +4945,25 @@ def write_ads_hb_neurotf_package(
         lines.append(f"{fitted_name}=" + "+".join(terms))
         fitted_names.append(fitted_name)
 
-    dc_matrix = dc_conductance_matrix(
-        sparam_labels,
-        dc_resistance,
-        dc_path_resistances,
-    )
+    dc_matrix = None
+    dc_matrix_names = None
+    if dc_model is not None:
+        lines.append("")
+        lines.append("; Geometry-dependent exact-DC conductance surrogate")
+        dc_matrix_names = _append_ads_hb_dc_conductance_model(
+            lines,
+            f"{prefix}_dc",
+            parameter_names,
+            sparam_labels,
+            parameter_features,
+            dc_model,
+        )
+    else:
+        dc_matrix = dc_conductance_matrix(
+            sparam_labels,
+            dc_resistance,
+            dc_path_resistances,
+        )
     active_names: list[str] = [""] * (nports * nports)
     for idx, label in enumerate(sparam_labels):
         row, col = sparam_indices(label) or (0, 0)
@@ -4604,6 +4990,7 @@ def write_ads_hb_neurotf_package(
         rf_y_names,
         "y",
         dc_conductance=dc_matrix,
+        dc_conductance_names=dc_matrix_names,
     )
     lines.extend([f"end {module_id}", ""])
 
@@ -4656,6 +5043,13 @@ def write_ads_hb_neurotf_package(
         "dc_port_paths": list(dc_path_resistances) if dc_path_resistances is not None else None,
         "dc_port_resistances_ohm": dc_path_resistances,
         "dc_resistance_source_kind": dc_source_kind,
+        "dc_model_kind": (
+            str(dc_model.get("kind")) if dc_model is not None else None
+        ),
+        "dc_geometry_dependent": dc_model is not None,
+        "dc_model_metadata": (
+            dc_model.get("metadata") if dc_model is not None else None
+        ),
         "dc_is_separate_from_fitted_response": True,
         "dc_stamping_representation": "separate_explicit_conductance_sdd",
         "rf_stamping_representation": "explicit_current_y_sdd",
@@ -5389,6 +5783,609 @@ class MLP:
         self.weights = best_weights
         self.biases = best_biases
         return history
+
+
+class DCConductanceModel:
+    """Geometry-only neural surrogate for exact-zero-frequency conductances.
+
+    The fitted outputs are logarithms of the non-negative branch conductances
+    selected by ``dc_port_paths``.  Frequency is deliberately not an input, so
+    this model cannot influence or extrapolate the positive-frequency RF fit.
+    """
+
+    def __init__(
+        self,
+        mlp: MLP,
+        x_scaler: Standardizer,
+        y_scaler: Standardizer,
+        parameter_names: Sequence[str],
+        sparam_labels: Sequence[str],
+        port_paths: Sequence[str],
+        z0: float,
+        log_conductance_min: float,
+        log_conductance_max: float,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.mlp = mlp
+        self.x_scaler = x_scaler
+        self.y_scaler = y_scaler
+        self.parameter_names = list(parameter_names)
+        self.sparam_labels = list(sparam_labels)
+        self.port_paths = list(port_paths)
+        self.z0 = float(z0)
+        self.log_conductance_min = float(log_conductance_min)
+        self.log_conductance_max = float(log_conductance_max)
+        self.metadata = dict(metadata or {})
+        nports = infer_complete_sparameter_ports(self.sparam_labels)
+        parsed = parse_dc_port_paths(self.port_paths, nports)
+        if [item[2] for item in parsed] != self.port_paths:
+            raise ValueError("DC model path order is not canonical")
+        if self.mlp.layer_sizes[0] != len(self.parameter_names):
+            raise ValueError("DC model input dimension does not match parameter names")
+        if self.mlp.layer_sizes[-1] != len(self.port_paths):
+            raise ValueError("DC model output dimension does not match port paths")
+
+    def predict_log_conductances(self, parameter_values: np.ndarray) -> np.ndarray:
+        values = np.asarray(parameter_values, dtype=float)
+        if values.ndim == 1:
+            values = values[None, :]
+        scaled = self.x_scaler.transform(values)
+        predicted_scaled = self.mlp.predict(scaled)
+        predicted = self.y_scaler.inverse_transform(predicted_scaled)
+        return np.clip(
+            predicted,
+            self.log_conductance_min,
+            self.log_conductance_max,
+        )
+
+    def predict_conductances(self, parameter_values: np.ndarray) -> np.ndarray:
+        return np.exp(self.predict_log_conductances(parameter_values))
+
+    def conductance_matrix(self, parameter_values: np.ndarray) -> np.ndarray:
+        conductances = self.predict_conductances(parameter_values)[0]
+        nports = infer_complete_sparameter_ports(self.sparam_labels)
+        return _dc_matrix_from_path_conductances(
+            nports,
+            parse_dc_port_paths(self.port_paths, nports),
+            conductances,
+        )
+
+    def predict_s_values(self, parameter_values: np.ndarray) -> np.ndarray:
+        y_matrix = self.conductance_matrix(parameter_values).astype(complex)
+        s_matrix = _y_matrix_to_s_matrix(y_matrix, self.z0)
+        values: list[complex] = []
+        for label in self.sparam_labels:
+            row, col = sparam_indices(label) or (0, 0)
+            values.append(s_matrix[row - 1, col - 1])
+        return np.asarray(values, dtype=complex)
+
+    def predict_block_s_values(self, block: MDIFBlock) -> np.ndarray:
+        return self.predict_s_values(parameter_matrix([block], self.parameter_names))
+
+    def export_data(self) -> dict[str, object]:
+        return {
+            "kind": "geometry_dependent_exact_dc_conductance_mlp",
+            "parameter_names": list(self.parameter_names),
+            "sparam_labels": list(self.sparam_labels),
+            "port_paths": list(self.port_paths),
+            "z0": self.z0,
+            "activation": self.mlp.activation,
+            "layer_sizes": list(self.mlp.layer_sizes),
+            "weights": [value.copy() for value in self.mlp.weights],
+            "biases": [value.copy() for value in self.mlp.biases],
+            "x_mean": np.asarray(self.x_scaler.mean, dtype=float).copy(),
+            "x_std": np.asarray(self.x_scaler.std, dtype=float).copy(),
+            "y_mean": np.asarray(self.y_scaler.mean, dtype=float).copy(),
+            "y_std": np.asarray(self.y_scaler.std, dtype=float).copy(),
+            "log_conductance_min": self.log_conductance_min,
+            "log_conductance_max": self.log_conductance_max,
+            "metadata": dict(self.metadata),
+        }
+
+    def save(self, out_dir: Path) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        arrays: dict[str, np.ndarray] = {
+            "x_mean": np.asarray(self.x_scaler.mean, dtype=float),
+            "x_std": np.asarray(self.x_scaler.std, dtype=float),
+            "y_mean": np.asarray(self.y_scaler.mean, dtype=float),
+            "y_std": np.asarray(self.y_scaler.std, dtype=float),
+        }
+        for idx, (weight, bias) in enumerate(zip(self.mlp.weights, self.mlp.biases)):
+            arrays[f"W{idx}"] = weight
+            arrays[f"b{idx}"] = bias
+        np.savez_compressed(out_dir / "dc_model.npz", **arrays)
+        payload = {
+            "version": VERSION,
+            "kind": "geometry_dependent_exact_dc_conductance_mlp",
+            "parameter_names": self.parameter_names,
+            "sparam_labels": self.sparam_labels,
+            "port_paths": self.port_paths,
+            "z0": self.z0,
+            "activation": self.mlp.activation,
+            "layer_sizes": self.mlp.layer_sizes,
+            "log_conductance_min": self.log_conductance_min,
+            "log_conductance_max": self.log_conductance_max,
+            **self.metadata,
+        }
+        (out_dir / "dc_model.json").write_text(json.dumps(payload, indent=2))
+
+    @staticmethod
+    def load_optional(model_dir: Path) -> "DCConductanceModel | None":
+        metadata_path = model_dir / "dc_model.json"
+        arrays_path = model_dir / "dc_model.npz"
+        if not metadata_path.exists() and not arrays_path.exists():
+            return None
+        if not metadata_path.exists() or not arrays_path.exists():
+            raise ValueError(
+                f"Incomplete DC surrogate in {model_dir}: dc_model.json and "
+                "dc_model.npz must both be present"
+            )
+        metadata = json.loads(metadata_path.read_text())
+        data = np.load(arrays_path)
+        mlp = MLP(metadata["layer_sizes"], metadata["activation"], seed=1)
+        for idx in range(len(mlp.weights)):
+            mlp.weights[idx] = data[f"W{idx}"]
+            mlp.biases[idx] = data[f"b{idx}"]
+        x_scaler = Standardizer()
+        x_scaler.mean = data["x_mean"]
+        x_scaler.std = data["x_std"]
+        y_scaler = Standardizer()
+        y_scaler.mean = data["y_mean"]
+        y_scaler.std = data["y_std"]
+        structural_keys = {
+            "version",
+            "kind",
+            "parameter_names",
+            "sparam_labels",
+            "port_paths",
+            "z0",
+            "activation",
+            "layer_sizes",
+            "log_conductance_min",
+            "log_conductance_max",
+        }
+        return DCConductanceModel(
+            mlp=mlp,
+            x_scaler=x_scaler,
+            y_scaler=y_scaler,
+            parameter_names=metadata["parameter_names"],
+            sparam_labels=metadata["sparam_labels"],
+            port_paths=metadata["port_paths"],
+            z0=float(metadata["z0"]),
+            log_conductance_min=float(metadata["log_conductance_min"]),
+            log_conductance_max=float(metadata["log_conductance_max"]),
+            metadata={
+                key: value for key, value in metadata.items() if key not in structural_keys
+            },
+        )
+
+
+def _y_matrix_to_s_matrix(y_matrix: np.ndarray, z0: float) -> np.ndarray:
+    identity = np.eye(y_matrix.shape[0], dtype=complex)
+    normalized_y = float(z0) * np.asarray(y_matrix, dtype=complex)
+    lhs = identity + normalized_y
+    rhs = identity - normalized_y
+    try:
+        return np.linalg.solve(lhs.T, rhs.T).T
+    except np.linalg.LinAlgError:
+        return rhs @ np.linalg.pinv(lhs)
+
+
+def _dc_matrix_from_path_conductances(
+    nports: int,
+    paths: Sequence[tuple[int, int | None, str]],
+    conductances: Sequence[float],
+) -> np.ndarray:
+    matrix = np.zeros((nports, nports), dtype=float)
+    for (first, second, _), raw_conductance in zip(paths, conductances):
+        conductance = max(0.0, float(raw_conductance))
+        matrix[first, first] += conductance
+        if second is not None:
+            matrix[second, second] += conductance
+            matrix[first, second] -= conductance
+            matrix[second, first] -= conductance
+    return matrix
+
+
+def _dc_path_basis(
+    nports: int,
+    paths: Sequence[tuple[int, int | None, str]],
+) -> np.ndarray:
+    columns = []
+    for path_index in range(len(paths)):
+        conductances = np.zeros(len(paths), dtype=float)
+        conductances[path_index] = 1.0
+        columns.append(
+            _dc_matrix_from_path_conductances(nports, paths, conductances).reshape(-1)
+        )
+    return np.column_stack(columns)
+
+
+def _nonnegative_least_squares(
+    matrix: np.ndarray,
+    target: np.ndarray,
+    *,
+    max_iterations: int = 2000,
+) -> np.ndarray:
+    """Small dependency-free projected-gradient NNLS solver."""
+
+    coefficients = np.maximum(
+        np.linalg.lstsq(matrix, target, rcond=None)[0],
+        0.0,
+    )
+    spectral_norm = float(np.linalg.norm(matrix, ord=2))
+    if not math.isfinite(spectral_norm) or spectral_norm <= EPS:
+        raise ValueError("Selected DC path topology has no usable conductance basis")
+    step = 1.0 / (spectral_norm * spectral_norm)
+    for _ in range(max_iterations):
+        updated = np.maximum(
+            coefficients - step * (matrix.T @ (matrix @ coefficients - target)),
+            0.0,
+        )
+        if np.linalg.norm(updated - coefficients) <= 1e-12 * max(
+            1.0, np.linalg.norm(coefficients)
+        ):
+            coefficients = updated
+            break
+        coefficients = updated
+    return coefficients
+
+
+def extract_dc_conductance_samples(
+    blocks: Sequence[MDIFBlock],
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    *,
+    z0: float = 50.0,
+    port_paths: object = None,
+    open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
+    open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
+    passivity_tolerance: float = DEFAULT_DC_PASSIVITY_TOLERANCE,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    """Extract one selected-path conductance vector per geometry at exact DC."""
+
+    if not blocks:
+        raise ValueError("DC conductance fitting requires at least one MDIF block")
+    if not math.isfinite(z0) or z0 <= 0.0:
+        raise ValueError("DC reference impedance must be positive and finite")
+    if open_threshold_ohm <= 0.0 or not math.isfinite(open_threshold_ohm):
+        raise ValueError("DC open threshold must be positive and finite")
+    if open_resistance_ohm <= open_threshold_ohm or not math.isfinite(
+        open_resistance_ohm
+    ):
+        raise ValueError("DC open resistance must exceed the open threshold")
+    nports = infer_complete_sparameter_ports(labels)
+    paths = parse_dc_port_paths(port_paths, nports)
+    basis = _dc_path_basis(nports, paths)
+    passivity_limit = 1.0 + float(passivity_tolerance)
+    minimum_conductance = 1.0 / float(open_resistance_ohm)
+    open_threshold_conductance = 1.0 / float(open_threshold_ohm)
+    sample_blocks: list[MDIFBlock] = []
+    conductance_rows: list[np.ndarray] = []
+    measured_s_rows: list[np.ndarray] = []
+    topology_s_rows: list[np.ndarray] = []
+    missing_blocks: list[int] = []
+    unusable_blocks: list[int] = []
+    ignored_nonpassive = 0
+    ignored_nonfinite = 0
+    dc_row_count = 0
+    topology_y_errors: list[float] = []
+
+    for block_index, block in enumerate(blocks):
+        exact_indices = np.flatnonzero(np.asarray(block.freq_hz, dtype=float) == 0.0)
+        if exact_indices.size == 0:
+            missing_blocks.append(block.source_index or block_index + 1)
+            continue
+        block_conductances: list[np.ndarray] = []
+        block_measured_s: list[np.ndarray] = []
+        block_topology_s: list[np.ndarray] = []
+        for frequency_index in exact_indices:
+            dc_row_count += 1
+            s_matrix = _block_s_matrix(block, labels, int(frequency_index), nports)
+            if not np.all(np.isfinite(s_matrix)):
+                ignored_nonfinite += 1
+                continue
+            try:
+                max_sigma = float(np.max(np.linalg.svd(s_matrix, compute_uv=False)))
+            except np.linalg.LinAlgError:
+                ignored_nonfinite += 1
+                continue
+            if not math.isfinite(max_sigma):
+                ignored_nonfinite += 1
+                continue
+            if max_sigma > passivity_limit:
+                ignored_nonpassive += 1
+                continue
+            identity = np.eye(nports, dtype=complex)
+            lhs = identity + s_matrix
+            rhs = identity - s_matrix
+            try:
+                y_matrix = np.linalg.solve(lhs.T, rhs.T).T / float(z0)
+            except np.linalg.LinAlgError:
+                y_matrix = rhs @ np.linalg.pinv(lhs) / float(z0)
+            if not np.all(np.isfinite(y_matrix)):
+                ignored_nonfinite += 1
+                continue
+            target_matrix = np.real(0.5 * (y_matrix + y_matrix.T))
+            conductances = _nonnegative_least_squares(basis, target_matrix.reshape(-1))
+            conductances[conductances < open_threshold_conductance] = minimum_conductance
+            topology_y = _dc_matrix_from_path_conductances(nports, paths, conductances)
+            topology_s = _y_matrix_to_s_matrix(topology_y.astype(complex), z0)
+            topology_y_errors.append(
+                float(np.sqrt(np.mean(np.abs(topology_y - y_matrix) ** 2)))
+            )
+            block_conductances.append(conductances)
+            block_measured_s.append(s_matrix)
+            block_topology_s.append(topology_s)
+        if not block_conductances:
+            unusable_blocks.append(block.source_index or block_index + 1)
+            continue
+        sample_blocks.append(block)
+        conductance_rows.append(np.mean(np.asarray(block_conductances), axis=0))
+        measured_s_rows.append(np.mean(np.asarray(block_measured_s), axis=0))
+        topology_s_rows.append(np.mean(np.asarray(block_topology_s), axis=0))
+
+    if missing_blocks:
+        raise ValueError(
+            "Every fitted geometry must contain an exact zero-Hz row for the separate "
+            "DC model; missing block(s): " + ", ".join(map(str, missing_blocks[:20]))
+        )
+    if unusable_blocks:
+        raise ValueError(
+            "No usable passive exact-zero-Hz row remains for fitted block(s): "
+            + ", ".join(map(str, unusable_blocks[:20]))
+        )
+    if not conductance_rows:
+        raise ValueError("No usable passive exact-zero-Hz rows remain for DC fitting")
+
+    x_values = parameter_matrix(sample_blocks, parameter_names)
+    conductances = np.asarray(conductance_rows, dtype=float)
+    measured_s = np.asarray(measured_s_rows, dtype=complex)
+    topology_s = np.asarray(topology_s_rows, dtype=complex)
+    s_error = np.abs(topology_s - measured_s)
+    metadata: dict[str, object] = {
+        "dc_model_kind": "geometry_dependent_exact_dc_conductance_mlp",
+        "dc_resistance_source_kind": "exact_zero_frequency",
+        "dc_port_paths": [item[2] for item in paths],
+        "dc_port_path_spec": dc_port_path_spec([item[2] for item in paths]),
+        "dc_row_count": dc_row_count,
+        "dc_resistance_block_count": len(sample_blocks),
+        "dc_missing_block_count": len(missing_blocks),
+        "dc_ignored_nonpassive_count": ignored_nonpassive,
+        "dc_ignored_nonfinite_count": ignored_nonfinite,
+        "dc_ignored_invalid_resistance_count": 0,
+        "dc_passivity_tolerance": float(passivity_tolerance),
+        "dc_open_threshold_ohm": float(open_threshold_ohm),
+        "dc_open_resistance_ohm": float(open_resistance_ohm),
+        "dc_resistance_source_z0_ohm": float(z0),
+        "dc_resistance_source_frequency_min_hz": 0.0,
+        "dc_resistance_source_frequency_max_hz": 0.0,
+        "dc_is_separate_from_fitted_response": True,
+        "dc_requires_exact_zero_frequency": True,
+        "dc_rf_fallback_allowed": False,
+        "dc_topology_y_rmse_siemens": float(np.sqrt(np.mean(np.square(topology_y_errors)))),
+        "dc_topology_s_rmse": float(np.sqrt(np.mean(s_error * s_error))),
+        "dc_topology_s_max_abs_error": float(np.max(s_error)),
+        "dc_resistance_extraction": (
+            "Each passive exact-zero-Hz S-matrix is converted to Y and projected onto "
+            "the declared non-negative branch-conductance graph before geometry-only fitting"
+        ),
+        "dc_response_topology": (
+            "Geometry-dependent selected-path conductance graph evaluated only at exactly zero Hz"
+        ),
+    }
+    return x_values, conductances, metadata
+
+
+def train_dc_conductance_model(
+    train_blocks: Sequence[MDIFBlock],
+    verify_blocks: Sequence[MDIFBlock],
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    *,
+    hidden_layers: Sequence[int],
+    activation: str,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    patience: int,
+    seed: int,
+    loss_interval: int = 1,
+    progress_interval: int = 25,
+    progress_label: str = "DC fit",
+    z0: float = 50.0,
+    port_paths: object = None,
+    open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
+    open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
+) -> tuple[DCConductanceModel, list[dict[str, float]], dict[str, object]]:
+    x_train, conductance_train, metadata = extract_dc_conductance_samples(
+        train_blocks,
+        parameter_names,
+        labels,
+        z0=z0,
+        port_paths=port_paths,
+        open_threshold_ohm=open_threshold_ohm,
+        open_resistance_ohm=open_resistance_ohm,
+    )
+    if verify_blocks:
+        x_verify, conductance_verify, verify_metadata = extract_dc_conductance_samples(
+            verify_blocks,
+            parameter_names,
+            labels,
+            z0=z0,
+            port_paths=metadata["dc_port_paths"],
+            open_threshold_ohm=open_threshold_ohm,
+            open_resistance_ohm=open_resistance_ohm,
+        )
+    else:
+        x_verify = None
+        conductance_verify = None
+        verify_metadata = None
+    log_min = math.log(1.0 / float(open_resistance_ohm))
+    observed_log_max = float(np.max(np.log(np.maximum(conductance_train, math.exp(log_min)))))
+    log_max = min(observed_log_max + math.log(100.0), 40.0)
+    y_train = np.log(np.maximum(conductance_train, math.exp(log_min)))
+    y_verify = (
+        np.log(np.maximum(conductance_verify, math.exp(log_min)))
+        if conductance_verify is not None
+        else None
+    )
+    x_scaler = Standardizer().fit(x_train)
+    y_scaler = Standardizer().fit(y_train)
+    constant_output_mask = np.std(y_train, axis=0) < EPS
+    mlp = MLP(
+        [x_train.shape[1], *list(hidden_layers), y_train.shape[1]],
+        activation=activation,
+        seed=seed + 101,
+    )
+    history = mlp.train(
+        x_scaler.transform(x_train),
+        y_scaler.transform(y_train),
+        x_scaler.transform(x_verify) if x_verify is not None else None,
+        y_scaler.transform(y_verify) if y_verify is not None else None,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        patience=patience,
+        seed=seed + 103,
+        loss_interval=loss_interval,
+        progress_callback=make_training_progress_callback(
+            progress_label,
+            epochs,
+            progress_interval,
+        ),
+        progress_interval=progress_interval,
+    )
+    # A path that is constant across every training geometry is represented
+    # exactly by its stored mean.  Leaving Standardizer's unit fallback scale
+    # in place would unnecessarily make that constant depend on neural-fit
+    # convergence and could badly perturb DC after a short run.
+    assert y_scaler.std is not None
+    y_scaler.std[constant_output_mask] = 0.0
+    model = DCConductanceModel(
+        mlp=mlp,
+        x_scaler=x_scaler,
+        y_scaler=y_scaler,
+        parameter_names=parameter_names,
+        sparam_labels=labels,
+        port_paths=metadata["dc_port_paths"],  # type: ignore[arg-type]
+        z0=z0,
+        log_conductance_min=log_min,
+        log_conductance_max=log_max,
+    )
+    train_prediction = model.predict_conductances(x_train)
+    train_log_error = model.predict_log_conductances(x_train) - y_train
+
+    nports = infer_complete_sparameter_ports(labels)
+    parsed_paths = parse_dc_port_paths(model.port_paths, nports)
+
+    def branch_s_matrices(rows: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            [
+                _y_matrix_to_s_matrix(
+                    _dc_matrix_from_path_conductances(
+                        nports,
+                        parsed_paths,
+                        row,
+                    ).astype(complex),
+                    z0,
+                )
+                for row in np.asarray(rows, dtype=float)
+            ],
+            dtype=complex,
+        )
+
+    train_s_error = np.abs(
+        branch_s_matrices(train_prediction) - branch_s_matrices(conductance_train)
+    )
+    metadata.update(
+        {
+            "dc_model_training_samples": int(len(x_train)),
+            "dc_model_verification_samples": int(len(x_verify)) if x_verify is not None else 0,
+            "dc_model_activation": activation,
+            "dc_model_layer_sizes": list(model.mlp.layer_sizes),
+            "dc_model_log_conductance_min": log_min,
+            "dc_model_log_conductance_max": log_max,
+            "dc_model_train_log_rmse": float(np.sqrt(np.mean(train_log_error**2))),
+            "dc_model_train_conductance_rmse_siemens": float(
+                np.sqrt(np.mean((train_prediction - conductance_train) ** 2))
+            ),
+            "dc_model_train_s_rmse": float(
+                np.sqrt(np.mean(train_s_error * train_s_error))
+            ),
+            "dc_model_train_s_max_abs_error": float(np.max(train_s_error)),
+            "dc_model_constant_paths": [
+                path
+                for path, is_constant in zip(model.port_paths, constant_output_mask)
+                if bool(is_constant)
+            ],
+        }
+    )
+    if x_verify is not None and y_verify is not None and conductance_verify is not None:
+        verify_prediction = model.predict_conductances(x_verify)
+        verify_log_error = model.predict_log_conductances(x_verify) - y_verify
+        verify_s_error = np.abs(
+            branch_s_matrices(verify_prediction)
+            - branch_s_matrices(conductance_verify)
+        )
+        metadata.update(
+            {
+                "dc_model_verify_log_rmse": float(
+                    np.sqrt(np.mean(verify_log_error**2))
+                ),
+                "dc_model_verify_conductance_rmse_siemens": float(
+                    np.sqrt(np.mean((verify_prediction - conductance_verify) ** 2))
+                ),
+                "dc_model_verify_s_rmse": float(
+                    np.sqrt(np.mean(verify_s_error * verify_s_error))
+                ),
+                "dc_model_verify_s_max_abs_error": float(np.max(verify_s_error)),
+                "dc_model_verification_extraction": verify_metadata,
+            }
+        )
+    mean_conductances = np.mean(conductance_train, axis=0)
+    path_resistances = {
+        path: min(1.0 / max(float(value), math.exp(log_min)), float(open_resistance_ohm))
+        for path, value in zip(model.port_paths, mean_conductances)
+    }
+    aggregate_mean = float(np.mean(mean_conductances))
+    metadata.update(
+        {
+            # Compatibility summaries for older reports/export readers.  These values
+            # do not drive a newly saved model when dc_model.npz is present.
+            "dc_equivalent_resistance_ohm": min(
+                1.0 / max(aggregate_mean, math.exp(log_min)),
+                float(open_resistance_ohm),
+            ),
+            "dc_equivalent_resistance_raw_mean_ohm": min(
+                1.0 / max(aggregate_mean, math.exp(log_min)),
+                float(open_resistance_ohm),
+            ),
+            "dc_resistance_sample_count": int(conductance_train.size),
+            "dc_open_resistance_sample_count": int(
+                np.sum(conductance_train <= math.exp(log_min) * (1.0 + 1e-12))
+            ),
+            "dc_mean_conductance_siemens": aggregate_mean,
+            "dc_port_resistances_ohm": path_resistances,
+            "dc_resistance_pair_means_ohm": path_resistances,
+            "dc_open_paths": [
+                path
+                for path, value in path_resistances.items()
+                if value >= float(open_resistance_ohm)
+            ],
+            "dc_open_path_count": sum(
+                value >= float(open_resistance_ohm)
+                for value in path_resistances.values()
+            ),
+            "dc_open_circuit_applied": any(
+                value >= float(open_resistance_ohm)
+                for value in path_resistances.values()
+            ),
+            "dc_aggregate_open_circuit_applied": aggregate_mean < 1.0 / open_threshold_ohm,
+        }
+    )
+    model.metadata = dict(metadata)
+    return model, history, metadata
 
 
 def mse(
@@ -7443,9 +8440,12 @@ def cleanup_trial_dir(trial_dir: Path, keep_trial_models: bool) -> None:
     for name in [
         "model.npz",
         "metadata.json",
+        "dc_model.npz",
+        "dc_model.json",
         "composite_model_manifest.json",
         "predicted_verification.mdif",
         "training_history.csv",
+        "dc_training_history.csv",
         "training_summary.md",
         "verification_metrics.csv",
     ]:
@@ -7697,10 +8697,12 @@ def build_training_export_commands(
     )
     dc_path = Path(template_mdif).resolve() if template_mdif else None
     dc_port_paths_spec: str | None = None
+    saved_dynamic_dc_model = False
     metadata_path = resolved_model_dir / "metadata.json"
     if metadata_path.is_file():
         try:
             saved_metadata = json.loads(metadata_path.read_text())
+            saved_dynamic_dc_model = bool(saved_metadata.get("dc_model_kind"))
             saved_spec = saved_metadata.get("dc_port_path_spec")
             if saved_spec:
                 dc_port_paths_spec = str(saved_spec)
@@ -7732,12 +8734,17 @@ def build_training_export_commands(
             hb_module_name,
             "--parameter-input-scales",
             parameter_scale_spec,
-            "--dc-open-threshold",
-            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
-            "--dc-open-resistance",
-            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
         ]
-        if dc_path is not None:
+        if not saved_dynamic_dc_model:
+            ads_hb_argv.extend(
+                [
+                    "--dc-open-threshold",
+                    f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
+                    "--dc-open-resistance",
+                    f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
+                ]
+            )
+        if dc_path is not None and not saved_dynamic_dc_model:
             ads_hb_argv.extend(
                 ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
             )
@@ -7764,12 +8771,17 @@ def build_training_export_commands(
             module_name,
             "--parameter-input-scales",
             parameter_scale_spec,
-            "--dc-open-threshold",
-            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
-            "--dc-open-resistance",
-            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
         ]
-        if dc_path is not None:
+        if not saved_dynamic_dc_model:
+            veriloga_argv.extend(
+                [
+                    "--dc-open-threshold",
+                    f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
+                    "--dc-open-resistance",
+                    f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
+                ]
+            )
+        if dc_path is not None and not saved_dynamic_dc_model:
             veriloga_argv.extend(
                 ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
             )
@@ -7799,12 +8811,17 @@ def build_training_export_commands(
             ),
             "--template-mdif",
             repository_relative_path(template_path, repository_root),
-            "--dc-open-threshold",
-            f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
-            "--dc-open-resistance",
-            f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
         ]
-        if dc_path is not None:
+        if not saved_dynamic_dc_model:
+            sampled_argv.extend(
+                [
+                    "--dc-open-threshold",
+                    f"{DEFAULT_DC_OPEN_THRESHOLD_OHM:g}",
+                    "--dc-open-resistance",
+                    f"{DEFAULT_DC_OPEN_RESISTANCE_OHM:g}",
+                ]
+            )
+        if dc_path is not None and not saved_dynamic_dc_model:
             sampled_argv.extend(
                 ["--dc-mdif", repository_relative_path(dc_path, repository_root)]
             )
@@ -7945,13 +8962,18 @@ def write_training_markdown(
     has_y_plots = isinstance(raw_y_plots, list) and bool(raw_y_plots)
     y_plot_warning = summary.get("worst_case_y_plot_warning")
     artifacts = [
-        ("Model weights", "model.npz"),
+        ("RF model weights", "model.npz"),
         ("Metadata", "metadata.json"),
-        ("Training history", "training_history.csv"),
+        ("DC model weights", "dc_model.npz"),
+        ("DC model metadata", "dc_model.json"),
+        ("RF training history", "training_history.csv"),
+        ("DC training history", "dc_training_history.csv"),
         ("Verification summary JSON", "verification_summary.json"),
     ]
     if (path.parent / "training_history.pdf").exists():
         artifacts.insert(3, ("Training loss plot", "training_history.pdf"))
+    if (path.parent / "dc_training_history.pdf").exists():
+        artifacts.append(("DC training loss plot", "dc_training_history.pdf"))
     if (path.parent / "kbnn_training_debug.json").exists():
         artifacts.append(("KBNN debug diagnostics", "kbnn_training_debug.json"))
     if not warning:
@@ -8784,11 +9806,14 @@ def copy_trial_model(
     overwrite: bool = False,
 ) -> tuple[bool, str | None]:
     trial_dir = sweep_dir / "trials" / f"trial_{trial:04d}"
-    missing = [
-        name
-        for name in ["model.npz", "metadata.json"]
-        if not (trial_dir / name).exists()
-    ]
+    required_names = ["model.npz", "metadata.json"]
+    try:
+        trial_metadata = json.loads((trial_dir / "metadata.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        trial_metadata = {}
+    if trial_metadata.get("dc_model_kind"):
+        required_names.extend(["dc_model.npz", "dc_model.json"])
+    missing = [name for name in required_names if not (trial_dir / name).exists()]
     if missing:
         return (
             False,

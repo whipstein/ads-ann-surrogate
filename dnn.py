@@ -26,10 +26,14 @@ import numpy as np
 
 from surrogate_common import (  # noqa: E402
     EPS,
+    DEFAULT_DC_OPEN_RESISTANCE_OHM,
+    DEFAULT_DC_OPEN_THRESHOLD_OHM,
+    DCConductanceModel,
     MDIFBlock,
     MLP,
     Standardizer,
     add_dc_export_arguments,
+    add_dc_fitting_arguments,
     add_dc_port_paths_argument,
     add_debug_argument,
     ads_ann_activation_enum,
@@ -88,6 +92,7 @@ from surrogate_common import (  # noqa: E402
     sweep_arg_values,
     sweep_trial_seed,
     trial_plot_paths,
+    train_dc_conductance_model,
     verification_metrics,
     write_training_verification_artifacts,
     write_ads_ann_package,
@@ -373,6 +378,7 @@ class DNN:
         dc_equivalent_resistance_ohm: float | None = None,
         dc_resistance_source_kind: str | None = None,
         dc_port_resistances_ohm: dict[str, float] | None = None,
+        dc_model: DCConductanceModel | None = None,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -396,6 +402,7 @@ class DNN:
                 for path, resistance in dc_port_resistances_ohm.items()
             }
         )
+        self.dc_model = dc_model
 
     def predict_blocks(self, blocks: Sequence[MDIFBlock]) -> list[MDIFBlock]:
         predicted = []
@@ -406,15 +413,19 @@ class DNN:
             values = columns_to_complex(y_columns)
             if self.output_domain == "y":
                 values = y_values_to_s_values(values, self.sparam_labels, self.target_z0)
-            values = apply_distinct_dc_response(
-                values,
-                block.freq_hz,
-                self.sparam_labels,
-                self.dc_equivalent_resistance_ohm,
-                self.dc_resistance_source_kind,
-                self.dc_port_resistances_ohm,
-                z0=self.target_z0,
-            )
+            dc_mask = np.asarray(block.freq_hz, dtype=float) == 0.0
+            if self.dc_model is not None and np.any(dc_mask):
+                values[dc_mask, :] = self.dc_model.predict_block_s_values(block)[None, :]
+            else:
+                values = apply_distinct_dc_response(
+                    values,
+                    block.freq_hz,
+                    self.sparam_labels,
+                    self.dc_equivalent_resistance_ohm,
+                    self.dc_resistance_source_kind,
+                    self.dc_port_resistances_ohm,
+                    z0=self.target_z0,
+                )
             sparams = {label: values[:, idx] for idx, label in enumerate(self.sparam_labels)}
             predicted.append(
                 MDIFBlock(
@@ -438,6 +449,8 @@ class DNN:
             arrays[f"W{idx}"] = weight
             arrays[f"b{idx}"] = bias
         np.savez_compressed(out_dir / "model.npz", **arrays)
+        if self.dc_model is not None:
+            self.dc_model.save(out_dir)
         combined_metadata = {
             "version": VERSION,
             "parameter_names": self.parameter_names,
@@ -480,10 +493,11 @@ class DNN:
             dc_equivalent_resistance_ohm=metadata.get("dc_equivalent_resistance_ohm"),
             dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
             dc_port_resistances_ohm=metadata.get("dc_port_resistances_ohm"),
+            dc_model=DCConductanceModel.load_optional(model_dir),
         )
 
 
-def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[str], list[str], list[dict[str, float]], dict[str, object]]:
+def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[str], list[str], list[dict[str, float]], list[dict[str, float]], dict[str, object]]:
     train_blocks, verify_blocks, all_blocks = split_data(args)
     if not train_blocks:
         raise ValueError("No training blocks found")
@@ -496,11 +510,31 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         raise ValueError("--target-z0 must be positive and finite")
     if output_domain == "y":
         infer_complete_sparameter_ports(labels)
-    dc_metadata = extract_average_dc_resistance(
+    hidden_layers = parse_hidden_layers(args.hidden_layers)
+    progress_interval = progress_interval_from_args(args)
+    dc_model, dc_history, dc_metadata = train_dc_conductance_model(
         train_blocks,
+        verify_blocks,
+        parameter_names,
         labels,
+        hidden_layers=hidden_layers,
+        activation=args.activation,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        patience=args.patience,
+        seed=args.seed,
+        loss_interval=getattr(args, "loss_interval", 1),
+        progress_interval=progress_interval,
+        progress_label=f"{getattr(args, 'progress_label', 'DNN fit')} DC",
         z0=target_z0,
         port_paths=getattr(args, "dc_port_paths", None),
+        open_threshold_ohm=float(
+            getattr(args, "dc_open_threshold", DEFAULT_DC_OPEN_THRESHOLD_OHM)
+        ),
+        open_resistance_ohm=float(
+            getattr(args, "dc_open_resistance", DEFAULT_DC_OPEN_RESISTANCE_OHM)
+        ),
     )
     fit_train_blocks = positive_frequency_blocks(train_blocks)
     fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
@@ -532,7 +566,6 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
     x_verify_scaled = x_scaler.transform(x_verify) if x_verify is not None else None
     y_verify_scaled = y_scaler.transform(y_verify) if y_verify is not None else None
 
-    hidden_layers = parse_hidden_layers(args.hidden_layers)
     layer_sizes = [x_train.shape[1], *hidden_layers, y_train.shape[1]]
     mlp = MLP(layer_sizes, activation=args.activation, seed=args.seed)
     sparam_weights = parse_sparam_weights(labels, getattr(args, "sparam_weights", None))
@@ -558,7 +591,6 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         )
     else:
         normalized_verify_frequency_weights = None
-    progress_interval = progress_interval_from_args(args)
     history = mlp.train(
         x_train_scaled,
         y_train_scaled,
@@ -594,6 +626,7 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         ),
         dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
         dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
+        dc_model=dc_model,
     )
     metadata = {
         "training_blocks": len(train_blocks),
@@ -617,8 +650,9 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
         **dc_metadata,
+        "dc_model_history_rows": len(dc_history),
     }
-    return model, verify_blocks, parameter_names, labels, history, metadata
+    return model, verify_blocks, parameter_names, labels, history, dc_history, metadata
 
 
 def dnn_export_commands(
@@ -636,10 +670,15 @@ def dnn_export_commands(
 
 
 def command_train(args: argparse.Namespace) -> int:
-    model, verify_blocks, parameter_names, labels, history, metadata = train_model(args)
+    model, verify_blocks, parameter_names, labels, history, dc_history, metadata = train_model(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save(out_dir, metadata=metadata)
+    write_history(
+        out_dir / "dc_training_history.csv",
+        dc_history,
+        plot_title="Separate exact-DC conductance model performance vs epoch",
+    )
     training_config = {
         "training_blocks": metadata["training_blocks"],
         "verification_blocks": metadata["verification_blocks"],
@@ -656,6 +695,13 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
+        "dc_model_kind": metadata["dc_model_kind"],
+        "dc_model_layer_sizes": metadata["dc_model_layer_sizes"],
+        "dc_model_train_log_rmse": metadata["dc_model_train_log_rmse"],
+        "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
+        "dc_model_train_s_max_abs_error": metadata["dc_model_train_s_max_abs_error"],
+        "dc_topology_s_rmse": metadata["dc_topology_s_rmse"],
+        "dc_topology_s_max_abs_error": metadata["dc_topology_s_max_abs_error"],
         "dc_resistance_filtering": {
             "raw_mean_ohm": metadata["dc_equivalent_resistance_raw_mean_ohm"],
             "mean_conductance_siemens": metadata["dc_mean_conductance_siemens"],
@@ -702,10 +748,18 @@ def command_train(args: argparse.Namespace) -> int:
 
     if verify_blocks:
         pred_blocks = model.predict_blocks(verify_blocks)
+        rf_verify_blocks = positive_frequency_blocks(
+            verify_blocks,
+            purpose="RF verification",
+        )
+        rf_pred_blocks = positive_frequency_blocks(
+            pred_blocks,
+            purpose="RF verification",
+        )
         summary = write_training_verification_artifacts(
             out_dir,
-            verify_blocks,
-            pred_blocks,
+            rf_verify_blocks,
+            rf_pred_blocks,
             labels,
             parameter_names,
             max_worst_plots=getattr(args, "worst_plots", 6),
@@ -713,6 +767,25 @@ def command_train(args: argparse.Namespace) -> int:
             frequency_weights=getattr(args, "frequency_weights", None),
             y_z0=model.target_z0,
             title_context=plot_context,
+        )
+        # Keep the complete deployment prediction, including the independently
+        # evaluated DC point, while RF metrics and sweep ranking remain DC-free.
+        write_mdif(out_dir / "predicted_verification.mdif", pred_blocks, labels)
+        summary.update(
+            {
+                "verification_frequency_scope": "positive_frequency_rf_only",
+                "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
+                "dc_model_train_s_max_abs_error": metadata[
+                    "dc_model_train_s_max_abs_error"
+                ],
+                "dc_model_verify_s_rmse": metadata.get("dc_model_verify_s_rmse"),
+                "dc_model_verify_s_max_abs_error": metadata.get(
+                    "dc_model_verify_s_max_abs_error"
+                ),
+            }
+        )
+        (out_dir / "verification_summary.json").write_text(
+            json.dumps(summary, indent=2)
         )
     else:
         summary = {"warning": "No verification blocks were available"}
@@ -740,6 +813,8 @@ def command_train(args: argparse.Namespace) -> int:
             "target_z0": model.target_z0,
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
+            "dc_model_kind": metadata["dc_model_kind"],
+            "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
             "dc_port_paths": metadata["dc_port_paths"],
             "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
             "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
@@ -790,6 +865,8 @@ def command_export_ads(args: argparse.Namespace) -> int:
         if isinstance(dc_metadata.get("dc_port_resistances_ohm"), dict)
         else None
     )
+    if args.dc_mdif:
+        model.dc_model = None
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mdif_name = args.output_name
@@ -1047,6 +1124,11 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
+        dc_model=(
+            model.dc_model.export_data()
+            if model.dc_model is not None and not args.dc_mdif
+            else None
+        ),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",
@@ -1141,6 +1223,11 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         ),
         dc_resistance_source_kind=dc_metadata.get("dc_resistance_source_kind"),
         dc_port_resistances_ohm=dc_metadata.get("dc_port_resistances_ohm"),
+        dc_model=(
+            model.dc_model.export_data()
+            if model.dc_model is not None and not args.dc_mdif
+            else None
+        ),
         source_model_dir=str(model_dir),
         extra_manifest={
             "model_family": "direct_dnn",
@@ -1227,6 +1314,8 @@ def namespace_for_trial(
         parameter_names=args.parameter_names,
         holdout_fraction=args.holdout_fraction,
         dc_port_paths=getattr(args, "dc_port_paths", None),
+        dc_open_threshold=args.dc_open_threshold,
+        dc_open_resistance=args.dc_open_resistance,
         freq_transform=str(candidate["freq_transform"]),
         hidden_layers=str(candidate["hidden_layers"]),
         activation=str(candidate["activation"]),
@@ -1442,7 +1531,7 @@ def add_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verify-values", default="verify,verification,test,validation")
     parser.add_argument("--parameter-names", help="Comma-separated geometry/process VAR names")
     parser.add_argument("--holdout-fraction", type=float, default=0.2)
-    add_dc_port_paths_argument(parser)
+    add_dc_fitting_arguments(parser)
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--loss-interval", type=int, default=1, help="Full train/validation loss check interval in epochs")
