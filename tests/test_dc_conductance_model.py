@@ -10,6 +10,7 @@ from surrogate_common import (
     MDIFBlock,
     _dc_matrix_from_path_conductances,
     _y_matrix_to_s_matrix,
+    extract_average_dc_resistance,
     extract_dc_conductance_samples,
     parse_dc_port_paths,
     resolve_export_dc_conductance_model,
@@ -24,8 +25,14 @@ LABELS_2 = ["S11", "S12", "S21", "S22"]
 LABELS_3 = [f"S{row}{col}" for row in range(1, 4) for col in range(1, 4)]
 
 
-def dc_block(parameter: float, conductances: list[float], paths: str) -> MDIFBlock:
-    nports = 3 if len(conductances) == 3 else 2
+def dc_block(
+    parameter: float,
+    conductances: list[float],
+    paths: str,
+    *,
+    nports: int | None = None,
+) -> MDIFBlock:
+    nports = nports or (3 if len(conductances) == 3 else 2)
     labels = LABELS_3 if nports == 3 else LABELS_2
     parsed_paths = parse_dc_port_paths(paths, nports)
     y_matrix = _dc_matrix_from_path_conductances(
@@ -56,6 +63,44 @@ def make_dc_nonpassive(block: MDIFBlock) -> MDIFBlock:
 
 
 class DCConductanceModelTests(unittest.TestCase):
+    def test_legacy_dc_extraction_counts_contributing_blocks(self) -> None:
+        metadata = extract_average_dc_resistance(
+            [dc_block(1.0, [0.01], "1-2")],
+            LABELS_2,
+            port_paths="1-2",
+        )
+        self.assertEqual(metadata["dc_resistance_block_count"], 1)
+
+    def test_default_dc_topology_is_complete_passive_graph(self) -> None:
+        self.assertEqual(
+            [path[2] for path in parse_dc_port_paths(None, 2)],
+            ["p1-p2", "p1-ground", "p2-ground"],
+        )
+        block = dc_block(
+            1.0,
+            [0.01, 0.02, 0.03],
+            "1-2,1-ground,2-ground",
+            nports=2,
+        )
+        _, conductances, metadata = extract_dc_conductance_samples(
+            [block],
+            ["W"],
+            LABELS_2,
+            port_paths=None,
+        )
+        np.testing.assert_allclose(
+            conductances[0],
+            np.asarray([0.01, 0.02, 0.03]),
+            rtol=1.0e-11,
+            atol=1.0e-12,
+        )
+        self.assertLess(metadata["dc_topology_s_max_abs_error"], 1.0e-12)
+        self.assertFalse(metadata["dc_port_paths_explicit"])
+        self.assertEqual(
+            metadata["dc_port_path_selection"],
+            "automatic_complete_graph",
+        )
+
     def test_joint_topology_projection_recovers_shared_node_branches(self) -> None:
         blocks = [dc_block(1.0, [0.01, 0.02, 0.03], "1-2,1-3,2-3")]
         _, conductances, metadata = extract_dc_conductance_samples(
@@ -313,6 +358,64 @@ class DCConductanceModelTests(unittest.TestCase):
         self.assertIsNotNone(resolved)
         self.assertEqual(export_metadata["dc_mdif_action"], "fitted_dc_only_model")
         self.assertTrue(export_metadata["dc_model_fitted_during_export"])
+        self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
+
+    def test_export_without_path_flag_upgrades_pair_only_saved_topology(self) -> None:
+        old_blocks = [
+            dc_block(1.0, [0.01], "1-2"),
+            dc_block(2.0, [0.01], "1-2"),
+        ]
+        old_model, _, old_metadata = train_dc_conductance_model(
+            old_blocks,
+            [],
+            ["W"],
+            LABELS_2,
+            hidden_layers=[2],
+            activation="tanh",
+            epochs=20,
+            batch_size=2,
+            learning_rate=0.01,
+            patience=10,
+            seed=13,
+            progress_interval=0,
+            port_paths="1-2",
+        )
+        generic_blocks = [
+            dc_block(
+                1.0,
+                [0.01, 0.02, 0.03],
+                "1-2,1-ground,2-ground",
+                nports=2,
+            ),
+            dc_block(
+                2.0,
+                [0.01, 0.02, 0.03],
+                "1-2,1-ground,2-ground",
+                nports=2,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "generic_dc.mdif"
+            write_mdif(dc_mdif, generic_blocks, LABELS_2)
+            resolved, export_metadata = resolve_export_dc_conductance_model(
+                old_model,
+                old_metadata,
+                ["W"],
+                LABELS_2,
+                dc_mdif=dc_mdif,
+                z0=50.0,
+                port_paths=None,
+                open_threshold_ohm=1.0e12,
+                open_resistance_ohm=1.0e19,
+                activation="tanh",
+                hidden_layers=[2],
+            )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(
+            resolved.port_paths,
+            ["p1-p2", "p1-ground", "p2-ground"],
+        )
+        self.assertEqual(export_metadata["dc_mdif_action"], "fitted_dc_only_model")
         self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
 
     def test_export_dc_mdif_excludes_nonpassive_training_block(self) -> None:

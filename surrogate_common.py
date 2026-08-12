@@ -667,22 +667,22 @@ def parse_dc_port_paths(
 
     Port-to-port paths accept forms such as ``1-2`` or ``p1-p2``. A shunt path
     to the simulator reference accepts ``1-ground`` or ``p1-gnd``. When no
-    specification is supplied, the legacy default selects every port pair (or
-    port 1 to ground for a one-port model).
+    specification is supplied, the generic default selects every port pair and
+    every port-to-ground path. This complete passive resistor graph can represent
+    both floating inter-port paths and grounded/shunt DC conductance.
     """
 
     if nports <= 0:
         raise ValueError("DC port-path parsing requires at least one port")
     if spec is None or (isinstance(spec, str) and not spec.strip()):
-        raw_paths = (
-            ["1-ground"]
-            if nports == 1
-            else [
+        raw_paths = [
+            *[
                 f"{first + 1}-{second + 1}"
                 for first in range(nports)
                 for second in range(first + 1, nports)
-            ]
-        )
+            ],
+            *[f"{port + 1}-ground" for port in range(nports)],
+        ]
     elif isinstance(spec, str):
         raw_paths = [item.strip() for item in re.split(r"[,;]", spec) if item.strip()]
     elif isinstance(spec, dict):
@@ -860,7 +860,7 @@ def extract_average_dc_resistance(
     ignored_invalid_resistance_count = 0
     open_resistance_sample_count = 0
     passivity_limit = 1.0 + float(passivity_tolerance)
-    for block in blocks:
+    for block_index, block in enumerate(blocks):
         freq = np.asarray(block.freq_hz, dtype=float)
         exact_dc_indices = np.flatnonzero(freq == 0.0)
         if exact_dc_indices.size == 0:
@@ -1142,7 +1142,8 @@ def add_dc_port_paths_argument(parser: argparse.ArgumentParser) -> None:
         help=(
             "Comma-separated viable DC paths, for example 1-2,3-4. Only declared "
             "paths are extracted and stamped; undeclared paths remain open. Use "
-            "1-ground for a port-to-reference path. Default: every port pair."
+            "1-ground for a port-to-reference path. Default: every port pair plus "
+            "every port-to-ground path."
         ),
     )
 
@@ -6067,6 +6068,10 @@ def extract_dc_conductance_samples(
     ):
         raise ValueError("DC open resistance must exceed the open threshold")
     nports = infer_complete_sparameter_ports(labels)
+    port_paths_explicit = not (
+        port_paths is None
+        or (isinstance(port_paths, str) and not port_paths.strip())
+    )
     paths = parse_dc_port_paths(port_paths, nports)
     basis = _dc_path_basis(nports, paths)
     passivity_limit = 1.0 + float(passivity_tolerance)
@@ -6163,6 +6168,10 @@ def extract_dc_conductance_samples(
         "dc_resistance_source_kind": "exact_zero_frequency",
         "dc_port_paths": [item[2] for item in paths],
         "dc_port_path_spec": dc_port_path_spec([item[2] for item in paths]),
+        "dc_port_paths_explicit": port_paths_explicit,
+        "dc_port_path_selection": (
+            "explicit" if port_paths_explicit else "automatic_complete_graph"
+        ),
         "dc_row_count": dc_row_count,
         "dc_resistance_block_count": len(sample_blocks),
         "dc_missing_block_count": len(missing_blocks),
@@ -6611,7 +6620,7 @@ def resolve_export_dc_conductance_model(
     """
 
     requested_paths = port_paths
-    if requested_paths is None:
+    if requested_paths is None and dc_mdif is None:
         requested_paths = (
             saved_model.port_paths
             if saved_model is not None
@@ -6692,14 +6701,21 @@ def resolve_export_dc_conductance_model(
             float(validation["dc_mdif_model_s_max_abs_error"])
             > DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE
         ):
+            topology_description = (
+                "automatic complete passive resistor graph"
+                if port_paths is None
+                else "declared --dc-port-paths resistor graph"
+            )
             raise ValueError(
                 "The DC-only export model does not reproduce the supplied exact-DC "
                 "S-parameters closely enough: maximum absolute error is "
                 f"{float(validation['dc_mdif_model_s_max_abs_error']):.6g}, "
-                f"limit {DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE:.6g}. The declared "
-                "--dc-port-paths topology error is "
+                f"limit {DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE:.6g}. The "
+                f"{topology_description} topology error is "
                 f"{float(validation['dc_mdif_topology_s_max_abs_error']):.6g}. "
-                "Check the selected DC paths and passive zero-Hz data; export was stopped."
+                "Selected paths: "
+                f"{', '.join(fitted_model.port_paths)}. Check the passive zero-Hz "
+                "data or provide an explicit topology; export was stopped."
             )
         metadata.update(validation)
         metadata.update(selection_metadata)
@@ -9037,9 +9053,12 @@ def build_training_export_commands(
             saved_metadata = json.loads(metadata_path.read_text())
             saved_dynamic_dc_model = bool(saved_metadata.get("dc_model_kind"))
             saved_spec = saved_metadata.get("dc_port_path_spec")
-            if saved_spec:
+            paths_were_explicit = (
+                saved_metadata.get("dc_port_paths_explicit") is not False
+            )
+            if saved_spec and paths_were_explicit:
                 dc_port_paths_spec = str(saved_spec)
-            elif saved_metadata.get("dc_port_paths"):
+            elif saved_metadata.get("dc_port_paths") and paths_were_explicit:
                 dc_port_paths_spec = dc_port_path_spec(
                     [str(path) for path in saved_metadata["dc_port_paths"]]
                 )
