@@ -40,6 +40,8 @@ native ADS ANN package generation.
 |-- neuro_tf.py                           Neuro-TF CLI and implementation
 |-- surrogate_common.py                   Shared training, reporting, and ADS export utilities
 |-- generate_points.py                    Geometry/process point-set generator
+|-- de_generated_scripts/
+|   `-- parse_ads_hb_solver_log.py        ADS Newton/Krylov status-log comparison utility
 |-- dnn_sample_training_verification.mdif
 |-- kbnn_sample_fine.mdif
 |-- kbnn_sample_coarse.mdif
@@ -678,6 +680,67 @@ S-parameter order, frequency transform, activation, layer sizes, and reference
 impedance. Both packages reuse the baseline's exact-DC model and two-branch SDD
 topology; only the RF model formulation changes. The default manifest lists the
 trial files and compatibility checks under `trial_exports`.
+
+### Parsing ADS Gain Compression solver logs
+
+The standalone
+`de_generated_scripts/parse_ads_hb_solver_log.py` utility converts the plain
+Status/Summary text from an ADS Gain Compression or HB run into comparable
+tables. It requires only standard Python and does not need to run inside ADS.
+
+Set the Gain Compression controller's **Freq > Levels > Status level** to `4`
+and copy each model's Status/Summary text into a plain log file. Level 4 is
+sufficient because every Newton summary row contains the number of Krylov
+iterations used for that step. Level 5 also works; the parser deliberately
+ignores its additional inner-Krylov residual table to avoid double-counting.
+
+Compare any number of model logs in one command:
+
+```bash
+python3 de_generated_scripts/parse_ads_hb_solver_log.py \
+  baseline_status.log direct_y_status.log \
+  --labels baseline direct_y \
+  --out-dir hb_solver_comparison
+```
+
+For a single copied log, pass `-` instead of a filename, paste the text into the
+terminal, and end standard input with Ctrl-D on Linux/macOS or Ctrl-Z followed
+by Enter on Windows.
+
+The report directory contains:
+
+- `ads_hb_solver_points.csv`: one row per detected HB solve, including
+  frequency and input power when ADS printed them, Newton count, total Krylov
+  count, final residuals, line numbers, and convergence/retry messages;
+- `ads_hb_solver_summary.csv`: totals plus mean, median, 95th-percentile, and
+  worst-case solver work for every model;
+- `ads_hb_solver_summary.json`: the same aggregate data and messages in a
+  machine-readable form.
+
+The parser starts a new solve when a printed frequency or input-power label
+changes, or when the Newton iteration counter resets. The reset fallback still
+produces correct aggregate solver-work comparisons when ADS does not print the
+adaptive Gain Compression power values. In that case, the frequency and power
+columns are intentionally blank.
+
+For model $m$, the most useful normalized comparison in the summary is
+
+$$
+\overline{K}_m=
+\frac{\sum_{q=1}^{N_m}\sum_{n=1}^{M_q}K_{q,n}}{N_m},
+$$
+
+where $N_m$ is the number of detected HB solves, $M_q$ is the number of Newton
+steps in solve $q$, and $K_{q,n}$ is the Krylov iteration count printed on a
+Newton summary row. Also compare `solve_count`: Gain Compression searches
+adaptively, so models can require different power-point sequences. Use the same
+status level and initial-guess policy for every timed run.
+
+If a particular ADS release uses different frequency or power wording, provide
+a release-specific regular expression with a named `value` group and optional
+`unit` group through `--frequency-regex` or `--power-regex`. Run `--help` for
+the exact syntax. A log that contains no recognized Newton/Krylov summary rows
+fails with an explicit request to enable status level 4 or 5.
 
 ### Reusing an ADS HB model at multiple parameter values
 
