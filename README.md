@@ -716,7 +716,8 @@ The report directory contains:
   worst-case solver work, ADS total and simulation stopwatch times, total
   stopwatch time per detected solve, and CPU time for every model;
 - `ads_hb_solver_summary.json`: the same aggregate data and messages in a
-  machine-readable form;
+  machine-readable form, plus the exact content-versioned SVG filenames used
+  by the Markdown report;
 - `ads_hb_solver_report.md`: an easy-to-scan comparison report containing the
   runtime and solver-work summary tables, changes relative to the first model,
   per-frequency results, highest-work solves, source coverage, and inline
@@ -729,13 +730,20 @@ The report directory contains:
 - `krylov_by_solve.svg`: solve-sequence comparison for finding localized
   convergence-cost differences.
 
+Each stable SVG also has a content-versioned copy such as
+`runtime_comparison.a1b2c3d4e5f6.svg`. The Markdown report references these
+physical copies directly, and `embedded_plot_artifacts` in the summary JSON
+lists all four filenames.
+
 The SVG plots are generated with the Python standard library and are referenced
 with relative paths inside `ads_hb_solver_report.md`, so the report directory is
 portable and the plots render inline in normal Markdown viewers. The image links
-include a content fingerprint so rerunning a report in the same directory does
-not leave a stale plot in the Markdown viewer's cache. The first log is treated
-as the baseline for percentage-change tables; put the standard model first in
-the command.
+point to real SVG files whose filenames include a content fingerprint. This
+keeps the links portable across Markdown renderers and prevents a rerun in the
+same directory from displaying a stale cached plot. The stable SVG filenames
+are also retained for direct access and automation. The first log is treated as
+the baseline for percentage-change tables; put the standard model first in the
+command.
 
 #### ADS Resource usage timing
 

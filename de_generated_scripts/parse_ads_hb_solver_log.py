@@ -1594,7 +1594,7 @@ def _write_report_artifacts(
     out_dir: Path,
     results: Sequence[ParseResult],
     summary_rows: Sequence[dict[str, object]],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     artifact_names = [
         "ads_hb_solver_report.md",
         "runtime_comparison.svg",
@@ -1606,20 +1606,23 @@ def _write_report_artifacts(
     _write_total_work_svg(out_dir / artifact_names[2], summary_rows)
     _write_krylov_statistics_svg(out_dir / artifact_names[3], summary_rows)
     _write_krylov_by_solve_svg(out_dir / artifact_names[4], results)
-    plot_hrefs = {
-        name: (
-            f"{name}?v="
-            f"{hashlib.sha256((out_dir / name).read_bytes()).hexdigest()[:12]}"
-        )
-        for name in artifact_names[1:]
-    }
+    plot_hrefs: dict[str, str] = {}
+    for name in artifact_names[1:]:
+        source_path = out_dir / name
+        content = source_path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()[:12]
+        embedded_name = f"{source_path.stem}.{digest}{source_path.suffix}"
+        embedded_path = out_dir / embedded_name
+        if not embedded_path.is_file() or embedded_path.read_bytes() != content:
+            embedded_path.write_bytes(content)
+        plot_hrefs[name] = embedded_name
     _write_markdown_report(
         out_dir / artifact_names[0],
         results,
         summary_rows,
         plot_hrefs,
     )
-    return artifact_names
+    return artifact_names, list(plot_hrefs.values())
 
 
 def _read_log(path_text: str) -> tuple[str, str]:
@@ -1788,12 +1791,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary_rows = [summarize_result(result) for result in results]
     _write_csv(out_dir / "ads_hb_solver_points.csv", point_rows)
     _write_csv(out_dir / "ads_hb_solver_summary.csv", summary_rows)
-    report_artifacts = _write_report_artifacts(out_dir, results, summary_rows)
+    report_artifacts, embedded_plot_artifacts = _write_report_artifacts(
+        out_dir, results, summary_rows
+    )
     (out_dir / "ads_hb_solver_summary.json").write_text(
         json.dumps(
             {
                 "summaries": summary_rows,
                 "report_artifacts": report_artifacts,
+                "embedded_plot_artifacts": embedded_plot_artifacts,
                 "unmatched_messages": [
                     {
                         "model": result.model,

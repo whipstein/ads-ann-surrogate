@@ -219,15 +219,26 @@ Iters Residual
                 report,
             )
             self.assertIn("| trial | +20.0% | +20.0% | +20.0% |", report)
-            self.assertIn("runtime_comparison.svg", report)
-            self.assertRegex(
-                report,
-                re.compile(r"runtime_comparison\.svg\?v=[0-9a-f]{12}"),
-            )
-            self.assertIn("solver_work_totals.svg", report)
-            self.assertIn("krylov_per_solve_statistics.svg", report)
-            self.assertIn("krylov_by_solve.svg", report)
             self.assertIn("## Results by frequency", report)
+            image_targets = re.findall(r"!\[[^]]*\]\(([^)]+)\)", report)
+            self.assertEqual(len(image_targets), 4)
+            expected_stems = (
+                "runtime_comparison",
+                "solver_work_totals",
+                "krylov_per_solve_statistics",
+                "krylov_by_solve",
+            )
+            for stem, target in zip(expected_stems, image_targets):
+                self.assertRegex(
+                    target,
+                    rf"^{re.escape(stem)}\.[0-9a-f]{{12}}\.svg$",
+                )
+                self.assertNotIn("?", target)
+                self.assertTrue(
+                    (output / target).is_file(),
+                    f"Markdown image target does not exist: {target}",
+                )
+                ElementTree.parse(output / target)
             for name in (
                 "runtime_comparison.svg",
                 "solver_work_totals.svg",
@@ -253,12 +264,47 @@ Iters Residual
                 ],
             )
             self.assertEqual(
+                summary_json["embedded_plot_artifacts"], image_targets
+            )
+            self.assertEqual(
                 summary_json["summaries"][0]["wall_clock_seconds"], 12.5
             )
             self.assertEqual(
                 summary_json["summaries"][0]["simulation_stopwatch_seconds"],
                 11.25,
             )
+
+            previous_runtime_target = image_targets[0]
+            second.write_text(
+                RESOURCE_USAGE_LOG.replace("12.5 seconds", "16.0 seconds")
+                .replace("11.25 seconds", "14.0 seconds")
+                .replace("18.75 seconds", "24.0 seconds")
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    PARSER.main(
+                        [
+                            str(first),
+                            str(second),
+                            "--labels",
+                            "baseline",
+                            "trial",
+                            "--out-dir",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
+            refreshed_report = (
+                output / "ads_hb_solver_report.md"
+            ).read_text()
+            refreshed_targets = re.findall(
+                r"!\[[^]]*\]\(([^)]+)\)", refreshed_report
+            )
+            self.assertNotEqual(previous_runtime_target, refreshed_targets[0])
+            for target in refreshed_targets:
+                self.assertTrue((output / target).is_file())
+                ElementTree.parse(output / target)
 
     def test_cli_timing_override_replaces_log_timing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
