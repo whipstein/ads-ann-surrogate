@@ -36,6 +36,14 @@ Total elapsed time: 12.5 seconds
 Total CPU time: 18.75 seconds
 """
 
+RESOURCE_USAGE_LOG = LEVEL5_LOG.replace(
+    "Total elapsed time: 12.5 seconds\nTotal CPU time: 18.75 seconds",
+    """Resource usage:
+Total CPU time = 18.75 seconds.
+Simulation stopwatch time = 11.25 seconds.
+Total stopwatch time = 12.5 seconds.""",
+)
+
 
 class AdsHbLogParserTests(unittest.TestCase):
     def test_parses_summary_rows_and_ignores_inner_krylov_rows(self) -> None:
@@ -66,6 +74,21 @@ class AdsHbLogParserTests(unittest.TestCase):
         result = PARSER.parse_ads_status_text(text, "trial", "trial.log")
         self.assertEqual(result.wall_clock_seconds, 62.5)
         self.assertEqual(result.cpu_time_seconds, 95.0)
+
+    def test_parses_ads_resource_usage_stopwatch_times(self) -> None:
+        result = PARSER.parse_ads_status_text(
+            RESOURCE_USAGE_LOG,
+            model="baseline",
+            source_file="baseline.log",
+        )
+        self.assertEqual(result.wall_clock_seconds, 12.5)
+        self.assertEqual(result.simulation_stopwatch_seconds, 11.25)
+        self.assertEqual(result.cpu_time_seconds, 18.75)
+        self.assertIn("Total stopwatch time", result.wall_clock_source)
+        self.assertIn(
+            "Simulation stopwatch time", result.simulation_stopwatch_source
+        )
+        self.assertIn("Total CPU time", result.cpu_time_source)
 
     def test_prefers_total_time_and_rejects_stage_elapsed_as_total(self) -> None:
         without_footer = LEVEL5_LOG.replace(
@@ -143,10 +166,12 @@ Iters Residual
             first = root / "baseline.log"
             second = root / "trial.log"
             output = root / "report"
-            first.write_text(LEVEL5_LOG)
+            first.write_text(RESOURCE_USAGE_LOG)
             second.write_text(
-                LEVEL5_LOG.replace("7     2.000e-03", "9     2.000e-03")
+                RESOURCE_USAGE_LOG.replace("7     2.000e-03", "9     2.000e-03")
                 .replace("12.5 seconds", "15.0 seconds")
+                .replace("11.25 seconds", "13.5 seconds")
+                .replace("18.75 seconds", "22.5 seconds")
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
@@ -169,10 +194,10 @@ Iters Residual
             report = (output / "ads_hb_solver_report.md").read_text()
             self.assertIn("# ADS HB Solver Comparison", report)
             self.assertIn(
-                "| baseline | 2 | 12.5 s | 6.25 s | 18.75 s | 4 | 19 |",
+                "| baseline | 2 | 12.5 s | 11.25 s | 6.25 s | 18.75 s | 4 | 19 |",
                 report,
             )
-            self.assertIn("| trial | +20.0% | +20.0% |", report)
+            self.assertIn("| trial | +20.0% | +20.0% | +20.0% |", report)
             self.assertIn("runtime_comparison.svg", report)
             self.assertIn("solver_work_totals.svg", report)
             self.assertIn("krylov_per_solve_statistics.svg", report)
@@ -204,6 +229,10 @@ Iters Residual
             )
             self.assertEqual(
                 summary_json["summaries"][0]["wall_clock_seconds"], 12.5
+            )
+            self.assertEqual(
+                summary_json["summaries"][0]["simulation_stopwatch_seconds"],
+                11.25,
             )
 
     def test_cli_timing_override_replaces_log_timing(self) -> None:

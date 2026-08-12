@@ -71,6 +71,16 @@ CPU_ELAPSED_PAIR_RE = re.compile(
     rf"(?P<cpu>{DURATION_TEXT})\s*(?:/|,)\s*(?P<wall>{DURATION_TEXT})",
     re.IGNORECASE,
 )
+SIMULATION_STOPWATCH_RE = re.compile(
+    rf"(?P<label>simulation\s+stopwatch\s+time)\s*[:=]\s*"
+    rf"(?P<duration>{DURATION_TEXT})",
+    re.IGNORECASE,
+)
+TOTAL_STOPWATCH_RE = re.compile(
+    rf"(?P<label>total\s+stopwatch\s+time)\s*[:=]\s*"
+    rf"(?P<duration>{DURATION_TEXT})",
+    re.IGNORECASE,
+)
 
 FREQUENCY_PATTERNS = [
     re.compile(
@@ -176,8 +186,10 @@ class ParseResult:
     diagnostic_lines: list[str]
     wall_clock_seconds: float | None
     cpu_time_seconds: float | None
+    simulation_stopwatch_seconds: float | None
     wall_clock_source: str
     cpu_time_source: str
+    simulation_stopwatch_source: str
 
 
 def _optional_number(value: float | None) -> float | str:
@@ -321,6 +333,20 @@ def _timing_score(label: str, line: str, match_start: int) -> int:
 def _timing_samples_from_line(line: str, line_number: int) -> list[TimingSample]:
     samples: list[TimingSample] = []
     paired_spans: list[tuple[int, int]] = []
+    for kind, pattern, score in (
+        ("simulation_stopwatch", SIMULATION_STOPWATCH_RE, 250),
+        ("wall", TOTAL_STOPWATCH_RE, 300),
+    ):
+        for match in pattern.finditer(line):
+            samples.append(
+                TimingSample(
+                    kind=kind,
+                    seconds=_duration_seconds(match.group("duration")),
+                    score=score,
+                    line_number=line_number,
+                    source_text=line.strip(),
+                )
+            )
     for match in CPU_ELAPSED_PAIR_RE.finditer(line):
         paired_spans.append(match.span())
         score = _timing_score(match.group("label"), line, match.start())
@@ -544,6 +570,9 @@ def parse_ads_status_text(
     finish_current()
     wall_timing = _select_timing_sample(timing_samples, "wall")
     cpu_timing = _select_timing_sample(timing_samples, "cpu")
+    simulation_stopwatch = _select_timing_sample(
+        timing_samples, "simulation_stopwatch"
+    )
     return ParseResult(
         model=model,
         source_file=source_file,
@@ -553,8 +582,14 @@ def parse_ads_status_text(
         diagnostic_lines=diagnostic_lines,
         wall_clock_seconds=(wall_timing.seconds if wall_timing else None),
         cpu_time_seconds=(cpu_timing.seconds if cpu_timing else None),
+        simulation_stopwatch_seconds=(
+            simulation_stopwatch.seconds if simulation_stopwatch else None
+        ),
         wall_clock_source=(wall_timing.source_text if wall_timing else ""),
         cpu_time_source=(cpu_timing.source_text if cpu_timing else ""),
+        simulation_stopwatch_source=(
+            simulation_stopwatch.source_text if simulation_stopwatch else ""
+        ),
     )
 
 
@@ -589,6 +624,14 @@ def summarize_result(result: ParseResult) -> dict[str, object]:
             if result.wall_clock_seconds is not None and result.solves
             else ""
         ),
+        "simulation_stopwatch_seconds": _optional_number(
+            result.simulation_stopwatch_seconds
+        ),
+        "simulation_stopwatch_per_solve_seconds": (
+            result.simulation_stopwatch_seconds / len(result.solves)
+            if result.simulation_stopwatch_seconds is not None and result.solves
+            else ""
+        ),
         "cpu_time_seconds": _optional_number(result.cpu_time_seconds),
         "cpu_time_per_solve_seconds": (
             result.cpu_time_seconds / len(result.solves)
@@ -596,6 +639,7 @@ def summarize_result(result: ParseResult) -> dict[str, object]:
             else ""
         ),
         "wall_clock_source": result.wall_clock_source,
+        "simulation_stopwatch_source": result.simulation_stopwatch_source,
         "cpu_time_source": result.cpu_time_source,
         "mean_newton_per_solve": _mean_or_blank(point_newton),
         "mean_krylov_per_solve": _mean_or_blank(point_krylov),
@@ -858,17 +902,21 @@ def _write_total_work_svg(
 def _write_runtime_svg(
     path: Path, summary_rows: Sequence[dict[str, object]]
 ) -> None:
-    width = 1040
+    width = 1450
     height = 470
-    elements = _svg_begin(width, height, "Wall-clock runtime comparison")
-    available = any(row["wall_clock_seconds"] != "" for row in summary_rows)
+    elements = _svg_begin(width, height, "ADS Resource usage timing")
+    available = any(
+        row["wall_clock_seconds"] != ""
+        or row["simulation_stopwatch_seconds"] != ""
+        for row in summary_rows
+    )
     if not available:
         elements.extend(
             [
                 _svg_text(
                     width / 2,
                     210,
-                    "No wall-clock timing was found in the supplied logs.",
+                    "No ADS stopwatch timing was found in the supplied logs.",
                     size=18,
                     weight="bold",
                     fill="#9a3412",
@@ -888,12 +936,13 @@ def _write_runtime_svg(
 
     models = [str(row["model"]) for row in summary_rows]
     panels = [
-        ("Total wall clock", "wall_clock_seconds"),
-        ("Wall clock per HB solve", "wall_clock_per_solve_seconds"),
+        ("Total stopwatch time", "wall_clock_seconds"),
+        ("Simulation stopwatch time", "simulation_stopwatch_seconds"),
+        ("Total stopwatch / HB solve", "wall_clock_per_solve_seconds"),
     ]
-    panel_width = 490.0
+    panel_width = 450.0
     for panel_index, (title, key) in enumerate(panels):
-        panel_x = 20.0 + panel_index * 515.0
+        panel_x = 10.0 + panel_index * 480.0
         left = panel_x + 72.0
         top = 82.0
         plot_width = panel_width - 100.0
@@ -960,7 +1009,7 @@ def _write_runtime_svg(
         _svg_text(
             width / 2,
             451,
-            "Per-solve time is total wall clock divided by detected HB solves.",
+            "Per-solve time is Total stopwatch time divided by detected HB solves.",
             size=12,
             fill="#4b5563",
         )
@@ -1233,6 +1282,7 @@ def _write_markdown_report(
             row["model"],
             row["solve_count"],
             _format_duration(row["wall_clock_seconds"]),
+            _format_duration(row["simulation_stopwatch_seconds"]),
             _format_duration(row["wall_clock_per_solve_seconds"]),
             _format_duration(row["cpu_time_seconds"]),
             row["total_newton_iterations"],
@@ -1250,6 +1300,10 @@ def _write_markdown_report(
             row["model"],
             _percent_change(
                 row["wall_clock_seconds"], baseline["wall_clock_seconds"]
+            ),
+            _percent_change(
+                row["simulation_stopwatch_seconds"],
+                baseline["simulation_stopwatch_seconds"],
             ),
             _percent_change(
                 row["wall_clock_per_solve_seconds"],
@@ -1313,6 +1367,8 @@ def _write_markdown_report(
             result.model,
             _format_duration(result.wall_clock_seconds),
             result.wall_clock_source or "not found",
+            _format_duration(result.simulation_stopwatch_seconds),
+            result.simulation_stopwatch_source or "not found",
             _format_duration(result.cpu_time_seconds),
             result.cpu_time_source or "not found",
         ]
@@ -1354,9 +1410,10 @@ def _write_markdown_report(
             [
                 "Model",
                 "HB solves",
-                "Wall clock",
-                "Wall/solve",
-                "CPU time",
+                "Total stopwatch",
+                "Simulation stopwatch",
+                "Total/solve",
+                "Total CPU",
                 "Newton total",
                 "Krylov total",
                 "Krylov/solve mean",
@@ -1373,8 +1430,9 @@ def _write_markdown_report(
         _markdown_table(
             [
                 "Model",
-                "Δ wall clock",
-                "Δ wall/solve",
+                "Δ total stopwatch",
+                "Δ simulation stopwatch",
+                "Δ total/solve",
                 "Δ Newton total",
                 "Δ Krylov total",
                 "Δ mean Krylov/solve",
@@ -1388,7 +1446,15 @@ def _write_markdown_report(
         "![Wall-clock runtime by model](runtime_comparison.svg)",
         "",
         _markdown_table(
-            ["Model", "Wall clock", "Wall source", "CPU time", "CPU source"],
+            [
+                "Model",
+                "Total stopwatch",
+                "Total source",
+                "Simulation stopwatch",
+                "Simulation source",
+                "Total CPU",
+                "CPU source",
+            ],
             timing_source_table,
         ),
         "",
@@ -1397,8 +1463,9 @@ def _write_markdown_report(
                 (
                     "> **Timing unavailable for "
                     + ", ".join(_markdown_escape(model) for model in missing_wall_models)
-                    + ".** The supplied log did not contain a recognized wall-clock "
-                    "total. Enable ADS event timing or pass `--wall-clock-seconds` "
+                    + ".** The supplied log did not contain a recognized `Total "
+                    "stopwatch time`. Enable ADS Resource usage output or pass "
+                    "`--wall-clock-seconds` "
                     "for each log."
                 ),
                 "",
@@ -1407,8 +1474,8 @@ def _write_markdown_report(
             else []
         ),
         (
-            "Wall time per solve is derived by dividing the complete logged wall "
-            "clock by the number of detected HB solves; it is not a separately "
+            "Total time per solve is derived by dividing `Total stopwatch time` "
+            "by the number of detected HB solves; it is not a separately "
             "measured point time."
         ),
         "",
@@ -1503,9 +1570,10 @@ def _write_markdown_report(
             "- `HB solves` is detected from frequency/power changes or a reset of the Newton counter.",
             "- Gain Compression chooses power points adaptively, so compare both totals and per-solve statistics.",
             "- Use identical StatusLevel, initial-guess policy, solver settings, circuit, and sweep configuration.",
-            "- `Wall clock` is parsed from the selected total elapsed/simulation-time line or supplied explicitly; it is never inferred from iteration count.",
-            "- CPU time can exceed wall time when ADS uses multiple cores, so wall clock is the primary end-to-end comparison.",
-            "- Compare cold and warm wall-clock runs separately.",
+            "- ADS `Total stopwatch time` is the primary end-to-end wall-clock comparison; `Simulation stopwatch time` isolates the simulation portion of that total.",
+            "- Timing is parsed from Resource usage or another recognized total-runtime line, or supplied explicitly; it is never inferred from iteration count.",
+            "- `Total CPU time` can exceed stopwatch time when ADS uses multiple cores.",
+            "- Compare cold and warm stopwatch-time runs separately.",
             "",
             "Machine-readable details are available in `ads_hb_solver_points.csv`, "
             "`ads_hb_solver_summary.csv`, and `ads_hb_solver_summary.json`.",
@@ -1563,6 +1631,7 @@ def _print_summary(rows: Sequence[dict[str, object]]) -> None:
         "model",
         "solve_count",
         "wall_clock_seconds",
+        "simulation_stopwatch_seconds",
         "total_newton_iterations",
         "total_krylov_iterations",
         "mean_krylov_per_solve",

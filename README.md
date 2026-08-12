@@ -713,16 +713,16 @@ The report directory contains:
   frequency and input power when ADS printed them, Newton count, total Krylov
   count, final residuals, line numbers, and convergence/retry messages;
 - `ads_hb_solver_summary.csv`: totals plus mean, median, 95th-percentile, and
-  worst-case solver work, total wall clock, wall clock per detected solve, and
-  CPU time for every model;
+  worst-case solver work, ADS total and simulation stopwatch times, total
+  stopwatch time per detected solve, and CPU time for every model;
 - `ads_hb_solver_summary.json`: the same aggregate data and messages in a
   machine-readable form;
 - `ads_hb_solver_report.md`: an easy-to-scan comparison report containing the
   runtime and solver-work summary tables, changes relative to the first model,
   per-frequency results, highest-work solves, source coverage, and inline
   plots;
-- `runtime_comparison.svg`: total wall clock and derived wall clock per detected
-  HB solve;
+- `runtime_comparison.svg`: ADS total stopwatch time, simulation stopwatch time,
+  and derived total stopwatch time per detected HB solve;
 - `solver_work_totals.svg`: total Newton and Krylov work by model;
 - `krylov_per_solve_statistics.svg`: mean, median, 95th-percentile, and maximum
   Krylov work per detected HB solve;
@@ -735,13 +735,23 @@ portable and the plots render inline in normal Markdown viewers. The first log
 is treated as the baseline for percentage-change tables; put the standard model
 first in the command.
 
-#### Wall-clock and CPU timing
+#### ADS Resource usage timing
 
-The parser recognizes common ADS footer labels such as `Total elapsed time`,
+The parser reads these exact fields from the `Resource usage` block at the end
+of an ADS log:
+
+- `Total stopwatch time` is the primary end-to-end wall-clock comparison;
+- `Simulation stopwatch time` is reported separately as time spent in the
+  simulation portion;
+- `Total CPU time` is retained as supporting processor-time context.
+
+The exact stopwatch labels take priority over generic timing lines elsewhere in
+the log. The parser also accepts fallback labels such as `Total elapsed time`,
 `Total simulation time`, `Wall clock time`, `CPU time`, and paired
-`CPU/Elapsed time` values. Clock-form durations such as `0:24:52` are converted
-to seconds. The selected source line is included in the Markdown report and the
-summary outputs so an ambiguous timing match is visible rather than silent.
+`CPU/Elapsed time` values for older or differently configured logs. Clock-form
+durations such as `0:24:52` are converted to seconds. The selected source line
+for every metric is included in the Markdown report and summary outputs so a
+timing match is visible rather than silent.
 
 If ADS does not print timing, enable its diagnostic event recording before
 starting ADS, then display that recording in the simulation log:
@@ -758,8 +768,8 @@ recording system is disabled by default in releases using the newer event
 subsystem. See the [Keysight circuit-simulator documentation](https://edadownload.software.keysight.com/eedl/ads/2011/pdf/cktsim.pdf)
 and [ADS diagnostic-event release note](https://docs.keysight.com/download/attachments/4403386/Advanced%20Design%20System%202017%20Release%20Notes_RC1.pdf?api=v2).
 
-For logs without an embedded total, supply independently measured times in log
-order. These values override parsed timing:
+For logs without an embedded `Total stopwatch time`, supply independently
+measured times in log order. These values override parsed total timing:
 
 ```bash
 python3 de_generated_scripts/parse_ads_hb_solver_log.py \
@@ -770,9 +780,10 @@ python3 de_generated_scripts/parse_ads_hb_solver_log.py \
   --out-dir hb_solver_comparison
 ```
 
-The report never estimates runtime from iteration counts. `Wall/solve` is only
-the total wall clock divided by the number of detected HB solves. Use wall clock
-as the primary end-to-end comparison and treat CPU time as supporting context,
+The report never estimates runtime from iteration counts. `Total/solve` is only
+`Total stopwatch time` divided by the number of detected HB solves. Use total
+stopwatch time as the primary end-to-end comparison, use simulation stopwatch
+time to isolate the simulator portion, and treat CPU time as supporting context,
 especially for multi-core runs. Diagnostic event recording can add overhead to
 very short sweeps, so benchmark every model with identical logging settings.
 
