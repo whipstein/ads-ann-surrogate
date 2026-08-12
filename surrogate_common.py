@@ -860,7 +860,7 @@ def extract_average_dc_resistance(
     ignored_invalid_resistance_count = 0
     open_resistance_sample_count = 0
     passivity_limit = 1.0 + float(passivity_tolerance)
-    for block_index, block in enumerate(blocks):
+    for block in blocks:
         freq = np.asarray(block.freq_hz, dtype=float)
         exact_dc_indices = np.flatnonzero(freq == 0.0)
         if exact_dc_indices.size == 0:
@@ -6143,15 +6143,12 @@ def extract_dc_conductance_samples(
             "one-based ACDATA block position(s) in the source MDIF: "
             + ", ".join(map(str, missing_blocks[:20]))
         )
-    if unusable_blocks and require_every_block:
-        raise ValueError(
-            "No usable passive exact-zero-Hz row remains at one-based ACDATA block "
-            "position(s) in the source MDIF: "
-            + ", ".join(map(str, unusable_blocks[:20]))
-        )
     if not conductance_rows:
         if require_every_block:
-            raise ValueError("No usable passive exact-zero-Hz rows remain for DC fitting")
+            raise ValueError(
+                "No usable passive exact-zero-Hz rows remain after excluding "
+                "non-passive or non-finite DC samples; a DC model cannot be fitted"
+            )
         x_values = np.empty((0, len(parameter_names)), dtype=float)
         conductances = np.empty((0, len(paths)), dtype=float)
         s_error = np.empty((0, nports, nports), dtype=float)
@@ -6169,6 +6166,12 @@ def extract_dc_conductance_samples(
         "dc_row_count": dc_row_count,
         "dc_resistance_block_count": len(sample_blocks),
         "dc_missing_block_count": len(missing_blocks),
+        "dc_missing_block_positions": missing_blocks,
+        "dc_unusable_block_count": len(unusable_blocks),
+        "dc_unusable_block_positions": unusable_blocks,
+        "dc_usable_block_positions": [
+            int(block.source_index) + 1 for block in sample_blocks
+        ],
         "dc_ignored_nonpassive_count": ignored_nonpassive,
         "dc_ignored_nonfinite_count": ignored_nonfinite,
         "dc_ignored_invalid_resistance_count": 0,
@@ -6523,7 +6526,15 @@ def validate_dc_model_against_mdif(
         )
     )
     nports = infer_complete_sparameter_ports(model.sparam_labels)
-    for block, parameter_row in zip(blocks, x_values):
+    usable_positions = {
+        int(value) for value in extraction["dc_usable_block_positions"]
+    }
+    usable_blocks = [
+        block
+        for block in blocks
+        if int(block.source_index) + 1 in usable_positions
+    ]
+    for block, parameter_row in zip(usable_blocks, x_values):
         predicted = model.predict_s_values(parameter_row)
         for raw_index in np.flatnonzero(
             np.asarray(block.freq_hz, dtype=float) == 0.0
@@ -6555,7 +6566,14 @@ def validate_dc_model_against_mdif(
         raise ValueError("No usable passive exact-DC rows remain for export validation")
     direct_error_array = np.asarray(direct_errors, dtype=float)
     return {
-        "dc_mdif_validation_block_count": len(blocks),
+        "dc_mdif_validation_input_block_count": len(blocks),
+        "dc_mdif_validation_block_count": len(usable_blocks),
+        "dc_mdif_excluded_unusable_block_count": extraction[
+            "dc_unusable_block_count"
+        ],
+        "dc_mdif_excluded_unusable_block_positions": extraction[
+            "dc_unusable_block_positions"
+        ],
         "dc_mdif_model_conductance_rmse_siemens": float(
             np.sqrt(np.mean(conductance_error**2))
         ),

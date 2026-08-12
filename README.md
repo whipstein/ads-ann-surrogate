@@ -557,8 +557,10 @@ frequency, RF samples, KBNN coarse responses, and S-parameter/frequency loss
 weights are not inputs to the DC fit.
 
 Every training and verification geometry must contain at least one exact-zero-
-Hz row, and each geometry must retain a usable passive row. Missing DC in any
-fitted block is an error. The lowest positive frequency is never substituted,
+Hz row. Non-passive or non-finite zero-Hz rows are discarded, and a geometry
+with no usable passive DC row is excluded from the separate DC fit. Fitting
+stops only when no usable passive DC geometries remain. A missing zero-Hz row
+in a training block is still an error. The lowest positive frequency is never substituted,
 and the RF response is never extrapolated to DC. RF verification metrics,
 worst-case plots, sweep ranking, and passivity selection use only positive-
 frequency rows. `predicted_verification.mdif` still contains both the separately

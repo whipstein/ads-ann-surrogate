@@ -944,6 +944,9 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "dc_mdif_excluded_verification_blocks": dc_metadata.get(
             "dc_mdif_excluded_verification_block_count"
         ),
+        "dc_mdif_excluded_unusable_blocks": dc_metadata.get(
+            "dc_mdif_excluded_unusable_block_count"
+        ),
         "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
         "dc_mdif_model_s_max_abs_error": dc_metadata.get(
             "dc_mdif_model_s_max_abs_error"
@@ -1198,6 +1201,9 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "dc_mdif_excluded_verification_blocks": dc_metadata.get(
             "dc_mdif_excluded_verification_block_count"
         ),
+        "dc_mdif_excluded_unusable_blocks": dc_metadata.get(
+            "dc_mdif_excluded_unusable_block_count"
+        ),
         "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
         "dc_mdif_model_s_max_abs_error": dc_metadata.get(
             "dc_mdif_model_s_max_abs_error"
@@ -1285,6 +1291,9 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 ),
                 "dc_mdif_excluded_verification_blocks": dc_metadata.get(
                     "dc_mdif_excluded_verification_block_count"
+                ),
+                "dc_mdif_excluded_unusable_blocks": dc_metadata.get(
+                    "dc_mdif_excluded_unusable_block_count"
                 ),
                 "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
                 "dc_mdif_model_s_max_abs_error": dc_metadata.get(

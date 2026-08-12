@@ -47,6 +47,14 @@ def dc_block(parameter: float, conductances: list[float], paths: str) -> MDIFBlo
     )
 
 
+def make_dc_nonpassive(block: MDIFBlock) -> MDIFBlock:
+    for label in block.sparams:
+        block.sparams[label] = block.sparams[label].copy()
+        block.sparams[label][0] = 0.0
+    block.sparams["S11"][0] = 2.0
+    return block
+
+
 class DCConductanceModelTests(unittest.TestCase):
     def test_joint_topology_projection_recovers_shared_node_branches(self) -> None:
         blocks = [dc_block(1.0, [0.01, 0.02, 0.03], "1-2,1-3,2-3")]
@@ -99,6 +107,51 @@ class DCConductanceModelTests(unittest.TestCase):
         )
         self.assertIsNotNone(model)
         self.assertEqual(metadata["dc_model_verification_samples"], 0)
+
+    def test_nonpassive_dc_training_block_is_excluded(self) -> None:
+        bad = make_dc_nonpassive(dc_block(1.0, [0.01], "1-2"))
+        good = dc_block(2.0, [0.02], "1-2")
+        bad.source_index = 0
+        good.source_index = 1
+        model, _, metadata = train_dc_conductance_model(
+            [bad, good],
+            [],
+            ["W"],
+            LABELS_2,
+            hidden_layers=[2],
+            activation="tanh",
+            epochs=20,
+            batch_size=2,
+            learning_rate=0.01,
+            patience=10,
+            seed=11,
+            progress_interval=0,
+            port_paths="1-2",
+        )
+        self.assertIsNotNone(model)
+        self.assertEqual(metadata["dc_model_training_samples"], 1)
+        self.assertEqual(metadata["dc_unusable_block_count"], 1)
+        self.assertEqual(metadata["dc_unusable_block_positions"], [1])
+        self.assertEqual(metadata["dc_usable_block_positions"], [2])
+
+    def test_dc_fit_fails_only_when_every_dc_sample_is_unusable(self) -> None:
+        bad = make_dc_nonpassive(dc_block(1.0, [0.01], "1-2"))
+        with self.assertRaisesRegex(ValueError, "a DC model cannot be fitted"):
+            train_dc_conductance_model(
+                [bad],
+                [],
+                ["W"],
+                LABELS_2,
+                hidden_layers=[2],
+                activation="tanh",
+                epochs=20,
+                batch_size=1,
+                learning_rate=0.01,
+                patience=10,
+                seed=12,
+                progress_interval=0,
+                port_paths="1-2",
+            )
 
     def test_training_save_load_and_geometry_only_prediction(self) -> None:
         blocks = [
@@ -261,6 +314,33 @@ class DCConductanceModelTests(unittest.TestCase):
         self.assertEqual(export_metadata["dc_mdif_action"], "fitted_dc_only_model")
         self.assertTrue(export_metadata["dc_model_fitted_during_export"])
         self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
+
+    def test_export_dc_mdif_excludes_nonpassive_training_block(self) -> None:
+        blocks = [
+            make_dc_nonpassive(dc_block(1.0, [0.02], "1-2")),
+            dc_block(2.0, [0.02], "1-2"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "dc.mdif"
+            write_mdif(dc_mdif, blocks, LABELS_2)
+            resolved, export_metadata = resolve_export_dc_conductance_model(
+                None,
+                {},
+                ["W"],
+                LABELS_2,
+                dc_mdif=dc_mdif,
+                z0=50.0,
+                port_paths="1-2",
+                open_threshold_ohm=1.0e12,
+                open_resistance_ohm=1.0e19,
+                activation="tanh",
+                hidden_layers=[2],
+            )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(export_metadata["dc_mdif_validation_input_block_count"], 2)
+        self.assertEqual(export_metadata["dc_mdif_validation_block_count"], 1)
+        self.assertEqual(export_metadata["dc_mdif_excluded_unusable_block_count"], 1)
+        self.assertEqual(export_metadata["dc_mdif_excluded_unusable_block_positions"], [1])
 
     def test_export_dc_mdif_uses_only_training_split_from_combined_file(self) -> None:
         training = [
