@@ -940,6 +940,10 @@ def command_export_ads(args: argparse.Namespace) -> int:
         ),
         "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
         "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+        "dc_mdif_training_blocks": dc_metadata.get("dc_mdif_training_block_count"),
+        "dc_mdif_excluded_verification_blocks": dc_metadata.get(
+            "dc_mdif_excluded_verification_block_count"
+        ),
         "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
         "dc_mdif_model_s_max_abs_error": dc_metadata.get(
             "dc_mdif_model_s_max_abs_error"
@@ -1190,6 +1194,10 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         ),
         "dc_open_circuit_applied": dc_metadata.get("dc_open_circuit_applied"),
         "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+        "dc_mdif_training_blocks": dc_metadata.get("dc_mdif_training_block_count"),
+        "dc_mdif_excluded_verification_blocks": dc_metadata.get(
+            "dc_mdif_excluded_verification_block_count"
+        ),
         "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
         "dc_mdif_model_s_max_abs_error": dc_metadata.get(
             "dc_mdif_model_s_max_abs_error"
@@ -1272,6 +1280,12 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "power_dependent": manifest["power_dependent"],
                 "supported_analyses": manifest["supported_analyses"],
                 "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
+                "dc_mdif_training_blocks": dc_metadata.get(
+                    "dc_mdif_training_block_count"
+                ),
+                "dc_mdif_excluded_verification_blocks": dc_metadata.get(
+                    "dc_mdif_excluded_verification_block_count"
+                ),
                 "dc_mdif_model_s_rmse": dc_metadata.get("dc_mdif_model_s_rmse"),
                 "dc_mdif_model_s_max_abs_error": dc_metadata.get(
                     "dc_mdif_model_s_max_abs_error"

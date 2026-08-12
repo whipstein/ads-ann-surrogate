@@ -598,6 +598,13 @@ model. The export manifest records `dc_mdif_action` plus the topology and final
 DC-model S-parameter errors. Export is rejected if the resulting DC network's
 maximum absolute S-parameter error remains above `1e-3`; this usually means the
 declared `--dc-port-paths` cannot represent the passive paths in the DC data.
+For a combined training/verification MDIF, export reuses the fitted model's
+`--split-var`, `--train-values`, and `--verify-values` metadata and fits or
+validates DC from the training split only. Verification blocks are never added
+to the DC optimizer; any verification blocks that do contain usable DC may be
+reported as validation during the original model fit, while verification blocks
+without DC are skipped. Missing-DC errors identify one-based `ACDATA` block
+positions in the original MDIF.
 
 For an integrated residual or prior-input KBNN, the composite Verilog-A and ADS
 HB components use the DC conductance surrogate fitted only from the fine-data

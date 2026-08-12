@@ -67,13 +67,38 @@ class DCConductanceModelTests(unittest.TestCase):
     def test_every_fitted_geometry_requires_an_exact_dc_row(self) -> None:
         block = dc_block(1.0, [0.01], "1-2")
         block.freq_hz = np.asarray([1.0, 1.0e9])
-        with self.assertRaisesRegex(ValueError, "Every fitted geometry"):
+        with self.assertRaisesRegex(ValueError, "Every DC-training geometry"):
             extract_dc_conductance_samples(
                 [block],
                 ["W"],
                 LABELS_2,
                 port_paths="1-2",
             )
+
+    def test_verification_blocks_without_dc_are_not_required_for_dc_fit(self) -> None:
+        train_blocks = [
+            dc_block(1.0, [0.01], "1-2"),
+            dc_block(2.0, [0.01], "1-2"),
+        ]
+        verification = dc_block(3.0, [0.01], "1-2")
+        verification.freq_hz = np.asarray([1.0, 1.0e9])
+        model, _, metadata = train_dc_conductance_model(
+            train_blocks,
+            [verification],
+            ["W"],
+            LABELS_2,
+            hidden_layers=[2],
+            activation="tanh",
+            epochs=20,
+            batch_size=2,
+            learning_rate=0.01,
+            patience=10,
+            seed=9,
+            progress_interval=0,
+            port_paths="1-2",
+        )
+        self.assertIsNotNone(model)
+        self.assertEqual(metadata["dc_model_verification_samples"], 0)
 
     def test_training_save_load_and_geometry_only_prediction(self) -> None:
         blocks = [
@@ -236,6 +261,49 @@ class DCConductanceModelTests(unittest.TestCase):
         self.assertEqual(export_metadata["dc_mdif_action"], "fitted_dc_only_model")
         self.assertTrue(export_metadata["dc_model_fitted_during_export"])
         self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
+
+    def test_export_dc_mdif_uses_only_training_split_from_combined_file(self) -> None:
+        training = [
+            dc_block(1.0, [0.02], "1-2"),
+            dc_block(2.0, [0.02], "1-2"),
+        ]
+        verification = [
+            dc_block(3.0, [0.02], "1-2"),
+            dc_block(4.0, [0.02], "1-2"),
+        ]
+        for block in training:
+            block.params["Dataset"] = "train"
+        for block in verification:
+            block.params["Dataset"] = "verify"
+            block.freq_hz = np.asarray([1.0, 1.0e9])
+        combined = [*training, *verification]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "combined.mdif"
+            write_mdif(dc_mdif, combined, LABELS_2)
+            resolved, export_metadata = resolve_export_dc_conductance_model(
+                None,
+                {
+                    "split_var": "dataset",
+                    "train_values": ["train", "training"],
+                    "verify_values": ["verify", "verification"],
+                },
+                ["W"],
+                LABELS_2,
+                dc_mdif=dc_mdif,
+                z0=50.0,
+                port_paths="1-2",
+                open_threshold_ohm=1.0e12,
+                open_resistance_ohm=1.0e19,
+                activation="tanh",
+                hidden_layers=[2],
+            )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(export_metadata["dc_mdif_total_block_count"], 4)
+        self.assertEqual(export_metadata["dc_mdif_training_block_count"], 2)
+        self.assertEqual(
+            export_metadata["dc_mdif_excluded_verification_block_count"],
+            2,
+        )
 
     def test_export_rejects_dc_topology_that_cannot_match_mdif(self) -> None:
         blocks = [dc_block(1.0, [0.01, 0.02, 0.03], "1-2,1-3,2-3")]

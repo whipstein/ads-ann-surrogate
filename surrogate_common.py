@@ -90,6 +90,16 @@ def normalize_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]+", "_", name.strip()).strip("_")
 
 
+def normalized_mapping_value(mapping: dict[str, str], name: str) -> str | None:
+    """Read a normalized MDIF VAR name without making its case significant."""
+
+    target = normalize_name(name).lower()
+    for key, value in mapping.items():
+        if normalize_name(key).lower() == target:
+            return value
+    return None
+
+
 def strip_quotes(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -5104,7 +5114,7 @@ def split_blocks(
     verify: list[MDIFBlock] = []
 
     for block in blocks:
-        value = block.params.get(split_key)
+        value = normalized_mapping_value(block.params, split_key)
         lowered = value.lower() if value is not None else ""
         if lowered in train_values:
             train.append(block)
@@ -6042,6 +6052,7 @@ def extract_dc_conductance_samples(
     open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
     open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
     passivity_tolerance: float = DEFAULT_DC_PASSIVITY_TOLERANCE,
+    require_every_block: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     """Extract one selected-path conductance vector per geometry at exact DC."""
 
@@ -6075,7 +6086,7 @@ def extract_dc_conductance_samples(
     for block_index, block in enumerate(blocks):
         exact_indices = np.flatnonzero(np.asarray(block.freq_hz, dtype=float) == 0.0)
         if exact_indices.size == 0:
-            missing_blocks.append(block.source_index or block_index + 1)
+            missing_blocks.append(int(block.source_index) + 1)
             continue
         block_conductances: list[np.ndarray] = []
         block_measured_s: list[np.ndarray] = []
@@ -6119,31 +6130,37 @@ def extract_dc_conductance_samples(
             block_measured_s.append(s_matrix)
             block_topology_s.append(topology_s)
         if not block_conductances:
-            unusable_blocks.append(block.source_index or block_index + 1)
+            unusable_blocks.append(int(block.source_index) + 1)
             continue
         sample_blocks.append(block)
         conductance_rows.append(np.mean(np.asarray(block_conductances), axis=0))
         measured_s_rows.append(np.mean(np.asarray(block_measured_s), axis=0))
         topology_s_rows.append(np.mean(np.asarray(block_topology_s), axis=0))
 
-    if missing_blocks:
+    if missing_blocks and require_every_block:
         raise ValueError(
-            "Every fitted geometry must contain an exact zero-Hz row for the separate "
-            "DC model; missing block(s): " + ", ".join(map(str, missing_blocks[:20]))
+            "Every DC-training geometry must contain an exact zero-Hz row; missing "
+            "one-based ACDATA block position(s) in the source MDIF: "
+            + ", ".join(map(str, missing_blocks[:20]))
         )
-    if unusable_blocks:
+    if unusable_blocks and require_every_block:
         raise ValueError(
-            "No usable passive exact-zero-Hz row remains for fitted block(s): "
+            "No usable passive exact-zero-Hz row remains at one-based ACDATA block "
+            "position(s) in the source MDIF: "
             + ", ".join(map(str, unusable_blocks[:20]))
         )
     if not conductance_rows:
-        raise ValueError("No usable passive exact-zero-Hz rows remain for DC fitting")
-
-    x_values = parameter_matrix(sample_blocks, parameter_names)
-    conductances = np.asarray(conductance_rows, dtype=float)
-    measured_s = np.asarray(measured_s_rows, dtype=complex)
-    topology_s = np.asarray(topology_s_rows, dtype=complex)
-    s_error = np.abs(topology_s - measured_s)
+        if require_every_block:
+            raise ValueError("No usable passive exact-zero-Hz rows remain for DC fitting")
+        x_values = np.empty((0, len(parameter_names)), dtype=float)
+        conductances = np.empty((0, len(paths)), dtype=float)
+        s_error = np.empty((0, nports, nports), dtype=float)
+    else:
+        x_values = parameter_matrix(sample_blocks, parameter_names)
+        conductances = np.asarray(conductance_rows, dtype=float)
+        measured_s = np.asarray(measured_s_rows, dtype=complex)
+        topology_s = np.asarray(topology_s_rows, dtype=complex)
+        s_error = np.abs(topology_s - measured_s)
     metadata: dict[str, object] = {
         "dc_model_kind": "geometry_dependent_exact_dc_conductance_mlp",
         "dc_resistance_source_kind": "exact_zero_frequency",
@@ -6164,9 +6181,17 @@ def extract_dc_conductance_samples(
         "dc_is_separate_from_fitted_response": True,
         "dc_requires_exact_zero_frequency": True,
         "dc_rf_fallback_allowed": False,
-        "dc_topology_y_rmse_siemens": float(np.sqrt(np.mean(np.square(topology_y_errors)))),
-        "dc_topology_s_rmse": float(np.sqrt(np.mean(s_error * s_error))),
-        "dc_topology_s_max_abs_error": float(np.max(s_error)),
+        "dc_topology_y_rmse_siemens": (
+            float(np.sqrt(np.mean(np.square(topology_y_errors))))
+            if topology_y_errors
+            else None
+        ),
+        "dc_topology_s_rmse": (
+            float(np.sqrt(np.mean(s_error * s_error))) if s_error.size else None
+        ),
+        "dc_topology_s_max_abs_error": (
+            float(np.max(s_error)) if s_error.size else None
+        ),
         "dc_resistance_extraction": (
             "Each passive exact-zero-Hz S-matrix is converted to Y and projected onto "
             "the declared non-negative branch-conductance graph before geometry-only fitting"
@@ -6217,7 +6242,11 @@ def train_dc_conductance_model(
             port_paths=metadata["dc_port_paths"],
             open_threshold_ohm=open_threshold_ohm,
             open_resistance_ohm=open_resistance_ohm,
+            require_every_block=False,
         )
+        if x_verify.shape[0] == 0:
+            x_verify = None
+            conductance_verify = None
     else:
         x_verify = None
         conductance_verify = None
@@ -6322,6 +6351,8 @@ def train_dc_conductance_model(
             ],
         }
     )
+    if verify_metadata is not None:
+        metadata["dc_model_verification_extraction"] = verify_metadata
     if x_verify is not None and y_verify is not None and conductance_verify is not None:
         verify_prediction = model.predict_conductances(x_verify)
         verify_log_error = model.predict_log_conductances(x_verify) - y_verify
@@ -6341,7 +6372,6 @@ def train_dc_conductance_model(
                     np.sqrt(np.mean(verify_s_error * verify_s_error))
                 ),
                 "dc_model_verify_s_max_abs_error": float(np.max(verify_s_error)),
-                "dc_model_verification_extraction": verify_metadata,
             }
         )
     mean_conductances = np.mean(conductance_train, axis=0)
@@ -6387,6 +6417,74 @@ def train_dc_conductance_model(
     )
     model.metadata = dict(metadata)
     return model, history, metadata
+
+
+def select_dc_export_training_blocks(
+    blocks: Sequence[MDIFBlock],
+    stored_metadata: dict[str, object],
+) -> tuple[list[MDIFBlock], dict[str, object]]:
+    """Select only the fitted split from a combined MDIF used during export."""
+
+    split_var = str(stored_metadata.get("split_var") or "dataset")
+    split_key = normalize_name(split_var)
+
+    def value_set(key: str, defaults: set[str]) -> set[str]:
+        raw = stored_metadata.get(key)
+        if isinstance(raw, str):
+            values = raw.split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            return defaults
+        parsed = {
+            strip_quotes(str(value)).strip().lower()
+            for value in values
+            if str(value).strip()
+        }
+        return parsed or defaults
+
+    train_values = value_set("train_values", {"train", "training"})
+    verify_values = value_set(
+        "verify_values",
+        {"verify", "verification", "test", "validation"},
+    )
+    training_blocks: list[MDIFBlock] = []
+    verification_count = 0
+    unclassified_count = 0
+    for block in blocks:
+        raw_value = normalized_mapping_value(block.params, split_key)
+        value = strip_quotes(str(raw_value)).strip().lower() if raw_value is not None else ""
+        if value in train_values:
+            training_blocks.append(block)
+        elif value in verify_values:
+            verification_count += 1
+        else:
+            unclassified_count += 1
+
+    if training_blocks:
+        selected = training_blocks
+        selection = "metadata_training_split"
+    elif verification_count:
+        raise ValueError(
+            f"The DC MDIF contains {verification_count} recognized verification block(s) "
+            f"but no {split_var!r} value matching the model's training values "
+            f"{sorted(train_values)}. Supply the training MDIF or correct its split VAR."
+        )
+    else:
+        selected = list(blocks)
+        selection = "all_blocks_no_recognized_split"
+
+    return selected, {
+        "dc_mdif_selection": selection,
+        "dc_mdif_split_var": split_var,
+        "dc_mdif_train_values": sorted(train_values),
+        "dc_mdif_total_block_count": len(blocks),
+        "dc_mdif_training_block_count": len(selected),
+        "dc_mdif_excluded_verification_block_count": verification_count,
+        "dc_mdif_excluded_unclassified_block_count": (
+            unclassified_count if training_blocks else 0
+        ),
+    }
 
 
 def validate_dc_model_against_mdif(
@@ -6520,7 +6618,11 @@ def resolve_export_dc_conductance_model(
 
     if dc_mdif is not None:
         dc_path = Path(dc_mdif)
-        blocks = read_mdif(dc_path)
+        all_blocks = read_mdif(dc_path)
+        blocks, selection_metadata = select_dc_export_training_blocks(
+            all_blocks,
+            stored_metadata,
+        )
         if saved_model is not None:
             saved_paths = list(saved_model.port_paths)
             requested_canonical = [
@@ -6539,6 +6641,7 @@ def resolve_export_dc_conductance_model(
                         if str(key).startswith("dc_")
                     }
                     metadata.update(validation)
+                    metadata.update(selection_metadata)
                     metadata["dc_resistance_source_file"] = str(dc_path)
                     metadata["dc_mdif_action"] = "validated_saved_dc_model"
                     return saved_model, metadata
@@ -6581,6 +6684,7 @@ def resolve_export_dc_conductance_model(
                 "Check the selected DC paths and passive zero-Hz data; export was stopped."
             )
         metadata.update(validation)
+        metadata.update(selection_metadata)
         metadata["dc_resistance_source_file"] = str(dc_path)
         metadata["dc_model_fitted_during_export"] = True
         metadata["dc_mdif_action"] = "fitted_dc_only_model"
