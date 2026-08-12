@@ -1708,6 +1708,7 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
         "dc_port_paths": metadata["dc_port_paths"],
         "dc_matrix_entries": metadata.get("dc_matrix_entries", []),
+        "dc_sparameter_entries": metadata.get("dc_sparameter_entries", []),
         "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
         "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
         "dc_resistance_extraction": metadata["dc_resistance_extraction"],
@@ -1717,6 +1718,9 @@ def command_train(args: argparse.Namespace) -> int:
         "dc_model_train_log_rmse": metadata.get("dc_model_train_log_rmse"),
         "dc_model_train_y_rmse_siemens": metadata.get(
             "dc_model_train_y_rmse_siemens"
+        ),
+        "dc_model_train_s_component_rmse": metadata.get(
+            "dc_model_train_component_rmse"
         ),
         "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
         "dc_model_train_s_max_abs_error": metadata["dc_model_train_s_max_abs_error"],
@@ -1847,6 +1851,7 @@ def command_train(args: argparse.Namespace) -> int:
             "dc_model_train_s_rmse": metadata["dc_model_train_s_rmse"],
             "dc_port_paths": metadata["dc_port_paths"],
             "dc_matrix_entries": metadata.get("dc_matrix_entries", []),
+            "dc_sparameter_entries": metadata.get("dc_sparameter_entries", []),
             "dc_port_resistances_ohm": metadata["dc_port_resistances_ohm"],
             "dc_resistance_pair_means_ohm": metadata["dc_resistance_pair_means_ohm"],
             "export_commands": dict(export_commands),
@@ -1966,6 +1971,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_port_paths": dc_metadata.get("dc_port_paths"),
         "dc_matrix_entries": dc_metadata.get("dc_matrix_entries"),
+        "dc_sparameter_entries": dc_metadata.get("dc_sparameter_entries"),
         "dc_model_kind": dc_metadata.get("dc_model_kind"),
         "dc_port_resistances_ohm": dc_metadata.get("dc_port_resistances_ohm"),
         "dc_ignored_nonpassive_count": dc_metadata.get(
@@ -1983,6 +1989,10 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "dc_mdif_model_s_max_abs_error": dc_metadata.get(
             "dc_mdif_model_s_max_abs_error"
         ),
+        "dc_mdif_match_within_tolerance": dc_metadata.get(
+            "dc_mdif_match_within_tolerance"
+        ),
+        "dc_mdif_warning": dc_metadata.get("dc_mdif_warning"),
     }, indent=2))
     return 0
 
@@ -2377,6 +2387,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "dc_equivalent_resistance_ohm": manifest["dc_equivalent_resistance_ohm"],
         "dc_port_paths": manifest.get("dc_port_paths"),
         "dc_matrix_entries": manifest.get("dc_matrix_entries"),
+        "dc_sparameter_entries": manifest.get("dc_sparameter_entries"),
         "dc_model_kind": manifest.get("dc_model_kind"),
         "dc_port_resistances_ohm": manifest.get("dc_port_resistances_ohm"),
         "dc_resistance_source_kind": manifest["dc_resistance_source_kind"],
@@ -2396,6 +2407,10 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "dc_mdif_model_s_max_abs_error": dc_metadata.get(
             "dc_mdif_model_s_max_abs_error"
         ),
+        "dc_mdif_match_within_tolerance": dc_metadata.get(
+            "dc_mdif_match_within_tolerance"
+        ),
+        "dc_mdif_warning": dc_metadata.get("dc_mdif_warning"),
     }, indent=2))
     return 0
 
@@ -2508,6 +2523,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "power_dependent": manifest["power_dependent"],
                 "supported_analyses": manifest["supported_analyses"],
                 "dc_matrix_entries": manifest.get("dc_matrix_entries"),
+                "dc_sparameter_entries": manifest.get("dc_sparameter_entries"),
                 "dc_model_kind": manifest.get("dc_model_kind"),
                 "dc_mdif_action": dc_metadata.get("dc_mdif_action"),
                 "dc_mdif_training_blocks": dc_metadata.get(
@@ -2522,6 +2538,10 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "dc_mdif_model_s_max_abs_error": dc_metadata.get(
                     "dc_mdif_model_s_max_abs_error"
                 ),
+                "dc_mdif_match_within_tolerance": dc_metadata.get(
+                    "dc_mdif_match_within_tolerance"
+                ),
+                "dc_mdif_warning": dc_metadata.get("dc_mdif_warning"),
             },
             indent=2,
         )

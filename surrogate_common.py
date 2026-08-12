@@ -669,7 +669,8 @@ def parse_dc_port_paths(
     to the simulator reference accepts ``1-ground`` or ``p1-gnd``. When no
     specification is supplied, this legacy path-parser helper selects every port
     pair and every port-to-ground path. Current fitting/export CLIs bypass that
-    fallback and fit the full ordered Y matrix when ``--dc-port-paths`` is omitted.
+    fallback and fit the full ordered complex S matrix when ``--dc-port-paths``
+    is omitted.
     """
 
     if nports <= 0:
@@ -1096,7 +1097,8 @@ def add_dc_export_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Exact-zero-Hz MDIF used to validate the saved geometry-dependent DC "
             "network. If it does not match, or the saved model is legacy, fit a new "
-            "DC-only full-Y or explicit-path model for this export without refitting RF."
+            "DC-only full-complex-S or explicit-path model for this export without "
+            "refitting RF."
         ),
     )
     add_dc_port_paths_argument(parser)
@@ -1142,8 +1144,9 @@ def add_dc_port_paths_argument(parser: argparse.ArgumentParser) -> None:
         help=(
             "Comma-separated viable DC paths, for example 1-2,3-4. Only declared "
             "paths are extracted and stamped; undeclared paths remain open. Use "
-            "1-ground for a port-to-reference path. If omitted, fit every ordered "
-            "entry of the full exact-DC Y matrix instead of a resistor-path graph."
+            "1-ground for a port-to-reference path. If omitted, fit both real and "
+            "imaginary components of every ordered exact-DC Sij value instead of a "
+            "resistor-path graph."
         ),
     )
 
@@ -2024,15 +2027,20 @@ def _veriloga_layer_assignments(
 def _append_veriloga_s_to_y_conversion(
     lines: list[str],
     nports: int,
+    *,
+    s_real: str = "sr",
+    s_imag: str = "si",
+    y_real: str = "yr",
+    y_imag: str = "yi",
 ) -> None:
     """Append the shared complex Y = (I-S) * inverse(I+S) / Z0 solve."""
 
     matrix_size = nports * nports
     lines.append(f"    for (i = 0; i < {matrix_size}; i = i + 1) begin")
-    lines.append("      ar[i] = sr[i];")
-    lines.append("      ai[i] = si[i];")
-    lines.append("      mr[i] = -sr[i];")
-    lines.append("      mi[i] = -si[i];")
+    lines.append(f"      ar[i] = {s_real}[i];")
+    lines.append(f"      ai[i] = {s_imag}[i];")
+    lines.append(f"      mr[i] = -{s_real}[i];")
+    lines.append(f"      mi[i] = -{s_imag}[i];")
     lines.append("      invr[i] = 0.0;")
     lines.append("      invi[i] = 0.0;")
     lines.append("    end")
@@ -2107,16 +2115,22 @@ def _append_veriloga_s_to_y_conversion(
     lines.append(f"        idx = row*{nports} + col;")
     lines.append(f"        i = row*{nports};")
     lines.append("        j = col;")
-    lines.append("        yr[idx] = mr[i]*invr[j] - mi[i]*invi[j];")
-    lines.append("        yi[idx] = mr[i]*invi[j] + mi[i]*invr[j];")
+    lines.append(f"        {y_real}[idx] = mr[i]*invr[j] - mi[i]*invi[j];")
+    lines.append(f"        {y_imag}[idx] = mr[i]*invi[j] + mi[i]*invr[j];")
     lines.append(f"        for (k = 1; k < {nports}; k = k + 1) begin")
     lines.append(f"          i = row*{nports} + k;")
     lines.append(f"          j = k*{nports} + col;")
-    lines.append("          yr[idx] = yr[idx] + (mr[i]*invr[j] - mi[i]*invi[j]);")
-    lines.append("          yi[idx] = yi[idx] + (mr[i]*invi[j] + mi[i]*invr[j]);")
+    lines.append(
+        f"          {y_real}[idx] = {y_real}[idx] + "
+        "(mr[i]*invr[j] - mi[i]*invi[j]);"
+    )
+    lines.append(
+        f"          {y_imag}[idx] = {y_imag}[idx] + "
+        "(mr[i]*invi[j] + mi[i]*invr[j]);"
+    )
     lines.append("        end")
-    lines.append("        yr[idx] = yr[idx]/z0;")
-    lines.append("        yi[idx] = yi[idx]/z0;")
+    lines.append(f"        {y_real}[idx] = {y_real}[idx]/z0;")
+    lines.append(f"        {y_imag}[idx] = {y_imag}[idx]/z0;")
     lines.append("      end")
     lines.append("    end")
     lines.append("")
@@ -2128,6 +2142,7 @@ def _append_veriloga_dc_or_fitted_y_assignments(
     fitted_real_by_flat: Sequence[str],
     fitted_imag_by_flat: Sequence[str],
     dc_real_by_flat: Sequence[str] | None = None,
+    dc_imag_by_flat: Sequence[str] | None = None,
 ) -> None:
     """Select fixed DC or fitted Y coefficients without enclosing ``ddt``."""
 
@@ -2136,6 +2151,8 @@ def _append_veriloga_dc_or_fitted_y_assignments(
         raise ValueError("Selected Verilog-A Y coefficient dimensions are inconsistent")
     if dc_real_by_flat is not None and len(dc_real_by_flat) != matrix_size:
         raise ValueError("Selected Verilog-A DC coefficient dimensions are inconsistent")
+    if dc_imag_by_flat is not None and len(dc_imag_by_flat) != matrix_size:
+        raise ValueError("Selected Verilog-A DC imaginary dimensions are inconsistent")
     lines.append("    if (dc_operating_point != 0) begin")
     for row in range(nports):
         for col in range(nports):
@@ -2153,7 +2170,10 @@ def _append_veriloga_dc_or_fitted_y_assignments(
                     f"      active_yr[{flat}] = ({veriloga_float(conductance_factor)})/"
                     "dc_equivalent_resistance_ohm;"
                 )
-            lines.append(f"      active_yi[{flat}] = 0.0;")
+            lines.append(
+                f"      active_yi[{flat}] = "
+                f"{dc_imag_by_flat[flat] if dc_imag_by_flat is not None else '0.0'};"
+            )
     lines.append("    end else begin")
     for flat in range(matrix_size):
         lines.append(f"      active_yr[{flat}] = {fitted_real_by_flat[flat]};")
@@ -2271,7 +2291,15 @@ def _veriloga_readme(
         )
     else:
         scale_rows = "- No geometry/process parameters were exported."
-    if dc_model_kind == "geometry_dependent_exact_dc_full_y_mlp":
+    if dc_model_kind == "geometry_dependent_exact_dc_full_s_mlp":
+        matrix_entries = list(dc_matrix_entries or [])
+        dc_topology_text = (
+            f"The embedded DC model fits all `{len(matrix_entries)}` real/imaginary "
+            "components of the ordered S matrix independently, then converts that "
+            "complete DC S matrix to Y for electrical stamping. No Y projection, "
+            "resistor-graph constraint, or reciprocity constraint is imposed."
+        )
+    elif dc_model_kind == "geometry_dependent_exact_dc_full_y_mlp":
         matrix_entries = list(dc_matrix_entries or [])
         dc_topology_text = (
             f"The embedded DC model stamps all `{len(matrix_entries)}` ordered real "
@@ -2440,7 +2468,9 @@ def _validated_dc_model_export(
         dc_model.get(
             "representation",
             (
-                "full_y_matrix"
+                "full_s_matrix"
+                if dc_model.get("kind") == "geometry_dependent_exact_dc_full_s_mlp"
+                else "full_y_matrix"
                 if dc_model.get("kind") == "geometry_dependent_exact_dc_full_y_mlp"
                 else "path_conductance"
             ),
@@ -2448,7 +2478,7 @@ def _validated_dc_model_export(
     )
     paths = (
         []
-        if representation == "full_y_matrix"
+        if representation in {"full_s_matrix", "full_y_matrix"}
         else parse_dc_port_paths(dc_model["port_paths"], nports)
     )
     layer_sizes = [int(value) for value in dc_model["layer_sizes"]]  # type: ignore[index]
@@ -2458,7 +2488,13 @@ def _validated_dc_model_export(
     x_std = np.asarray(dc_model["x_std"], dtype=float)
     y_mean = np.asarray(dc_model["y_mean"], dtype=float)
     y_std = np.asarray(dc_model["y_std"], dtype=float)
-    expected_outputs = nports * nports if representation == "full_y_matrix" else len(paths)
+    expected_outputs = (
+        2 * nports * nports
+        if representation == "full_s_matrix"
+        else nports * nports
+        if representation == "full_y_matrix"
+        else len(paths)
+    )
     if layer_sizes[0] != len(parameter_names) or layer_sizes[-1] != expected_outputs:
         raise ValueError("DC model dimensions do not match its selected representation")
     if len(weights) != len(biases) or len(weights) != len(layer_sizes) - 1:
@@ -2517,6 +2553,18 @@ def _dc_export_default_s_values(
         + np.asarray(dc_model_data["y_mean"], dtype=float)
     )
     nports = infer_complete_sparameter_ports(sparam_labels)
+    if dc_model_data.get("representation") == "full_s_matrix":
+        real = outputs[0, : nports * nports]
+        imag = outputs[0, nports * nports :]
+        s_matrix = (real + 1j * imag).reshape(nports, nports)
+        return np.asarray(
+            [
+                s_matrix[(sparam_indices(label) or (0, 0))[0] - 1,
+                         (sparam_indices(label) or (0, 0))[1] - 1]
+                for label in sparam_labels
+            ],
+            dtype=complex,
+        )
     if dc_model_data.get("representation") == "full_y_matrix":
         y_matrix = outputs[0].reshape(nports, nports).astype(complex)
     else:
@@ -2588,7 +2636,10 @@ def veriloga_module_text(
         parameter_names,
         sparam_labels,
     )
-    if dc_model_data is not None and dc_model_data["representation"] == "full_y_matrix":
+    if dc_model_data is not None and dc_model_data["representation"] in {
+        "full_s_matrix",
+        "full_y_matrix",
+    }:
         dc_path_resistances = None
         dc_parameter_rows = []
         dc_real_by_flat = ["0.0"] * len(sparam_labels)
@@ -2902,7 +2953,16 @@ def veriloga_module_text(
     if dc_model_data is not None:
         dc_layer_sizes = dc_model_data["layer_sizes"]
         assert isinstance(dc_layer_sizes, list)
-        if dc_model_data.get("representation") == "full_y_matrix":
+        if dc_model_data.get("representation") == "full_s_matrix":
+            lines.extend(
+                [
+                    f"  real dc_sr [0:{matrix_size - 1}];",
+                    f"  real dc_si [0:{matrix_size - 1}];",
+                    f"  real dc_yr [0:{matrix_size - 1}];",
+                    f"  real dc_yi [0:{matrix_size - 1}];",
+                ]
+            )
+        elif dc_model_data.get("representation") == "full_y_matrix":
             lines.append(f"  real dc_y [0:{matrix_size - 1}];")
         else:
             lines.append(f"  real dc_log_g [0:{len(dc_model_data['paths_parsed']) - 1}];")  # type: ignore[arg-type]
@@ -2947,7 +3007,22 @@ def veriloga_module_text(
         dc_final_layer = f"dc_l{len(dc_model_data['layer_sizes']) - 1}"  # type: ignore[arg-type]
         dc_y_mean = np.asarray(dc_model_data["y_mean"], dtype=float)
         dc_y_std = np.asarray(dc_model_data["y_std"], dtype=float)
-        if dc_model_data.get("representation") == "full_y_matrix":
+        if dc_model_data.get("representation") == "full_s_matrix":
+            for idx in range(matrix_size):
+                lines.append(
+                    f"    dc_sr[{idx}] = {dc_final_layer}[{idx}]*"
+                    f"({veriloga_float(float(dc_y_std[idx]))}) + "
+                    f"({veriloga_float(float(dc_y_mean[idx]))});"
+                )
+                imag_idx = matrix_size + idx
+                lines.append(
+                    f"    dc_si[{idx}] = {dc_final_layer}[{imag_idx}]*"
+                    f"({veriloga_float(float(dc_y_std[imag_idx]))}) + "
+                    f"({veriloga_float(float(dc_y_mean[imag_idx]))});"
+                )
+            dc_real_by_flat = [f"dc_yr[{idx}]" for idx in range(matrix_size)]
+            dc_imag_by_flat = [f"dc_yi[{idx}]" for idx in range(matrix_size)]
+        elif dc_model_data.get("representation") == "full_y_matrix":
             for idx in range(len(dc_y_mean)):
                 lines.append(
                     f"    dc_y[{idx}] = {dc_final_layer}[{idx}]*"
@@ -2955,6 +3030,7 @@ def veriloga_module_text(
                     f"({veriloga_float(float(dc_y_mean[idx]))});"
                 )
             dc_real_by_flat = [f"dc_y[{idx}]" for idx in range(matrix_size)]
+            dc_imag_by_flat = None
         else:
             dc_log_min = veriloga_float(float(dc_model_data["log_conductance_min"]))
             dc_log_max = veriloga_float(float(dc_model_data["log_conductance_max"]))
@@ -2973,7 +3049,10 @@ def veriloga_module_text(
                 dc_model_data["paths_parsed"],  # type: ignore[arg-type]
                 [f"dc_g[{idx}]" for idx in range(len(dc_y_mean))],
             )
+            dc_imag_by_flat = None
         lines.append("")
+    else:
+        dc_imag_by_flat = None
 
     if coarse_embedded:
         lines.append("    // Self-contained coarse S-parameter DNN.")
@@ -3114,12 +3193,22 @@ def veriloga_module_text(
     else:
         stamp_real = [f"yr[{flat}]" for flat in range(matrix_size)]
         stamp_imag = [f"yi[{flat}]" for flat in range(matrix_size)]
+    if dc_model_data is not None and dc_model_data.get("representation") == "full_s_matrix":
+        _append_veriloga_s_to_y_conversion(
+            lines,
+            nports,
+            s_real="dc_sr",
+            s_imag="dc_si",
+            y_real="dc_yr",
+            y_imag="dc_yi",
+        )
     _append_veriloga_dc_or_fitted_y_assignments(
         lines,
         nports,
         stamp_real,
         stamp_imag,
         dc_real_by_flat,
+        dc_imag_by_flat,
     )
     _append_veriloga_port_stamps(
         lines,
@@ -3208,10 +3297,15 @@ def veriloga_module_text(
             if dc_model_data is not None
             else []
         ),
+        "dc_sparameter_entries": (
+            list(dc_model_data.get("sparameter_entries", []))
+            if dc_model_data is not None
+            else []
+        ),
         "dc_port_resistances_ohm": (
             None
             if dc_model_data is not None
-            and dc_model_data.get("representation") == "full_y_matrix"
+            and dc_model_data.get("representation") in {"full_s_matrix", "full_y_matrix"}
             else dc_path_resistances
         ),
         "dc_port_parameter_identifiers": {
@@ -3227,6 +3321,12 @@ def veriloga_module_text(
             dc_model_data.get("metadata") if dc_model_data is not None else None
         ),
         "dc_response_topology": (
+            "Geometry-dependent full ordered complex S matrix; every real and "
+            "imaginary S-parameter component is represented and converted to Y "
+            "independently of the fitted RF response at zero Hz"
+            if dc_model_data is not None
+            and dc_model_data.get("representation") == "full_s_matrix"
+            else
             "Geometry-dependent full ordered real Y matrix; every S-parameter entry "
             "is represented and the fitted RF response is bypassed at zero Hz"
             if dc_model_data is not None
@@ -3432,7 +3532,10 @@ def neurotf_veriloga_module_text(
         parameter_names,
         sparam_labels,
     )
-    if dc_model_data is not None and dc_model_data["representation"] == "full_y_matrix":
+    if dc_model_data is not None and dc_model_data["representation"] in {
+        "full_s_matrix",
+        "full_y_matrix",
+    }:
         dc_path_resistances = None
         dc_parameter_rows = []
         dc_real_by_flat = ["0.0"] * len(sparam_labels)
@@ -3609,7 +3712,16 @@ def neurotf_veriloga_module_text(
     if dc_model_data is not None:
         dc_layer_sizes = dc_model_data["layer_sizes"]
         assert isinstance(dc_layer_sizes, list)
-        if dc_model_data.get("representation") == "full_y_matrix":
+        if dc_model_data.get("representation") == "full_s_matrix":
+            lines.extend(
+                [
+                    f"  real dc_sr [0:{matrix_size - 1}];",
+                    f"  real dc_si [0:{matrix_size - 1}];",
+                    f"  real dc_yr [0:{matrix_size - 1}];",
+                    f"  real dc_yi [0:{matrix_size - 1}];",
+                ]
+            )
+        elif dc_model_data.get("representation") == "full_y_matrix":
             lines.append(f"  real dc_y [0:{matrix_size - 1}];")
         else:
             dc_path_count = len(dc_model_data["paths_parsed"])  # type: ignore[arg-type]
@@ -3656,7 +3768,22 @@ def neurotf_veriloga_module_text(
         dc_final_layer = f"dc_l{len(dc_model_data['layer_sizes']) - 1}"  # type: ignore[arg-type]
         dc_y_mean = np.asarray(dc_model_data["y_mean"], dtype=float)
         dc_y_std = np.asarray(dc_model_data["y_std"], dtype=float)
-        if dc_model_data.get("representation") == "full_y_matrix":
+        if dc_model_data.get("representation") == "full_s_matrix":
+            for idx in range(matrix_size):
+                lines.append(
+                    f"    dc_sr[{idx}] = {dc_final_layer}[{idx}]*"
+                    f"({veriloga_float(float(dc_y_std[idx]))}) + "
+                    f"({veriloga_float(float(dc_y_mean[idx]))});"
+                )
+                imag_idx = matrix_size + idx
+                lines.append(
+                    f"    dc_si[{idx}] = {dc_final_layer}[{imag_idx}]*"
+                    f"({veriloga_float(float(dc_y_std[imag_idx]))}) + "
+                    f"({veriloga_float(float(dc_y_mean[imag_idx]))});"
+                )
+            dc_real_by_flat = [f"dc_yr[{idx}]" for idx in range(matrix_size)]
+            dc_imag_by_flat = [f"dc_yi[{idx}]" for idx in range(matrix_size)]
+        elif dc_model_data.get("representation") == "full_y_matrix":
             for idx in range(len(dc_y_mean)):
                 lines.append(
                     f"    dc_y[{idx}] = {dc_final_layer}[{idx}]*"
@@ -3664,6 +3791,7 @@ def neurotf_veriloga_module_text(
                     f"({veriloga_float(float(dc_y_mean[idx]))});"
                 )
             dc_real_by_flat = [f"dc_y[{idx}]" for idx in range(matrix_size)]
+            dc_imag_by_flat = None
         else:
             dc_log_min = veriloga_float(float(dc_model_data["log_conductance_min"]))
             dc_log_max = veriloga_float(float(dc_model_data["log_conductance_max"]))
@@ -3682,7 +3810,10 @@ def neurotf_veriloga_module_text(
                 dc_model_data["paths_parsed"],  # type: ignore[arg-type]
                 [f"dc_g[{idx}]" for idx in range(len(dc_y_mean))],
             )
+            dc_imag_by_flat = None
         lines.append("")
+    else:
+        dc_imag_by_flat = None
     for idx, (ident, scale_ident) in enumerate(zip(param_ids, scale_ids)):
         lines.append(
             f"    l0[{idx}] = ((({ident})/({scale_ident})) - "
@@ -3751,12 +3882,22 @@ def neurotf_veriloga_module_text(
         lines.append("")
 
     _append_veriloga_s_to_y_conversion(lines, nports)
+    if dc_model_data is not None and dc_model_data.get("representation") == "full_s_matrix":
+        _append_veriloga_s_to_y_conversion(
+            lines,
+            nports,
+            s_real="dc_sr",
+            s_imag="dc_si",
+            y_real="dc_yr",
+            y_imag="dc_yi",
+        )
     _append_veriloga_dc_or_fitted_y_assignments(
         lines,
         nports,
         [f"yr[{flat}]" for flat in range(matrix_size)],
         [f"yi[{flat}]" for flat in range(matrix_size)],
         dc_real_by_flat,
+        dc_imag_by_flat,
     )
     _append_veriloga_port_stamps(
         lines,
@@ -3826,10 +3967,15 @@ def neurotf_veriloga_module_text(
             if dc_model_data is not None
             else []
         ),
+        "dc_sparameter_entries": (
+            list(dc_model_data.get("sparameter_entries", []))
+            if dc_model_data is not None
+            else []
+        ),
         "dc_port_resistances_ohm": (
             None
             if dc_model_data is not None
-            and dc_model_data.get("representation") == "full_y_matrix"
+            and dc_model_data.get("representation") in {"full_s_matrix", "full_y_matrix"}
             else dc_path_resistances
         ),
         "dc_port_parameter_identifiers": {
@@ -3845,6 +3991,12 @@ def neurotf_veriloga_module_text(
             dc_model_data.get("metadata") if dc_model_data is not None else None
         ),
         "dc_response_topology": (
+            "Geometry-dependent full ordered complex S matrix; every real and "
+            "imaginary S-parameter component is represented and converted to Y "
+            "independently of the fitted coefficient response at zero Hz"
+            if dc_model_data is not None
+            and dc_model_data.get("representation") == "full_s_matrix"
+            else
             "Geometry-dependent full ordered real Y matrix; every S-parameter entry "
             "is represented and the fitted coefficient response is bypassed at zero Hz"
             if dc_model_data is not None
@@ -4307,7 +4459,7 @@ def _append_ads_hb_dc_conductance_model(
     representation = str(dc_model.get("representation", "path_conductance"))
     paths = (
         []
-        if representation == "full_y_matrix"
+        if representation in {"full_s_matrix", "full_y_matrix"}
         else parse_dc_port_paths(dc_model["port_paths"], nports)
     )
     outputs = _append_ads_hb_mlp_equations(
@@ -4323,6 +4475,24 @@ def _append_ads_hb_dc_conductance_model(
         np.asarray(dc_model["y_mean"], dtype=float),
         np.asarray(dc_model["y_std"], dtype=float),
     )
+    if representation == "full_s_matrix":
+        matrix_size = nports * nports
+        if len(outputs) != 2 * matrix_size:
+            raise ValueError("Full-S DC model output count is not complex N-port S")
+        s_names: list[str] = []
+        for idx in range(matrix_size):
+            name = f"{prefix}_s{idx}"
+            lines.append(
+                f"{name}=complex({outputs[idx]},{outputs[matrix_size + idx]})"
+            )
+            s_names.append(name)
+        return _append_ads_hb_s_to_y_equations(
+            lines,
+            f"{prefix}_stoy",
+            s_names,
+            nports,
+            float(dc_model["z0"]),
+        )
     if representation == "full_y_matrix":
         if len(outputs) != nports * nports:
             raise ValueError("Full-matrix DC model output count is not N-port Y")
@@ -4717,11 +4887,13 @@ def write_ads_hb_mlp_package(
     full_dc_model = dc_model is not None and str(
         dc_model.get(
             "representation",
-            "full_y_matrix"
+            "full_s_matrix"
+            if dc_model.get("kind") == "geometry_dependent_exact_dc_full_s_mlp"
+            else "full_y_matrix"
             if dc_model.get("kind") == "geometry_dependent_exact_dc_full_y_mlp"
             else "path_conductance",
         )
-    ) == "full_y_matrix"
+    ) in {"full_s_matrix", "full_y_matrix"}
     dc_path_resistances = (
         None
         if full_dc_model
@@ -4931,10 +5103,13 @@ def write_ads_hb_mlp_package(
         "dc_matrix_entries": (
             list(dc_model.get("matrix_entries", [])) if dc_model is not None else []
         ),
+        "dc_sparameter_entries": (
+            list(dc_model.get("sparameter_entries", [])) if dc_model is not None else []
+        ),
         "dc_port_resistances_ohm": (
             None
             if dc_model is not None
-            and dc_model.get("representation") == "full_y_matrix"
+            and dc_model.get("representation") in {"full_s_matrix", "full_y_matrix"}
             else dc_path_resistances
         ),
         "dc_resistance_source_kind": dc_source_kind,
@@ -4947,7 +5122,10 @@ def write_ads_hb_mlp_package(
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_stamping_representation": (
-            "separate_full_ordered_y_sdd"
+            "separate_full_ordered_complex_s_to_y_sdd"
+            if dc_model is not None
+            and dc_model.get("representation") == "full_s_matrix"
+            else "separate_full_ordered_y_sdd"
             if dc_model is not None
             and dc_model.get("representation") == "full_y_matrix"
             else "separate_explicit_conductance_sdd"
@@ -5040,11 +5218,13 @@ def write_ads_hb_neurotf_package(
     full_dc_model = dc_model is not None and str(
         dc_model.get(
             "representation",
-            "full_y_matrix"
+            "full_s_matrix"
+            if dc_model.get("kind") == "geometry_dependent_exact_dc_full_s_mlp"
+            else "full_y_matrix"
             if dc_model.get("kind") == "geometry_dependent_exact_dc_full_y_mlp"
             else "path_conductance",
         )
-    ) == "full_y_matrix"
+    ) in {"full_s_matrix", "full_y_matrix"}
     dc_path_resistances = (
         None
         if full_dc_model
@@ -5218,10 +5398,13 @@ def write_ads_hb_neurotf_package(
         "dc_matrix_entries": (
             list(dc_model.get("matrix_entries", [])) if dc_model is not None else []
         ),
+        "dc_sparameter_entries": (
+            list(dc_model.get("sparameter_entries", [])) if dc_model is not None else []
+        ),
         "dc_port_resistances_ohm": (
             None
             if dc_model is not None
-            and dc_model.get("representation") == "full_y_matrix"
+            and dc_model.get("representation") in {"full_s_matrix", "full_y_matrix"}
             else dc_path_resistances
         ),
         "dc_resistance_source_kind": dc_source_kind,
@@ -5234,7 +5417,10 @@ def write_ads_hb_neurotf_package(
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_stamping_representation": (
-            "separate_full_ordered_y_sdd"
+            "separate_full_ordered_complex_s_to_y_sdd"
+            if dc_model is not None
+            and dc_model.get("representation") == "full_s_matrix"
+            else "separate_full_ordered_y_sdd"
             if dc_model is not None
             and dc_model.get("representation") == "full_y_matrix"
             else "separate_explicit_conductance_sdd"
@@ -5973,12 +6159,13 @@ class MLP:
 
 
 class DCConductanceModel:
-    """Geometry-only neural surrogate for an exact-zero-frequency Y matrix.
+    """Geometry-only neural surrogate for an exact-zero-frequency network.
 
     Explicit path mode fits logarithms of selected non-negative branch
-    conductances. Full-matrix mode fits every ordered real Y-matrix entry.
-    Frequency is deliberately not an input, so neither representation can
-    influence or extrapolate the positive-frequency RF fit.
+    conductances. The generic full-S mode fits the real and imaginary component
+    of every ordered Sij directly. The former full-Y representation remains
+    loadable for backward compatibility. Frequency is deliberately not an input,
+    so no representation can influence the positive-frequency RF fit.
     """
 
     def __init__(
@@ -6020,11 +6207,20 @@ class DCConductanceModel:
                 raise ValueError("Full-matrix DC model must not contain resistor paths")
             if self.mlp.layer_sizes[-1] != nports * nports:
                 raise ValueError("Full-matrix DC model output dimension is not N-port Y")
+        elif self.representation == "full_s_matrix":
+            if self.port_paths:
+                raise ValueError("Full-S DC model must not contain resistor paths")
+            if self.mlp.layer_sizes[-1] != 2 * nports * nports:
+                raise ValueError(
+                    "Full-S DC model output dimension is not complex N-port S"
+                )
         else:
             raise ValueError(f"Unsupported DC model representation {self.representation!r}")
 
     @property
     def kind(self) -> str:
+        if self.representation == "full_s_matrix":
+            return "geometry_dependent_exact_dc_full_s_mlp"
         if self.representation == "full_y_matrix":
             return "geometry_dependent_exact_dc_full_y_mlp"
         return "geometry_dependent_exact_dc_conductance_mlp"
@@ -6055,8 +6251,26 @@ class DCConductanceModel:
             raise ValueError("Path DC model does not contain direct matrix entries")
         return self.predict_outputs(parameter_values)
 
+    def predict_s_components(self, parameter_values: np.ndarray) -> np.ndarray:
+        if self.representation != "full_s_matrix":
+            raise ValueError("This DC model does not contain direct complex S entries")
+        return self.predict_outputs(parameter_values)
+
+    def predict_s_matrices(self, parameter_values: np.ndarray) -> np.ndarray:
+        components = self.predict_s_components(parameter_values)
+        nports = infer_complete_sparameter_ports(self.sparam_labels)
+        matrix_size = nports * nports
+        return (
+            components[:, :matrix_size] + 1j * components[:, matrix_size:]
+        ).reshape(-1, nports, nports)
+
     def conductance_matrix(self, parameter_values: np.ndarray) -> np.ndarray:
         nports = infer_complete_sparameter_ports(self.sparam_labels)
+        if self.representation == "full_s_matrix":
+            return _s_matrix_to_y_matrix(
+                self.predict_s_matrices(parameter_values)[0],
+                self.z0,
+            )
         if self.representation == "full_y_matrix":
             return self.predict_matrix_entries(parameter_values)[0].reshape(
                 nports,
@@ -6070,6 +6284,16 @@ class DCConductanceModel:
         )
 
     def predict_s_values(self, parameter_values: np.ndarray) -> np.ndarray:
+        if self.representation == "full_s_matrix":
+            matrix = self.predict_s_matrices(parameter_values)[0]
+            return np.asarray(
+                [
+                    matrix[(sparam_indices(label) or (0, 0))[0] - 1,
+                           (sparam_indices(label) or (0, 0))[1] - 1]
+                    for label in self.sparam_labels
+                ],
+                dtype=complex,
+            )
         y_matrix = self.conductance_matrix(parameter_values).astype(complex)
         s_matrix = _y_matrix_to_s_matrix(y_matrix, self.z0)
         values: list[complex] = []
@@ -6089,6 +6313,9 @@ class DCConductanceModel:
             "sparam_labels": list(self.sparam_labels),
             "port_paths": list(self.port_paths),
             "matrix_entries": list(self.metadata.get("dc_matrix_entries", [])),
+            "sparameter_entries": list(
+                self.metadata.get("dc_sparameter_entries", [])
+            ),
             "z0": self.z0,
             "activation": self.mlp.activation,
             "layer_sizes": list(self.mlp.layer_sizes),
@@ -6171,7 +6398,10 @@ class DCConductanceModel:
             metadata.get(
                 "representation",
                 (
-                    "full_y_matrix"
+                    "full_s_matrix"
+                    if metadata.get("kind")
+                    == "geometry_dependent_exact_dc_full_s_mlp"
+                    else "full_y_matrix"
                     if metadata.get("kind")
                     == "geometry_dependent_exact_dc_full_y_mlp"
                     else "path_conductance"
@@ -6204,6 +6434,18 @@ def _y_matrix_to_s_matrix(y_matrix: np.ndarray, z0: float) -> np.ndarray:
         return np.linalg.solve(lhs.T, rhs.T).T
     except np.linalg.LinAlgError:
         return rhs @ np.linalg.pinv(lhs)
+
+
+def _s_matrix_to_y_matrix(s_matrix: np.ndarray, z0: float) -> np.ndarray:
+    """Convert a complete complex S matrix to Y at the given reference impedance."""
+
+    identity = np.eye(s_matrix.shape[0], dtype=complex)
+    lhs = identity + np.asarray(s_matrix, dtype=complex)
+    rhs = identity - np.asarray(s_matrix, dtype=complex)
+    try:
+        return np.linalg.solve(lhs.T, rhs.T).T / float(z0)
+    except np.linalg.LinAlgError:
+        return rhs @ np.linalg.pinv(lhs) / float(z0)
 
 
 def _dc_matrix_from_path_conductances(
@@ -6264,6 +6506,128 @@ def _nonnegative_least_squares(
             break
         coefficients = updated
     return coefficients
+
+
+def extract_dc_full_s_samples(
+    blocks: Sequence[MDIFBlock],
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    *,
+    z0: float = 50.0,
+    passivity_tolerance: float = DEFAULT_DC_PASSIVITY_TOLERANCE,
+    require_every_block: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    """Extract both components of every ordered exact-DC Sij entry."""
+
+    if not blocks:
+        raise ValueError("DC full-S fitting requires at least one MDIF block")
+    if not math.isfinite(z0) or z0 <= 0.0:
+        raise ValueError("DC reference impedance must be positive and finite")
+    nports = infer_complete_sparameter_ports(labels)
+    passivity_limit = 1.0 + float(passivity_tolerance)
+    sample_blocks: list[MDIFBlock] = []
+    component_rows: list[np.ndarray] = []
+    missing_blocks: list[int] = []
+    unusable_blocks: list[int] = []
+    ignored_nonpassive = 0
+    ignored_nonfinite = 0
+    dc_row_count = 0
+
+    for block in blocks:
+        exact_indices = np.flatnonzero(np.asarray(block.freq_hz, dtype=float) == 0.0)
+        if exact_indices.size == 0:
+            missing_blocks.append(int(block.source_index) + 1)
+            continue
+        block_s: list[np.ndarray] = []
+        for raw_index in exact_indices:
+            dc_row_count += 1
+            s_matrix = _block_s_matrix(block, labels, int(raw_index), nports)
+            if not np.all(np.isfinite(s_matrix)):
+                ignored_nonfinite += 1
+                continue
+            try:
+                max_sigma = float(np.max(np.linalg.svd(s_matrix, compute_uv=False)))
+            except np.linalg.LinAlgError:
+                ignored_nonfinite += 1
+                continue
+            if not math.isfinite(max_sigma):
+                ignored_nonfinite += 1
+                continue
+            if max_sigma > passivity_limit:
+                ignored_nonpassive += 1
+                continue
+            block_s.append(s_matrix.reshape(-1))
+        if not block_s:
+            unusable_blocks.append(int(block.source_index) + 1)
+            continue
+        mean_s = np.mean(np.asarray(block_s, dtype=complex), axis=0)
+        sample_blocks.append(block)
+        component_rows.append(np.concatenate([mean_s.real, mean_s.imag]))
+
+    if missing_blocks and require_every_block:
+        raise ValueError(
+            "Every DC-training geometry must contain an exact zero-Hz row; missing "
+            "one-based ACDATA block position(s) in the source MDIF: "
+            + ", ".join(map(str, missing_blocks[:20]))
+        )
+    if not component_rows:
+        if require_every_block:
+            raise ValueError(
+                "No usable passive exact-zero-Hz rows remain after excluding "
+                "non-passive or non-finite DC samples; a DC model cannot be fitted"
+            )
+        x_values = np.empty((0, len(parameter_names)), dtype=float)
+        component_values = np.empty((0, 2 * nports * nports), dtype=float)
+    else:
+        x_values = parameter_matrix(sample_blocks, parameter_names)
+        component_values = np.asarray(component_rows, dtype=float)
+    matrix_entries = [
+        f"S{row}{col}.{component}"
+        for component in ("real", "imag")
+        for row in range(1, nports + 1)
+        for col in range(1, nports + 1)
+    ]
+    metadata: dict[str, object] = {
+        "dc_model_kind": "geometry_dependent_exact_dc_full_s_mlp",
+        "dc_model_representation": "full_s_matrix",
+        "dc_resistance_source_kind": "exact_zero_frequency",
+        "dc_port_paths": [],
+        "dc_port_path_spec": "",
+        "dc_port_paths_explicit": False,
+        "dc_port_path_selection": "full_ordered_complex_s_matrix",
+        "dc_matrix_entries": matrix_entries,
+        "dc_sparameter_entries": list(labels),
+        "dc_row_count": dc_row_count,
+        "dc_resistance_block_count": len(sample_blocks),
+        "dc_missing_block_count": len(missing_blocks),
+        "dc_missing_block_positions": missing_blocks,
+        "dc_unusable_block_count": len(unusable_blocks),
+        "dc_unusable_block_positions": unusable_blocks,
+        "dc_usable_block_positions": [
+            int(block.source_index) + 1 for block in sample_blocks
+        ],
+        "dc_ignored_nonpassive_count": ignored_nonpassive,
+        "dc_ignored_nonfinite_count": ignored_nonfinite,
+        "dc_ignored_invalid_resistance_count": 0,
+        "dc_passivity_tolerance": float(passivity_tolerance),
+        "dc_resistance_source_z0_ohm": float(z0),
+        "dc_resistance_source_frequency_min_hz": 0.0,
+        "dc_resistance_source_frequency_max_hz": 0.0,
+        "dc_is_separate_from_fitted_response": True,
+        "dc_requires_exact_zero_frequency": True,
+        "dc_rf_fallback_allowed": False,
+        "dc_topology_s_rmse": 0.0,
+        "dc_topology_s_max_abs_error": 0.0,
+        "dc_resistance_extraction": (
+            "Both real and imaginary components of every ordered Sij value are "
+            "taken directly from passive exact-zero-Hz rows; no Y projection, "
+            "resistor-path projection, or reciprocity constraint is applied"
+        ),
+        "dc_response_topology": (
+            "Geometry-dependent full ordered complex S matrix evaluated only at zero Hz"
+        ),
+    }
+    return x_values, component_values, metadata
 
 
 def extract_dc_full_y_samples(
@@ -6618,7 +6982,7 @@ def train_dc_conductance_model(
     open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
 ) -> tuple[DCConductanceModel, list[dict[str, float]], dict[str, object]]:
     if port_paths is None or (isinstance(port_paths, str) and not port_paths.strip()):
-        return train_dc_full_y_model(
+        return train_dc_full_s_model(
             train_blocks,
             verify_blocks,
             parameter_names,
@@ -6826,6 +7190,183 @@ def train_dc_conductance_model(
                 for value in path_resistances.values()
             ),
             "dc_aggregate_open_circuit_applied": aggregate_mean < 1.0 / open_threshold_ohm,
+        }
+    )
+    model.metadata = dict(metadata)
+    return model, history, metadata
+
+
+def train_dc_full_s_model(
+    train_blocks: Sequence[MDIFBlock],
+    verify_blocks: Sequence[MDIFBlock],
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    *,
+    hidden_layers: Sequence[int],
+    activation: str,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    patience: int,
+    seed: int,
+    loss_interval: int = 1,
+    progress_interval: int = 25,
+    progress_label: str = "DC fit",
+    z0: float = 50.0,
+    open_threshold_ohm: float = DEFAULT_DC_OPEN_THRESHOLD_OHM,
+    open_resistance_ohm: float = DEFAULT_DC_OPEN_RESISTANCE_OHM,
+) -> tuple[DCConductanceModel, list[dict[str, float]], dict[str, object]]:
+    """Fit both components of every ordered exact-DC Sij entry."""
+
+    x_train, s_train, metadata = extract_dc_full_s_samples(
+        train_blocks,
+        parameter_names,
+        labels,
+        z0=z0,
+    )
+    if verify_blocks:
+        x_verify, s_verify, verify_metadata = extract_dc_full_s_samples(
+            verify_blocks,
+            parameter_names,
+            labels,
+            z0=z0,
+            require_every_block=False,
+        )
+        if x_verify.shape[0] == 0:
+            x_verify = None
+            s_verify = None
+    else:
+        x_verify = None
+        s_verify = None
+        verify_metadata = None
+
+    x_scaler = Standardizer().fit(x_train)
+    y_scaler = Standardizer().fit(s_train)
+    constant_output_mask = np.std(s_train, axis=0) < EPS
+    mlp = MLP(
+        [x_train.shape[1], *list(hidden_layers), s_train.shape[1]],
+        activation=activation,
+        seed=seed + 101,
+    )
+    history = mlp.train(
+        x_scaler.transform(x_train),
+        y_scaler.transform(s_train),
+        x_scaler.transform(x_verify) if x_verify is not None else None,
+        y_scaler.transform(s_verify) if s_verify is not None else None,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        patience=patience,
+        seed=seed + 103,
+        loss_interval=loss_interval,
+        progress_callback=make_training_progress_callback(
+            progress_label,
+            epochs,
+            progress_interval,
+        ),
+        progress_interval=progress_interval,
+    )
+    assert y_scaler.std is not None
+    y_scaler.std[constant_output_mask] = 0.0
+    model = DCConductanceModel(
+        mlp=mlp,
+        x_scaler=x_scaler,
+        y_scaler=y_scaler,
+        parameter_names=parameter_names,
+        sparam_labels=labels,
+        port_paths=[],
+        z0=z0,
+        log_conductance_min=-50.0,
+        log_conductance_max=50.0,
+        representation="full_s_matrix",
+    )
+    train_prediction = model.predict_s_components(x_train)
+    train_component_error = train_prediction - s_train
+    nports = infer_complete_sparameter_ports(labels)
+    matrix_size = nports * nports
+
+    def components_to_s(rows: np.ndarray) -> np.ndarray:
+        values = np.asarray(rows, dtype=float)
+        return (
+            values[:, :matrix_size] + 1j * values[:, matrix_size:]
+        ).reshape(-1, nports, nports)
+
+    train_s_error = np.abs(
+        components_to_s(train_prediction) - components_to_s(s_train)
+    )
+    metadata.update(
+        {
+            "dc_model_training_samples": int(len(x_train)),
+            "dc_model_verification_samples": (
+                int(len(x_verify)) if x_verify is not None else 0
+            ),
+            "dc_model_activation": activation,
+            "dc_model_layer_sizes": list(model.mlp.layer_sizes),
+            "dc_model_train_component_rmse": float(
+                np.sqrt(np.mean(train_component_error**2))
+            ),
+            "dc_model_train_s_rmse": float(
+                np.sqrt(np.mean(train_s_error * train_s_error))
+            ),
+            "dc_model_train_s_max_abs_error": float(np.max(train_s_error)),
+            "dc_model_constant_matrix_entries": [
+                entry
+                for entry, is_constant in zip(
+                    metadata["dc_matrix_entries"],
+                    constant_output_mask,
+                )
+                if bool(is_constant)
+            ],
+            "dc_open_threshold_ohm": float(open_threshold_ohm),
+            "dc_open_resistance_ohm": float(open_resistance_ohm),
+        }
+    )
+    if verify_metadata is not None:
+        metadata["dc_model_verification_extraction"] = verify_metadata
+    if x_verify is not None and s_verify is not None:
+        verify_prediction = model.predict_s_components(x_verify)
+        verify_component_error = verify_prediction - s_verify
+        verify_s_error = np.abs(
+            components_to_s(verify_prediction) - components_to_s(s_verify)
+        )
+        metadata.update(
+            {
+                "dc_model_verify_component_rmse": float(
+                    np.sqrt(np.mean(verify_component_error**2))
+                ),
+                "dc_model_verify_s_rmse": float(
+                    np.sqrt(np.mean(verify_s_error * verify_s_error))
+                ),
+                "dc_model_verify_s_max_abs_error": float(np.max(verify_s_error)),
+            }
+        )
+
+    mean_s = np.mean(components_to_s(s_train), axis=0)
+    mean_y = _s_matrix_to_y_matrix(mean_s, z0)
+    minimum_conductance = 1.0 / float(open_resistance_ohm)
+    diagonal = np.maximum(np.real(np.diag(mean_y)), minimum_conductance)
+    aggregate_conductance = float(np.mean(diagonal))
+    equivalent_resistance = min(
+        1.0 / max(aggregate_conductance, minimum_conductance),
+        float(open_resistance_ohm),
+    )
+    metadata.update(
+        {
+            "dc_equivalent_resistance_ohm": equivalent_resistance,
+            "dc_equivalent_resistance_raw_mean_ohm": equivalent_resistance,
+            "dc_resistance_sample_count": int(s_train.size),
+            "dc_open_resistance_sample_count": int(
+                np.sum(diagonal <= minimum_conductance * (1.0 + 1e-12))
+            ),
+            "dc_mean_conductance_siemens": aggregate_conductance,
+            "dc_port_resistances_ohm": {},
+            "dc_resistance_pair_means_ohm": {},
+            "dc_open_paths": [],
+            "dc_open_path_count": 0,
+            "dc_open_circuit_applied": False,
+            "dc_aggregate_open_circuit_applied": (
+                aggregate_conductance < 1.0 / float(open_threshold_ohm)
+            ),
         }
     )
     model.metadata = dict(metadata)
@@ -7086,7 +7627,15 @@ def validate_dc_model_against_mdif(
 ) -> dict[str, object]:
     """Compare a saved/export DC model directly with exact-DC MDIF rows."""
 
-    if model.representation == "full_y_matrix":
+    if model.representation == "full_s_matrix":
+        x_values, target_outputs, extraction = extract_dc_full_s_samples(
+            blocks,
+            model.parameter_names,
+            model.sparam_labels,
+            z0=model.z0,
+        )
+        predicted_outputs = model.predict_s_components(x_values)
+    elif model.representation == "full_y_matrix":
         x_values, target_outputs, extraction = extract_dc_full_y_samples(
             blocks,
             model.parameter_names,
@@ -7186,6 +7735,11 @@ def validate_dc_model_against_mdif(
             if model.representation == "full_y_matrix"
             else None
         ),
+        "dc_mdif_model_s_component_rmse": (
+            float(np.sqrt(np.mean(output_error**2)))
+            if model.representation == "full_s_matrix"
+            else None
+        ),
         "dc_mdif_model_s_rmse": float(
             np.sqrt(np.mean(direct_error_array**2))
         ),
@@ -7229,12 +7783,15 @@ def resolve_export_dc_conductance_model(
     if saved_model is not None and dc_mdif is None:
         if (
             port_paths is None
-            and saved_model.representation == "path_conductance"
-            and stored_metadata.get("dc_port_paths_explicit") is False
+            and saved_model.representation != "full_s_matrix"
+            and (
+                saved_model.representation == "full_y_matrix"
+                or stored_metadata.get("dc_port_paths_explicit") is False
+            )
         ):
             raise ValueError(
-                "The saved DC model uses the former automatic resistor-path graph. "
-                "Supply --dc-mdif to upgrade it to the full ordered Y-matrix model, "
+                "The saved DC model uses an older lossy DC representation. "
+                "Supply --dc-mdif to upgrade it to the full ordered complex-S model, "
                 "or pass --dc-port-paths explicitly to retain a restricted graph."
             )
         nports = infer_complete_sparameter_ports(labels)
@@ -7263,7 +7820,7 @@ def resolve_export_dc_conductance_model(
         if saved_model is not None:
             if port_paths is None:
                 saved_representation_matches = (
-                    saved_model.representation == "full_y_matrix"
+                    saved_model.representation == "full_s_matrix"
                 )
             else:
                 requested_canonical = [
@@ -7289,11 +7846,23 @@ def resolve_export_dc_conductance_model(
                     metadata.update(selection_metadata)
                     metadata["dc_resistance_source_file"] = str(dc_path)
                     metadata["dc_mdif_action"] = "validated_saved_dc_model"
+                    metadata["dc_mdif_match_within_tolerance"] = True
                     return saved_model, metadata
 
         resolved_hidden_layers = [int(value) for value in hidden_layers]
         if not resolved_hidden_layers:
             resolved_hidden_layers = [32, 32]
+        if requested_paths is None:
+            # The automatic model carries two components for every ordered Sij.
+            # Give this export-only fit enough capacity and convergence time instead
+            # of inheriting an undersized RF/DC architecture from an older model.
+            minimum_width = max(
+                64,
+                4 * len(parameter_names),
+                2 * len(labels),
+            )
+            resolved_width = max(minimum_width, *resolved_hidden_layers)
+            resolved_hidden_layers = [resolved_width, resolved_width]
         fitted_model, _, metadata = train_dc_conductance_model(
             blocks,
             [],
@@ -7301,10 +7870,10 @@ def resolve_export_dc_conductance_model(
             labels,
             hidden_layers=resolved_hidden_layers,
             activation=activation,
-            epochs=4000,
+            epochs=8000 if requested_paths is None else 4000,
             batch_size=min(256, max(1, len(blocks))),
             learning_rate=2.0e-3,
-            patience=400,
+            patience=800 if requested_paths is None else 400,
             seed=1234,
             loss_interval=5,
             progress_interval=0,
@@ -7315,12 +7884,13 @@ def resolve_export_dc_conductance_model(
             open_resistance_ohm=open_resistance_ohm,
         )
         validation = validate_dc_model_against_mdif(fitted_model, blocks)
-        if (
+        within_tolerance = (
             float(validation["dc_mdif_model_s_max_abs_error"])
-            > DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE
-        ):
+            <= DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE
+        )
+        if not within_tolerance and port_paths is not None:
             topology_description = (
-                "automatic full ordered real Y-matrix"
+                "automatic full ordered complex S-matrix"
                 if port_paths is None
                 else "declared --dc-port-paths resistor graph"
             )
@@ -7332,7 +7902,7 @@ def resolve_export_dc_conductance_model(
                 f"{topology_description} topology error is "
                 f"{float(validation['dc_mdif_topology_s_max_abs_error']):.6g}. "
                 + (
-                    "Fitted matrix entries: "
+                    "Fitted matrix components: "
                     + ", ".join(
                         str(value)
                         for value in fitted_model.metadata.get(
@@ -7340,12 +7910,21 @@ def resolve_export_dc_conductance_model(
                             [],
                         )
                     )
-                    if fitted_model.representation == "full_y_matrix"
+                    if fitted_model.representation in {"full_s_matrix", "full_y_matrix"}
                     else "Selected paths: " + ", ".join(fitted_model.port_paths)
                 )
                 + ". Check the passive zero-Hz data; export was stopped."
             )
         metadata.update(validation)
+        metadata["dc_mdif_match_within_tolerance"] = within_tolerance
+        if not within_tolerance:
+            metadata["dc_mdif_warning"] = (
+                "The unrestricted full-complex-S DC model exceeded the preferred "
+                f"maximum S-error {DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE:g}, but export "
+                "continued because every Sij component is represented and there is no "
+                "topology/projection error. The measured fit error is recorded in the "
+                "manifest."
+            )
         metadata.update(selection_metadata)
         metadata["dc_resistance_source_file"] = str(dc_path)
         metadata["dc_model_fitted_during_export"] = True
@@ -9683,9 +10262,9 @@ def build_training_export_commands(
             saved_metadata = json.loads(metadata_path.read_text())
             saved_dynamic_dc_model = bool(saved_metadata.get("dc_model_kind"))
             saved_full_matrix_dc_model = (
-                saved_metadata.get("dc_model_representation") == "full_y_matrix"
+                saved_metadata.get("dc_model_representation") == "full_s_matrix"
                 or saved_metadata.get("dc_model_kind")
-                == "geometry_dependent_exact_dc_full_y_mlp"
+                == "geometry_dependent_exact_dc_full_s_mlp"
             )
             saved_spec = saved_metadata.get("dc_port_path_spec")
             paths_were_explicit = (

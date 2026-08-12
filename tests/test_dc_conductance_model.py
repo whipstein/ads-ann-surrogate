@@ -15,6 +15,7 @@ from surrogate_common import (
     parse_dc_port_paths,
     resolve_export_dc_conductance_model,
     train_dc_conductance_model,
+    validate_dc_model_against_mdif,
     write_mdif,
     write_ads_hb_mlp_package,
     write_veriloga_package,
@@ -75,6 +76,21 @@ def dc_y_block(
     )
 
 
+def dc_s_block(parameter: float, s_matrix: np.ndarray) -> MDIFBlock:
+    matrix = np.asarray(s_matrix, dtype=complex)
+    sparams = {}
+    for label in LABELS_2:
+        row = int(label[1]) - 1
+        col = int(label[2]) - 1
+        sparams[label] = np.asarray([matrix[row, col], 0.1 + 0.02j])
+    return MDIFBlock(
+        params={"W": str(parameter)},
+        freq_hz=np.asarray([0.0, 1.0e9]),
+        sparams=sparams,
+        source_index=int(parameter),
+    )
+
+
 def make_dc_nonpassive(block: MDIFBlock) -> MDIFBlock:
     for label in block.sparams:
         block.sparams[label] = block.sparams[label].copy()
@@ -122,7 +138,7 @@ class DCConductanceModelTests(unittest.TestCase):
             "automatic_complete_graph",
         )
 
-    def test_unspecified_topology_fits_every_ordered_dc_y_entry(self) -> None:
+    def test_unspecified_topology_fits_every_complex_ordered_dc_s_entry(self) -> None:
         y_matrix = np.asarray([[0.02, 0.005], [-0.005, 0.02]])
         blocks = [dc_y_block(1.0, y_matrix), dc_y_block(2.0, y_matrix)]
         model, _, metadata = train_dc_conductance_model(
@@ -140,9 +156,15 @@ class DCConductanceModelTests(unittest.TestCase):
             progress_interval=0,
             port_paths=None,
         )
-        self.assertEqual(model.representation, "full_y_matrix")
+        self.assertEqual(model.representation, "full_s_matrix")
         self.assertEqual(model.port_paths, [])
-        self.assertEqual(metadata["dc_matrix_entries"], ["Y11", "Y12", "Y21", "Y22"])
+        self.assertEqual(
+            metadata["dc_matrix_entries"],
+            [
+                "S11.real", "S12.real", "S21.real", "S22.real",
+                "S11.imag", "S12.imag", "S21.imag", "S22.imag",
+            ],
+        )
         np.testing.assert_allclose(
             model.conductance_matrix(np.asarray([1.0])),
             y_matrix,
@@ -182,7 +204,7 @@ class DCConductanceModelTests(unittest.TestCase):
             model.save(root / "model")
             loaded = DCConductanceModel.load_optional(root / "model")
             self.assertIsNotNone(loaded)
-            self.assertEqual(loaded.representation, "full_y_matrix")
+            self.assertEqual(loaded.representation, "full_s_matrix")
             np.testing.assert_allclose(
                 loaded.conductance_matrix(np.asarray([1.0])),
                 y_matrix,
@@ -194,13 +216,20 @@ class DCConductanceModelTests(unittest.TestCase):
             self.assertNotIn("_dc_g0=exp(", hb_text)
             self.assertEqual(
                 hb_manifest["dc_matrix_entries"],
-                ["Y11", "Y12", "Y21", "Y22"],
+                [
+                    "S11.real", "S12.real", "S21.real", "S22.real",
+                    "S11.imag", "S12.imag", "S21.imag", "S22.imag",
+                ],
             )
             self.assertEqual(hb_manifest["dc_port_paths"], [])
+            self.assertEqual(
+                hb_manifest["dc_sparameter_entries"],
+                ["S11", "S12", "S21", "S22"],
+            )
             self.assertIsNone(hb_manifest["dc_port_resistances_ohm"])
             self.assertEqual(
                 hb_manifest["dc_stamping_representation"],
-                "separate_full_ordered_y_sdd",
+                "separate_full_ordered_complex_s_to_y_sdd",
             )
 
             va_manifest = write_veriloga_package(
@@ -209,16 +238,96 @@ class DCConductanceModelTests(unittest.TestCase):
                 **common,
             )
             va_text = (root / "va" / "full_dc.va").read_text()
-            self.assertIn("real dc_y [0:3];", va_text)
-            self.assertIn("active_yr[1] = dc_y[1]", va_text)
+            self.assertIn("real dc_sr [0:3];", va_text)
+            self.assertIn("real dc_si [0:3];", va_text)
+            self.assertIn("active_yr[1] = dc_yr[1]", va_text)
             self.assertEqual(
                 va_manifest["dc_matrix_entries"],
-                ["Y11", "Y12", "Y21", "Y22"],
+                [
+                    "S11.real", "S12.real", "S21.real", "S22.real",
+                    "S11.imag", "S12.imag", "S21.imag", "S22.imag",
+                ],
             )
             self.assertEqual(va_manifest["dc_port_paths"], [])
+            self.assertEqual(
+                va_manifest["dc_sparameter_entries"],
+                ["S11", "S12", "S21", "S22"],
+            )
             self.assertIsNone(va_manifest["dc_port_resistances_ohm"])
             readme = (root / "va" / "VERILOGA_README.md").read_text()
-            self.assertIn("stamps all `4` ordered real Y-matrix entries", readme)
+            self.assertIn("fits all `8` real/imaginary components", readme)
+
+    def test_default_dc_preserves_complex_s_without_projection_error(self) -> None:
+        s_matrix = np.asarray(
+            [[0.2 + 0.1j, 0.15 - 0.05j], [0.05 + 0.08j, -0.1 + 0.12j]]
+        )
+        blocks = [dc_s_block(1.0, s_matrix), dc_s_block(2.0, s_matrix)]
+        model, _, metadata = train_dc_conductance_model(
+            blocks,
+            [],
+            ["W"],
+            LABELS_2,
+            hidden_layers=[2],
+            activation="tanh",
+            epochs=5,
+            batch_size=2,
+            learning_rate=0.01,
+            patience=5,
+            seed=17,
+            progress_interval=0,
+            port_paths=None,
+        )
+        self.assertEqual(metadata["dc_topology_s_max_abs_error"], 0.0)
+        np.testing.assert_allclose(
+            model.predict_s_values(np.asarray([1.0])),
+            s_matrix.reshape(-1),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
+        validation = validate_dc_model_against_mdif(model, blocks)
+        self.assertLess(validation["dc_mdif_model_s_max_abs_error"], 1.0e-12)
+        common = dict(
+            model_kind="DNN",
+            module_name="complex_dc",
+            parameter_names=["W"],
+            sparam_labels=LABELS_2,
+            freq_transform="log",
+            activation="tanh",
+            layer_sizes=[2, 8],
+            weights=[np.zeros((2, 8))],
+            biases=[np.zeros(8)],
+            x_mean=np.asarray([1.0, 9.0]),
+            x_std=np.ones(2),
+            y_mean=np.zeros(8),
+            y_std=np.ones(8),
+            z0=50.0,
+            dc_equivalent_resistance_ohm=metadata[
+                "dc_equivalent_resistance_ohm"
+            ],
+            dc_resistance_source_kind="exact_zero_frequency",
+            dc_port_resistances_ohm={},
+            dc_model=model.export_data(),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_veriloga_package(
+                out_dir=root / "va",
+                frequency_expression="$freq",
+                **common,
+            )
+            va_text = (root / "va" / "complex_dc.va").read_text()
+            self.assertIn("dc_si[0]", va_text)
+            self.assertIn("active_yi[0] = dc_yi[0]", va_text)
+            hb_manifest = write_ads_hb_mlp_package(
+                out_dir=root / "hb",
+                **common,
+            )
+            hb_text = (root / "hb" / "complex_dc.net").read_text()
+            self.assertIn("_dc_s0=complex(", hb_text)
+            self.assertEqual(
+                hb_manifest["dc_stamping_representation"],
+                "separate_full_ordered_complex_s_to_y_sdd",
+            )
 
     def test_unspecified_four_port_model_has_all_sixteen_ordered_entries(self) -> None:
         skew = np.asarray(
@@ -250,12 +359,13 @@ class DCConductanceModelTests(unittest.TestCase):
             port_paths=None,
         )
         expected_entries = [
-            f"Y{row}{col}"
+            f"S{row}{col}.{component}"
+            for component in ("real", "imag")
             for row in range(1, 5)
             for col in range(1, 5)
         ]
         self.assertEqual(metadata["dc_matrix_entries"], expected_entries)
-        self.assertEqual(model.mlp.layer_sizes[-1], 16)
+        self.assertEqual(model.mlp.layer_sizes[-1], 32)
         np.testing.assert_allclose(
             model.conductance_matrix(np.asarray([1.0])),
             y_matrix,
@@ -522,7 +632,7 @@ class DCConductanceModelTests(unittest.TestCase):
         self.assertTrue(export_metadata["dc_model_fitted_during_export"])
         self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
 
-    def test_export_without_path_flag_upgrades_pair_only_saved_model_to_full_y(self) -> None:
+    def test_export_without_path_flag_upgrades_pair_only_saved_model_to_full_s(self) -> None:
         old_blocks = [
             dc_block(1.0, [0.01], "1-2"),
             dc_block(2.0, [0.01], "1-2"),
@@ -573,16 +683,19 @@ class DCConductanceModelTests(unittest.TestCase):
                 hidden_layers=[2],
             )
         self.assertIsNotNone(resolved)
-        self.assertEqual(resolved.representation, "full_y_matrix")
+        self.assertEqual(resolved.representation, "full_s_matrix")
         self.assertEqual(resolved.port_paths, [])
         self.assertEqual(
             export_metadata["dc_matrix_entries"],
-            ["Y11", "Y12", "Y21", "Y22"],
+            [
+                "S11.real", "S12.real", "S21.real", "S22.real",
+                "S11.imag", "S12.imag", "S21.imag", "S22.imag",
+            ],
         )
         self.assertEqual(export_metadata["dc_mdif_action"], "fitted_dc_only_model")
         self.assertLess(export_metadata["dc_mdif_model_s_max_abs_error"], 1.0e-12)
 
-    def test_legacy_automatic_path_model_requires_mdif_for_full_y_upgrade(self) -> None:
+    def test_legacy_automatic_path_model_requires_mdif_for_full_s_upgrade(self) -> None:
         blocks = [
             dc_block(1.0, [0.01], "1-2"),
             dc_block(2.0, [0.01], "1-2"),
@@ -707,6 +820,32 @@ class DCConductanceModelTests(unittest.TestCase):
                     activation="tanh",
                     hidden_layers=[2],
                 )
+
+    def test_unrestricted_full_s_export_reports_fit_error_without_stopping(self) -> None:
+        first = dc_s_block(1.0, np.asarray([[0.2, 0.1], [0.1, 0.2]]))
+        second = dc_s_block(1.0, np.asarray([[-0.2, 0.1], [0.1, -0.2]]))
+        first.source_index = 0
+        second.source_index = 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dc_mdif = Path(temp_dir) / "conflicting_dc.mdif"
+            write_mdif(dc_mdif, [first, second], LABELS_2)
+            resolved, export_metadata = resolve_export_dc_conductance_model(
+                None,
+                {},
+                ["W"],
+                LABELS_2,
+                dc_mdif=dc_mdif,
+                z0=50.0,
+                port_paths=None,
+                open_threshold_ohm=1.0e12,
+                open_resistance_ohm=1.0e19,
+                activation="tanh",
+                hidden_layers=[2],
+            )
+        self.assertIsNotNone(resolved)
+        self.assertFalse(export_metadata["dc_mdif_match_within_tolerance"])
+        self.assertIn("export continued", export_metadata["dc_mdif_warning"])
+        self.assertGreater(export_metadata["dc_mdif_model_s_max_abs_error"], 0.1)
 
 
 if __name__ == "__main__":
