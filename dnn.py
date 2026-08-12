@@ -1299,7 +1299,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
             "The fitted RF response is evaluated at each HB spectral frequency.",
             "The passive network has no input-power parameter and introduces no compression.",
         ],
-        emit_combined_sdd_trial=True,
+        emit_folded_scalers_trial=True,
     )
     print(
         json.dumps(

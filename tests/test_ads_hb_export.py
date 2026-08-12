@@ -5,13 +5,30 @@ from pathlib import Path
 
 import numpy as np
 
-from surrogate_common import write_ads_hb_mlp_package, write_ads_hb_neurotf_package
+from surrogate_common import (
+    _fold_mlp_scalers_into_layers,
+    write_ads_hb_mlp_package,
+    write_ads_hb_neurotf_package,
+)
 
 
 LABELS = ["S11", "S12", "S21", "S22"]
 
 
 class AdsHbExportTests(unittest.TestCase):
+    @staticmethod
+    def _evaluate_mlp(
+        values: np.ndarray,
+        weights: list[np.ndarray],
+        biases: list[np.ndarray],
+    ) -> np.ndarray:
+        result = np.asarray(values, dtype=float)
+        for layer_idx, (weight, bias) in enumerate(zip(weights, biases)):
+            result = result @ weight + bias
+            if layer_idx < len(weights) - 1:
+                result = np.tanh(result)
+        return result
+
     def _assert_explicit_separate_stamps(self, netlist: str, module_name: str) -> None:
         self.assertNotIn("F[", netlist)
         self.assertIn("I[1,0]=0.0", netlist)
@@ -135,6 +152,141 @@ class AdsHbExportTests(unittest.TestCase):
             )
             self.assertTrue(
                 (out_dir / "ADS_HB_COMBINED_SDD_TRIAL_README.md").is_file()
+            )
+
+    def test_mlp_scaler_folding_is_algebraically_exact(self) -> None:
+        rng = np.random.default_rng(31)
+        x_mean = np.array([2.5, -0.75, 10.0])
+        x_std = np.array([0.5, 4.0, 2.0])
+        y_mean = np.array([-1.25, 3.0])
+        y_std = np.array([2.5, 0.125])
+        samples = rng.normal(size=(20, 3))
+
+        for layer_sizes in ([3, 2], [3, 5, 4, 2]):
+            weights = [
+                rng.normal(size=(input_size, output_size))
+                for input_size, output_size in zip(
+                    layer_sizes[:-1], layer_sizes[1:]
+                )
+            ]
+            biases = [
+                rng.normal(size=output_size) for output_size in layer_sizes[1:]
+            ]
+            expected = self._evaluate_mlp(
+                (samples - x_mean) / x_std,
+                weights,
+                biases,
+            )
+            expected = expected * y_std + y_mean
+
+            folded_weights, folded_biases = _fold_mlp_scalers_into_layers(
+                weights,
+                biases,
+                x_mean,
+                x_std,
+                y_mean,
+                y_std,
+            )
+            actual = self._evaluate_mlp(
+                samples,
+                folded_weights,
+                folded_biases,
+            )
+            np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+    def test_mlp_export_can_emit_folded_scalers_as_separate_trial(self) -> None:
+        rng = np.random.default_rng(19)
+        dc_model = {
+            "parameter_names": ["W"],
+            "sparam_labels": LABELS,
+            "representation": "path_conductance",
+            "port_paths": ["p1-p2"],
+            "activation": "tanh",
+            "layer_sizes": [1, 3, 1],
+            "weights": [rng.normal(size=(1, 3)), rng.normal(size=(3, 1))],
+            "biases": [rng.normal(size=3), rng.normal(size=1)],
+            "x_mean": np.array([1.25]),
+            "x_std": np.array([0.4]),
+            "y_mean": np.array([-2.0]),
+            "y_std": np.array([0.75]),
+            "log_conductance_min": -40.0,
+            "log_conductance_max": 10.0,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            module_name = "test_dnn"
+            manifest = write_ads_hb_mlp_package(
+                out_dir=out_dir,
+                model_kind="DNN",
+                module_name=module_name,
+                parameter_names=["W"],
+                sparam_labels=LABELS,
+                freq_transform="log",
+                activation="tanh",
+                layer_sizes=[2, 4, 8],
+                weights=[rng.normal(size=(2, 4)), rng.normal(size=(4, 8))],
+                biases=[rng.normal(size=4), rng.normal(size=8)],
+                x_mean=np.array([1.25, 9.0]),
+                x_std=np.array([0.4, 1.5]),
+                y_mean=rng.normal(size=8),
+                y_std=np.linspace(0.25, 2.0, 8),
+                z0=50.0,
+                output_domain="s",
+                dc_equivalent_resistance_ohm=100.0,
+                dc_resistance_source_kind="exact_zero_frequency",
+                dc_model=dc_model,
+                emit_folded_scalers_trial=True,
+            )
+
+            default_netlist = (out_dir / f"{module_name}.net").read_text()
+            self.assertIn(f"SDD:{module_name}_core_rf", default_netlist)
+            self.assertIn(f"SDD:{module_name}_core_dc", default_netlist)
+            self.assertIn("if (freq equals 0) then 0.0 else", default_netlist)
+            self.assertIn(
+                "if (freq equals 0) then test_dnn_m_dc_y0 else",
+                default_netlist,
+            )
+            self.assertIn(f"{module_name}_m_fine_x0=", default_netlist)
+            self.assertIn(f"{module_name}_m_fine_out0=", default_netlist)
+            self.assertIn(f"{module_name}_m_dc_net_x0=", default_netlist)
+            self.assertIn(f"{module_name}_m_dc_net_out0=", default_netlist)
+
+            trial_module = f"{module_name}_folded_scalers_trial"
+            trial_netlist = (out_dir / f"{trial_module}.net").read_text()
+            self.assertIn(f"SDD:{trial_module}_core_rf", trial_netlist)
+            self.assertIn(f"SDD:{trial_module}_core_dc", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_fine_x0=", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_fine_out0=", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_dc_net_x0=", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_dc_net_out0=", trial_netlist)
+            self.assertEqual(default_netlist.count("H["), trial_netlist.count("H["))
+
+            trial_exports = manifest["trial_exports"]
+            self.assertEqual(len(trial_exports), 1)
+            self.assertEqual(trial_exports[0]["kind"], "folded_mlp_scalers")
+            self.assertEqual(
+                trial_exports[0]["sdd_dc_rf_topology"],
+                "separate_parallel_sdds",
+            )
+            self.assertEqual(
+                trial_exports[0]["mlp_scaler_implementation"],
+                "folded_into_first_and_final_layers",
+            )
+
+            trial_manifest = json.loads(
+                (out_dir / "ads_hb_folded_scalers_trial_manifest.json").read_text()
+            )
+            self.assertTrue(trial_manifest["folded_input_scaler"])
+            self.assertTrue(trial_manifest["folded_output_scaler"])
+            self.assertEqual(
+                trial_manifest["sdd_dc_rf_topology"],
+                "separate_parallel_sdds",
+            )
+            self.assertTrue(
+                (out_dir / "ADS_HB_FOLDED_SCALERS_TRIAL_INSTANCE_TEMPLATE.txt").is_file()
+            )
+            self.assertTrue(
+                (out_dir / "ADS_HB_FOLDED_SCALERS_TRIAL_README.md").is_file()
             )
 
     def test_neurotf_export_uses_the_same_explicit_stamps(self) -> None:

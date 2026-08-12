@@ -671,11 +671,12 @@ This avoids the additional modified-nodal branch unknowns created by the former
 implicit S-wave implementation.
 
 DNN `export-ads-hb` also writes an automatic comparison trial while the default
-implementation remains unchanged. The trial uses one explicit-current SDD whose
-frequency weights select exact DC or fitted RF, instead of two mutually
-exclusive parallel SDDs. It reuses the same trained DNN, exact-DC model,
-parameter defaults, and S-to-Y equations, so the only intended difference is
-the SDD stamp topology. The default manifest lists the trial files under
+implementation remains unchanged. The trial folds each embedded MLP input
+standardizer into its first affine layer and its output inverse-standardizer
+into its final affine layer. The default and trial retain the same two-branch
+DC/RF SDD topology, trained response, exact-DC model, parameter defaults, and
+S-to-Y equations. Only the implementation of the algebraically exact neural
+scaling operations changes. The default manifest lists the trial files under
 `trial_exports`.
 
 ### Reusing an ADS HB model at multiple parameter values
@@ -1186,18 +1187,23 @@ stamp. DC is stamped separately from the fitted RF response.
 
 The same command additionally writes these trial artifacts:
 
-- `<module>_combined_sdd_trial.net`
-- `ads_hb_combined_sdd_trial_manifest.json`
-- `ADS_HB_COMBINED_SDD_TRIAL_INSTANCE_TEMPLATE.txt`
-- `ADS_HB_COMBINED_SDD_TRIAL_README.md`
+- `<module>_folded_scalers_trial.net`
+- `ads_hb_folded_scalers_trial_manifest.json`
+- `ADS_HB_FOLDED_SCALERS_TRIAL_INSTANCE_TEMPLATE.txt`
+- `ADS_HB_FOLDED_SCALERS_TRIAL_README.md`
 
-The trial module is named `<module>_combined_sdd_trial`. The default uses two
-parallel SDDs whose DC and RF weights are mutually exclusive; the trial uses one
-SDD with a DC-or-RF selection in each frequency weight. Because the module names
-are distinct, both definitions may be included in one workspace. For a fair
-timing comparison, run otherwise identical simulations with only the default or
-only the trial instance active. Compare DC, S-parameters, HB fundamental power,
-convergence behavior, and elapsed simulation time before promoting the trial.
+The trial module is named `<module>_folded_scalers_trial`. The default emits
+separate input-standardization and output-inverse-standardization equations for
+the RF DNN and geometry-dependent DC DNN. The trial absorbs those affine
+operations exactly into the first- and final-layer weights and biases. It keeps
+the default two parallel SDD branches, so this comparison does not include the
+slower combined-SDD topology. For each embedded MLP, this removes
+$n_\mathrm{in}+n_\mathrm{out}$ separate scaler equations without changing its
+layer widths or activation functions. Because the module names are distinct, both
+definitions may be included in one workspace. For a fair timing comparison,
+run otherwise identical simulations with only the default or only the trial
+instance active. Compare DC, S-parameters, HB fundamental power, convergence
+behavior, and elapsed simulation time before promoting the trial.
 
 ### Direct Verilog-A Export
 

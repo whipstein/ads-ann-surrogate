@@ -4225,6 +4225,34 @@ def _ads_hb_weighted_sum(
     return "+".join(terms)
 
 
+def _fold_mlp_scalers_into_layers(
+    weights: Sequence[np.ndarray],
+    biases: Sequence[np.ndarray],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Fold affine input/output standardizers into an MLP exactly."""
+
+    folded_weights = [np.asarray(value, dtype=float).copy() for value in weights]
+    folded_biases = [np.asarray(value, dtype=float).copy() for value in biases]
+    if not folded_weights or len(folded_weights) != len(folded_biases):
+        raise ValueError("Scaler folding requires matching non-empty MLP layers")
+    x_mean_array = np.asarray(x_mean, dtype=float)
+    x_std_array = np.asarray(x_std, dtype=float)
+    y_mean_array = np.asarray(y_mean, dtype=float)
+    y_std_array = np.asarray(y_std, dtype=float)
+    if np.any(x_std_array == 0.0):
+        raise ValueError("Input scaler standard deviations must be non-zero")
+
+    folded_weights[0] = folded_weights[0] / x_std_array[:, None]
+    folded_biases[0] = folded_biases[0] - x_mean_array @ folded_weights[0]
+    folded_weights[-1] = folded_weights[-1] * y_std_array[None, :]
+    folded_biases[-1] = folded_biases[-1] * y_std_array + y_mean_array
+    return folded_weights, folded_biases
+
+
 def _append_ads_hb_mlp_equations(
     lines: list[str],
     prefix: str,
@@ -4237,8 +4265,9 @@ def _append_ads_hb_mlp_equations(
     x_std: np.ndarray,
     y_mean: np.ndarray,
     y_std: np.ndarray,
+    fold_scalers: bool = False,
 ) -> list[str]:
-    """Append shared ADS equations and return unscaled output expression names."""
+    """Append shared ADS equations and return physical-output expression names."""
 
     numeric_weights = [np.asarray(value, dtype=float) for value in weights]
     numeric_biases = [np.asarray(value, dtype=float) for value in biases]
@@ -4262,15 +4291,6 @@ def _append_ads_hb_mlp_equations(
     if np.any(x_std_array == 0.0):
         raise ValueError("ADS HB MLP input scaler standard deviations must be non-zero")
 
-    source_names: list[str] = []
-    for idx, expression in enumerate(feature_expressions):
-        name = f"{prefix}_x{idx}"
-        lines.append(
-            f"{name}=(({expression})-({veriloga_float(float(x_mean_array[idx]))}))"
-            f"/({veriloga_float(float(x_std_array[idx]))})"
-        )
-        source_names.append(name)
-
     for layer_idx, (weight, bias) in enumerate(zip(numeric_weights, numeric_biases)):
         expected = (sizes[layer_idx], sizes[layer_idx + 1])
         if weight.shape != expected or bias.shape != (sizes[layer_idx + 1],):
@@ -4278,6 +4298,30 @@ def _append_ads_hb_mlp_equations(
                 f"ADS HB MLP layer {layer_idx} has shapes {weight.shape}/{bias.shape}; "
                 f"expected {expected}/{(sizes[layer_idx + 1],)}"
             )
+
+    if fold_scalers:
+        numeric_weights, numeric_biases = _fold_mlp_scalers_into_layers(
+            numeric_weights,
+            numeric_biases,
+            x_mean_array,
+            x_std_array,
+            y_mean_array,
+            y_std_array,
+        )
+
+    if fold_scalers:
+        source_names = list(feature_expressions)
+    else:
+        source_names = []
+        for idx, expression in enumerate(feature_expressions):
+            name = f"{prefix}_x{idx}"
+            lines.append(
+                f"{name}=(({expression})-({veriloga_float(float(x_mean_array[idx]))}))"
+                f"/({veriloga_float(float(x_std_array[idx]))})"
+            )
+            source_names.append(name)
+
+    for layer_idx, (weight, bias) in enumerate(zip(numeric_weights, numeric_biases)):
         dest_names: list[str] = []
         hidden_activation = activation if layer_idx < len(numeric_weights) - 1 else None
         for out_idx in range(sizes[layer_idx + 1]):
@@ -4290,6 +4334,9 @@ def _append_ads_hb_mlp_equations(
             lines.append(f"{dest}={_ads_hb_activation(expression, hidden_activation)}")
             dest_names.append(dest)
         source_names = dest_names
+
+    if fold_scalers:
+        return source_names
 
     outputs: list[str] = []
     for idx, source in enumerate(source_names):
@@ -4482,6 +4529,7 @@ def _append_ads_hb_dc_conductance_model(
     sparam_labels: Sequence[str],
     parameter_features: Sequence[str],
     dc_model: dict[str, object],
+    fold_scalers: bool = False,
 ) -> list[str]:
     """Append a geometry-only DC MLP and return row-major Y expressions."""
 
@@ -4508,6 +4556,7 @@ def _append_ads_hb_dc_conductance_model(
         np.asarray(dc_model["x_std"], dtype=float),
         np.asarray(dc_model["y_mean"], dtype=float),
         np.asarray(dc_model["y_std"], dtype=float),
+        fold_scalers=fold_scalers,
     )
     if representation == "full_s_matrix":
         matrix_size = nports * nports
@@ -4685,6 +4734,7 @@ def _ads_hb_readme(
     instance_template_name: str = "ADS_HB_INSTANCE_TEMPLATE.txt",
     readme_name: str = "ADS_HB_README.md",
     combined_sdd: bool = False,
+    fold_mlp_scalers: bool = False,
     extra_notes: Sequence[str] | None = None,
 ) -> str:
     parameter_rows = "\n".join(
@@ -4723,6 +4773,16 @@ directly stamps the separately extracted conductance matrix. For current models
 this matrix is evaluated from geometry only; legacy models use a fixed matrix.
 At every non-zero spectral frequency, the DC branch contributes exactly zero
 current and only the fitted RF surrogate is used."""
+    scaler_behavior = (
+        "The trial folds every embedded MLP input standardizer into its first "
+        "affine layer and every output inverse-standardizer into its final affine "
+        "layer. No separate neural input/output scaling equations are emitted. "
+        "The transformation is algebraically exact and does not change the trained "
+        "network response."
+        if fold_mlp_scalers
+        else "The package emits the trained MLP input standardization and output "
+        "inverse-standardization as explicit ADS equations."
+    )
     return f"""# ADS Harmonic-Balance Passive Network
 
 This package contains a self-contained ADS Symbolically Defined Device (SDD)
@@ -4843,6 +4903,10 @@ The exact sanitized parameter names, scales, and defaults are also recorded in
 
 {dc_rf_behavior} DC is never extrapolated from the RF fit.
 
+## MLP scaler implementation
+
+{scaler_behavior}
+
 Negative frequencies use the complex conjugate of the surrogate at the
 matching positive frequency, preserving the conjugate symmetry required for
 real voltage and current waveforms. The selection occurs only in SDD frequency
@@ -4907,7 +4971,9 @@ def write_ads_hb_mlp_package(
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
     combined_sdd: bool = False,
+    fold_mlp_scalers: bool = False,
     emit_combined_sdd_trial: bool = False,
+    emit_folded_scalers_trial: bool = False,
     artifact_variant: str | None = None,
 ) -> dict[str, object]:
     """Write a self-contained, linear ADS SDD model for HB/AC/SP analyses."""
@@ -4919,9 +4985,11 @@ def write_ads_hb_mlp_package(
         raise ValueError("Direct-Y ADS HB export does not support KBNN coarse hooks")
     if not math.isfinite(z0) or z0 <= 0.0:
         raise ValueError("ADS HB reference impedance must be positive and finite")
-    if combined_sdd and emit_combined_sdd_trial:
+    if (combined_sdd or fold_mlp_scalers) and (
+        emit_combined_sdd_trial or emit_folded_scalers_trial
+    ):
         raise ValueError(
-            "A combined-SDD package cannot recursively emit another combined-SDD trial"
+            "A trial package cannot recursively emit additional ADS HB trials"
         )
     nports = infer_complete_sparameter_ports(sparam_labels)
     n_sparams = len(sparam_labels)
@@ -5003,6 +5071,7 @@ def write_ads_hb_mlp_package(
             np.asarray(embedded_coarse_model["x_std"], dtype=float),
             np.asarray(embedded_coarse_model["y_mean"], dtype=float),
             np.asarray(embedded_coarse_model["y_std"], dtype=float),
+            fold_scalers=fold_mlp_scalers,
         )
         lines.append("")
     elif uses_coarse_inputs or adds_coarse_to_output:
@@ -5026,6 +5095,7 @@ def write_ads_hb_mlp_package(
         np.asarray(x_std, dtype=float),
         np.asarray(y_mean, dtype=float),
         np.asarray(y_std, dtype=float),
+        fold_scalers=fold_mlp_scalers,
     )
     lines.append("")
     if len(primary_outputs) != 2 * n_sparams:
@@ -5058,6 +5128,7 @@ def write_ads_hb_mlp_package(
             sparam_labels,
             parameter_features,
             dc_model,
+            fold_scalers=fold_mlp_scalers,
         )
     else:
         dc_matrix = dc_conductance_matrix(
@@ -5157,6 +5228,13 @@ def write_ads_hb_mlp_package(
         "sparam_labels": list(sparam_labels),
         "response_domain": response_domain,
         "z0": z0,
+        "folded_input_scaler": bool(fold_mlp_scalers),
+        "folded_output_scaler": bool(fold_mlp_scalers),
+        "mlp_scaler_implementation": (
+            "folded_into_first_and_final_layers"
+            if fold_mlp_scalers
+            else "explicit_input_and_output_equations"
+        ),
         "linear": True,
         "power_dependent": False,
         "passivity_enforced_by_export": False,
@@ -5236,6 +5314,11 @@ def write_ads_hb_mlp_package(
             "algebraically equivalent to the separate branches while exposing one "
             "dense SDD control/stamp graph."
             if combined_sdd
+            else "The default separate DC/RF SDD topology is retained while every "
+            "embedded MLP's input standardizer and output inverse-standardizer are "
+            "folded into its first and final affine layers. This trial is "
+            "algebraically equivalent to the explicit scaler equations."
+            if fold_mlp_scalers
             else "Separate explicit-current SDD branches stamp the extracted DC "
             "conductance and fitted RF admittance. S-output fits are converted to Y "
             "in frequency-only equations before stamping; no implicit port-current "
@@ -5249,6 +5332,7 @@ def write_ads_hb_mlp_package(
     if extra_manifest:
         manifest.update(extra_manifest)
     resolved_notes = list(extra_notes or [])
+    trial_exports: list[dict[str, object]] = []
     if emit_combined_sdd_trial:
         trial_module_name = f"{module_id}_combined_sdd_trial"
         trial_extra_manifest = dict(extra_manifest or {})
@@ -5294,7 +5378,9 @@ def write_ads_hb_mlp_package(
                 f"The unchanged default implementation remains `{netlist_name}` with module `{module_id}`.",
             ],
             combined_sdd=True,
+            fold_mlp_scalers=False,
             emit_combined_sdd_trial=False,
+            emit_folded_scalers_trial=False,
             artifact_variant="combined_sdd_trial",
         )
         trial_export = {
@@ -5307,7 +5393,7 @@ def write_ads_hb_mlp_package(
             "instance_template_file": trial_manifest["instance_template_file"],
             "sdd_dc_rf_topology": trial_manifest["sdd_dc_rf_topology"],
         }
-        manifest["trial_exports"] = [trial_export]
+        trial_exports.append(trial_export)
         resolved_notes.extend(
             [
                 "The default two-SDD implementation in this package is unchanged.",
@@ -5315,6 +5401,79 @@ def write_ads_hb_mlp_package(
                 f"Use `{trial_export['instance_template_file']}` and `{trial_export['readme_file']}` for the trial; benchmark the default and trial as separate instances.",
             ]
         )
+    if emit_folded_scalers_trial:
+        trial_module_name = f"{module_id}_folded_scalers_trial"
+        trial_extra_manifest = dict(extra_manifest or {})
+        trial_extra_manifest.update(
+            {
+                "trial_parent_module_name": module_id,
+                "trial_purpose": (
+                    "Compare algebraically folded MLP input/output scalers against "
+                    "the default explicit scaler equations"
+                ),
+            }
+        )
+        trial_manifest = write_ads_hb_mlp_package(
+            out_dir=out_dir,
+            model_kind=model_kind,
+            module_name=trial_module_name,
+            parameter_names=parameter_names,
+            sparam_labels=sparam_labels,
+            freq_transform=freq_transform,
+            activation=activation,
+            layer_sizes=layer_sizes,
+            weights=weights,
+            biases=biases,
+            x_mean=x_mean,
+            x_std=x_std,
+            y_mean=y_mean,
+            y_std=y_std,
+            z0=z0,
+            parameter_input_scales=parameter_input_scales,
+            output_domain=output_domain,
+            uses_coarse_inputs=uses_coarse_inputs,
+            adds_coarse_to_output=adds_coarse_to_output,
+            embedded_coarse_model=embedded_coarse_model,
+            dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
+            dc_resistance_source_kind=dc_resistance_source_kind,
+            dc_port_resistances_ohm=dc_port_resistances_ohm,
+            dc_model=dc_model,
+            source_model_dir=source_model_dir,
+            extra_manifest=trial_extra_manifest,
+            extra_notes=[
+                *resolved_notes,
+                "Trial implementation: all embedded MLP scalers are folded into their first and final affine layers.",
+                f"The unchanged default implementation remains `{netlist_name}` with module `{module_id}`.",
+            ],
+            combined_sdd=False,
+            fold_mlp_scalers=True,
+            emit_combined_sdd_trial=False,
+            emit_folded_scalers_trial=False,
+            artifact_variant="folded_scalers_trial",
+        )
+        trial_export = {
+            "kind": "folded_mlp_scalers",
+            "status": "trial",
+            "module_name": trial_manifest["module_name"],
+            "netlist_file": trial_manifest["netlist_file"],
+            "manifest_file": trial_manifest["manifest_file"],
+            "readme_file": trial_manifest["readme_file"],
+            "instance_template_file": trial_manifest["instance_template_file"],
+            "sdd_dc_rf_topology": trial_manifest["sdd_dc_rf_topology"],
+            "mlp_scaler_implementation": trial_manifest[
+                "mlp_scaler_implementation"
+            ],
+        }
+        trial_exports.append(trial_export)
+        resolved_notes.extend(
+            [
+                "The default two-SDD topology and explicit scaler equations remain unchanged.",
+                f"The active scaler-folding comparison trial is `{trial_export['netlist_file']}` with module `{trial_export['module_name']}`.",
+                f"Use `{trial_export['instance_template_file']}` and `{trial_export['readme_file']}` for the trial; benchmark it independently from other trial implementations.",
+            ]
+        )
+    if trial_exports:
+        manifest["trial_exports"] = trial_exports
     (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
     (out_dir / readme_name).write_text(
         _ads_hb_readme(
@@ -5332,6 +5491,7 @@ def write_ads_hb_mlp_package(
             instance_template_name=instance_template_name,
             readme_name=readme_name,
             combined_sdd=combined_sdd,
+            fold_mlp_scalers=fold_mlp_scalers,
             extra_notes=resolved_notes,
         )
     )
