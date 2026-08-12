@@ -547,11 +547,31 @@ class DCConductanceModelTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            hb_manifest = write_ads_hb_mlp_package(out_dir=root / "hb", **common)
+            hb_manifest = write_ads_hb_mlp_package(
+                out_dir=root / "hb",
+                emit_combined_sdd_trial=True,
+                **common,
+            )
             hb_text = (root / "hb" / "dynamic_dc.net").read_text()
             self.assertIn("_dc_g0=exp(", hb_text)
             self.assertRegex(hb_text, r"then dynamic_dc_m_dc_y0 else 0\.0")
             self.assertTrue(hb_manifest["dc_geometry_dependent"])
+            hb_trial_text = (
+                root / "hb" / "dynamic_dc_combined_sdd_trial.net"
+            ).read_text()
+            self.assertIn(
+                "SDD:dynamic_dc_combined_sdd_trial_core_combined",
+                hb_trial_text,
+            )
+            self.assertNotIn(
+                "SDD:dynamic_dc_combined_sdd_trial_core_dc",
+                hb_trial_text,
+            )
+            self.assertRegex(
+                hb_trial_text,
+                r"then dynamic_dc_combined_sdd_trial_m_dc_y0 else "
+                r"dynamic_dc_combined_sdd_trial_m_stoy_y_0_0",
+            )
 
             va_manifest = write_veriloga_package(
                 out_dir=root / "va",

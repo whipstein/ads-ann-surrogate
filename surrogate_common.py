@@ -4365,6 +4365,7 @@ def _append_ads_hb_sdd(
     response_domain: str,
     dc_conductance: np.ndarray | None = None,
     dc_conductance_names: Sequence[str] | None = None,
+    combine_dc_rf: bool = False,
 ) -> None:
     nports = len(port_ids)
     if len(response_names) != nports * nports:
@@ -4394,6 +4395,39 @@ def _append_ads_hb_sdd(
         raise ValueError("ADS HB dynamic DC conductance matrix has invalid dimensions")
     if dc_matrix is not None and dc_conductance_names is not None:
         raise ValueError("ADS HB DC stamping must use either static values or expressions")
+
+    if combine_dc_rf:
+        # Trial topology: use one explicit-current SDD and select its complete
+        # frequency weight between the exact-DC and fitted-RF admittances.  This
+        # is algebraically identical to summing the two mutually exclusive
+        # parallel SDDs below, but presents only one dense control/stamp graph to
+        # ADS.  Keep the established two-SDD implementation as the default until
+        # circuit-level timing and response equivalence have been verified.
+        combined_tokens = [f"SDD:{instance_name}_combined {nodes}"]
+        weight_index = 2
+        for row in range(nports):
+            port_number = row + 1
+            combined_tokens.append(f"I[{port_number},0]=0.0")
+            for col in range(nports):
+                control_number = col + 1
+                flat = row * nports + col
+                response_name = response_names[flat]
+                if dc_conductance_names is not None:
+                    conductance = str(dc_conductance_names[flat])
+                elif dc_matrix is not None:
+                    conductance = veriloga_float(float(dc_matrix[row, col]))
+                else:
+                    conductance = "0.0"
+                combined_tokens.append(
+                    f"I[{port_number},{weight_index}]=_v{control_number}"
+                )
+                combined_tokens.append(
+                    f"H[{weight_index}]=if (freq equals 0) then {conductance} "
+                    f"else {response_name} endif"
+                )
+                weight_index += 1
+        append_tokens(combined_tokens)
+        return
 
     # Explicit-current SDDs use ordinary nodal analysis and introduce no
     # branch-current unknowns. Keep RF and DC in separate parallel branches:
@@ -4648,6 +4682,9 @@ def _ads_hb_readme(
     parameter_scales: Sequence[float],
     parameter_instance_defaults: Sequence[float],
     response_domain: str,
+    instance_template_name: str = "ADS_HB_INSTANCE_TEMPLATE.txt",
+    readme_name: str = "ADS_HB_README.md",
+    combined_sdd: bool = False,
     extra_notes: Sequence[str] | None = None,
 ) -> str:
     parameter_rows = "\n".join(
@@ -4672,6 +4709,20 @@ def _ads_hb_readme(
     notes = "\n".join(f"- {note}" for note in (extra_notes or []))
     if notes:
         notes = f"\n## Notes\n\n{notes}\n"
+    if combined_sdd:
+        dc_rf_behavior = """The export contains one explicit-current SDD. Each
+frequency weight selects the separately extracted geometry-dependent DC
+admittance at `freq=0` and the fitted RF admittance at every non-zero spectral
+frequency. This is algebraically equivalent to the default package's two
+mutually exclusive parallel SDDs, but exposes only one dense SDD control/stamp
+graph to ADS for performance evaluation."""
+    else:
+        dc_rf_behavior = """The export contains two explicit-current SDD branches.
+At `freq=0`, the RF branch contributes exactly zero current and the DC branch
+directly stamps the separately extracted conductance matrix. For current models
+this matrix is evaluated from geometry only; legacy models use a fixed matrix.
+At every non-zero spectral frequency, the DC branch contributes exactly zero
+current and only the fitted RF surrogate is used."""
     return f"""# ADS Harmonic-Balance Passive Network
 
 This package contains a self-contained ADS Symbolically Defined Device (SDD)
@@ -4685,8 +4736,8 @@ power dependent.
 
 - `{netlist_name}`: self-contained ADS simulator subnetwork
 - `{manifest_name}`: model contract and generation metadata
-- `ADS_HB_INSTANCE_TEMPLATE.txt`: copyable two-instance native ADS call example
-- `ADS_HB_README.md`: this file
+- `{instance_template_name}`: copyable two-instance native ADS call example
+- `{readme_name}`: this file
 
 ## Use in ADS
 
@@ -4742,7 +4793,7 @@ and the `_A`/`_B` variables with values or top-level ADS `VAR` expressions:
 ```
 
 For a quick netlist-only hookup, label the corresponding top-level schematic
-nets, copy the calls from `ADS_HB_INSTANCE_TEMPLATE.txt` into a separate `.net`
+nets, copy the calls from `{instance_template_name}` into a separate `.net`
 fragment, and add that fragment to the same top-level `NetlistInclude` **after**
 `{netlist_name}`, for example as
 `IncludeFiles[2]="my_model_instances.net"`. This creates electrically connected
@@ -4790,13 +4841,7 @@ The exact sanitized parameter names, scales, and defaults are also recorded in
 
 ## DC and RF behavior
 
-The export contains two explicit-current SDD branches. At `freq=0`, the RF
-branch contributes exactly zero current and the DC branch directly stamps the
-separately extracted conductance matrix. For current models this matrix is
-evaluated from geometry only; legacy models use a fixed matrix. At every
-non-zero spectral frequency, the DC branch contributes exactly zero current and
-only the fitted RF surrogate is used. DC is never converted to S-parameters and
-never evaluated by the RF fit.
+{dc_rf_behavior} DC is never extrapolated from the RF fit.
 
 Negative frequencies use the complex conjugate of the surrogate at the
 matching positive frequency, preserving the conjugate symmetry required for
@@ -4861,6 +4906,9 @@ def write_ads_hb_mlp_package(
     source_model_dir: str | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
+    combined_sdd: bool = False,
+    emit_combined_sdd_trial: bool = False,
+    artifact_variant: str | None = None,
 ) -> dict[str, object]:
     """Write a self-contained, linear ADS SDD model for HB/AC/SP analyses."""
 
@@ -4871,6 +4919,10 @@ def write_ads_hb_mlp_package(
         raise ValueError("Direct-Y ADS HB export does not support KBNN coarse hooks")
     if not math.isfinite(z0) or z0 <= 0.0:
         raise ValueError("ADS HB reference impedance must be positive and finite")
+    if combined_sdd and emit_combined_sdd_trial:
+        raise ValueError(
+            "A combined-SDD package cannot recursively emit another combined-SDD trial"
+        )
     nports = infer_complete_sparameter_ports(sparam_labels)
     n_sparams = len(sparam_labels)
     matrix_size = nports * nports
@@ -5043,22 +5095,45 @@ def write_ads_hb_mlp_package(
         "y",
         dc_conductance=dc_matrix,
         dc_conductance_names=dc_matrix_names,
+        combine_dc_rf=combined_sdd,
     )
     lines.extend([f"end {module_id}", ""])
 
     out_dir.mkdir(parents=True, exist_ok=True)
     netlist_name = f"{module_id}.net"
-    manifest_name = "ads_hb_manifest.json"
+    artifact_token = (
+        _ads_hb_identifier(artifact_variant, "trial").lower()
+        if artifact_variant
+        else None
+    )
+    manifest_name = (
+        f"ads_hb_{artifact_token}_manifest.json"
+        if artifact_token
+        else "ads_hb_manifest.json"
+    )
+    readme_name = (
+        f"ADS_HB_{artifact_token.upper()}_README.md"
+        if artifact_token
+        else "ADS_HB_README.md"
+    )
     (out_dir / netlist_name).write_text("\n".join(lines))
-    instance_template_name = "ADS_HB_INSTANCE_TEMPLATE.txt"
+    instance_template_name = (
+        f"ADS_HB_{artifact_token.upper()}_INSTANCE_TEMPLATE.txt"
+        if artifact_token
+        else "ADS_HB_INSTANCE_TEMPLATE.txt"
+    )
     (out_dir / instance_template_name).write_text(
         _ads_hb_instance_template(module_id, netlist_name, nports, param_ids)
     )
     manifest: dict[str, object] = {
         "format": "ads_hb_sdd_linear_multiport",
+        "implementation_status": "trial" if artifact_token else "default",
+        "artifact_variant": artifact_token,
         "model_kind": model_kind,
         "module_name": module_id,
         "netlist_file": netlist_name,
+        "manifest_file": manifest_name,
+        "readme_file": readme_name,
         "nports": nports,
         "parameter_names": list(parameter_names),
         "parameter_identifiers": param_ids,
@@ -5122,7 +5197,17 @@ def write_ads_hb_mlp_package(
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_stamping_representation": (
-            "separate_full_ordered_complex_s_to_y_sdd"
+            "combined_full_ordered_complex_s_to_y_sdd"
+            if combined_sdd
+            and dc_model is not None
+            and dc_model.get("representation") == "full_s_matrix"
+            else "combined_full_ordered_y_sdd"
+            if combined_sdd
+            and dc_model is not None
+            and dc_model.get("representation") == "full_y_matrix"
+            else "combined_explicit_conductance_sdd"
+            if combined_sdd
+            else "separate_full_ordered_complex_s_to_y_sdd"
             if dc_model is not None
             and dc_model.get("representation") == "full_s_matrix"
             else "separate_full_ordered_y_sdd"
@@ -5130,16 +5215,31 @@ def write_ads_hb_mlp_package(
             and dc_model.get("representation") == "full_y_matrix"
             else "separate_explicit_conductance_sdd"
         ),
-        "rf_stamping_representation": "explicit_current_y_sdd",
+        "rf_stamping_representation": (
+            "combined_explicit_current_y_sdd"
+            if combined_sdd
+            else "explicit_current_y_sdd"
+        ),
+        "sdd_dc_rf_topology": (
+            "single_frequency_selected_sdd"
+            if combined_sdd
+            else "separate_parallel_sdds"
+        ),
         "rf_source_conversion": (
             "runtime_frequency_only_s_to_y" if response_domain == "s" else "none"
         ),
         "implicit_port_equations": False,
         "supported_analyses": ["DC", "AC", "SP", "HB"],
         "implementation_note": (
-            "Separate explicit-current SDD branches stamp the extracted DC conductance "
-            "and fitted RF admittance. S-output fits are converted to Y in frequency-only "
-            "equations before stamping; no implicit port-current unknowns are introduced."
+            "One explicit-current SDD selects the extracted DC admittance at zero "
+            "frequency and the fitted RF admittance otherwise. This trial is "
+            "algebraically equivalent to the separate branches while exposing one "
+            "dense SDD control/stamp graph."
+            if combined_sdd
+            else "Separate explicit-current SDD branches stamp the extracted DC "
+            "conductance and fitted RF admittance. S-output fits are converted to Y "
+            "in frequency-only equations before stamping; no implicit port-current "
+            "unknowns are introduced."
         ),
         "reference_note": (
             "Generated against Keysight's documented ADS SDD frequency-weighting and "
@@ -5148,8 +5248,75 @@ def write_ads_hb_mlp_package(
     }
     if extra_manifest:
         manifest.update(extra_manifest)
+    resolved_notes = list(extra_notes or [])
+    if emit_combined_sdd_trial:
+        trial_module_name = f"{module_id}_combined_sdd_trial"
+        trial_extra_manifest = dict(extra_manifest or {})
+        trial_extra_manifest.update(
+            {
+                "trial_parent_module_name": module_id,
+                "trial_purpose": (
+                    "Compare one frequency-selected DC/RF SDD against the default "
+                    "two mutually exclusive parallel SDDs"
+                ),
+            }
+        )
+        trial_manifest = write_ads_hb_mlp_package(
+            out_dir=out_dir,
+            model_kind=model_kind,
+            module_name=trial_module_name,
+            parameter_names=parameter_names,
+            sparam_labels=sparam_labels,
+            freq_transform=freq_transform,
+            activation=activation,
+            layer_sizes=layer_sizes,
+            weights=weights,
+            biases=biases,
+            x_mean=x_mean,
+            x_std=x_std,
+            y_mean=y_mean,
+            y_std=y_std,
+            z0=z0,
+            parameter_input_scales=parameter_input_scales,
+            output_domain=output_domain,
+            uses_coarse_inputs=uses_coarse_inputs,
+            adds_coarse_to_output=adds_coarse_to_output,
+            embedded_coarse_model=embedded_coarse_model,
+            dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
+            dc_resistance_source_kind=dc_resistance_source_kind,
+            dc_port_resistances_ohm=dc_port_resistances_ohm,
+            dc_model=dc_model,
+            source_model_dir=source_model_dir,
+            extra_manifest=trial_extra_manifest,
+            extra_notes=[
+                *resolved_notes,
+                "Trial implementation: one SDD selects exact DC or fitted RF in each frequency weight.",
+                f"The unchanged default implementation remains `{netlist_name}` with module `{module_id}`.",
+            ],
+            combined_sdd=True,
+            emit_combined_sdd_trial=False,
+            artifact_variant="combined_sdd_trial",
+        )
+        trial_export = {
+            "kind": "combined_dc_rf_sdd",
+            "status": "trial",
+            "module_name": trial_manifest["module_name"],
+            "netlist_file": trial_manifest["netlist_file"],
+            "manifest_file": trial_manifest["manifest_file"],
+            "readme_file": trial_manifest["readme_file"],
+            "instance_template_file": trial_manifest["instance_template_file"],
+            "sdd_dc_rf_topology": trial_manifest["sdd_dc_rf_topology"],
+        }
+        manifest["trial_exports"] = [trial_export]
+        resolved_notes.extend(
+            [
+                "The default two-SDD implementation in this package is unchanged.",
+                f"A comparison trial is also exported as `{trial_export['netlist_file']}` with module `{trial_export['module_name']}`.",
+                f"Use `{trial_export['instance_template_file']}` and `{trial_export['readme_file']}` for the trial; benchmark the default and trial as separate instances.",
+            ]
+        )
     (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
-    (out_dir / "ADS_HB_README.md").write_text(
+    (out_dir / readme_name).write_text(
         _ads_hb_readme(
             model_kind=model_kind,
             module_name=module_id,
@@ -5162,7 +5329,10 @@ def write_ads_hb_mlp_package(
             parameter_scales=param_scales,
             parameter_instance_defaults=param_defaults,
             response_domain=response_domain,
-            extra_notes=extra_notes,
+            instance_template_name=instance_template_name,
+            readme_name=readme_name,
+            combined_sdd=combined_sdd,
+            extra_notes=resolved_notes,
         )
     )
     return manifest

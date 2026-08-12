@@ -1299,6 +1299,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
             "The fitted RF response is evaluated at each HB spectral frequency.",
             "The passive network has no input-power parameter and introduces no compression.",
         ],
+        emit_combined_sdd_trial=True,
     )
     print(
         json.dumps(
@@ -1310,6 +1311,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "linear": manifest["linear"],
                 "power_dependent": manifest["power_dependent"],
                 "supported_analyses": manifest["supported_analyses"],
+                "trial_exports": manifest.get("trial_exports", []),
                 "dc_matrix_entries": manifest.get("dc_matrix_entries"),
                 "dc_sparameter_entries": manifest.get("dc_sparameter_entries"),
                 "dc_model_kind": manifest.get("dc_model_kind"),

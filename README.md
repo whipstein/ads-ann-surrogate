@@ -670,6 +670,14 @@ the RF branch is open at DC and the DC branch is open at every RF frequency.
 This avoids the additional modified-nodal branch unknowns created by the former
 implicit S-wave implementation.
 
+DNN `export-ads-hb` also writes an automatic comparison trial while the default
+implementation remains unchanged. The trial uses one explicit-current SDD whose
+frequency weights select exact DC or fitted RF, instead of two mutually
+exclusive parallel SDDs. It reuses the same trained DNN, exact-DC model,
+parameter defaults, and S-to-Y equations, so the only intended difference is
+the SDD stamp topology. The default manifest lists the trial files under
+`trial_exports`.
+
 ### Reusing an ADS HB model at multiple parameter values
 
 The exported `.net` file contains one native ADS subnetwork definition. Load
@@ -1165,9 +1173,9 @@ python3 dnn.py export-ads-hb \
   --z0 50
 ```
 
-The package contains `<module>.net`, `ads_hb_manifest.json`,
-`ADS_HB_INSTANCE_TEMPLATE.txt`, and `ADS_HB_README.md`. Include the netlist
-with an ADS `NetlistInclude`, then
+The default package contains `<module>.net`, `ads_hb_manifest.json`,
+`ADS_HB_INSTANCE_TEMPLATE.txt`, and `ADS_HB_README.md`. Include the netlist with
+an ADS `NetlistInclude`, then
 instantiate `<module>:X1` with the electrical nodes and geometry parameters.
 ADS applies the embedded matrix independently to the fundamental, harmonics,
 and mixing products requested by the HB controller. The model is linear and
@@ -1175,6 +1183,21 @@ power independent. Direct-Y DNNs use
 $\mathbf I=\mathbf Y(f)\mathbf V$ immediately; S-output DNNs are
 converted to Y in frequency-only equations and use the same explicit current
 stamp. DC is stamped separately from the fitted RF response.
+
+The same command additionally writes these trial artifacts:
+
+- `<module>_combined_sdd_trial.net`
+- `ads_hb_combined_sdd_trial_manifest.json`
+- `ADS_HB_COMBINED_SDD_TRIAL_INSTANCE_TEMPLATE.txt`
+- `ADS_HB_COMBINED_SDD_TRIAL_README.md`
+
+The trial module is named `<module>_combined_sdd_trial`. The default uses two
+parallel SDDs whose DC and RF weights are mutually exclusive; the trial uses one
+SDD with a DC-or-RF selection in each frequency weight. Because the module names
+are distinct, both definitions may be included in one workspace. For a fair
+timing comparison, run otherwise identical simulations with only the default or
+only the trial instance active. Compare DC, S-parameters, HB fundamental power,
+convergence behavior, and elapsed simulation time before promoting the trial.
 
 ### Direct Verilog-A Export
 

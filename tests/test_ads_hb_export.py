@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,15 @@ class AdsHbExportTests(unittest.TestCase):
         self.assertIn("if (freq equals 0) then 0.0 else", netlist)
         self.assertIn("if (freq equals 0) then 1.00000000000000002e-02", netlist)
         self.assertIn("if (freq equals 0) then -1.00000000000000002e-02", netlist)
+
+    def _assert_combined_stamp(self, netlist: str, module_name: str) -> None:
+        self.assertNotIn("F[", netlist)
+        self.assertIn("I[1,0]=0.0", netlist)
+        self.assertIn(f"SDD:{module_name}_core_combined", netlist)
+        self.assertNotIn(f"SDD:{module_name}_core_rf", netlist)
+        self.assertNotIn(f"SDD:{module_name}_core_dc", netlist)
+        self.assertIn("if (freq equals 0) then 1.00000000000000002e-02 else", netlist)
+        self.assertIn("if (freq equals 0) then -1.00000000000000002e-02 else", netlist)
 
     def test_mlp_s_and_y_exports_use_explicit_y_stamps(self) -> None:
         common = dict(
@@ -58,6 +68,74 @@ class AdsHbExportTests(unittest.TestCase):
                     manifest["dc_stamping_representation"],
                     "separate_explicit_conductance_sdd",
                 )
+
+    def test_mlp_export_can_emit_combined_sdd_as_separate_trial(self) -> None:
+        common = dict(
+            parameter_names=["W"],
+            sparam_labels=LABELS,
+            freq_transform="log",
+            activation="tanh",
+            layer_sizes=[2, 8],
+            weights=[np.zeros((2, 8))],
+            biases=[np.zeros(8)],
+            x_mean=np.array([1.0, 9.0]),
+            x_std=np.ones(2),
+            y_mean=np.zeros(8),
+            y_std=np.ones(8),
+            z0=50.0,
+            dc_equivalent_resistance_ohm=100.0,
+            dc_resistance_source_kind="exact_zero_frequency",
+            dc_port_resistances_ohm={"p1-p2": 100.0},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            module_name = "test_dnn"
+            manifest = write_ads_hb_mlp_package(
+                out_dir=out_dir,
+                model_kind="DNN",
+                module_name=module_name,
+                output_domain="s",
+                emit_combined_sdd_trial=True,
+                **common,
+            )
+
+            default_netlist = (out_dir / f"{module_name}.net").read_text()
+            self._assert_explicit_separate_stamps(default_netlist, module_name)
+            self.assertEqual(default_netlist.count("H["), 2 * len(LABELS))
+
+            trial_module = f"{module_name}_combined_sdd_trial"
+            trial_netlist_name = f"{trial_module}.net"
+            trial_netlist = (out_dir / trial_netlist_name).read_text()
+            self._assert_combined_stamp(trial_netlist, trial_module)
+            self.assertEqual(trial_netlist.count(f"SDD:{trial_module}_core"), 1)
+            self.assertEqual(trial_netlist.count("H["), len(LABELS))
+
+            trial_exports = manifest["trial_exports"]
+            self.assertEqual(len(trial_exports), 1)
+            self.assertEqual(trial_exports[0]["netlist_file"], trial_netlist_name)
+            self.assertEqual(trial_exports[0]["status"], "trial")
+            self.assertEqual(
+                trial_exports[0]["sdd_dc_rf_topology"],
+                "single_frequency_selected_sdd",
+            )
+
+            trial_manifest_path = out_dir / "ads_hb_combined_sdd_trial_manifest.json"
+            trial_manifest = json.loads(trial_manifest_path.read_text())
+            self.assertEqual(trial_manifest["implementation_status"], "trial")
+            self.assertEqual(
+                trial_manifest["sdd_dc_rf_topology"],
+                "single_frequency_selected_sdd",
+            )
+            self.assertEqual(
+                trial_manifest["dc_stamping_representation"],
+                "combined_explicit_conductance_sdd",
+            )
+            self.assertTrue(
+                (out_dir / "ADS_HB_COMBINED_SDD_TRIAL_INSTANCE_TEMPLATE.txt").is_file()
+            )
+            self.assertTrue(
+                (out_dir / "ADS_HB_COMBINED_SDD_TRIAL_README.md").is_file()
+            )
 
     def test_neurotf_export_uses_the_same_explicit_stamps(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
