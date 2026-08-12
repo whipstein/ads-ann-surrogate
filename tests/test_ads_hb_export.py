@@ -289,6 +289,109 @@ class AdsHbExportTests(unittest.TestCase):
                 (out_dir / "ADS_HB_FOLDED_SCALERS_TRIAL_README.md").is_file()
             )
 
+    def test_mlp_export_can_eliminate_constant_outputs_as_separate_trial(self) -> None:
+        rng = np.random.default_rng(23)
+        dc_model = {
+            "parameter_names": ["W"],
+            "sparam_labels": LABELS,
+            "representation": "full_s_matrix",
+            "port_paths": [],
+            "z0": 50.0,
+            "activation": "tanh",
+            "layer_sizes": [1, 3, 8],
+            "weights": [rng.normal(size=(1, 3)), rng.normal(size=(3, 8))],
+            "biases": [rng.normal(size=3), rng.normal(size=8)],
+            "x_mean": np.array([1.25]),
+            "x_std": np.array([0.4]),
+            "y_mean": np.array([0.2, 0.8, 0.8, 0.2, 0.0, 0.0, 0.0, 0.0]),
+            "y_std": np.zeros(8),
+        }
+        rf_y_std = np.ones(8)
+        rf_y_std[0] = 0.0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            module_name = "test_dnn"
+            manifest = write_ads_hb_mlp_package(
+                out_dir=out_dir,
+                model_kind="DNN",
+                module_name=module_name,
+                parameter_names=["W"],
+                sparam_labels=LABELS,
+                freq_transform="log",
+                activation="tanh",
+                layer_sizes=[2, 4, 8],
+                weights=[rng.normal(size=(2, 4)), rng.normal(size=(4, 8))],
+                biases=[rng.normal(size=4), rng.normal(size=8)],
+                x_mean=np.array([1.25, 9.0]),
+                x_std=np.array([0.4, 1.5]),
+                y_mean=np.linspace(-0.4, 0.3, 8),
+                y_std=rf_y_std,
+                z0=50.0,
+                output_domain="s",
+                dc_equivalent_resistance_ohm=100.0,
+                dc_resistance_source_kind="exact_zero_frequency",
+                dc_model=dc_model,
+                emit_constant_outputs_trial=True,
+            )
+
+            default_netlist = (out_dir / f"{module_name}.net").read_text()
+            self.assertIn(f"{module_name}_m_fine_l2_0=", default_netlist)
+            self.assertIn(f"{module_name}_m_fine_out0=", default_netlist)
+            self.assertIn(f"{module_name}_m_dc_net_x0=", default_netlist)
+            self.assertIn(f"{module_name}_m_dc_stoy_a0_0_0=", default_netlist)
+
+            trial_module = f"{module_name}_constant_outputs_trial"
+            trial_netlist = (out_dir / f"{trial_module}.net").read_text()
+            self.assertNotIn(f"{trial_module}_m_fine_l2_0=", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_fine_out0=", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_dc_net_", trial_netlist)
+            self.assertNotIn(f"{trial_module}_m_dc_stoy_", trial_netlist)
+            self.assertIn("Entire exact-DC MLP is constant", trial_netlist)
+            self.assertIn(f"SDD:{trial_module}_core_rf", trial_netlist)
+            self.assertIn(f"SDD:{trial_module}_core_dc", trial_netlist)
+            self.assertEqual(default_netlist.count("H["), trial_netlist.count("H["))
+
+            trial_exports = manifest["trial_exports"]
+            self.assertEqual(len(trial_exports), 1)
+            self.assertEqual(
+                trial_exports[0]["kind"],
+                "eliminated_constant_outputs",
+            )
+            self.assertTrue(trial_exports[0]["dc_constant_matrix_precomputed"])
+
+            trial_manifest = json.loads(
+                (out_dir / "ads_hb_constant_outputs_trial_manifest.json").read_text()
+            )
+            self.assertTrue(trial_manifest["constant_output_elimination"])
+            self.assertTrue(trial_manifest["dc_constant_matrix_precomputed"])
+            self.assertEqual(
+                trial_manifest["dc_stamping_representation"],
+                "separate_precomputed_constant_y_sdd",
+            )
+            self.assertEqual(
+                trial_manifest["constant_output_summary"]["rf"][
+                    "constant_output_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                trial_manifest["constant_output_summary"]["dc"][
+                    "constant_output_count"
+                ],
+                8,
+            )
+            self.assertTrue(
+                trial_manifest["constant_output_summary"]["dc"][
+                    "entire_mlp_constant"
+                ]
+            )
+            self.assertTrue(
+                (out_dir / "ADS_HB_CONSTANT_OUTPUTS_TRIAL_INSTANCE_TEMPLATE.txt").is_file()
+            )
+            self.assertTrue(
+                (out_dir / "ADS_HB_CONSTANT_OUTPUTS_TRIAL_README.md").is_file()
+            )
+
     def test_neurotf_export_uses_the_same_explicit_stamps(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir)

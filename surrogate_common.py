@@ -4266,6 +4266,7 @@ def _append_ads_hb_mlp_equations(
     y_mean: np.ndarray,
     y_std: np.ndarray,
     fold_scalers: bool = False,
+    eliminate_constant_outputs: bool = False,
 ) -> list[str]:
     """Append shared ADS equations and return physical-output expression names."""
 
@@ -4290,6 +4291,11 @@ def _append_ads_hb_mlp_equations(
         raise ValueError("ADS HB MLP output scaler dimensions are inconsistent")
     if np.any(x_std_array == 0.0):
         raise ValueError("ADS HB MLP input scaler standard deviations must be non-zero")
+    constant_output_mask = (
+        y_std_array == 0.0
+        if eliminate_constant_outputs
+        else np.zeros(sizes[-1], dtype=bool)
+    )
 
     for layer_idx, (weight, bias) in enumerate(zip(numeric_weights, numeric_biases)):
         expected = (sizes[layer_idx], sizes[layer_idx + 1])
@@ -4309,6 +4315,9 @@ def _append_ads_hb_mlp_equations(
             y_std_array,
         )
 
+    if bool(np.all(constant_output_mask)):
+        return [veriloga_float(float(value)) for value in y_mean_array]
+
     if fold_scalers:
         source_names = list(feature_expressions)
     else:
@@ -4325,6 +4334,12 @@ def _append_ads_hb_mlp_equations(
         dest_names: list[str] = []
         hidden_activation = activation if layer_idx < len(numeric_weights) - 1 else None
         for out_idx in range(sizes[layer_idx + 1]):
+            if (
+                layer_idx == len(numeric_weights) - 1
+                and bool(constant_output_mask[out_idx])
+            ):
+                dest_names.append(veriloga_float(float(y_mean_array[out_idx])))
+                continue
             dest = f"{prefix}_l{layer_idx + 1}_{out_idx}"
             expression = _ads_hb_weighted_sum(
                 float(bias[out_idx]),
@@ -4340,6 +4355,9 @@ def _append_ads_hb_mlp_equations(
 
     outputs: list[str] = []
     for idx, source in enumerate(source_names):
+        if bool(constant_output_mask[idx]):
+            outputs.append(source)
+            continue
         name = f"{prefix}_out{idx}"
         lines.append(
             f"{name}=({source})*({veriloga_float(float(y_std_array[idx]))})+"
@@ -4530,6 +4548,7 @@ def _append_ads_hb_dc_conductance_model(
     parameter_features: Sequence[str],
     dc_model: dict[str, object],
     fold_scalers: bool = False,
+    eliminate_constant_outputs: bool = False,
 ) -> list[str]:
     """Append a geometry-only DC MLP and return row-major Y expressions."""
 
@@ -4544,6 +4563,50 @@ def _append_ads_hb_dc_conductance_model(
         if representation in {"full_s_matrix", "full_y_matrix"}
         else parse_dc_port_paths(dc_model["port_paths"], nports)
     )
+    dc_y_mean = np.asarray(dc_model["y_mean"], dtype=float)
+    dc_y_std = np.asarray(dc_model["y_std"], dtype=float)
+    if eliminate_constant_outputs and bool(np.all(dc_y_std == 0.0)):
+        lines.append(
+            "; Entire exact-DC MLP is constant; its physical Y matrix was "
+            "precomputed at export"
+        )
+        if representation == "full_s_matrix":
+            matrix_size = nports * nports
+            if dc_y_mean.shape != (2 * matrix_size,):
+                raise ValueError("Full-S DC model output count is not complex N-port S")
+            dc_s_matrix = (
+                dc_y_mean[:matrix_size] + 1j * dc_y_mean[matrix_size:]
+            ).reshape(nports, nports)
+            dc_y_matrix = _s_matrix_to_y_matrix(
+                dc_s_matrix,
+                float(dc_model["z0"]),
+            )
+            return [
+                f"complex({veriloga_float(float(value.real))},"
+                f"{veriloga_float(float(value.imag))})"
+                for value in dc_y_matrix.reshape(-1)
+            ]
+        if representation == "full_y_matrix":
+            if dc_y_mean.shape != (nports * nports,):
+                raise ValueError("Full-matrix DC model output count is not N-port Y")
+            return [veriloga_float(float(value)) for value in dc_y_mean]
+        if dc_y_mean.shape != (len(paths),):
+            raise ValueError("DC model output count does not match selected path count")
+        dc_conductances = np.exp(
+            np.clip(
+                dc_y_mean,
+                float(dc_model["log_conductance_min"]),
+                float(dc_model["log_conductance_max"]),
+            )
+        )
+        dc_y_matrix = _dc_matrix_from_path_conductances(
+            nports,
+            paths,
+            dc_conductances,
+        )
+        return [
+            veriloga_float(float(value)) for value in dc_y_matrix.reshape(-1)
+        ]
     outputs = _append_ads_hb_mlp_equations(
         lines,
         f"{prefix}_net",
@@ -4557,6 +4620,7 @@ def _append_ads_hb_dc_conductance_model(
         np.asarray(dc_model["y_mean"], dtype=float),
         np.asarray(dc_model["y_std"], dtype=float),
         fold_scalers=fold_scalers,
+        eliminate_constant_outputs=eliminate_constant_outputs,
     )
     if representation == "full_s_matrix":
         matrix_size = nports * nports
@@ -4735,6 +4799,7 @@ def _ads_hb_readme(
     readme_name: str = "ADS_HB_README.md",
     combined_sdd: bool = False,
     fold_mlp_scalers: bool = False,
+    eliminate_constant_outputs: bool = False,
     extra_notes: Sequence[str] | None = None,
 ) -> str:
     parameter_rows = "\n".join(
@@ -4782,6 +4847,17 @@ current and only the fitted RF surrogate is used."""
         if fold_mlp_scalers
         else "The package emits the trained MLP input standardization and output "
         "inverse-standardization as explicit ADS equations."
+    )
+    constant_output_behavior = (
+        "The trial replaces every MLP output whose saved inverse-standardizer "
+        "scale is exactly zero with its stored physical mean. Its final-neuron and "
+        "output-scaling equations are omitted. If every output of the exact-DC "
+        "MLP is constant, the complete DC MLP and DC S-to-Y conversion are replaced "
+        "by the export-time Y matrix. This is exact because the saved model already "
+        "defines those outputs as geometry independent."
+        if eliminate_constant_outputs
+        else "The package retains the trained equation graph for constant and "
+        "geometry-dependent outputs alike."
     )
     return f"""# ADS Harmonic-Balance Passive Network
 
@@ -4907,6 +4983,10 @@ The exact sanitized parameter names, scales, and defaults are also recorded in
 
 {scaler_behavior}
 
+## Constant-output implementation
+
+{constant_output_behavior}
+
 Negative frequencies use the complex conjugate of the surrogate at the
 matching positive frequency, preserving the conjugate symmetry required for
 real voltage and current waveforms. The selection occurs only in SDD frequency
@@ -4972,8 +5052,10 @@ def write_ads_hb_mlp_package(
     extra_notes: Sequence[str] | None = None,
     combined_sdd: bool = False,
     fold_mlp_scalers: bool = False,
+    eliminate_constant_outputs: bool = False,
     emit_combined_sdd_trial: bool = False,
     emit_folded_scalers_trial: bool = False,
+    emit_constant_outputs_trial: bool = False,
     artifact_variant: str | None = None,
 ) -> dict[str, object]:
     """Write a self-contained, linear ADS SDD model for HB/AC/SP analyses."""
@@ -4985,8 +5067,10 @@ def write_ads_hb_mlp_package(
         raise ValueError("Direct-Y ADS HB export does not support KBNN coarse hooks")
     if not math.isfinite(z0) or z0 <= 0.0:
         raise ValueError("ADS HB reference impedance must be positive and finite")
-    if (combined_sdd or fold_mlp_scalers) and (
-        emit_combined_sdd_trial or emit_folded_scalers_trial
+    if (combined_sdd or fold_mlp_scalers or eliminate_constant_outputs) and (
+        emit_combined_sdd_trial
+        or emit_folded_scalers_trial
+        or emit_constant_outputs_trial
     ):
         raise ValueError(
             "A trial package cannot recursively emit additional ADS HB trials"
@@ -5072,6 +5156,7 @@ def write_ads_hb_mlp_package(
             np.asarray(embedded_coarse_model["y_mean"], dtype=float),
             np.asarray(embedded_coarse_model["y_std"], dtype=float),
             fold_scalers=fold_mlp_scalers,
+            eliminate_constant_outputs=eliminate_constant_outputs,
         )
         lines.append("")
     elif uses_coarse_inputs or adds_coarse_to_output:
@@ -5096,6 +5181,7 @@ def write_ads_hb_mlp_package(
         np.asarray(y_mean, dtype=float),
         np.asarray(y_std, dtype=float),
         fold_scalers=fold_mlp_scalers,
+        eliminate_constant_outputs=eliminate_constant_outputs,
     )
     lines.append("")
     if len(primary_outputs) != 2 * n_sparams:
@@ -5129,6 +5215,7 @@ def write_ads_hb_mlp_package(
             parameter_features,
             dc_model,
             fold_scalers=fold_mlp_scalers,
+            eliminate_constant_outputs=eliminate_constant_outputs,
         )
     else:
         dc_matrix = dc_conductance_matrix(
@@ -5196,6 +5283,38 @@ def write_ads_hb_mlp_package(
     (out_dir / instance_template_name).write_text(
         _ads_hb_instance_template(module_id, netlist_name, nports, param_ids)
     )
+
+    def constant_output_summary(values: object) -> dict[str, object]:
+        scales = np.asarray(values, dtype=float).reshape(-1)
+        constant_count = int(np.count_nonzero(scales == 0.0))
+        return {
+            "output_count": int(scales.size),
+            "constant_output_count": constant_count,
+            "entire_mlp_constant": bool(scales.size > 0 and constant_count == scales.size),
+            "eliminated_in_this_package": bool(
+                eliminate_constant_outputs and constant_count > 0
+            ),
+        }
+
+    constant_outputs: dict[str, object] = {
+        "rf": constant_output_summary(y_std),
+        "embedded_coarse": (
+            constant_output_summary(embedded_coarse_model["y_std"])
+            if embedded_coarse_model is not None
+            else None
+        ),
+        "dc": (
+            constant_output_summary(dc_model["y_std"])
+            if dc_model is not None
+            else None
+        ),
+    }
+    dc_constant_summary = constant_outputs["dc"]
+    dc_matrix_precomputed = bool(
+        eliminate_constant_outputs
+        and isinstance(dc_constant_summary, dict)
+        and dc_constant_summary["entire_mlp_constant"]
+    )
     manifest: dict[str, object] = {
         "format": "ads_hb_sdd_linear_multiport",
         "implementation_status": "trial" if artifact_token else "default",
@@ -5235,6 +5354,9 @@ def write_ads_hb_mlp_package(
             if fold_mlp_scalers
             else "explicit_input_and_output_equations"
         ),
+        "constant_output_elimination": bool(eliminate_constant_outputs),
+        "constant_output_summary": constant_outputs,
+        "dc_constant_matrix_precomputed": dc_matrix_precomputed,
         "linear": True,
         "power_dependent": False,
         "passivity_enforced_by_export": False,
@@ -5275,7 +5397,11 @@ def write_ads_hb_mlp_package(
         ),
         "dc_is_separate_from_fitted_response": True,
         "dc_stamping_representation": (
-            "combined_full_ordered_complex_s_to_y_sdd"
+            "combined_precomputed_constant_y_sdd"
+            if combined_sdd and dc_matrix_precomputed
+            else "separate_precomputed_constant_y_sdd"
+            if dc_matrix_precomputed
+            else "combined_full_ordered_complex_s_to_y_sdd"
             if combined_sdd
             and dc_model is not None
             and dc_model.get("representation") == "full_s_matrix"
@@ -5319,6 +5445,11 @@ def write_ads_hb_mlp_package(
             "folded into its first and final affine layers. This trial is "
             "algebraically equivalent to the explicit scaler equations."
             if fold_mlp_scalers
+            else "The default separate DC/RF SDD topology and explicit scaler "
+            "equations are retained while outputs with exactly zero saved scale "
+            "are emitted as their stored constants. An entirely constant exact-DC "
+            "network is precomputed as a fixed Y matrix."
+            if eliminate_constant_outputs
             else "Separate explicit-current SDD branches stamp the extracted DC "
             "conductance and fitted RF admittance. S-output fits are converted to Y "
             "in frequency-only equations before stamping; no implicit port-current "
@@ -5379,8 +5510,10 @@ def write_ads_hb_mlp_package(
             ],
             combined_sdd=True,
             fold_mlp_scalers=False,
+            eliminate_constant_outputs=False,
             emit_combined_sdd_trial=False,
             emit_folded_scalers_trial=False,
+            emit_constant_outputs_trial=False,
             artifact_variant="combined_sdd_trial",
         )
         trial_export = {
@@ -5447,8 +5580,10 @@ def write_ads_hb_mlp_package(
             ],
             combined_sdd=False,
             fold_mlp_scalers=True,
+            eliminate_constant_outputs=False,
             emit_combined_sdd_trial=False,
             emit_folded_scalers_trial=False,
+            emit_constant_outputs_trial=False,
             artifact_variant="folded_scalers_trial",
         )
         trial_export = {
@@ -5472,6 +5607,81 @@ def write_ads_hb_mlp_package(
                 f"Use `{trial_export['instance_template_file']}` and `{trial_export['readme_file']}` for the trial; benchmark it independently from other trial implementations.",
             ]
         )
+    if emit_constant_outputs_trial:
+        trial_module_name = f"{module_id}_constant_outputs_trial"
+        trial_extra_manifest = dict(extra_manifest or {})
+        trial_extra_manifest.update(
+            {
+                "trial_parent_module_name": module_id,
+                "trial_purpose": (
+                    "Compare exact elimination of saved constant MLP outputs and "
+                    "an entirely constant DC model against the default equation graph"
+                ),
+            }
+        )
+        trial_manifest = write_ads_hb_mlp_package(
+            out_dir=out_dir,
+            model_kind=model_kind,
+            module_name=trial_module_name,
+            parameter_names=parameter_names,
+            sparam_labels=sparam_labels,
+            freq_transform=freq_transform,
+            activation=activation,
+            layer_sizes=layer_sizes,
+            weights=weights,
+            biases=biases,
+            x_mean=x_mean,
+            x_std=x_std,
+            y_mean=y_mean,
+            y_std=y_std,
+            z0=z0,
+            parameter_input_scales=parameter_input_scales,
+            output_domain=output_domain,
+            uses_coarse_inputs=uses_coarse_inputs,
+            adds_coarse_to_output=adds_coarse_to_output,
+            embedded_coarse_model=embedded_coarse_model,
+            dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
+            dc_resistance_source_kind=dc_resistance_source_kind,
+            dc_port_resistances_ohm=dc_port_resistances_ohm,
+            dc_model=dc_model,
+            source_model_dir=source_model_dir,
+            extra_manifest=trial_extra_manifest,
+            extra_notes=[
+                *resolved_notes,
+                "Trial implementation: exactly constant MLP outputs are replaced by their stored physical means.",
+                "If every exact-DC output is constant, its complete MLP and S-to-Y graph are precomputed away.",
+                f"The unchanged default implementation remains `{netlist_name}` with module `{module_id}`.",
+            ],
+            combined_sdd=False,
+            fold_mlp_scalers=False,
+            eliminate_constant_outputs=True,
+            emit_combined_sdd_trial=False,
+            emit_folded_scalers_trial=False,
+            emit_constant_outputs_trial=False,
+            artifact_variant="constant_outputs_trial",
+        )
+        trial_export = {
+            "kind": "eliminated_constant_outputs",
+            "status": "trial",
+            "module_name": trial_manifest["module_name"],
+            "netlist_file": trial_manifest["netlist_file"],
+            "manifest_file": trial_manifest["manifest_file"],
+            "readme_file": trial_manifest["readme_file"],
+            "instance_template_file": trial_manifest["instance_template_file"],
+            "sdd_dc_rf_topology": trial_manifest["sdd_dc_rf_topology"],
+            "constant_output_summary": trial_manifest["constant_output_summary"],
+            "dc_constant_matrix_precomputed": trial_manifest[
+                "dc_constant_matrix_precomputed"
+            ],
+        }
+        trial_exports.append(trial_export)
+        resolved_notes.extend(
+            [
+                "The default two-SDD topology, neural scalers, and nonconstant equations remain unchanged.",
+                f"The active constant-output comparison trial is `{trial_export['netlist_file']}` with module `{trial_export['module_name']}`.",
+                f"Use `{trial_export['instance_template_file']}` and `{trial_export['readme_file']}` for the trial; benchmark it independently from earlier trials.",
+            ]
+        )
     if trial_exports:
         manifest["trial_exports"] = trial_exports
     (out_dir / manifest_name).write_text(json.dumps(manifest, indent=2))
@@ -5492,6 +5702,7 @@ def write_ads_hb_mlp_package(
             readme_name=readme_name,
             combined_sdd=combined_sdd,
             fold_mlp_scalers=fold_mlp_scalers,
+            eliminate_constant_outputs=eliminate_constant_outputs,
             extra_notes=resolved_notes,
         )
     )
