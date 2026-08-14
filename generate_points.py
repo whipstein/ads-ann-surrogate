@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Generate geometry/process sample points for surrogate-model extraction.
+"""Generate and adapt geometry/process points for surrogate-model extraction.
 
 The default method is a maximin Latin hypercube because finite EM sample sets
 usually benefit from stratification plus good point separation. Sobol is also
-available when SciPy is installed.
+available when SciPy is installed. After a fit, GP-UCB acquisition can use a
+Matérn-5/2 posterior over geometry-level model error to select the next EM
+batch while retaining the original error-distance selector as an alternative.
 """
 
 from __future__ import annotations
@@ -86,6 +88,21 @@ class SuggestedPoint:
     nearest_error_source_index: str
     nearest_error_score: float
     nearest_error_distance: float
+    predicted_error: float | None = None
+    gp_log_uncertainty: float | None = None
+    gp_upper_confidence_error: float | None = None
+
+
+@dataclass
+class GaussianProcessModel:
+    observation_points: list[list[float]]
+    log_error_mean: float
+    log_error_scale: float
+    length_scale: float
+    noise_variance: float
+    cholesky: list[list[float]]
+    alpha: list[float]
+    log_marginal_likelihood: float
 
 
 def split_value_token(token: object) -> tuple[float, str]:
@@ -386,7 +403,10 @@ def latin_hypercube_points(count: int, dimensions: int, rng: random.Random) -> l
     return points
 
 
-def min_pairwise_distance(points: Sequence[Sequence[float]]) -> float:
+def min_pairwise_distance(
+    points: Sequence[Sequence[float]],
+    abandon_at_or_below: float | None = None,
+) -> float:
     if len(points) < 2:
         return float("inf")
     best = float("inf")
@@ -395,6 +415,11 @@ def min_pairwise_distance(points: Sequence[Sequence[float]]) -> float:
             distance2 = sum((float(a) - float(b)) ** 2 for a, b in zip(lhs, rhs))
             if distance2 < best:
                 best = distance2
+                if (
+                    abandon_at_or_below is not None
+                    and math.sqrt(best) <= abandon_at_or_below
+                ):
+                    return math.sqrt(best)
     return math.sqrt(best)
 
 
@@ -408,7 +433,10 @@ def maximin_lhs_points(
     best_score = -1.0
     for _ in range(max(1, candidates)):
         trial = latin_hypercube_points(count, dimensions, rng)
-        score = min_pairwise_distance(trial)
+        score = min_pairwise_distance(
+            trial,
+            abandon_at_or_below=best_score if best_score >= 0.0 else None,
+        )
         if score > best_score:
             best_score = score
             best_points = trial
@@ -491,6 +519,8 @@ def generate_unit_points(
     scramble: bool,
     skip: int,
 ) -> list[list[float]]:
+    if method == "minimax-lhs":
+        method = "maximin-lhs"
     rng = random.Random(seed)
     if method == "latin-hypercube":
         return latin_hypercube_points(count, dimensions, rng)
@@ -1173,6 +1203,275 @@ def candidate_focus(
     return total, best_region, best_distance
 
 
+def _matern52_kernel(
+    lhs: Sequence[float],
+    rhs: Sequence[float],
+    length_scale: float,
+) -> float:
+    distance2 = sum(
+        ((float(a) - float(b)) / length_scale) ** 2
+        for a, b in zip(lhs, rhs)
+    )
+    if distance2 <= 0.0:
+        return 1.0
+    distance = math.sqrt(distance2)
+    root_five_distance = math.sqrt(5.0) * distance
+    return (
+        1.0 + root_five_distance + (5.0 / 3.0) * distance2
+    ) * math.exp(-root_five_distance)
+
+
+def _cholesky_factor(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
+    size = len(matrix)
+    factor = [[0.0] * size for _ in range(size)]
+    for row in range(size):
+        for col in range(row + 1):
+            value = float(matrix[row][col]) - sum(
+                factor[row][idx] * factor[col][idx] for idx in range(col)
+            )
+            if row == col:
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError("Gaussian-process covariance is not positive definite")
+                factor[row][col] = math.sqrt(value)
+            else:
+                factor[row][col] = value / factor[col][col]
+    return factor
+
+
+def _solve_lower(factor: Sequence[Sequence[float]], values: Sequence[float]) -> list[float]:
+    result: list[float] = []
+    for row in range(len(factor)):
+        value = float(values[row]) - sum(
+            float(factor[row][col]) * result[col] for col in range(row)
+        )
+        result.append(value / float(factor[row][row]))
+    return result
+
+
+def _solve_upper_from_lower(
+    factor: Sequence[Sequence[float]], values: Sequence[float]
+) -> list[float]:
+    size = len(factor)
+    result = [0.0] * size
+    for row in range(size - 1, -1, -1):
+        value = float(values[row]) - sum(
+            float(factor[col][row]) * result[col]
+            for col in range(row + 1, size)
+        )
+        result[row] = value / float(factor[row][row])
+    return result
+
+
+def _unique_gp_observations(
+    regions: Sequence[ErrorRegion],
+    error_floor: float,
+) -> tuple[list[list[float]], list[float]]:
+    grouped: dict[tuple[float, ...], tuple[list[float], float]] = {}
+    for region in regions:
+        key = tuple(round(float(value), 12) for value in region.unit_point)
+        score = max(float(region.score), error_floor)
+        previous = grouped.get(key)
+        if previous is None or score > previous[1]:
+            grouped[key] = (list(region.unit_point), score)
+    points = [value[0] for value in grouped.values()]
+    log_errors = [math.log(value[1]) for value in grouped.values()]
+    return points, log_errors
+
+
+def _factor_gp_candidate(
+    points: Sequence[Sequence[float]],
+    normalized_targets: Sequence[float],
+    length_scale: float,
+    noise_variance: float,
+) -> tuple[list[list[float]], list[float], float]:
+    covariance = [
+        [
+            _matern52_kernel(lhs, rhs, length_scale)
+            + (noise_variance if row == col else 0.0)
+            for col, rhs in enumerate(points)
+        ]
+        for row, lhs in enumerate(points)
+    ]
+    jitter = max(1e-12, noise_variance * 1e-6)
+    for _ in range(8):
+        try:
+            factor = _cholesky_factor(covariance)
+            break
+        except ValueError:
+            for idx in range(len(covariance)):
+                covariance[idx][idx] += jitter
+            jitter *= 10.0
+    else:
+        raise ValueError(
+            "Could not stabilize the Gaussian-process covariance; increase "
+            "--gp-noise-variance"
+        )
+    intermediate = _solve_lower(factor, normalized_targets)
+    alpha = _solve_upper_from_lower(factor, intermediate)
+    quadratic = sum(
+        float(value) * coefficient
+        for value, coefficient in zip(normalized_targets, alpha)
+    )
+    log_determinant_half = sum(math.log(row[idx]) for idx, row in enumerate(factor))
+    log_marginal_likelihood = (
+        -0.5 * quadratic
+        - log_determinant_half
+        - 0.5 * len(points) * math.log(2.0 * math.pi)
+    )
+    return factor, alpha, log_marginal_likelihood
+
+
+def fit_error_gaussian_process(
+    regions: Sequence[ErrorRegion],
+    length_scale: float | None,
+    noise_variance: float,
+    error_floor: float,
+) -> GaussianProcessModel:
+    points, log_errors = _unique_gp_observations(regions, error_floor)
+    if len(points) < 2:
+        raise ValueError(
+            "GP-UCB acquisition requires errors at at least two distinct geometries"
+        )
+    log_error_mean = sum(log_errors) / len(log_errors)
+    variance = sum((value - log_error_mean) ** 2 for value in log_errors) / max(
+        1, len(log_errors) - 1
+    )
+    # Retain meaningful posterior uncertainty when the first few measured
+    # errors happen to be almost equal. A 0.25 natural-log scale corresponds
+    # to about a 28% multiplicative one-sigma uncertainty.
+    log_error_scale = max(math.sqrt(max(variance, 0.0)), 0.25)
+    normalized_targets = [
+        (value - log_error_mean) / log_error_scale for value in log_errors
+    ]
+    candidates = (
+        [float(length_scale)]
+        if length_scale is not None
+        else [0.08, 0.12, 0.18, 0.27, 0.4, 0.6, 0.9, 1.35]
+    )
+    best: tuple[list[list[float]], list[float], float, float] | None = None
+    for candidate in candidates:
+        factor, alpha, likelihood = _factor_gp_candidate(
+            points,
+            normalized_targets,
+            candidate,
+            noise_variance,
+        )
+        if best is None or likelihood > best[2]:
+            best = (factor, alpha, likelihood, candidate)
+    assert best is not None
+    return GaussianProcessModel(
+        observation_points=points,
+        log_error_mean=log_error_mean,
+        log_error_scale=log_error_scale,
+        length_scale=best[3],
+        noise_variance=noise_variance,
+        cholesky=best[0],
+        alpha=best[1],
+        log_marginal_likelihood=best[2],
+    )
+
+
+def predict_error_gaussian_process(
+    model: GaussianProcessModel,
+    point: Sequence[float],
+) -> tuple[float, float]:
+    covariance = [
+        _matern52_kernel(point, observed, model.length_scale)
+        for observed in model.observation_points
+    ]
+    normalized_mean = sum(
+        value * coefficient for value, coefficient in zip(covariance, model.alpha)
+    )
+    projected = _solve_lower(model.cholesky, covariance)
+    normalized_variance = max(
+        0.0,
+        1.0 - sum(value * value for value in projected),
+    )
+    mean_log_error = (
+        model.log_error_mean + model.log_error_scale * normalized_mean
+    )
+    std_log_error = model.log_error_scale * math.sqrt(normalized_variance)
+    return mean_log_error, std_log_error
+
+
+def _nearest_error_region(
+    point: Sequence[float], regions: Sequence[ErrorRegion]
+) -> tuple[ErrorRegion | None, float]:
+    if not regions:
+        return None, math.sqrt(len(point))
+    region = min(
+        regions,
+        key=lambda value: squared_distance(point, value.unit_point),
+    )
+    return region, math.sqrt(squared_distance(point, region.unit_point))
+
+
+def select_gp_ucb_points(
+    candidate_points: Sequence[Sequence[float]],
+    regions: Sequence[ErrorRegion],
+    existing_points: Sequence[Sequence[float]],
+    count: int,
+    exploration_weight: float,
+    novelty_power: float,
+    min_distance: float,
+    length_scale: float | None,
+    noise_variance: float,
+    error_floor: float,
+) -> tuple[list[SuggestedPoint], GaussianProcessModel]:
+    model = fit_error_gaussian_process(
+        regions,
+        length_scale=length_scale,
+        noise_variance=noise_variance,
+        error_floor=error_floor,
+    )
+    selected: list[SuggestedPoint] = []
+    occupied = [list(point) for point in existing_points]
+    diag = max(
+        math.sqrt(len(candidate_points[0])) if candidate_points else 1.0,
+        1e-12,
+    )
+    unused: list[tuple[list[float], float, float, float]] = []
+    for raw_point in candidate_points:
+        point = list(raw_point)
+        mean_log_error, std_log_error = predict_error_gaussian_process(model, point)
+        predicted_error = math.exp(min(700.0, mean_log_error))
+        upper_error = math.exp(
+            min(700.0, mean_log_error + exploration_weight * std_log_error)
+        )
+        unused.append((point, predicted_error, std_log_error, upper_error))
+
+    while len(selected) < count and unused:
+        best_idx: int | None = None
+        best_point: SuggestedPoint | None = None
+        for idx, (point, predicted_error, std_log_error, upper_error) in enumerate(unused):
+            distance_existing = nearest_distance(point, occupied)
+            if distance_existing < min_distance:
+                continue
+            novelty = min(1.0, distance_existing / diag)
+            acquisition = upper_error * (max(novelty, 1e-12) ** novelty_power)
+            region, region_distance = _nearest_error_region(point, regions)
+            candidate = SuggestedPoint(
+                unit_point=point,
+                acquisition_score=acquisition,
+                distance_to_existing=distance_existing,
+                nearest_error_source_index=(region.source_index if region else ""),
+                nearest_error_score=(region.score if region else 0.0),
+                nearest_error_distance=region_distance,
+                predicted_error=predicted_error,
+                gp_log_uncertainty=std_log_error,
+                gp_upper_confidence_error=upper_error,
+            )
+            if best_point is None or candidate.acquisition_score > best_point.acquisition_score:
+                best_idx = idx
+                best_point = candidate
+        if best_idx is None or best_point is None:
+            break
+        selected.append(best_point)
+        occupied.append(best_point.unit_point)
+        unused.pop(best_idx)
+    return selected, model
+
+
 def select_targeted_points(
     candidate_points: Sequence[Sequence[float]],
     regions: Sequence[ErrorRegion],
@@ -1230,22 +1529,33 @@ def write_suggested_points_csv(
     parameters: Sequence[ParameterSpec],
     split_var: str,
     target_dataset: str,
-    method: str,
+    candidate_method: str,
+    acquisition_method: str,
     metric_name: str,
     include_normalized: bool,
     decimal_places: int | None = None,
+    acquisition_metadata: dict[str, object] | None = None,
 ) -> Path:
+    method_name = (
+        f"targeted-{candidate_method}"
+        if acquisition_method == "error-distance"
+        else f"{acquisition_method}-{candidate_method}"
+    )
     fields = [
         "point_index",
         split_var,
         "additional_sequence",
         "method",
+        "acquisition_method",
         "analysis_metric",
         "fit_error_score",
         "nearest_error_source_index",
         "nearest_error_distance",
         "distance_to_existing",
         "acquisition_score",
+        "predicted_error",
+        "gp_log_uncertainty",
+        "gp_upper_confidence_error",
     ]
     if include_normalized:
         fields.extend(f"u_{parameter.name}" for parameter in parameters)
@@ -1257,13 +1567,29 @@ def write_suggested_points_csv(
             "point_index": idx,
             split_var: target_dataset,
             "additional_sequence": idx,
-            "method": f"targeted-{method}",
+            "method": method_name,
+            "acquisition_method": acquisition_method,
             "analysis_metric": metric_name,
             "fit_error_score": f"{suggestion.nearest_error_score:.12g}",
             "nearest_error_source_index": suggestion.nearest_error_source_index,
             "nearest_error_distance": f"{suggestion.nearest_error_distance:.12g}",
             "distance_to_existing": f"{suggestion.distance_to_existing:.12g}",
             "acquisition_score": f"{suggestion.acquisition_score:.12g}",
+            "predicted_error": (
+                ""
+                if suggestion.predicted_error is None
+                else f"{suggestion.predicted_error:.12g}"
+            ),
+            "gp_log_uncertainty": (
+                ""
+                if suggestion.gp_log_uncertainty is None
+                else f"{suggestion.gp_log_uncertainty:.12g}"
+            ),
+            "gp_upper_confidence_error": (
+                ""
+                if suggestion.gp_upper_confidence_error is None
+                else f"{suggestion.gp_upper_confidence_error:.12g}"
+            ),
         }
         rounded_values = [
             round_parameter_value(
@@ -1295,9 +1621,14 @@ def write_suggested_points_csv(
         rows,
         split_var,
         generation_kind="targeted_additional",
-        method=f"targeted-{method}",
+        method=method_name,
         decimal_places=decimal_places,
-        extra={"analysis_metric": metric_name},
+        extra={
+            "analysis_metric": metric_name,
+            "acquisition_method": acquisition_method,
+            "candidate_method": candidate_method,
+            **(acquisition_metadata or {}),
+        },
     )
 
 
@@ -1306,12 +1637,20 @@ def parse_methods(raw_methods: Sequence[str]) -> list[str]:
     for raw in raw_methods:
         for part in raw.split(","):
             method = part.strip().lower()
+            if method == "minimax-lhs":
+                method = "maximin-lhs"
             if method:
                 methods.append(method)
     return methods
 
 
-VALID_METHODS = {"maximin-lhs", "latin-hypercube", "sobol", "halton"}
+VALID_METHODS = {
+    "maximin-lhs",
+    "minimax-lhs",
+    "latin-hypercube",
+    "sobol",
+    "halton",
+}
 
 
 def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1468,9 +1807,51 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--candidate-method",
-        default="latin-hypercube",
+        default="maximin-lhs",
         choices=sorted(VALID_METHODS),
-        help="Method used to create the candidate pool before targeted selection. Default: latin-hypercube.",
+        help=(
+            "Method used to create the candidate pool before targeted selection. "
+            "minimax-lhs is accepted as an alias for maximin-lhs. Default: maximin-lhs."
+        ),
+    )
+    parser.add_argument(
+        "--acquisition",
+        choices=["error-distance", "gp-ucb"],
+        default="error-distance",
+        help=(
+            "Candidate scoring method. gp-ucb fits a Matérn-5/2 Gaussian process "
+            "to log geometry-level error; error-distance retains the original "
+            "Gaussian focus/novelty selector. Default: error-distance."
+        ),
+    )
+    parser.add_argument(
+        "--exploration-weight",
+        type=float,
+        default=2.0,
+        help=(
+            "GP-UCB standard-deviation multiplier. Larger values explore uncertain "
+            "regions more strongly. Default: 2.0."
+        ),
+    )
+    parser.add_argument(
+        "--gp-length-scale",
+        type=float,
+        help=(
+            "Optional Matérn-5/2 length scale in normalized geometry space. If "
+            "omitted, select it by log marginal likelihood."
+        ),
+    )
+    parser.add_argument(
+        "--gp-noise-variance",
+        type=float,
+        default=1e-6,
+        help="Non-negative normalized GP covariance nugget. Default: 1e-6.",
+    )
+    parser.add_argument(
+        "--gp-error-floor",
+        type=float,
+        default=1e-12,
+        help="Positive error floor applied before the GP log transform. Default: 1e-12.",
     )
     parser.add_argument(
         "--candidate-count",
@@ -1769,6 +2150,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error("--novelty-power must be non-negative")
     if args.min_distance < 0.0:
         parser.error("--min-distance must be non-negative")
+    if args.exploration_weight < 0.0:
+        parser.error("--exploration-weight must be non-negative")
+    if args.gp_length_scale is not None and args.gp_length_scale <= 0.0:
+        parser.error("--gp-length-scale must be positive")
+    if args.gp_noise_variance < 0.0:
+        parser.error("--gp-noise-variance must be non-negative")
+    if args.gp_error_floor <= 0.0:
+        parser.error("--gp-error-floor must be positive")
     validate_shared_sampling_args(parser, args)
     parameters = parse_parameters_or_error(parser, args)
     validate_parameter_decimal_places(parser, parameters, args.decimal_places)
@@ -1796,9 +2185,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     existing_points = dedupe_points(existing_points)
 
     candidate_count = args.candidate_count or max(1000, args.count * args.candidate_factor)
+    candidate_method = (
+        "maximin-lhs"
+        if args.candidate_method == "minimax-lhs"
+        else args.candidate_method
+    )
     try:
         candidates = generate_unit_points(
-            args.candidate_method,
+            candidate_method,
             count=candidate_count,
             dimensions=len(parameters),
             seed=args.seed,
@@ -1810,16 +2204,55 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    suggestions = select_targeted_points(
-        candidates,
-        regions,
-        existing_points,
-        count=args.count,
-        focus_radius=args.focus_radius,
-        focus_power=args.focus_power,
-        novelty_power=args.novelty_power,
-        min_distance=args.min_distance,
-    )
+    acquisition_metadata: dict[str, object] = {}
+    if args.acquisition == "gp-ucb":
+        try:
+            suggestions, gp_model = select_gp_ucb_points(
+                candidates,
+                regions,
+                existing_points,
+                count=args.count,
+                exploration_weight=args.exploration_weight,
+                novelty_power=args.novelty_power,
+                min_distance=args.min_distance,
+                length_scale=args.gp_length_scale,
+                noise_variance=args.gp_noise_variance,
+                error_floor=args.gp_error_floor,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        acquisition_metadata = {
+            "gp": {
+                "kernel": "matern52_isotropic",
+                "target_transform": "natural_log_error",
+                "observation_count": len(gp_model.observation_points),
+                "length_scale": gp_model.length_scale,
+                "length_scale_selection": (
+                    "user" if args.gp_length_scale is not None else "log_marginal_likelihood"
+                ),
+                "noise_variance": gp_model.noise_variance,
+                "exploration_weight": args.exploration_weight,
+                "log_marginal_likelihood": gp_model.log_marginal_likelihood,
+            }
+        }
+        if len(gp_model.observation_points) < len(parameters) + 1:
+            print(
+                "warning: GP-UCB has fewer distinct error observations than "
+                "dimensions + 1; selections will emphasize posterior uncertainty "
+                "until more simulated error observations are available",
+                file=sys.stderr,
+            )
+    else:
+        suggestions = select_targeted_points(
+            candidates,
+            regions,
+            existing_points,
+            count=args.count,
+            focus_radius=args.focus_radius,
+            focus_power=args.focus_power,
+            novelty_power=args.novelty_power,
+            min_distance=args.min_distance,
+        )
     if len(suggestions) < args.count:
         print(
             f"warning: selected {len(suggestions)} of {args.count} requested points; "
@@ -1836,13 +2269,26 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parameters,
         split_var=args.split_var,
         target_dataset=args.target_dataset,
-        method=args.candidate_method,
+        candidate_method=candidate_method,
+        acquisition_method=args.acquisition,
         metric_name=metric_name,
         include_normalized=args.include_normalized,
         decimal_places=args.decimal_places,
+        acquisition_metadata=acquisition_metadata,
     )
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
-    print(f"considered {len(existing_points)} existing point(s) and {candidate_count} candidate point(s)")
+    print(
+        f"considered {len(existing_points)} existing point(s) and "
+        f"{candidate_count} {candidate_method} candidate point(s)"
+    )
+    print(f"acquisition method: {args.acquisition}")
+    if args.acquisition == "gp-ucb":
+        print(
+            "GP observations: "
+            f"{len(gp_model.observation_points)}, "
+            f"Matérn-5/2 length scale: {gp_model.length_scale:.6g}, "
+            f"exploration weight: {args.exploration_weight:.6g}"
+        )
     print(f"wrote {out_path}")
     print(f"wrote {metadata_path}")
     print(f"wrote {analysis_path}")

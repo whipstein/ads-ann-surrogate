@@ -204,7 +204,8 @@ point set with a symmetrically wider range. It does not perform the one-sided
 append workflow.
 
 For expensive EM campaigns, treat each point as one geometry/process setting
-with a full frequency sweep. A practical initial design size is:
+with a full frequency sweep. For a one-shot design that is expected to work
+without adaptive refinement, a practical initial design size is:
 
 | Geometry parameters | Training points | Verification points |
 | ---: | ---: | ---: |
@@ -258,6 +259,85 @@ nearest high-error verification source, distance from existing points, and
 acquisition score. A companion `*_fit_error_regions.csv` file ranks the current
 verification points by the selected metric, which defaults to `evm_pct`.
 
+#### Gaussian-Process Adaptive Loop
+
+`suggest-additional` also provides a true Gaussian-process upper-confidence
+bound acquisition mode. It fits a Matérn-5/2 GP to the natural logarithm of the
+current geometry-level error and scores candidate point $\mathbf p$ using
+
+$$
+A(\mathbf p)=
+\exp\!\left(\mu_{\log e}(\mathbf p)+
+\kappa\sigma_{\log e}(\mathbf p)\right)
+D(\mathbf p)^{\nu},
+$$
+
+where $D$ is normalized distance from already simulated or selected points,
+$\kappa$ is `--exploration-weight`, and $\nu$ is `--novelty-power`. The GP
+length scale is selected from a normalized candidate grid by log marginal
+likelihood unless `--gp-length-scale` is supplied.
+
+There is no enforced $8d$ or power-of-two initial-point minimum. For six
+geometry parameters, a cost-conscious first trial can start with 32 points: 24
+training and 8 acquisition-validation points. This is intentionally lean and
+should be grown adaptively; it is not a guarantee that 32 points can resolve
+every six-dimensional response.
+
+```bash
+python3 generate_points.py generate \
+  --parameter P1=0:1 --parameter P2=0:1 \
+  --parameter P3=0:1 --parameter P4=0:1 \
+  --parameter P5=0:1 --parameter P6=0:1 \
+  --count 32 \
+  --verification-count 8 \
+  --out adaptive_round_0.csv
+```
+
+Both initial generation and adaptive candidate generation use `maximin-lhs` by
+default. `minimax-lhs` is accepted as an alias for the same standard maximin
+Latin-hypercube method. After simulating the initial points and fitting the
+chosen provisional network, request a small next batch:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter P1=0:1 --parameter P2=0:1 \
+  --parameter P3=0:1 --parameter P4=0:1 \
+  --parameter P5=0:1 --parameter P6=0:1 \
+  --count 6 \
+  --fit-dir outputs/dnn_compact \
+  --existing-points adaptive_round_0.csv \
+  --acquisition gp-ucb \
+  --target-dataset train \
+  --out adaptive_round_1.csv
+```
+
+For each round:
+
+1. Simulate the suggested geometry batch.
+2. Evaluate the pre-refit network at those new geometries when practical; a
+   geometry-level cross-validation or accumulated pre-refit error CSV is a
+   better GP target than training residuals.
+3. Append the simulated blocks to the training MDIF and retrain the same
+   provisional architecture and fitting objective.
+4. Regenerate `verification_metrics.csv`, run `suggest-additional` again, and
+   repeat until the error target stops improving or the simulation budget is
+   reached.
+5. Evaluate a separate final audit set that was never used by GP acquisition.
+
+The acquisition is model-aware: keep the model family, S/Y output domain,
+frequency transform, weighting, and provisional network architecture fixed
+during the loop. The physical samples remain reusable, so after acquisition
+you can rescreen architectures and run one cleanup GP round with the final
+configuration. Persistent failure of only the compact network, while a larger
+reference succeeds at the same points, indicates capacity limitation rather
+than missing data.
+
+The suggested CSV records `predicted_error`, `gp_log_uncertainty`, and
+`gp_upper_confidence_error`. Its companion JSON records the fitted length
+scale, observation count, likelihood, noise variance, and exploration weight.
+The original `error-distance` selector remains the default acquisition mode
+until this alternative has been validated against the target EM/model flow.
+
 The explicit `generate` subcommand is optional; invoking `generate_points.py`
 without a subcommand uses it automatically.
 
@@ -273,12 +353,22 @@ without a subcommand uses it automatically.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--candidate-method METHOD</code></nobr> | <code>suggest-additional</code> | Candidate-pool method: <code>halton</code>, <code>latin-hypercube</code>, <code>maximin-lhs</code>, or <code>sobol</code>. Default: <code>latin-hypercube</code>. | <nobr><code>--candidate-method sobol</code></nobr> |
+| <nobr><code>--candidate-method METHOD</code></nobr> | <code>suggest-additional</code> | Candidate-pool method: <code>halton</code>, <code>latin-hypercube</code>, <code>maximin-lhs</code>, or <code>sobol</code>. <code>minimax-lhs</code> is accepted as an alias for <code>maximin-lhs</code>. Default: <code>maximin-lhs</code>. | <nobr><code>--candidate-method sobol</code></nobr> |
 | <nobr><code>--lhs-candidates INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Candidate Latin hypercubes tried when using <code>maximin-lhs</code>. Default: <code>64</code>. | <nobr><code>--lhs-candidates 128</code></nobr> |
-| <nobr><code>--method METHOD</code></nobr> | <code>generate</code> | Repeat or comma-separate point-set methods. Choices: <code>halton</code>, <code>latin-hypercube</code>, <code>maximin-lhs</code>, and <code>sobol</code>. Default: <code>maximin-lhs</code>. | <nobr><code>--method sobol,maximin-lhs</code></nobr> |
+| <nobr><code>--method METHOD</code></nobr> | <code>generate</code> | Repeat or comma-separate point-set methods. Choices: <code>halton</code>, <code>latin-hypercube</code>, <code>maximin-lhs</code>, and <code>sobol</code>. <code>minimax-lhs</code> is accepted as an alias for <code>maximin-lhs</code>. Default: <code>maximin-lhs</code>. | <nobr><code>--method sobol,maximin-lhs</code></nobr> |
 | <nobr><code>--no-scramble</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Disables Sobol scrambling, which is enabled by default. | <nobr><code>--no-scramble</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Random seed used by randomized sampling methods. Default: <code>1234</code>. | <nobr><code>--seed 42</code></nobr> |
 | <nobr><code>--skip INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Non-negative number of leading Sobol or Halton points to skip. Default: <code>0</code>. | <nobr><code>--skip 64</code></nobr> |
+
+### Gaussian-Process Acquisition
+
+| Option | Subcommands | Description | Example |
+| --- | --- | --- | --- |
+| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: original <code>error-distance</code> or Matérn-5/2 <code>gp-ucb</code>. Default: <code>error-distance</code>. | <nobr><code>--acquisition gp-ucb</code></nobr> |
+| <nobr><code>--exploration-weight FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative GP-UCB multiplier $\kappa$ on posterior log-error uncertainty. Default: <code>2.0</code>. | <nobr><code>--exploration-weight 2.5</code></nobr> |
+| <nobr><code>--gp-error-floor FLOAT</code></nobr> | <code>suggest-additional</code> | Positive floor applied before taking the natural logarithm of geometry error. Default: <code>1e-12</code>. | <nobr><code>--gp-error-floor 1e-9</code></nobr> |
+| <nobr><code>--gp-length-scale FLOAT</code></nobr> | <code>suggest-additional</code> | Optional positive Matérn-5/2 length scale in normalized geometry coordinates. When omitted, it is selected by log marginal likelihood. | <nobr><code>--gp-length-scale 0.4</code></nobr> |
+| <nobr><code>--gp-noise-variance FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative normalized covariance nugget for GP stability and noisy error observations. Default: <code>1e-6</code>. | <nobr><code>--gp-noise-variance 1e-5</code></nobr> |
 
 ### Output and Dataset Splits
 
@@ -304,8 +394,8 @@ without a subcommand uses it automatically.
 | <nobr><code>--candidate-factor INT</code></nobr> | <code>suggest-additional</code> | Positive candidate multiplier used when <code>--candidate-count</code> is omitted. Default: <code>200</code>. | <nobr><code>--candidate-factor 300</code></nobr> |
 | <nobr><code>--existing-mdif PATH</code></nobr> | <code>suggest-additional</code> | Repeatable MDIF containing previously simulated parameter points to avoid. | <nobr><code>--existing-mdif training.mdif</code></nobr> |
 | <nobr><code>--fit-dir PATH</code></nobr> | <code>suggest-additional</code> | Fit directory containing <code>verification_metrics.csv</code>. Ignored when <code>--verification-metrics</code> is given. | <nobr><code>--fit-dir outputs/dnn_model</code></nobr> |
-| <nobr><code>--focus-power FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative exponent applied to verification-error scores. Default: <code>1.0</code>. | <nobr><code>--focus-power 1.5</code></nobr> |
-| <nobr><code>--focus-radius FLOAT</code></nobr> | <code>suggest-additional</code> | Positive unit-cube radius around high-error verification points. Default: <code>0.25</code>. | <nobr><code>--focus-radius 0.2</code></nobr> |
+| <nobr><code>--focus-power FLOAT</code></nobr> | <code>suggest-additional</code> | With <code>--acquisition error-distance</code>, non-negative exponent applied to verification-error scores. Default: <code>1.0</code>. | <nobr><code>--focus-power 1.5</code></nobr> |
+| <nobr><code>--focus-radius FLOAT</code></nobr> | <code>suggest-additional</code> | With <code>--acquisition error-distance</code>, positive unit-cube radius around high-error verification points. Default: <code>0.25</code>. | <nobr><code>--focus-radius 0.2</code></nobr> |
 | <nobr><code>--metric NAME</code></nobr> | <code>suggest-additional</code> | Verification-metrics column used to target errors; <code>auto</code> selects a known available metric. Default: <code>evm_pct</code>. | <nobr><code>--metric auto</code></nobr> |
 | <nobr><code>--min-distance FLOAT</code></nobr> | <code>suggest-additional</code> | Rejects candidates closer than this non-negative normalized distance to existing or already suggested points. Default: <code>0.0</code>. | <nobr><code>--min-distance 0.05</code></nobr> |
 | <nobr><code>--novelty-power FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative exponent applied to distance from existing and suggested points. Default: <code>1.0</code>. | <nobr><code>--novelty-power 2</code></nobr> |
