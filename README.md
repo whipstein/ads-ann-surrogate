@@ -276,6 +276,9 @@ where $D$ is normalized distance from already simulated or selected points,
 $\kappa$ is `--exploration-weight`, and $\nu$ is `--novelty-power`. The GP
 length scale is selected from a normalized candidate grid by log marginal
 likelihood unless `--gp-length-scale` is supplied.
+[Appendix C](#appendix-c-gaussian-process-adaptive-point-selection) documents
+the exact target construction, covariance, posterior, batch acquisition,
+diagnostics, limitations, and references.
 
 There is no enforced $8d$ or power-of-two initial-point minimum. For six
 geometry parameters, a cost-conscious first trial can start with 32 points: 24
@@ -337,6 +340,133 @@ The suggested CSV records `predicted_error`, `gp_log_uncertainty`, and
 scale, observation count, likelihood, noise variance, and exploration weight.
 The original `error-distance` selector remains the default acquisition mode
 until this alternative has been validated against the target EM/model flow.
+
+#### Copyable Adaptive Point-Generation Examples
+
+The examples below use the same two geometry variables so the differences
+between workflows are explicit. `geometries.csv` is assumed to list every
+geometry already simulated, and each `--fit-dir` is assumed to contain the
+`verification_metrics.csv` produced by the current fit. Replace the DNN output
+directory with a KBNN or Neuro-TF output directory without changing the point
+generation options.
+
+For a one-sided range change, first create guaranteed coverage of only the new
+slab. This shared seed step extends the upper `W` bound from `0.80mm` to
+`1.00mm`, retains the original rows, and appends 20 maximin-LHS points:
+
+```bash
+python3 generate_points.py generate \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --extend-range W=0.40mm:1.00mm \
+  --existing-points geometries.csv \
+  --count 20 \
+  --verification-count 4 \
+  --method maximin-lhs \
+  --include-normalized \
+  --out geometries_extended_seed.csv
+```
+
+Simulate the appended rows, include their results in the training and
+verification MDIF, and refit over the expanded domain. Then use one of the two
+following alternatives for another range-extension refinement batch.
+
+##### Range Extension With the Legacy Error-Distance Selector
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:1.00mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 8 \
+  --fit-dir outputs/dnn_extended_seed \
+  --existing-points geometries_extended_seed.csv \
+  --acquisition error-distance \
+  --candidate-method maximin-lhs \
+  --metric evm_pct \
+  --focus-radius 0.25 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --target-dataset train \
+  --out range_extension_legacy_additional.csv
+```
+
+##### Range Extension With the GP-UCB Selector
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:1.00mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 8 \
+  --fit-dir outputs/dnn_extended_seed \
+  --existing-points geometries_extended_seed.csv \
+  --acquisition gp-ucb \
+  --candidate-method maximin-lhs \
+  --metric evm_pct \
+  --exploration-weight 2.0 \
+  --gp-noise-variance 1e-6 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --target-dataset train \
+  --out range_extension_gp_additional.csv
+```
+
+These refinement commands score candidates over the entire expanded rectangle,
+so they may also repair an error remaining in the original range. The initial
+`generate --extend-range` command is what guarantees coverage specifically in
+the new slab.
+
+When the parameter ranges are unchanged, omit the slab-generation step.
+
+##### Standard Addition With the Legacy Error-Distance Selector
+
+Use the legacy selector to concentrate additions around observed high-error
+verification geometries:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 8 \
+  --fit-dir outputs/dnn_current \
+  --existing-points geometries.csv \
+  --acquisition error-distance \
+  --candidate-method maximin-lhs \
+  --metric evm_pct \
+  --focus-radius 0.25 \
+  --focus-power 1.0 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --target-dataset train \
+  --out standard_legacy_additional.csv
+```
+
+##### Standard Addition With the GP-UCB Selector
+
+Use GP-UCB over the same unchanged range to balance predicted error against
+uncertainty and point separation:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 8 \
+  --fit-dir outputs/dnn_current \
+  --existing-points geometries.csv \
+  --acquisition gp-ucb \
+  --candidate-method maximin-lhs \
+  --metric evm_pct \
+  --exploration-weight 2.0 \
+  --gp-noise-variance 1e-6 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --target-dataset train \
+  --out standard_gp_additional.csv
+```
+
+For a controlled comparison, run the legacy and GP commands from the same fit,
+with the same existing-point files, candidate count, random seed, metric, and
+batch size. Simulate the two output batches separately; do not combine one
+method's new results into the fit used to judge the other method.
 
 The explicit `generate` subcommand is optional; invoking `generate_points.py`
 without a subcommand uses it automatically.
@@ -3562,3 +3692,339 @@ normative implementation:
 | Fixed-pole construction, rational coefficient extraction, and Neuro-TF evaluation | [`neuro_tf.py`](neuro_tf.py) |
 | MDIF parsing, splitting, weighting, MLP/Adam, metrics, exact DC, and simulator generators | [`surrogate_common.py`](surrogate_common.py) |
 | DC and export regression coverage | [`tests/test_dc_conductance_model.py`](tests/test_dc_conductance_model.py) and [`tests/test_ads_hb_export.py`](tests/test_ads_hb_export.py) |
+
+## Appendix C: Gaussian-Process Adaptive Point Selection
+
+This appendix documents the exact GP-assisted point-selection implementation
+in `generate_points.py`. The GP is not the exported RF surrogate and does not
+predict S-parameters. It is a small auxiliary model of **geometry-level
+surrogate error** used only to choose the next expensive EM geometries.
+
+### C.1 End-to-end data flow
+
+One adaptive round follows this sequence:
+
+1. Train or load a DNN, KBNN, or Neuro-TF using the currently simulated MDIF.
+2. Evaluate that surrogate on verification geometries and produce
+   `verification_metrics.csv`.
+3. Aggregate the selected metric into one non-negative error value per
+   geometry.
+4. Normalize every geometry variable to the unit hypercube.
+5. Fit the GP to the logarithm of geometry error.
+6. Generate a finite maximin-LHS candidate pool.
+7. Score candidates using an upper confidence bound and a diversity factor.
+8. Select a batch, write its physical parameter values to CSV, and simulate
+   that batch externally.
+9. Append the resulting MDIF blocks, refit the RF surrogate, and repeat.
+
+The GP is rebuilt on every invocation. It is not serialized as part of the DNN,
+KBNN, Neuro-TF, Verilog-A, ADS ANN, or ADS HB model.
+
+### C.2 Geometry normalization
+
+Let geometry parameter $p_j$ have lower and upper bounds $a_j$ and $b_j$. A
+linear parameter is mapped to
+
+$$
+u_j=\frac{p_j-a_j}{b_j-a_j}.
+$$
+
+A log-scaled parameter is mapped to
+
+$$
+u_j=
+\frac{\log p_j-\log a_j}{\log b_j-\log a_j}.
+$$
+
+Thus every observation and candidate is represented by
+$\mathbf u\in[0,1]^d$. Distances, the GP length scale, `--focus-radius`, and
+`--min-distance` all operate in this normalized geometry space. The command's
+`--parameter` bounds must therefore describe the complete domain being scored.
+
+### C.3 Geometry-level error target
+
+The selected `--metric` is read from `verification_metrics.csv`. For each
+geometry, the implementation combines its S-parameter rows using
+
+$$
+e(\mathbf u)=
+\sqrt{
+\frac{\sum_q w_q e_q^2}
+     {\sum_q w_q}
+},
+$$
+
+where $q$ indexes the available metric rows and $w_q$ is
+`normalized_sparam_weight`, then `sparam_weight`, or $1$ when neither usable
+weight is present. Most metrics are converted to absolute values. An `evm_db`
+metric is first converted to a linear amplitude ratio.
+
+The GP target is
+
+$$
+y(\mathbf u)=\log\!\left(\max(e(\mathbf u),\epsilon)\right),
+$$
+
+where $\epsilon$ is `--gp-error-floor`. The log transform makes multiplicative
+changes in error easier to represent and prevents a few large errors from
+dominating the covariance calculation. Duplicate normalized geometries are
+collapsed, retaining the largest error. At least two distinct geometries are
+required.
+
+The target is standardized before GP fitting:
+
+$$
+z_i=\frac{y_i-\overline y}{s_y},
+\qquad
+s_y=\max\!\left(\operatorname{std}(y),0.25\right).
+$$
+
+The $0.25$ floor retains useful posterior uncertainty when the first observed
+errors are nearly equal; it corresponds to approximately a 28% multiplicative
+one-standard-deviation interval in the original error domain.
+
+### C.4 Matérn-5/2 covariance and fitting
+
+The implementation uses one isotropic length scale $\ell$ for all normalized
+geometry dimensions. Define
+
+$$
+r(\mathbf u,\mathbf u')=
+\sqrt{\sum_{j=1}^{d}
+\left(\frac{u_j-u'_j}{\ell}\right)^2}.
+$$
+
+The unit-amplitude Matérn-5/2 covariance is
+
+$$
+k(\mathbf u,\mathbf u')=
+\left(1+\sqrt{5}r+\frac{5}{3}r^2\right)
+\exp(-\sqrt{5}r).
+$$
+
+For $n$ observed geometries, the covariance matrix is
+
+$$
+K_{ij}=k(\mathbf u_i,\mathbf u_j)+\eta\,\delta_{ij},
+$$
+
+where $\eta$ is `--gp-noise-variance`. It acts as a normalized covariance
+nugget for noisy error observations and numerical stability. The system is
+factored using a dense Cholesky decomposition; progressively larger diagonal
+jitter is added only if needed to stabilize that factorization.
+
+When `--gp-length-scale` is omitted, the code tests
+
+$$
+\ell\in
+\{0.08,0.12,0.18,0.27,0.40,0.60,0.90,1.35\}
+$$
+
+and chooses the value with the largest log marginal likelihood
+
+$$
+\log p(\mathbf z\mid\ell)=
+-\frac{1}{2}\mathbf z^{\mathsf T}K^{-1}\mathbf z
+-\sum_{i=1}^{n}\log L_{ii}
+-\frac{n}{2}\log(2\pi),
+$$
+
+where $K=LL^{\mathsf T}$. This is a small deterministic grid search, not a
+continuous optimizer and not automatic relevance determination. Supplying
+`--gp-length-scale` bypasses this search.
+
+### C.5 Posterior prediction
+
+For a candidate $\mathbf u_*$, let $\mathbf k_*$ contain its covariance with
+each observed geometry and let
+$\boldsymbol\alpha=K^{-1}\mathbf z$. The normalized posterior is
+
+$$
+\begin{aligned}
+m_* &= \mathbf k_*^{\mathsf T}\boldsymbol\alpha,\\
+v_* &= \max\!\left(
+0,
+1-\left\|L^{-1}\mathbf k_*\right\|_2^2
+\right).
+\end{aligned}
+$$
+
+The posterior log-error mean and standard deviation are
+
+$$
+\mu_{\log e}=\overline y+s_y m_*,
+\qquad
+\sigma_{\log e}=s_y\sqrt{v_*}.
+$$
+
+The reported `predicted_error` is
+$\exp(\mu_{\log e})$. The reported `gp_log_uncertainty` is
+$\sigma_{\log e}$, so it is dimensionless and multiplicative in the original
+error domain rather than an additive error bar.
+
+### C.6 Acquisition and batch diversity
+
+The GP upper-confidence error is
+
+$$
+U(\mathbf u)=
+\exp\!\left(
+\mu_{\log e}(\mathbf u)+
+\kappa\sigma_{\log e}(\mathbf u)
+\right),
+$$
+
+where $\kappa$ is `--exploration-weight`. Small $\kappa$ emphasizes predicted
+high-error regions; large $\kappa$ emphasizes uncertain regions.
+
+Let $\mathcal O$ contain all observed points and points already chosen for the
+current batch. The normalized diversity factor is
+
+$$
+D(\mathbf u)=
+\min\!\left(
+1,
+\frac{\min_{\mathbf v\in\mathcal O}
+\|\mathbf u-\mathbf v\|_2}{\sqrt d}
+\right).
+$$
+
+The implemented acquisition score is
+
+$$
+A(\mathbf u)=U(\mathbf u)D(\mathbf u)^{\nu},
+$$
+
+where $\nu$ is `--novelty-power`. Candidates closer than `--min-distance` to
+any occupied point are rejected before scoring. After selecting the best
+candidate, that point is added to $\mathcal O$ and all remaining candidates
+are rescored. This sequential diversity penalty keeps one batch from
+collapsing around a single peak.
+
+The GP posterior itself is not fantasy-updated after each point in the batch;
+only the diversity term changes. Consequently, this is a practical batch
+GP-UCB-inspired acquisition rule, not an implementation of a joint batch
+Bayesian-optimization proof or its convergence guarantees.
+
+### C.7 Candidate generation
+
+Both initial point generation and adaptive candidate generation default to
+`maximin-lhs`. The accepted `minimax-lhs` spelling is an alias for the same
+maximin criterion. In each Latin-hypercube candidate design, every dimension is
+divided into equally populated strata. The script creates `--lhs-candidates`
+such designs and retains the design with the largest minimum pairwise distance:
+
+$$
+X^*=\underset{X}{\operatorname{arg\,max}}
+\;\min_{\mathbf u_i\ne\mathbf u_j\in X}
+\|\mathbf u_i-\mathbf u_j\|_2.
+$$
+
+For adaptive selection, the pool size is `--candidate-count`, or
+
+$$
+\max(1000,\;200\,n_{\mathrm{requested}})
+$$
+
+by default. GP-UCB scores this finite pool; it does not continuously optimize
+the acquisition function. Increasing the pool improves search resolution but
+also increases point-generation and posterior-evaluation time.
+
+### C.8 Range extension behavior
+
+`generate --extend-range` and `suggest-additional --acquisition gp-ucb` serve
+different purposes:
+
+- `generate --extend-range` samples only the new one-sided slab and appends
+  those points to the original geometry CSV. It provides guaranteed initial
+  boundary coverage without using model error.
+- `suggest-additional` scores the full domain supplied through `--parameter`.
+  When those bounds include an extension, GP uncertainty and the diversity
+  term can favor the new region, but the selector may legitimately choose an
+  old-region point with a larger acquisition score.
+
+For that reason, the recommended range workflow is to seed the new slab first,
+simulate it, refit the surrogate, and then compare legacy and GP refinement
+batches from that identical expanded-domain fit. This also gives the GP actual
+error observations inside the new region instead of asking it to rely entirely
+on extrapolated uncertainty.
+
+### C.9 Diagnostics and tuning
+
+The suggested-point CSV contains:
+
+| Column | Meaning |
+| --- | --- |
+| `acquisition_score` | Final GP upper-confidence error multiplied by the diversity penalty. |
+| `distance_to_existing` | Raw Euclidean distance to the nearest occupied normalized point at selection time. |
+| `fit_error_score` | Error at the nearest observed verification geometry; this is contextual and is not the GP prediction. |
+| `gp_log_uncertainty` | Posterior standard deviation in natural-log-error space. |
+| `gp_upper_confidence_error` | $\exp(\mu_{\log e}+\kappa\sigma_{\log e})$ before the diversity penalty. |
+| `predicted_error` | Posterior median-scale error, $\exp(\mu_{\log e})$. |
+
+The companion JSON records the kernel, target transform, observation count,
+chosen length scale, selection mode, nugget, exploration weight, and log
+marginal likelihood. The companion `*_fit_error_regions.csv` ranks the source
+error geometries used by both acquisition modes.
+
+Practical tuning guidance:
+
+| Observation | Adjustment |
+| --- | --- |
+| Most points cluster near one measured error peak | Increase `--novelty-power`, `--min-distance`, or `--exploration-weight`. |
+| Points are too exploratory and ignore known bad regions | Decrease `--exploration-weight`; optionally decrease `--novelty-power`. |
+| Selected points change excessively between fits with similar errors | Increase `--gp-noise-variance`. |
+| The error surface is known to change over short parameter distances | Supply a smaller `--gp-length-scale`. |
+| The error surface should be broad and smooth | Supply a larger `--gp-length-scale`. |
+| Too few requested points survive distance filtering | Lower `--min-distance` or increase `--candidate-count`. |
+
+Use error measured before retraining on a newly acquired point when practical.
+A training residual after the point has already been absorbed by the network
+systematically understates how valuable that point was. Keep the provisional
+model family, architecture, frequency transform, output domain, loss weights,
+and random-seed policy fixed while comparing acquisition rounds. Reserve a
+final audit set that never enters GP acquisition.
+
+### C.10 Limitations and computational cost
+
+- The auxiliary GP models one scalar aggregate error, not individual
+  S-parameter errors or the underlying complex response.
+- One isotropic length scale assumes comparable smoothness across normalized
+  dimensions. Strongly anisotropic problems may need more observations or a
+  future per-dimension length-scale implementation.
+- GP quality depends on the provisional RF surrogate. A persistent error caused
+  by insufficient neural capacity may attract additional EM points without
+  resolving the architecture limitation.
+- Sparse initial observations can make uncertainty dominate. The command warns
+  when there are fewer distinct error observations than $d+1$.
+- Dense GP fitting costs $O(n^3)$ in the number of observed error geometries,
+  and posterior evaluation uses dense triangular solves for every candidate.
+  The implementation is intended for expensive-EM campaigns with modest
+  geometry counts, not millions of observations.
+- The method does not automatically run ADS/EM simulation, merge MDIF blocks,
+  retrain a surrogate, or decide convergence. Those remain explicit steps so
+  each new expensive simulation batch can be inspected.
+
+### C.11 References and normative source map
+
+1. C. E. Rasmussen and C. K. I. Williams, *Gaussian Processes for Machine
+   Learning*, MIT Press, 2006, Chapters 2 and 4.
+   [Official open-access text](https://gaussianprocess.org/gpml/chapters/).
+   Source for GP regression, marginal likelihood, and Matérn covariance
+   background.
+2. N. Srinivas, A. Krause, S. M. Kakade, and M. Seeger, “Gaussian process
+   optimization in the bandit setting: No regret and experimental design,”
+   *Proceedings of ICML*, 2010.
+   [arXiv:0912.3995](https://arxiv.org/abs/0912.3995). Source for the GP-UCB
+   exploration/exploitation principle. The repository's finite-candidate,
+   diversity-penalized batch formulation is an engineering adaptation.
+3. M. D. Morris and T. J. Mitchell, “Exploratory designs for computational
+   experiments,” *Journal of Statistical Planning and Inference*, vol. 43,
+   no. 3, pp. 381–402, 1995.
+   [doi:10.1016/0378-3758(94)00035-T](https://doi.org/10.1016/0378-3758(94)00035-T).
+   Background for maximin distance designs within Latin hypercubes.
+
+| Area | Source |
+| --- | --- |
+| Geometry parsing, normalization, Latin hypercubes, GP fitting, acquisition, CSV/JSON output, and CLI | [`generate_points.py`](generate_points.py) |
+| GP, alias, default-method, and legacy-compatibility regression tests | [`tests/test_generate_points_gp.py`](tests/test_generate_points_gp.py) |
