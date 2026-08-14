@@ -600,7 +600,7 @@ Legacy `--mode grid|random` commands remain valid; on KBNN optimize commands,
 `--mode plain|residual|prior-input` now has the same model meaning as it does
 for `train`.
 
-Run a hyperparameter sweep and keep the best completed model:
+Run a discrete random sweep and keep the best completed model:
 
 ```bash
 python3 dnn.py optimize \
@@ -613,13 +613,41 @@ python3 dnn.py optimize \
   --require-passive
 ```
 
-### Adaptive Hyperparameter Optimization
+### Running Adaptive Hyperparameter Optimization
 
 Use `--search-mode adaptive` when a grid is too large and random trials are not
 learning from previous results. Specify only the settings that should vary with
 repeatable `--optimize-parameter` options. Unspecified model settings stay at
 the first value supplied through their normal optimize option, including the
 documented default when that option is omitted.
+
+The practical workflow is:
+
+1. Start from a working `train` command and change `train` to `optimize`.
+2. Add `--search-mode adaptive`.
+3. Add one repeatable `--optimize-parameter NAME=DOMAIN` option for every
+   setting that should vary. Leave fixed settings on their normal train-style
+   options.
+4. Set the actual fitting budget with `--max-trials`. A useful first run is
+   24–40 trials, with 6–8 initial space-filling trials.
+5. Choose the performance objective with `--selection-metric` and add
+   `--require-passive` when passivity is mandatory.
+
+`--adaptive-candidate-pool` is the number of unevaluated configurations made
+available to the optimizer; it is not the number of models fitted.
+`--max-trials` is the fitting budget. `--adaptive-initial-trials` controls how
+many maximin-separated trials run before GP guidance, and
+`--adaptive-exploration` controls how strongly the later lower-confidence-bound
+selection favors uncertain regions. Adaptive fitting is sequential and forces
+one job because every new selection uses the preceding trial results.
+
+Supported adaptive domains by model are:
+
+| Model | `--optimize-parameter` names |
+| --- | --- |
+| DNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `learning_rate`, `output_domain`, `patience`, `target_z0` |
+| KBNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `include_coarse_input`, `learning_rate`, `mode`, `patience` |
+| Neuro-TF | `activation`, `batch_size`, `epochs`, `hidden_layers`, `learning_rate`, `order`, `patience`, `pole_damping`, `ridge` |
 
 This example searches learning rate, activation, and neural architecture while
 requiring a passive result:
@@ -658,16 +686,22 @@ python3 dnn.py optimize \
   --require-passive
 ```
 
-Numeric ranges use `NAME=LOW:HIGH[:linear|log]`. Integer parameters such as
-Neuro-TF `order`, `batch_size`, `epochs`, and `patience` are sampled as
-integers. Categorical choices use commas. Hidden layers support either an
-explicit layout set such as
-`--optimize-parameter 'hidden_layers=32;64;64,64;128,64'` or the structured
-range
-`hidden_layers=MIN_DEPTH:MAX_DEPTHxMIN_WIDTH:MAX_WIDTH[:linear|log]`. A
-structured range creates uniform-width networks; widths are rounded to
-`--adaptive-hidden-width-step`, which defaults to 8. Use explicit layouts when
-tapered networks are important.
+Domain syntax:
+
+| Domain type | Syntax | Example |
+| --- | --- | --- |
+| Linear numeric range | `NAME=LOW:HIGH` or `NAME=LOW:HIGH:linear` | `batch_size=64:512` |
+| Logarithmic numeric range | `NAME=LOW:HIGH:log` | `learning_rate=1e-4:1e-2:log` |
+| Categorical choices | `NAME=VALUE1,VALUE2,...` | `activation=tanh,relu` |
+| Explicit hidden layouts | `hidden_layers=LAYOUT1;LAYOUT2;...` | `hidden_layers=64,64;128,128,64;256,128,64` |
+| Hidden depth/width range | `hidden_layers=MIN_DEPTH:MAX_DEPTHxMIN_WIDTH:MAX_WIDTH[:SCALE]`, where scale is `linear` or `log` | `hidden_layers=1:4x32:256:log` |
+
+Integer parameters such as Neuro-TF `order`, `batch_size`, `epochs`, and
+`patience` are sampled as integers. A structured hidden-layer range creates
+uniform-width networks; widths are rounded to `--adaptive-hidden-width-step`,
+which defaults to 8. Use explicit layouts when tapered networks are important.
+Quote hidden-layer domains in the shell because semicolons are command
+separators.
 
 The search begins with maximin-separated configurations, then fits a small
 Matérn-5/2 GP to a feasibility-aware objective and selects each later trial by
@@ -676,6 +710,20 @@ eligible trials are ranked by `--selection-metric`; until one exists,
 passivity-violation count and singular-value excess guide the search. Adaptive
 search is sequential, so it uses one job even if a larger `--jobs` value is
 given.
+
+After the command finishes, open the model-specific Markdown report in the
+chosen output directory:
+
+| Model | Trial results | Markdown report | Selection JSON |
+| --- | --- | --- | --- |
+| DNN | `dnn_sweep_results.csv` | `dnn_sweep_summary.md` | `dnn_best_config.json` |
+| KBNN | `kbnn_sweep_results.csv` | `kbnn_sweep_summary.md` | `kbnn_best_config.json` |
+| Neuro-TF | `neurotf_sweep_results.csv` | `neurotf_sweep_summary.md` | `neurotf_best_config.json` |
+
+The report contains the ranked trial table, adaptive search stage and
+uncertainty, inline trend plots, and links to the detailed diagnostics. When an
+eligible winner exists, `best_model/` contains the promoted model and the
+report includes a copyable command for reproducing it by itself.
 
 If every completed trial fails training or the passivity constraints, the
 command returns a nonzero status and does not promote `best_model/`, but it
@@ -1318,6 +1366,45 @@ trial in `best_model/` as the sweep runs. This avoids a final refit after all
 trials finish. When the sweep completes, it prints a copyable standalone
 `train` command for the winning configuration and records that command in
 `dnn_best_config.json` and `dnn_sweep_summary.md`.
+
+#### Adaptive range optimization
+
+This is the recommended command when the useful values are not already known
+as a short discrete list. It searches continuous learning-rate and integer
+batch-size ranges, categorical activations, and the hidden-layer depth/width
+space:
+
+```bash
+python3 dnn.py optimize \
+  --mdif train_verify.mdif \
+  --out-dir dnn_adaptive \
+  --parameter-names W,L,H \
+  --search-mode adaptive \
+  --optimize-parameter learning_rate=1e-4:1e-2:log \
+  --optimize-parameter batch_size=64:512:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter freq_transform=log,log-linear \
+  --optimize-parameter 'hidden_layers=1:4x32:256:log' \
+  --adaptive-initial-trials 8 \
+  --adaptive-candidate-pool 768 \
+  --adaptive-exploration 1.5 \
+  --max-trials 32 \
+  --sparam-weights 'diag=1;offdiag=0.2' \
+  --selection-metric weighted_evm_pct \
+  --require-passive
+```
+
+Here, only the five named domains vary. Options such as `--epochs`,
+`--patience`, `--output-domain`, and `--target-z0` retain their normal values
+unless they are also supplied through `--optimize-parameter`. To test specific
+architectures instead of uniform-width depth/width combinations, use an
+explicit domain such as
+`--optimize-parameter 'hidden_layers=64,64;128,128,64;256,128,64'`.
+
+#### Discrete grid or random optimization
+
+Use the plural list options with `grid` or `random` when the complete candidate
+set is already known. This is the original discrete optimization method:
 
 ```bash
 python3 dnn.py optimize \
@@ -2002,6 +2089,48 @@ trials finish. When the sweep completes, it prints a copyable standalone
 `train` command for the winning configuration and records that command in
 `kbnn_best_config.json` and `kbnn_sweep_summary.md`.
 
+#### Adaptive range optimization
+
+For an integrated KBNN, pass `--coarse-mdif` as usual. The coarse DNN is fitted
+once, frozen, and reused while the adaptive optimizer trials different fine
+model configurations:
+
+```bash
+python3 kbnn.py optimize \
+  --mdif fine_train_verify.mdif \
+  --coarse-mdif coarse_train_verify.mdif \
+  --out-dir kbnn_adaptive \
+  --parameter-names W,L \
+  --search-mode adaptive \
+  --optimize-parameter mode=residual,prior-input \
+  --optimize-parameter include_coarse_input=false,true \
+  --optimize-parameter freq_transform=log,linear \
+  --optimize-parameter learning_rate=1e-4:8e-3:log \
+  --optimize-parameter batch_size=64:512:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter 'hidden_layers=1:4x32:192:log' \
+  --adaptive-initial-trials 8 \
+  --adaptive-candidate-pool 768 \
+  --adaptive-exploration 1.5 \
+  --max-trials 32 \
+  --sparam-weights 'diag=1;offdiag=0.2' \
+  --selection-metric weighted_evm_pct \
+  --require-passive
+```
+
+Invalid KBNN combinations are removed automatically: `plain` cannot use a
+coarse input, and `prior-input` always requires it. Residual candidates may be
+tested with either coarse-input setting. The coarse-model architecture is
+fixed by the normal `--coarse-*` options; the adaptive hidden-layer and fitting
+domains above apply to the fine network. Use `--coarse-model-dir` in place of
+`--coarse-mdif` only when intentionally reusing a previously fitted coarse
+network.
+
+#### Discrete grid or random optimization
+
+Use the plural list options when the KBNN modes and network configurations are
+already known as a finite candidate set:
+
 ```bash
 python3 kbnn.py optimize \
   --mdif fine_train_verify.mdif \
@@ -2038,13 +2167,11 @@ All integrated coarse-DNN controls listed for `train` (`--coarse-hidden-layers`,
 transform, seed, weights, and reporting intervals) also apply to `optimize`.
 They configure the one shared coarse fit, not separate per-trial fits.
 
-KBNN adaptive search supports `mode`, `include_coarse_input`,
-`freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`,
-`epochs`, and `patience`. For example, add
-`--search-mode adaptive --optimize-parameter mode=residual,prior-input`
-`--optimize-parameter 'hidden_layers=1:4x32:192:log'`
-`--optimize-parameter learning_rate=1e-4:8e-3:log`. The fitted coarse model is
-still prepared once and shared by every fine-model trial.
+In addition to the domains shown in the adaptive example, `epochs` and
+`patience` can be ranged with integer `--optimize-parameter` domains. Any
+setting omitted from those domains remains fixed at its normal option value.
+The fitted coarse model is still prepared once and shared by every fine-model
+trial.
 
 For fitting failures that do not produce an obvious Python error, rerun a small
 or representative sweep with `--debug --jobs 1`. The shared sweep debug mode
@@ -2650,6 +2777,43 @@ This avoids a final refit after all trials finish. When the sweep completes,
 it prints a copyable standalone `train` command for the winning configuration
 and records that command in `neurotf_best_config.json` and
 `neurotf_sweep_summary.md`.
+
+#### Adaptive range optimization
+
+Neuro-TF can adapt both the rational transfer-function fit and the neural
+coefficient model. This example searches pole count, damping, ridge
+regularization, learning rate, activation, and hidden-layer structure:
+
+```bash
+python3 neuro_tf.py optimize \
+  --mdif train_verify.mdif \
+  --out-dir neuro_tf_adaptive \
+  --parameter-names W,L,H \
+  --search-mode adaptive \
+  --optimize-parameter order=6:20 \
+  --optimize-parameter pole_damping=0.08:0.35:log \
+  --optimize-parameter ridge=1e-10:1e-5:log \
+  --optimize-parameter learning_rate=1e-4:8e-3:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter 'hidden_layers=1:4x32:192:log' \
+  --adaptive-initial-trials 8 \
+  --adaptive-candidate-pool 768 \
+  --adaptive-exploration 1.5 \
+  --max-trials 32 \
+  --selection-metric rmse_abs \
+  --require-passive
+```
+
+`order` is sampled as an integer. The positive `pole_damping`, `ridge`, and
+`learning_rate` ranges use logarithmic sampling so each decade is represented.
+To weight specific frequency bands during coefficient fitting and model
+selection, add a normal option such as
+`--frequency-weights 'default=1;2GHz:4GHz=5'`.
+
+#### Discrete grid or random optimization
+
+Use the plural list options when the rational and network candidates are
+already known as a finite set:
 
 ```bash
 python3 neuro_tf.py optimize \
