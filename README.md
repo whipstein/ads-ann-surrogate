@@ -163,15 +163,16 @@ any verification errors exist.
 Assume:
 
 - `geometries.csv` contains every geometry already simulated;
+- `geometries.json` is the companion metadata written when that CSV was
+  generated and contains the parameter names, ranges, units, and linear/log
+  scaling;
 - `outputs/dnn_adaptive/best_model/` is the winning optimize result; and
-- its parameter ranges are `W=0.40mm:0.80mm` and `L=1.00mm:1.60mm`.
+- the fit's verification metrics use the same geometry parameters.
 
 Request eight additional training geometries with this complete command:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/dnn_adaptive/best_model \
   --existing-points geometries.csv \
@@ -197,8 +198,9 @@ The important inputs are:
 | Input | Purpose |
 | --- | --- |
 | `--fit-dir` | Directory containing the current fit's `verification_metrics.csv`. For a successful optimize run, use its `best_model/` directory. |
-| `--parameter` | Complete physical domain over which candidates may be selected. Repeat it for every model parameter, using the same names and units as the fit data. |
-| `--existing-points` | CSV of already simulated geometries that must not be suggested again. Repeat for multiple CSVs. `--existing-mdif` can be used instead of or together with it. |
+| `--existing-points` | CSV of already simulated geometries that must not be suggested again. Its same-stem JSON is loaded automatically as the parameter domain. Repeat for multiple CSVs. `--existing-mdif` can be used together with it. |
+| `--parameter-json` | Explicit geometry metadata source when no original point CSV is supplied, such as an MDIF-only workflow. It is normally unnecessary. |
+| `--parameter` | Optional backward-compatible domain override. Repeat it for every parameter only when intentionally bypassing the generated JSON. |
 | `--count` | Number of new expensive geometries to return, not candidate-pool size. Start with roughly one or two points per dimension. |
 | `--candidate-count` | Number of inexpensive candidate locations scored by the GP. Only the best `--count` locations are written for simulation. |
 | `--metric` | Per-row error column from `verification_metrics.csv`. Typical choices are `evm_pct`, `rmse_abs`, and `max_abs`; `auto` chooses an available metric. |
@@ -217,6 +219,13 @@ The new-point CSV includes `predicted_error`, `gp_log_uncertainty`,
 `gp_upper_confidence_error`, `distance_to_existing`, and
 `acquisition_score`. It does not modify `geometries.csv` or an MDIF.
 
+The selector first looks for `geometries.json` beside
+`--existing-points geometries.csv`. If a split file such as
+`geometries_train.csv` is supplied, it also finds the single combined
+`geometries.json`; split generation intentionally does not create duplicate
+JSON files. Use `--parameter-json PATH` only when the CSV/JSON names no longer
+match or when occupied points are supplied only through `--existing-mdif`.
+
 #### After Simulating the First GP Batch
 
 Run the following sequence:
@@ -233,8 +242,6 @@ For example:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 6 \
   --fit-dir outputs/dnn_gp_round_1_refit \
   --existing-points geometries.csv \
@@ -271,8 +278,6 @@ For example, if an all-ineligible report identifies one-based trial 7:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
   --existing-points geometries.csv \
@@ -391,8 +396,6 @@ omits `--acquisition` and therefore uses the legacy default:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 12 \
   --fit-dir outputs/dnn_model \
   --existing-points geometries.csv \
@@ -448,9 +451,6 @@ chosen provisional network, request a small next batch:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter P1=0:1 --parameter P2=0:1 \
-  --parameter P3=0:1 --parameter P4=0:1 \
-  --parameter P5=0:1 --parameter P6=0:1 \
   --count 6 \
   --fit-dir outputs/dnn_compact \
   --existing-points adaptive_round_0.csv \
@@ -490,7 +490,8 @@ until this alternative has been validated against the target EM/model flow.
 
 Most examples below use the same two geometry variables so the differences
 between workflows are explicit. `geometries.csv` is assumed to list every
-geometry already simulated, and each `--fit-dir` is assumed to contain the
+geometry already simulated, `geometries.json` is its automatically generated
+parameter metadata, and each `--fit-dir` is assumed to contain the
 `verification_metrics.csv` produced by the current fit. Replace the DNN output
 directory with a KBNN or Neuro-TF output directory without changing the point
 generation options.
@@ -504,10 +505,9 @@ requesting a geometry already present in the simulated MDIF:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 10 \
   --fit-dir outputs/dnn_adaptive/best_model \
+  --existing-points geometries.csv \
   --existing-mdif train_verify.mdif \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -541,10 +541,9 @@ metrics under the selected KBNN model:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/kbnn_adaptive/best_model \
+  --parameter-json fine_geometries.json \
   --existing-mdif fine_train_verify.mdif \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -560,10 +559,9 @@ Use the same workflow with the selected Neuro-TF model:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/neuro_tf_adaptive/best_model \
+  --parameter-json geometries.json \
   --existing-mdif train_verify.mdif \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -584,10 +582,9 @@ directly to that retained trial's metrics:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 10 \
   --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
+  --parameter-json geometries.json \
   --existing-mdif train_verify.mdif \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -615,8 +612,6 @@ round 2 cannot suggest them again:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 6 \
   --fit-dir outputs/dnn_gp_round_1_refit \
   --existing-points geometries.csv \
@@ -643,19 +638,17 @@ same candidate population.
 
 #### Six-Parameter GP Batch With Linear and Logarithmic Ranges
 
-This higher-dimensional example uses an explicit candidate budget and includes
-the normalized coordinates in the result for auditing:
+This higher-dimensional example assumes `six_parameter_geometries.json` was
+written with the original six-parameter geometry CSV and therefore already
+contains the complete mix of linear and logarithmic ranges. It uses an explicit
+candidate budget and includes the normalized coordinates in the result for
+auditing:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.20mm:0.80mm \
-  --parameter L=0.50mm:2.00mm \
-  --parameter H=0.05mm:0.30mm \
-  --parameter Er=2.8:4.2 \
-  --parameter TanD=0.001:0.03:log \
-  --parameter Roughness=0.10um:5.00um:log \
   --count 8 \
   --fit-dir outputs/dnn_six_parameter/best_model \
+  --parameter-json six_parameter_geometries.json \
   --existing-mdif six_parameter_train_verify.mdif \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -747,8 +740,6 @@ following alternatives for another range-extension refinement batch.
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:1.00mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/dnn_extended_seed \
   --existing-points geometries_extended_seed.csv \
@@ -766,8 +757,6 @@ python3 generate_points.py suggest-additional \
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:1.00mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/dnn_extended_seed \
   --existing-points geometries_extended_seed.csv \
@@ -796,8 +785,6 @@ verification geometries:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/dnn_current \
   --existing-points geometries.csv \
@@ -819,8 +806,6 @@ uncertainty and point separation:
 
 ```bash
 python3 generate_points.py suggest-additional \
-  --parameter W=0.40mm:0.80mm \
-  --parameter L=1.00mm:1.60mm \
   --count 8 \
   --fit-dir outputs/dnn_current \
   --existing-points geometries.csv \
@@ -848,8 +833,9 @@ without a subcommand uses it automatically.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--extend-range SPEC</code></nobr> | <code>generate</code> | Optional one-sided append workflow. Supplies the new overall bounds as <code>NAME=NEW_LOW:NEW_HIGH</code>; exactly one bound must match the original <code>--parameter</code> range and the other must move outward. Requires <code>--existing-points</code>. | <nobr><code>--extend-range W=0.40mm:1.00mm</code></nobr> |
-| <nobr><code>--parameter SPEC</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Required and repeatable. Defines an existing parameter as <code>NAME=LOW:HIGH[:linear\|log]</code>. Matching bound units are retained in the output. | <nobr><code>--parameter W=0.40mm:0.80mm</code></nobr> |
-| <nobr><code>--range-factor SPEC</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Optional and repeatable. Expands the named parameter's total span around its existing center. The finite factor must be greater than 1. | <nobr><code>--range-factor W=1.5</code></nobr> |
+| <nobr><code>--parameter SPEC</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Repeatable definition in the form <code>NAME=LOW:HIGH[:linear\|log]</code>. Required for <code>generate</code>. For <code>suggest-additional</code>, it is an optional complete override when intentionally bypassing generated metadata. | <nobr><code>--parameter W=0.40mm:0.80mm</code></nobr> |
+| <nobr><code>--parameter-json PATH</code></nobr> | <code>suggest-additional</code> | Explicit generated geometry JSON from which to load every parameter name, bound, unit, and linear/log scale. Omit it when a companion JSON can be inferred from <code>--existing-points</code>. Cannot be combined with <code>--parameter</code>. | <nobr><code>--parameter-json geometries.json</code></nobr> |
+| <nobr><code>--range-factor SPEC</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Optional and repeatable. Expands the named parameter's total span around its existing center, whether the domain came from <code>--parameter</code> or JSON. The finite factor must be greater than 1. | <nobr><code>--range-factor W=1.5</code></nobr> |
 
 ### Sampling
 
@@ -879,7 +865,7 @@ without a subcommand uses it automatically.
 | <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked fit-error-region CSV. Default: <code>&lt;out&gt;_fit_error_regions.csv</code>. | <nobr><code>--analysis-out error_regions.csv</code></nobr> |
 | <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of new points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. | <nobr><code>--count 80</code></nobr> |
 | <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
-| <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid. | <nobr><code>--existing-points geometries.csv</code></nobr> |
+| <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. A <code>*_train.csv</code> or <code>*_verification.csv</code> split also resolves the combined JSON. | <nobr><code>--existing-points geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
 | <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges is written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
@@ -4375,8 +4361,10 @@ $$
 
 Thus every observation and candidate is represented by
 $\mathbf u\in[0,1]^d$. Distances, the GP length scale, `--focus-radius`, and
-`--min-distance` all operate in this normalized geometry space. The command's
-`--parameter` bounds must therefore describe the complete domain being scored.
+`--min-distance` all operate in this normalized geometry space. The resolved
+parameter bounds—from the companion geometry JSON, an explicit
+`--parameter-json`, or explicit `--parameter` overrides—must therefore describe
+the complete domain being scored.
 
 ### C.3 Geometry-level error target
 
@@ -4575,10 +4563,11 @@ different purposes:
 - `generate --extend-range` samples only the new one-sided slab and appends
   those points to the original geometry CSV. It provides guaranteed initial
   boundary coverage without using model error.
-- `suggest-additional` scores the full domain supplied through `--parameter`.
-  When those bounds include an extension, GP uncertainty and the diversity
-  term can favor the new region, but the selector may legitimately choose an
-  old-region point with a larger acquisition score.
+- `suggest-additional` scores the full domain loaded from the expanded
+  geometry's JSON (or explicitly overridden). When those bounds include an
+  extension, GP uncertainty and the diversity term can favor the new region,
+  but the selector may legitimately choose an old-region point with a larger
+  acquisition score.
 
 For that reason, the recommended range workflow is to seed the new slab first,
 simulate it, refit the surrogate, and then compare legacy and GP refinement

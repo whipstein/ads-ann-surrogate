@@ -197,7 +197,8 @@ def apply_range_factors(
         name, factor = parse_range_factor(raw)
         if name not in by_name:
             raise ValueError(
-                f"Range factor refers to unknown parameter {name!r}; add it with --parameter first"
+                f"Range factor refers to unknown parameter {name!r}; define it "
+                "with --parameter or in the selected parameter metadata JSON"
             )
         if name in factors:
             raise ValueError(f"Range factor for parameter {name!r} was specified more than once")
@@ -616,6 +617,103 @@ def write_geometry_metadata(
     metadata_path = geometry_metadata_path(geometry_path)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return metadata_path
+
+
+def parameter_specs_from_geometry_metadata(path: Path) -> list[ParameterSpec]:
+    if not path.exists():
+        raise ValueError(f"Parameter metadata JSON does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read parameter metadata JSON {path}: {exc}") from exc
+    raw_parameters = payload.get("parameters")
+    if not isinstance(raw_parameters, list) or not raw_parameters:
+        raise ValueError(
+            f"Parameter metadata JSON {path} has no non-empty 'parameters' list"
+        )
+
+    parameters: list[ParameterSpec] = []
+    seen: set[str] = set()
+    for index, raw_parameter in enumerate(raw_parameters, start=1):
+        if not isinstance(raw_parameter, dict):
+            raise ValueError(
+                f"Parameter entry {index} in {path} must be a JSON object"
+            )
+        name = str(raw_parameter.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"Parameter entry {index} in {path} has no name")
+        if name in seen:
+            raise ValueError(f"Parameter {name!r} appears more than once in {path}")
+        seen.add(name)
+        raw_range = raw_parameter.get("range")
+        if not isinstance(raw_range, dict):
+            raise ValueError(f"Parameter {name!r} in {path} has no range object")
+        try:
+            lower_declared = float(raw_range["lower"])
+            upper_declared = float(raw_range["upper"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Parameter {name!r} in {path} needs numeric range.lower and range.upper"
+            ) from exc
+        unit = str(raw_range.get("unit") or "").strip().lower()
+        if unit not in UNIT_SCALES:
+            raise ValueError(
+                f"Parameter {name!r} in {path} uses unsupported unit {unit!r}"
+            )
+        scale = str(raw_parameter.get("scale") or "linear").strip().lower()
+        if scale not in {"linear", "log"}:
+            raise ValueError(
+                f"Parameter {name!r} in {path} has unsupported scale {scale!r}"
+            )
+        lower = lower_declared * UNIT_SCALES[unit]
+        upper = upper_declared * UNIT_SCALES[unit]
+        if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
+            raise ValueError(
+                f"Parameter {name!r} in {path} needs finite ordered bounds"
+            )
+        if scale == "log" and lower <= 0.0:
+            raise ValueError(
+                f"Log-scaled parameter {name!r} in {path} needs positive bounds"
+            )
+        parameters.append(
+            ParameterSpec(
+                name=name,
+                lower=lower,
+                upper=upper,
+                unit=unit,
+                scale=scale,
+            )
+        )
+    return parameters
+
+
+def companion_geometry_metadata_candidates(csv_path: Path) -> list[Path]:
+    candidates = [geometry_metadata_path(csv_path)]
+    for suffix in ("_train", "_verification"):
+        if csv_path.stem.endswith(suffix):
+            combined_path = csv_path.with_name(
+                f"{csv_path.stem[:-len(suffix)]}{csv_path.suffix or '.csv'}"
+            )
+            candidates.append(geometry_metadata_path(combined_path))
+    return list(dict.fromkeys(candidates))
+
+
+def parameter_specs_equal(
+    lhs: Sequence[ParameterSpec],
+    rhs: Sequence[ParameterSpec],
+) -> bool:
+    if len(lhs) != len(rhs):
+        return False
+    for left, right in zip(lhs, rhs):
+        if (
+            left.name != right.name
+            or left.unit != right.unit
+            or left.scale != right.scale
+            or not math.isclose(left.lower, right.lower, rel_tol=1e-10, abs_tol=1e-15)
+            or not math.isclose(left.upper, right.upper, rel_tol=1e-10, abs_tol=1e-15)
+        ):
+            return False
+    return True
 
 
 def generated_point_rows(
@@ -1653,13 +1751,25 @@ VALID_METHODS = {
 }
 
 
-def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
+def add_parameter_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    parameter_required: bool = True,
+) -> None:
     parser.add_argument(
         "--parameter",
         action="append",
-        required=True,
+        required=parameter_required,
+        default=[],
         metavar="NAME=LOW:HIGH[:linear|log]",
-        help="Repeat once per geometry/process variable, e.g. W=0.40mm:0.80mm or R=1:100:log.",
+        help=(
+            "Repeat once per geometry/process variable, e.g. W=0.40mm:0.80mm "
+            "or R=1:100:log."
+            if parameter_required
+            else "Optional explicit parameter-domain override. When omitted, "
+            "suggest-additional loads parameters from --parameter-json or the "
+            "companion JSON beside --existing-points."
+        ),
     )
     parser.add_argument(
         "--range-factor",
@@ -1667,8 +1777,8 @@ def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
         default=[],
         metavar="NAME=FACTOR",
         help=(
-            "Increase an existing --parameter span around its center by this factor. "
-            "Repeat for multiple parameters, e.g. W=1.5."
+            "Increase an existing parameter-domain span around its center by this "
+            "factor. Repeat for multiple parameters, e.g. W=1.5."
         ),
     )
     parser.add_argument("--seed", type=int, default=1234, help="Random seed for randomized methods.")
@@ -1778,7 +1888,15 @@ def build_suggest_parser() -> argparse.ArgumentParser:
             "geometry/process points for the next EM batch."
         ),
     )
-    add_parameter_arguments(parser)
+    add_parameter_arguments(parser, parameter_required=False)
+    parser.add_argument(
+        "--parameter-json",
+        help=(
+            "Generated geometry metadata JSON containing parameter names, bounds, "
+            "units, and scales. When omitted with no --parameter options, infer the "
+            "same-stem JSON from --existing-points."
+        ),
+    )
     parser.add_argument("--count", type=int, required=True, help="Number of additional points to suggest.")
     parser.add_argument(
         "--fit-dir",
@@ -1792,7 +1910,11 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         "--existing-points",
         action="append",
         default=[],
-        help="CSV containing already simulated points. Repeat for multiple files.",
+        help=(
+            "CSV containing already simulated points. Repeat for multiple files. "
+            "When --parameter and --parameter-json are omitted, load the parameter "
+            "domain from its generated companion JSON."
+        ),
     )
     parser.add_argument(
         "--existing-mdif",
@@ -1925,6 +2047,49 @@ def parse_parameters_or_error(
     except ValueError as exc:
         parser.error(str(exc))
     raise AssertionError("unreachable")
+
+
+def resolve_suggest_parameters(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> list[ParameterSpec]:
+    if args.parameter and args.parameter_json:
+        parser.error("Use either --parameter or --parameter-json, not both")
+    if args.parameter:
+        args.parameter_metadata_source = None
+        return parse_parameters_or_error(parser, args)
+
+    metadata_paths: list[Path] = []
+    if args.parameter_json:
+        metadata_paths.append(Path(args.parameter_json))
+    else:
+        for raw_path in args.existing_points:
+            for candidate in companion_geometry_metadata_candidates(Path(raw_path)):
+                if candidate.exists() and candidate not in metadata_paths:
+                    metadata_paths.append(candidate)
+                    break
+    if not metadata_paths:
+        parser.error(
+            "No parameter domain was supplied. Add --existing-points with its "
+            "same-stem generated JSON, pass --parameter-json explicitly, or use "
+            "repeatable --parameter overrides."
+        )
+
+    try:
+        parameters = parameter_specs_from_geometry_metadata(metadata_paths[0])
+        for metadata_path in metadata_paths[1:]:
+            other_parameters = parameter_specs_from_geometry_metadata(metadata_path)
+            if not parameter_specs_equal(parameters, other_parameters):
+                raise ValueError(
+                    "Existing-point metadata files describe different parameter "
+                    f"domains: {metadata_paths[0]} and {metadata_path}. Use "
+                    "--parameter-json to select the intended complete domain."
+                )
+        parameters = apply_range_factors(parameters, args.range_factor)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.parameter_metadata_source = str(metadata_paths[0])
+    return parameters
 
 
 def validate_shared_sampling_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -2159,7 +2324,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     if args.gp_error_floor <= 0.0:
         parser.error("--gp-error-floor must be positive")
     validate_shared_sampling_args(parser, args)
-    parameters = parse_parameters_or_error(parser, args)
+    parameters = resolve_suggest_parameters(parser, args)
     validate_parameter_decimal_places(parser, parameters, args.decimal_places)
 
     metrics_path = verification_metrics_path(args, parser)
@@ -2205,6 +2370,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         return 2
 
     acquisition_metadata: dict[str, object] = {}
+    if getattr(args, "parameter_metadata_source", None):
+        acquisition_metadata["parameter_metadata_source"] = (
+            args.parameter_metadata_source
+        )
     if args.acquisition == "gp-ucb":
         try:
             suggestions, gp_model = select_gp_ucb_points(
@@ -2221,19 +2390,17 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             )
         except ValueError as exc:
             parser.error(str(exc))
-        acquisition_metadata = {
-            "gp": {
-                "kernel": "matern52_isotropic",
-                "target_transform": "natural_log_error",
-                "observation_count": len(gp_model.observation_points),
-                "length_scale": gp_model.length_scale,
-                "length_scale_selection": (
-                    "user" if args.gp_length_scale is not None else "log_marginal_likelihood"
-                ),
-                "noise_variance": gp_model.noise_variance,
-                "exploration_weight": args.exploration_weight,
-                "log_marginal_likelihood": gp_model.log_marginal_likelihood,
-            }
+        acquisition_metadata["gp"] = {
+            "kernel": "matern52_isotropic",
+            "target_transform": "natural_log_error",
+            "observation_count": len(gp_model.observation_points),
+            "length_scale": gp_model.length_scale,
+            "length_scale_selection": (
+                "user" if args.gp_length_scale is not None else "log_marginal_likelihood"
+            ),
+            "noise_variance": gp_model.noise_variance,
+            "exploration_weight": args.exploration_weight,
+            "log_marginal_likelihood": gp_model.log_marginal_likelihood,
         }
         if len(gp_model.observation_points) < len(parameters) + 1:
             print(
@@ -2282,6 +2449,8 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         f"{candidate_count} {candidate_method} candidate point(s)"
     )
     print(f"acquisition method: {args.acquisition}")
+    if getattr(args, "parameter_metadata_source", None):
+        print(f"parameter domain: {args.parameter_metadata_source}")
     if args.acquisition == "gp-ucb":
         print(
             "GP observations: "
