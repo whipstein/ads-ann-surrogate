@@ -147,6 +147,150 @@ used, the one JSON describes the complete combined geometry; the separate
 train/verification CSVs do not receive duplicate JSON files. Targeted
 additional-point CSVs receive their own JSON files.
 
+### Using GP to Determine Additional Points
+
+This is the direct workflow for using the Gaussian-process selector to choose
+new EM geometries. It is separate from GP hyperparameter optimization: this
+command models the current surrogate's **geometry-level verification error**
+and writes the next physical data points to simulate.
+
+The GP workflow requires an existing DNN, KBNN, or Neuro-TF fit containing
+`verification_metrics.csv`; it cannot choose an informed first design before
+any verification errors exist.
+
+#### First GP Addition Round
+
+Assume:
+
+- `geometries.csv` contains every geometry already simulated;
+- `outputs/dnn_adaptive/best_model/` is the winning optimize result; and
+- its parameter ranges are `W=0.40mm:0.80mm` and `L=1.00mm:1.60mm`.
+
+Request eight additional training geometries with this complete command:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 8 \
+  --fit-dir outputs/dnn_adaptive/best_model \
+  --existing-points geometries.csv \
+  --acquisition gp-ucb \
+  --candidate-method maximin-lhs \
+  --candidate-count 1600 \
+  --lhs-candidates 32 \
+  --metric evm_pct \
+  --exploration-weight 2.0 \
+  --gp-noise-variance 1e-6 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --seed 1234 \
+  --decimal-places 4 \
+  --include-normalized \
+  --target-dataset train \
+  --analysis-out outputs/gp_round_1_error_regions.csv \
+  --out outputs/gp_round_1_points.csv
+```
+
+The important inputs are:
+
+| Input | Purpose |
+| --- | --- |
+| `--fit-dir` | Directory containing the current fit's `verification_metrics.csv`. For a successful optimize run, use its `best_model/` directory. |
+| `--parameter` | Complete physical domain over which candidates may be selected. Repeat it for every model parameter, using the same names and units as the fit data. |
+| `--existing-points` | CSV of already simulated geometries that must not be suggested again. Repeat for multiple CSVs. `--existing-mdif` can be used instead of or together with it. |
+| `--count` | Number of new expensive geometries to return, not candidate-pool size. Start with roughly one or two points per dimension. |
+| `--candidate-count` | Number of inexpensive candidate locations scored by the GP. Only the best `--count` locations are written for simulation. |
+| `--metric` | Per-row error column from `verification_metrics.csv`. Typical choices are `evm_pct`, `rmse_abs`, and `max_abs`; `auto` chooses an available metric. |
+| `--exploration-weight` | GP-UCB uncertainty weight. `2.0` is balanced; smaller values exploit known high-error regions and larger values explore uncertain regions. |
+| `--novelty-power` and `--min-distance` | Encourage separation from simulated points and from other points selected in the same batch. Distances use normalized geometry coordinates. |
+
+The command writes three analysis artifacts:
+
+- `outputs/gp_round_1_points.csv`: the eight new geometries to simulate;
+- `outputs/gp_round_1_points.json`: parameter ranges and GP/acquisition
+  metadata; and
+- `outputs/gp_round_1_error_regions.csv`: current verification geometries
+  ranked by the error used to fit the GP.
+
+The new-point CSV includes `predicted_error`, `gp_log_uncertainty`,
+`gp_upper_confidence_error`, `distance_to_existing`, and
+`acquisition_score`. It does not modify `geometries.csv` or an MDIF.
+
+#### After Simulating the First GP Batch
+
+Run the following sequence:
+
+1. Simulate every row in `outputs/gp_round_1_points.csv`.
+2. Add the resulting blocks to the training MDIF.
+3. Refit the same provisional model architecture and fitting objective.
+4. Produce a new `verification_metrics.csv` from verification data not used as
+   training data.
+5. Run a second GP command using the new fit and mark both the original and
+   first-round CSVs as occupied.
+
+For example:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 6 \
+  --fit-dir outputs/dnn_gp_round_1_refit \
+  --existing-points geometries.csv \
+  --existing-points outputs/gp_round_1_points.csv \
+  --acquisition gp-ucb \
+  --candidate-method maximin-lhs \
+  --candidate-count 1400 \
+  --metric evm_pct \
+  --exploration-weight 1.5 \
+  --gp-noise-variance 1e-6 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --seed 1235 \
+  --target-dataset train \
+  --analysis-out outputs/gp_round_2_error_regions.csv \
+  --out outputs/gp_round_2_points.csv
+```
+
+Repeat the simulate, append, refit, and acquire cycle until the verification
+target stops improving or the EM budget is exhausted. Keep a separate final
+audit set that never supplies GP error observations.
+
+#### Which Fit Path to Use
+
+| Current model result | GP error input |
+| --- | --- |
+| Direct `train` run | `--fit-dir outputs/dnn_model` (or the corresponding KBNN/Neuro-TF model directory) |
+| Successful DNN optimize run | `--fit-dir outputs/dnn_adaptive/best_model` |
+| Successful KBNN optimize run | `--fit-dir outputs/kbnn_adaptive/best_model` |
+| Successful Neuro-TF optimize run | `--fit-dir outputs/neuro_tf_adaptive/best_model` |
+| All optimize trials failed the passivity criteria | Run optimize with `--keep-trial-models`, take `best_available_trial` from the best-config JSON, and use `--verification-metrics <sweep>/trials/trial_NNNN/verification_metrics.csv`. |
+
+For example, if an all-ineligible report identifies one-based trial 7:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 8 \
+  --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
+  --existing-points geometries.csv \
+  --acquisition gp-ucb \
+  --candidate-method maximin-lhs \
+  --metric evm_pct \
+  --exploration-weight 2.5 \
+  --gp-noise-variance 1e-5 \
+  --novelty-power 1.25 \
+  --min-distance 0.05 \
+  --target-dataset train \
+  --out outputs/gp_from_trial_0007.csv
+```
+
+More GP examples—including six-parameter, range-extension, KBNN, Neuro-TF,
+and exploration-versus-exploitation commands—are provided under
+[Copyable Adaptive Point-Generation Examples](#copyable-adaptive-point-generation-examples).
+
 ### Extending an Existing Parameter Range
 
 To extend one side of an existing design, keep the original bounds in
@@ -238,11 +382,12 @@ python3 generate_points.py \
   --out geometries_{method}.csv
 ```
 
-After a first model fit, use the `suggest-additional` command to target the
-next expensive EM simulations toward the current worst-fit regions. The command
-reads `verification_metrics.csv`, ranks verification points by error, scores a
-candidate pool by proximity to high-error regions and distance from existing
-points, then writes a new CSV for the next training batch:
+### Legacy Error-Distance Additional Points
+
+The older `error-distance` method remains available for comparison. It ranks
+verification points by error and scores candidates by proximity to high-error
+regions and distance from existing points. The following command intentionally
+omits `--acquisition` and therefore uses the legacy default:
 
 ```bash
 python3 generate_points.py suggest-additional \
@@ -259,7 +404,7 @@ nearest high-error verification source, distance from existing points, and
 acquisition score. A companion `*_fit_error_regions.csv` file ranks the current
 verification points by the selected metric, which defaults to `evm_pct`.
 
-#### Gaussian-Process Adaptive Loop
+### Gaussian-Process Adaptive Loop
 
 `suggest-additional` also provides a true Gaussian-process upper-confidence
 bound acquisition mode. It fits a Matérn-5/2 GP to the natural logarithm of the
@@ -341,7 +486,7 @@ scale, observation count, likelihood, noise variance, and exploration weight.
 The original `error-distance` selector remains the default acquisition mode
 until this alternative has been validated against the target EM/model flow.
 
-#### Copyable Adaptive Point-Generation Examples
+### Copyable Adaptive Point-Generation Examples
 
 Most examples below use the same two geometry variables so the differences
 between workflows are explicit. `geometries.csv` is assumed to list every
@@ -350,7 +495,7 @@ geometry already simulated, and each `--fit-dir` is assumed to contain the
 directory with a KBNN or Neuro-TF output directory without changing the point
 generation options.
 
-##### GP Additions From a Successful DNN Optimize Run
+#### GP Additions From a Successful DNN Optimize Run
 
 For an optimize or sweep result, point `--fit-dir` at `best_model/`, not at the
 sweep root. The promoted model directory contains the winning trial's
@@ -389,7 +534,7 @@ Global summary fields such as `weighted_evm_pct` are not per-geometry input
 columns. The requested CSV contains only the ten new geometries; it does not
 append or rewrite the original MDIF.
 
-##### GP Additions From KBNN and Neuro-TF Optimize Runs
+#### GP Additions From KBNN and Neuro-TF Optimize Runs
 
 The point selector is model-family independent. Use the fine-model verification
 metrics under the selected KBNN model:
@@ -430,7 +575,7 @@ python3 generate_points.py suggest-additional \
   --out outputs/neuro_tf_gp_round_1.csv
 ```
 
-##### GP Additions When Every Optimize Trial Failed Passivity
+#### GP Additions When Every Optimize Trial Failed Passivity
 
 An all-ineligible sweep has no `best_model/`. Run the optimization with
 `--keep-trial-models`, open its Markdown report, and use the closest available
@@ -461,7 +606,7 @@ one-based trial number. Without `--keep-trial-models`, nonwinning trial
 `verification_metrics.csv` files are intentionally removed after the sweep,
 so they cannot be used for a later GP round.
 
-##### A Second GP Acquisition Round
+#### A Second GP Acquisition Round
 
 After simulating `gp_round_1_points.csv`, add those blocks to the training
 MDIF, refit the same provisional model, and generate fresh verification
@@ -496,7 +641,7 @@ collapsed internally. Incrementing `--seed` changes the finite candidate pool.
 Keep the seed fixed instead when comparing GP tuning settings on exactly the
 same candidate population.
 
-##### Six-Parameter GP Batch With Linear and Logarithmic Ranges
+#### Six-Parameter GP Batch With Linear and Logarithmic Ranges
 
 This higher-dimensional example uses an explicit candidate budget and includes
 the normalized coordinates in the result for auditing:
@@ -534,7 +679,7 @@ batch only when the first acquisition remains broadly uncertain. Small batches
 allow the GP error surface to be rebuilt after each set of expensive
 simulations.
 
-##### Exploitation-Focused and Exploration-Focused Variants
+#### Exploitation-Focused and Exploration-Focused Variants
 
 To concentrate near currently predicted high-error regions, start from the
 successful-DNN command and change these controls:
@@ -598,7 +743,7 @@ Simulate the appended rows, include their results in the training and
 verification MDIF, and refit over the expanded domain. Then use one of the two
 following alternatives for another range-extension refinement batch.
 
-##### Range Extension With the Legacy Error-Distance Selector
+#### Range Extension With the Legacy Error-Distance Selector
 
 ```bash
 python3 generate_points.py suggest-additional \
@@ -617,7 +762,7 @@ python3 generate_points.py suggest-additional \
   --out range_extension_legacy_additional.csv
 ```
 
-##### Range Extension With the GP-UCB Selector
+#### Range Extension With the GP-UCB Selector
 
 ```bash
 python3 generate_points.py suggest-additional \
@@ -644,7 +789,7 @@ the new slab.
 
 When the parameter ranges are unchanged, omit the slab-generation step.
 
-##### Standard Addition With the Legacy Error-Distance Selector
+#### Standard Addition With the Legacy Error-Distance Selector
 
 Use the legacy selector to concentrate additions around observed high-error
 verification geometries:
@@ -667,7 +812,7 @@ python3 generate_points.py suggest-additional \
   --out standard_legacy_additional.csv
 ```
 
-##### Standard Addition With the GP-UCB Selector
+#### Standard Addition With the GP-UCB Selector
 
 Use GP-UCB over the same unchanged range to balance predicted error against
 uncertainty and point separation:
