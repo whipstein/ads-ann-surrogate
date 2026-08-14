@@ -35,13 +35,16 @@ from surrogate_common import (  # noqa: E402
     add_dc_export_arguments,
     add_dc_fitting_arguments,
     add_dc_port_paths_argument,
+    add_adaptive_search_arguments,
     add_debug_argument,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
     ads_ann_training_type_enum,
     apply_distinct_dc_response,
+    apply_candidate_overrides,
     build_ads_export_blocks,
+    build_adaptive_candidate_pool,
     build_training_export_commands,
     cleanup_trial_dir,
     common_sparameter_labels,
@@ -1532,6 +1535,35 @@ def summary_metric(summary: dict[str, object], metric_name: str) -> float | None
 
 
 def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
+    if args.mode == "adaptive":
+        base_config = {
+            "freq_transform": parse_text_options(args.freq_transform_options)[0],
+            "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options)[0],
+            "activation": parse_text_options(args.activation_options)[0],
+            "learning_rate": parse_float_options(args.learning_rates)[0],
+        }
+        candidates, columns, log_parameters = build_adaptive_candidate_pool(
+            base_config,
+            args.optimize_parameter,
+            {
+                "activation": "str",
+                "batch_size": "int",
+                "epochs": "int",
+                "freq_transform": "str",
+                "hidden_layers": "hidden_layers",
+                "learning_rate": "float",
+                "output_domain": "str",
+                "patience": "int",
+                "target_z0": "float",
+            },
+            max_trials=args.max_trials,
+            candidate_pool=args.adaptive_candidate_pool,
+            hidden_width_step=args.adaptive_hidden_width_step,
+            seed=args.seed,
+        )
+        args.adaptive_result_columns = columns
+        args.adaptive_log_parameters = log_parameters
+        return candidates
     axes = {
         "freq_transform": parse_text_options(args.freq_transform_options),
         "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options),
@@ -1562,7 +1594,7 @@ def namespace_for_trial(
     plots: int,
 ) -> argparse.Namespace:
     trial_seed = sweep_trial_seed(args.seed, trial_index, getattr(args, "trial_seed_mode", "fixed"))
-    return argparse.Namespace(
+    return apply_candidate_overrides(argparse.Namespace(
         mdif=args.mdif,
         verification_mdif=args.verification_mdif,
         out_dir=str(out_dir),
@@ -1592,7 +1624,7 @@ def namespace_for_trial(
         frequency_weights=args.frequency_weights,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
-    )
+    ), candidate)
 
 
 def dnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object], str, int, int]) -> dict[str, object]:
@@ -1643,14 +1675,15 @@ def command_sweep(args: argparse.Namespace) -> int:
         train_command_prefix=[sys.executable, "dnn.py", "train"],
     )
     best_dir = Path(args.out_dir) / "best_model"
-    update_training_export_commands(
-        best_dir / "training_summary.md",
-        dnn_export_commands(best_dir, args.mdif),
-    )
-    update_training_export_commands(
-        Path(args.out_dir) / "dnn_sweep_summary.md",
-        dnn_export_commands(best_dir, args.mdif),
-    )
+    if status == 0:
+        update_training_export_commands(
+            best_dir / "training_summary.md",
+            dnn_export_commands(best_dir, args.mdif),
+        )
+        update_training_export_commands(
+            Path(args.out_dir) / "dnn_sweep_summary.md",
+            dnn_export_commands(best_dir, args.mdif),
+        )
     return status
 
 
@@ -1890,11 +1923,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--search-mode",
         "--mode",
         dest="mode",
-        choices=["grid", "random"],
+        choices=["adaptive", "grid", "random"],
         default="random",
         help="Sweep search strategy. --mode remains a backward-compatible alias.",
     )
     sweep.add_argument("--max-trials", type=int, default=24)
+    add_adaptive_search_arguments(sweep)
     sweep.add_argument(
         "--trial-seed-mode",
         choices=["fixed", "indexed"],

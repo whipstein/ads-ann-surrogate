@@ -42,13 +42,16 @@ from surrogate_common import (  # noqa: E402
     add_dc_export_arguments,
     add_dc_fitting_arguments,
     add_dc_port_paths_argument,
+    add_adaptive_search_arguments,
     add_debug_argument,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
     ads_ann_training_type_enum,
     apply_distinct_dc_response,
+    apply_candidate_overrides,
     build_ads_export_blocks,
+    build_adaptive_candidate_pool,
     build_training_export_commands,
     cleanup_trial_dir,
     common_sparameter_labels,
@@ -2575,6 +2578,70 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
     for freq_transform in freq_transform_options:
         if freq_transform not in {"log", "linear"}:
             raise ValueError(f"Unsupported frequency transform {freq_transform!r}")
+    if args.mode == "adaptive":
+        base_config = {
+            "mode": normalize_mode(
+                parse_text_options(
+                    getattr(args, "mode_options", None) or "residual"
+                )[0]
+            ),
+            "include_coarse_input": parse_bool_option(
+                parse_text_options(args.include_coarse_input_options)[0]
+            ),
+            "freq_transform": freq_transform_options[0],
+            "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options)[0],
+            "activation": parse_text_options(args.activation_options)[0],
+            "learning_rate": parse_float_options(args.learning_rates)[0],
+        }
+        candidates, columns, log_parameters = build_adaptive_candidate_pool(
+            base_config,
+            args.optimize_parameter,
+            {
+                "activation": "str",
+                "batch_size": "int",
+                "epochs": "int",
+                "freq_transform": "str",
+                "hidden_layers": "hidden_layers",
+                "include_coarse_input": "bool",
+                "learning_rate": "float",
+                "mode": "str",
+                "patience": "int",
+            },
+            max_trials=args.max_trials,
+            candidate_pool=args.adaptive_candidate_pool,
+            hidden_width_step=args.adaptive_hidden_width_step,
+            seed=args.seed,
+        )
+        filtered = []
+        include_coarse_was_optimized = any(
+            str(raw).split("=", 1)[0].strip().lower().replace("-", "_")
+            == "include_coarse_input"
+            for raw in args.optimize_parameter
+        )
+        for candidate in candidates:
+            candidate_mode = normalize_mode(str(candidate["mode"]))
+            if not include_coarse_was_optimized:
+                if candidate_mode == "prior-input":
+                    candidate["include_coarse_input"] = True
+                elif candidate_mode == "plain":
+                    candidate["include_coarse_input"] = False
+            include_coarse = bool(candidate["include_coarse_input"])
+            if candidate_mode == "plain" and include_coarse:
+                continue
+            if candidate_mode == "prior-input" and not include_coarse:
+                continue
+            if not args.coarse_model_dir and candidate_mode != "plain":
+                continue
+            candidate["mode"] = candidate_mode
+            filtered.append(candidate)
+        if not filtered:
+            raise ValueError(
+                "Adaptive KBNN ranges produced no valid configurations; residual "
+                "and prior-input modes require a fitted coarse model"
+            )
+        args.adaptive_result_columns = columns
+        args.adaptive_log_parameters = log_parameters
+        return filtered
     axes = {
         "mode": [
             normalize_mode(value)
@@ -2631,7 +2698,7 @@ def namespace_for_trial(
     plots: int,
 ) -> argparse.Namespace:
     trial_seed = sweep_trial_seed(args.seed, trial_index, getattr(args, "trial_seed_mode", "fixed"))
-    return argparse.Namespace(
+    return apply_candidate_overrides(argparse.Namespace(
         mdif=args.mdif,
         verification_mdif=args.verification_mdif,
         coarse_model_dir=args.coarse_model_dir,
@@ -2662,7 +2729,7 @@ def namespace_for_trial(
         frequency_weights=args.frequency_weights,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
-    )
+    ), candidate)
 
 
 def kbnn_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object], str, int, int]) -> dict[str, object]:
@@ -2702,7 +2769,7 @@ def command_sweep(args: argparse.Namespace) -> int:
     compatibility_mode = getattr(args, "mode", None)
     model_modes = getattr(args, "mode_options", None)
     search_mode = getattr(args, "search_mode", "random")
-    if compatibility_mode in {"grid", "random"}:
+    if compatibility_mode in {"adaptive", "grid", "random"}:
         search_mode = compatibility_mode
     elif compatibility_mode is not None:
         if model_modes is not None:
@@ -2729,6 +2796,8 @@ def command_sweep(args: argparse.Namespace) -> int:
         diagnostics_prefix="kbnn",
         train_command_prefix=None,
     )
+    if status != 0:
+        return status
     if integrated_coarse_fit and prepared_args.coarse_model_dir:
         set_packaged_coarse_reference(
             Path(prepared_args.out_dir) / "best_model",
@@ -3049,8 +3118,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument(
         "--mode",
-        choices=["plain", "residual", "prior-input", "grid", "random"],
-        help="One train-compatible KBNN model mode; grid/random remain accepted for legacy search-mode commands.",
+        choices=["plain", "residual", "prior-input", "adaptive", "grid", "random"],
+        help="One train-compatible KBNN model mode; adaptive/grid/random remain accepted for legacy search-mode commands.",
     )
     sweep.add_argument(
         "--include-coarse-inputs",
@@ -3110,11 +3179,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument(
         "--search-mode",
-        choices=["grid", "random"],
+        choices=["adaptive", "grid", "random"],
         default="random",
         help="Sweep search strategy. Legacy --mode grid/random is still accepted.",
     )
     sweep.add_argument("--max-trials", type=int, default=24)
+    add_adaptive_search_arguments(sweep)
     sweep.add_argument(
         "--trial-seed-mode",
         choices=["fixed", "indexed"],

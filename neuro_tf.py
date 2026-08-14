@@ -295,6 +295,37 @@ class NeuroTF:
 
 
 def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
+    if args.mode == "adaptive":
+        base_config = {
+            "order": parse_int_options(args.orders)[0],
+            "pole_damping": parse_float_options(args.pole_dampings)[0],
+            "ridge": parse_float_options(args.ridge_values)[0],
+            "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options)[0],
+            "activation": parse_text_options(args.activation_options)[0],
+            "learning_rate": parse_float_options(args.learning_rates)[0],
+        }
+        candidates, columns, log_parameters = build_adaptive_candidate_pool(
+            base_config,
+            args.optimize_parameter,
+            {
+                "activation": "str",
+                "batch_size": "int",
+                "epochs": "int",
+                "hidden_layers": "hidden_layers",
+                "learning_rate": "float",
+                "order": "int",
+                "patience": "int",
+                "pole_damping": "float",
+                "ridge": "float",
+            },
+            max_trials=args.max_trials,
+            candidate_pool=args.adaptive_candidate_pool,
+            hidden_width_step=args.adaptive_hidden_width_step,
+            seed=args.seed,
+        )
+        args.adaptive_result_columns = columns
+        args.adaptive_log_parameters = log_parameters
+        return candidates
     axes = {
         "order": parse_int_options(args.orders),
         "pole_damping": parse_float_options(args.pole_dampings),
@@ -318,7 +349,7 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
 
 def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], out_dir: Path, trial_index: int, plots: int) -> argparse.Namespace:
     trial_seed = sweep_trial_seed(args.seed, trial_index, getattr(args, "trial_seed_mode", "fixed"))
-    return argparse.Namespace(
+    return apply_candidate_overrides(argparse.Namespace(
         mdif=args.mdif,
         verification_mdif=args.verification_mdif,
         out_dir=str(out_dir),
@@ -347,7 +378,7 @@ def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], 
         frequency_weights=args.frequency_weights,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
-    )
+    ), candidate)
 
 
 def neurotf_sweep_trial_worker(payload: tuple[dict[str, object], dict[str, object], str, int, int]) -> dict[str, object]:
@@ -398,14 +429,15 @@ def command_sweep(args: argparse.Namespace) -> int:
         train_command_prefix=[sys.executable, "neuro_tf.py", "train"],
     )
     best_dir = Path(args.out_dir) / "best_model"
-    update_training_export_commands(
-        best_dir / "training_summary.md",
-        neurotf_export_commands(best_dir, args.mdif),
-    )
-    update_training_export_commands(
-        Path(args.out_dir) / "neurotf_sweep_summary.md",
-        neurotf_export_commands(best_dir, args.mdif),
-    )
+    if status == 0:
+        update_training_export_commands(
+            best_dir / "training_summary.md",
+            neurotf_export_commands(best_dir, args.mdif),
+        )
+        update_training_export_commands(
+            Path(args.out_dir) / "neurotf_sweep_summary.md",
+            neurotf_export_commands(best_dir, args.mdif),
+        )
     return status
 
 
@@ -1193,11 +1225,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--search-mode",
         "--mode",
         dest="mode",
-        choices=["grid", "random"],
+        choices=["adaptive", "grid", "random"],
         default="random",
         help="Sweep search strategy. --mode remains a backward-compatible alias.",
     )
     sweep.add_argument("--max-trials", type=int, default=24)
+    add_adaptive_search_arguments(sweep)
     sweep.add_argument(
         "--trial-seed-mode",
         choices=["fixed", "indexed"],

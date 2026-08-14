@@ -595,8 +595,8 @@ Existing `*-options` spellings remain supported as compatibility aliases.
 | `--ridge 1e-8` | `--ridges 1e-10,1e-8,1e-6` |
 | KBNN `--mode residual` | KBNN `--modes residual,prior-input` |
 
-Use `--search-mode grid|random` for the optimize search strategy. Legacy
-`--mode grid|random` commands remain valid; on KBNN optimize commands,
+Use `--search-mode adaptive|grid|random` for the optimize search strategy.
+Legacy `--mode grid|random` commands remain valid; on KBNN optimize commands,
 `--mode plain|residual|prior-input` now has the same model meaning as it does
 for `train`.
 
@@ -612,6 +612,79 @@ python3 dnn.py optimize \
   --selection-metric weighted_evm_pct \
   --require-passive
 ```
+
+### Adaptive Hyperparameter Optimization
+
+Use `--search-mode adaptive` when a grid is too large and random trials are not
+learning from previous results. Specify only the settings that should vary with
+repeatable `--optimize-parameter` options. Unspecified model settings stay at
+the first value supplied through their normal optimize option, including the
+documented default when that option is omitted.
+
+This example searches learning rate, activation, and neural architecture while
+requiring a passive result:
+
+```bash
+python3 dnn.py optimize \
+  --mdif train_verify.mdif \
+  --out-dir outputs/dnn_adaptive \
+  --parameter-names W,L,H \
+  --search-mode adaptive \
+  --optimize-parameter learning_rate=1e-4:1e-2:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter 'hidden_layers=1:4x32:256:log' \
+  --adaptive-initial-trials 8 \
+  --adaptive-candidate-pool 768 \
+  --adaptive-exploration 1.5 \
+  --max-trials 32 \
+  --selection-metric weighted_evm_pct \
+  --require-passive
+```
+
+For a one-parameter study, provide only one range and fix the architecture with
+the normal train-compatible option:
+
+```bash
+python3 dnn.py optimize \
+  --mdif train_verify.mdif \
+  --out-dir outputs/dnn_learning_rate \
+  --parameter-names W,L,H \
+  --hidden-layers 128,128,64 \
+  --activation tanh \
+  --search-mode adaptive \
+  --optimize-parameter learning_rate=2e-4:8e-3:log \
+  --max-trials 20 \
+  --selection-metric rmse_abs \
+  --require-passive
+```
+
+Numeric ranges use `NAME=LOW:HIGH[:linear|log]`. Integer parameters such as
+Neuro-TF `order`, `batch_size`, `epochs`, and `patience` are sampled as
+integers. Categorical choices use commas. Hidden layers support either an
+explicit layout set such as
+`--optimize-parameter 'hidden_layers=32;64;64,64;128,64'` or the structured
+range
+`hidden_layers=MIN_DEPTH:MAX_DEPTHxMIN_WIDTH:MAX_WIDTH[:linear|log]`. A
+structured range creates uniform-width networks; widths are rounded to
+`--adaptive-hidden-width-step`, which defaults to 8. Use explicit layouts when
+tapered networks are important.
+
+The search begins with maximin-separated configurations, then fits a small
+Matérn-5/2 GP to a feasibility-aware objective and selects each later trial by
+a lower confidence bound. With `--require-passive` or a passivity limit,
+eligible trials are ranked by `--selection-metric`; until one exists,
+passivity-violation count and singular-value excess guide the search. Adaptive
+search is sequential, so it uses one job even if a larger `--jobs` value is
+given.
+
+If every completed trial fails training or the passivity constraints, the
+command returns a nonzero status and does not promote `best_model/`, but it
+still writes the normal results CSV, best-config JSON, Markdown sweep summary,
+diagnostic PDF, inline SVG trend plots, and diagnostic CSV. The Markdown
+identifies the closest available ineligible trial and embeds the trend plots
+directly in the report. Diagnostic plots retain all trial points, and the CSV
+contains both passive-only statistics and `all_*` statistics so trends are
+visible even when the passive subset is empty.
 
 Predict a new set of parameter/frequency blocks after training:
 
@@ -1343,9 +1416,10 @@ Useful selection metrics:
 - `weighted_evm_rms`: S-parameter-weighted EVM ratio
 - `weighted_rmse_abs`: S-parameter-weighted complex RMSE
 
-Set `--search-mode grid` to exhaustively test all combinations, or keep the default
-`--search-mode random --max-trials N` for direct hyperparameter optimization over a
-larger search space.
+Set `--search-mode grid` to exhaustively test all combinations, keep the
+default `--search-mode random --max-trials N` to sample a discrete product, or
+use `--search-mode adaptive` with `--optimize-parameter` ranges so later trials
+target the best results observed so far.
 
 Use `--require-passive` when passivity is a hard acceptance criterion. The
 sweep still records every trial, but `best_model/` is selected from the passive
@@ -1358,11 +1432,12 @@ promoted from the best completed trial by default, its plot set comes from
 `--trial-worst-plots`. Use `--retrain-best` when you want the older behavior:
 the winning configuration is fit again after the sweep and `--worst-plots`
 controls that final model's verification plots. After each sweep, the summary
-links a diagnostics PDF and CSV under `sweep_diagnostics/` comparing error
-metrics against each swept option. Passivity-failing trials are shown in red on
-those plots and are excluded from the grouped mean values in the diagnostic
-CSV/PDF; the CSV records how many samples were excluded for each setting. If the
-goal is fastest direct
+embeds SVG trend plots and links a diagnostics PDF and CSV under
+`sweep_diagnostics/`, comparing error metrics against each swept option.
+Passivity-failing trials are shown in red on those plots. Passive-only grouped
+statistics remain available, while dashed all-trial means and `all_*` CSV
+columns preserve trends when every trial fails passivity. If the goal is
+fastest direct
 Verilog-A simulation, add `--output-domain y` to the sweep command so the
 winning model can be exported as a direct admittance-stamping n-port. During a
 DNN sweep, parsed MDIF blocks and prepared feature/target matrices are cached
@@ -1746,18 +1821,23 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
+| <nobr><code>--adaptive-candidate-pool INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Raw candidate configurations requested for adaptive search. The generator requests at least `--max-trials`, removes duplicates, and warns if the requested ranges contain fewer unique configurations. Must be positive. Default: `512`. | <nobr><code>--adaptive-candidate-pool 768</code></nobr> |
+| <nobr><code>--adaptive-exploration FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Non-negative GP lower-confidence-bound uncertainty multiplier. Larger values explore uncertain configurations more strongly. Default: `1.5`. | <nobr><code>--adaptive-exploration 2</code></nobr> |
+| <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
+| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximin-separated trials evaluated before GP guidance. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir dnn_sweep/best_model_passive</code></nobr> |
-| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
+| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum number of candidate configurations to evaluate. In `random` mode this limits the random sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
+| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget; in `random` mode it limits the sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
+| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. DNN supports `freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `output_domain`, `target_z0`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter learning_rate=1e-4:1e-2:log</code></nobr> |
 | <nobr><code>--overwrite</code></nobr> | <code>rerank-sweep</code> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
 | <nobr><code>--promote-best</code></nobr> | <code>rerank-sweep</code> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
 | <nobr><code>--replace-current-best</code></nobr> | <code>rerank-sweep</code> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
 | <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
 | <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
-| <nobr><code>--search-mode {grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. `grid` evaluates combinations in deterministic product order; `random` samples combinations from the full grid. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode random</code></nobr> |
+| <nobr><code>--search-mode {adaptive,grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. `adaptive` learns sequentially from completed trials, `grid` follows product order, and `random` samples the discrete product. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode adaptive</code></nobr> |
 | <nobr><code>--selection-metric NAME</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Metric minimized when choosing the best trial. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
 | <nobr><code>--sweep-dir PATH</code></nobr> | <code>rerank-sweep</code> | Required. Existing DNN sweep or optimize output directory. | <nobr><code>--sweep-dir dnn_sweep</code></nobr> |
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
@@ -1958,6 +2038,14 @@ All integrated coarse-DNN controls listed for `train` (`--coarse-hidden-layers`,
 transform, seed, weights, and reporting intervals) also apply to `optimize`.
 They configure the one shared coarse fit, not separate per-trial fits.
 
+KBNN adaptive search supports `mode`, `include_coarse_input`,
+`freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`,
+`epochs`, and `patience`. For example, add
+`--search-mode adaptive --optimize-parameter mode=residual,prior-input`
+`--optimize-parameter 'hidden_layers=1:4x32:192:log'`
+`--optimize-parameter learning_rate=1e-4:8e-3:log`. The fitted coarse model is
+still prepared once and shared by every fine-model trial.
+
 For fitting failures that do not produce an obvious Python error, rerun a small
 or representative sweep with `--debug --jobs 1`. The shared sweep debug mode
 prints the selected candidate list and failed-trial tracebacks. KBNN also prints
@@ -2021,11 +2109,11 @@ promoted from the best completed trial by default, its plot set comes from
 `--trial-worst-plots`. Use `--retrain-best` when you want the older behavior:
 the winning configuration is fit again after the sweep and `--worst-plots`
 controls that final model's verification plots. After each sweep, the summary
-links a diagnostics PDF and CSV under `sweep_diagnostics/` comparing error
-metrics against each swept option. Passivity-failing trials are shown in red on
-those plots and are excluded from the grouped mean values in the diagnostic
-CSV/PDF; the CSV records how many samples were excluded for each setting. During
-a KBNN sweep, parsed MDIF
+embeds SVG trend plots and links a diagnostics PDF and CSV under
+`sweep_diagnostics/`, comparing error metrics against each swept option.
+Passivity-failing trials are shown in red. Passive-only grouped statistics
+remain available, while dashed all-trial means and `all_*` CSV columns preserve
+trends when every trial fails passivity. During a KBNN sweep, parsed MDIF
 blocks, aligned/interpolated coarse responses, and prepared feature/target
 matrices are cached inside each process. Repeated trials with the same data,
 mode, coarse-input setting, and frequency transform reuse those arrays instead
@@ -2407,18 +2495,23 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
+| <nobr><code>--adaptive-candidate-pool INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Raw candidate configurations requested for adaptive search. The generator requests at least `--max-trials`, removes duplicates, and warns if the requested ranges contain fewer unique configurations. Must be positive. Default: `512`. | <nobr><code>--adaptive-candidate-pool 768</code></nobr> |
+| <nobr><code>--adaptive-exploration FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Non-negative GP lower-confidence-bound uncertainty multiplier. Larger values explore uncertain configurations more strongly. Default: `1.5`. | <nobr><code>--adaptive-exploration 2</code></nobr> |
+| <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
+| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximin-separated trials evaluated before GP guidance. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir kbnn_sweep/best_model_passive</code></nobr> |
-| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
+| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum candidate configurations to evaluate. Default: `24`. | <nobr><code>--max-trials 24</code></nobr> |
+| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget. Default: `24`. | <nobr><code>--max-trials 24</code></nobr> |
+| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. KBNN supports `mode`, `include_coarse_input`, `freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter mode=residual,prior-input</code></nobr> |
 | <nobr><code>--overwrite</code></nobr> | <code>rerank-sweep</code> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
 | <nobr><code>--promote-best</code></nobr> | <code>rerank-sweep</code> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
 | <nobr><code>--replace-current-best</code></nobr> | <code>rerank-sweep</code> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
 | <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
 | <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
-| <nobr><code>--search-mode {grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. Legacy `--mode grid` and `--mode random` remain valid. Default: `random`. | <nobr><code>--search-mode random</code></nobr> |
+| <nobr><code>--search-mode {adaptive,grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. `adaptive` learns sequentially from completed trials. Legacy `--mode adaptive`, `--mode grid`, and `--mode random` remain valid. Default: `random`. | <nobr><code>--search-mode adaptive</code></nobr> |
 | <nobr><code>--selection-metric NAME</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Metric minimized to choose the best model. Options include `evm_pct`, `rmse_abs`, passivity metrics, and weighted metrics such as `weighted_evm_pct` and `weighted_rmse_abs`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_evm_pct</code></nobr> |
 | <nobr><code>--sweep-dir PATH</code></nobr> | <code>rerank-sweep</code> | Required. Existing KBNN sweep or optimize output directory. | <nobr><code>--sweep-dir kbnn_sweep</code></nobr> |
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
@@ -2587,9 +2680,11 @@ Useful selection metrics:
 - `weighted_rmse_abs`, `weighted_evm_pct`, and the other `weighted_*`
   variants: the same metrics using `--frequency-weights`
 
-Set `--search-mode grid` to exhaustively test all combinations, or keep the default
-`--search-mode random --max-trials N` for direct hyperparameter optimization over a
-larger search space.
+Set `--search-mode grid` to exhaustively test all combinations, keep the
+default `--search-mode random --max-trials N` to sample a discrete product, or
+use `--search-mode adaptive` with ranges for `order`, `pole_damping`, `ridge`,
+`hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, or
+`patience`.
 
 Use `--require-passive` when passivity is a hard acceptance criterion. The
 sweep still records every trial, but `best_model/` is selected from the passive
@@ -2602,10 +2697,11 @@ promoted from the best completed trial by default, its plot set comes from
 `--trial-worst-plots`. Use `--retrain-best` when you want the older behavior:
 the winning configuration is fit again after the sweep and `--worst-plots`
 controls that final model's verification plots. After each sweep, the summary
-links a diagnostics PDF and CSV under `sweep_diagnostics/` comparing error
-metrics against each swept option. Passivity-failing trials are shown in red on
-those plots and are excluded from the grouped mean values in the diagnostic
-CSV/PDF; the CSV records how many samples were excluded for each setting.
+embeds SVG trend plots and links a diagnostics PDF and CSV under
+`sweep_diagnostics/`, comparing error metrics against each swept option.
+Passivity-failing trials are shown in red on those plots. Passive-only grouped
+statistics remain available, while dashed all-trial means and `all_*` CSV
+columns preserve trends when every trial fails passivity.
 
 ### Predict
 
@@ -2751,14 +2847,19 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of sweep trials to train in parallel. Use up to the number of physical cores and lower it if memory use gets high. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
+| <nobr><code>--adaptive-candidate-pool INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Raw candidate configurations requested for adaptive search. The generator requests at least `--max-trials`, removes duplicates, and warns if the requested ranges contain fewer unique configurations. Must be positive. Default: `512`. | <nobr><code>--adaptive-candidate-pool 768</code></nobr> |
+| <nobr><code>--adaptive-exploration FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Non-negative GP lower-confidence-bound uncertainty multiplier. Larger values explore uncertain configurations more strongly. Default: `1.5`. | <nobr><code>--adaptive-exploration 2</code></nobr> |
+| <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
+| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximin-separated trials evaluated before GP guidance. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
+| <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
-| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum number of candidate configurations to evaluate. In `random` mode this limits the random sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
+| <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget; in `random` mode it limits the sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
+| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. Neuro-TF supports `order`, `pole_damping`, `ridge`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter order=6:20</code></nobr> |
 | <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
 | <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
-| <nobr><code>--search-mode {grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode random</code></nobr> |
+| <nobr><code>--search-mode {adaptive,grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. `adaptive` learns sequentially from completed trials. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode adaptive</code></nobr> |
 | <nobr><code>--selection-metric NAME</code></nobr> | <code>sweep</code>, <code>optimize</code> | Metric minimized when choosing the best trial. Includes unweighted error, passivity, and `weighted_*` metrics that apply `--frequency-weights`. Default: `rmse_abs`. | <nobr><code>--selection-metric weighted_rmse_abs</code></nobr> |
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
 | <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |

@@ -11148,6 +11148,11 @@ def write_sweep_markdown(
     best_metric: float | None,
     reproduction_command: str | None = None,
     diagnostic_artifacts: Sequence[str] | None = None,
+    diagnostic_images: Sequence[str] | None = None,
+    selection_failure: str | None = None,
+    best_available_config: dict[str, object] | None = None,
+    best_available_metric: float | None = None,
+    best_available_passivity: dict[str, object] | None = None,
 ) -> None:
     sorted_rows = sorted(
         rows,
@@ -11166,6 +11171,35 @@ def write_sweep_markdown(
     if best_config is not None and best_metric is not None:
         config_text = ", ".join(f"`{key}={value}`" for key, value in best_config.items())
         lines.extend([f"Best metric: `{best_metric:.6g}`", f"Best configuration: {config_text}", ""])
+    if selection_failure:
+        lines.extend(
+            [
+                "## Selection Status",
+                "",
+                f"> {markdown_escape(selection_failure)}",
+                "",
+            ]
+        )
+        if best_available_config is not None:
+            config_text = ", ".join(
+                f"`{key}={value}`" for key, value in best_available_config.items()
+            )
+            lines.extend(
+                [
+                    "The closest available completed trial is shown for analysis only; "
+                    "it was not promoted to `best_model/`.",
+                    "",
+                    f"Best available metric: `{metric_text(best_available_metric)}`",
+                    f"Best available configuration: {config_text}",
+                ]
+            )
+            if best_available_passivity:
+                lines.append(
+                    "Best available passivity: "
+                    f"max sigma `{metric_text(best_available_passivity.get('max_singular_value'))}`, "
+                    f"violations `{metric_text(best_available_passivity.get('violating_points'))}`."
+                )
+            lines.append("")
     if reproduction_command:
         lines.extend(
             [
@@ -11185,10 +11219,22 @@ def write_sweep_markdown(
             label = Path(artifact).name
             lines.append(f"- [{markdown_escape(label)}]({artifact})")
         lines.append("")
+    if diagnostic_images:
+        lines.extend(["## Sweep Trend Plots", ""])
+        for image_path in diagnostic_images:
+            label = Path(image_path).stem.replace("_", " ")
+            lines.extend(
+                [
+                    f"### {markdown_escape(label)}",
+                    "",
+                    f"![Sweep trend plot: {markdown_escape(label)}]({markdown_escape(image_path)})",
+                    "",
+                ]
+            )
     lines.extend(
         [
-            "| Rank | Trial | Metric | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Trial plots | Error |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
+            "| Rank | Trial | Metric | Search stage | Predicted objective | Search uncertainty | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Trial plots | Error |",
+            "| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     known = {
@@ -11215,6 +11261,9 @@ def write_sweep_markdown(
         "trial_seed",
         "trial_seed_mode",
         "worst_case_plots",
+        "adaptive_stage",
+        "adaptive_predicted_objective",
+        "adaptive_uncertainty",
     }
     for rank, row in enumerate(sorted_rows, start=1):
         config = ", ".join(
@@ -11229,6 +11278,9 @@ def write_sweep_markdown(
                     str(rank),
                     metric_text(row.get("trial")),
                     metric_text(row.get("metric")),
+                    markdown_escape(row.get("adaptive_stage", "")),
+                    metric_text(row.get("adaptive_predicted_objective")),
+                    metric_text(row.get("adaptive_uncertainty")),
                     metric_text(row.get("rmse_abs")),
                     metric_text(row.get("max_abs")),
                     metric_text(row.get("evm_pct")),
@@ -11354,8 +11406,19 @@ def write_sweep_diagnostic_stats(
         for parameter_name in swept_columns:
             groups: dict[str, dict[str, object]] = {}
             for value, y, _trial, passivity_failed in finite_metric_pairs(rows, parameter_name, metric_name):
-                group = groups.setdefault(str(value), {"values": [], "total_count": 0, "failed_count": 0})
+                group = groups.setdefault(
+                    str(value),
+                    {
+                        "values": [],
+                        "all_values": [],
+                        "total_count": 0,
+                        "failed_count": 0,
+                    },
+                )
                 group["total_count"] = int(group["total_count"]) + 1
+                all_values = group["all_values"]
+                assert isinstance(all_values, list)
+                all_values.append(y)
                 if passivity_failed:
                     group["failed_count"] = int(group["failed_count"]) + 1
                 else:
@@ -11365,6 +11428,7 @@ def write_sweep_diagnostic_stats(
             for value in sorted(groups, key=sort_category_key):
                 group = groups[value]
                 values = np.asarray(group["values"], dtype=float)
+                all_values = np.asarray(group["all_values"], dtype=float)
                 total_count = int(group["total_count"])
                 failed_count = int(group["failed_count"])
                 stat_rows.append(
@@ -11381,6 +11445,10 @@ def write_sweep_diagnostic_stats(
                         "median": float(np.median(values)) if values.size else "",
                         "mean": float(np.mean(values)) if values.size else "",
                         "worst": float(np.max(values)) if values.size else "",
+                        "all_best": float(np.min(all_values)) if all_values.size else "",
+                        "all_median": float(np.median(all_values)) if all_values.size else "",
+                        "all_mean": float(np.mean(all_values)) if all_values.size else "",
+                        "all_worst": float(np.max(all_values)) if all_values.size else "",
                     }
                 )
     write_csv(path, stat_rows)
@@ -11392,11 +11460,13 @@ def plot_sweep_diagnostics_matplotlib(
     swept_columns: Sequence[str],
     metric_names: Sequence[str],
     selection_metric: str,
-) -> bool:
+    image_prefix: str,
+) -> list[Path] | None:
     modules = load_matplotlib_modules()
     if modules is None:
-        return False
+        return None
     plt, PdfPages = modules
+    image_paths: list[Path] = []
     with PdfPages(path) as pdf:
         for metric_name in metric_names:
             label = sweep_diagnostic_metric_label(metric_name, selection_metric)
@@ -11450,10 +11520,24 @@ def plot_sweep_diagnostics_matplotlib(
                             label="passivity fail",
                         )
                     grouped: dict[float, list[float]] = {}
+                    grouped_all: dict[float, list[float]] = {}
                     for x_value, y_value, passivity_failed in zip(x_values, y_values, failed_mask):
+                        grouped_all.setdefault(float(x_value), []).append(float(y_value))
                         if passivity_failed:
                             continue
                         grouped.setdefault(float(x_value), []).append(float(y_value))
+                    all_xs = sorted(grouped_all)
+                    all_means = [float(np.mean(grouped_all[x])) for x in all_xs]
+                    if len(all_xs) > 1:
+                        ax.plot(
+                            all_xs,
+                            all_means,
+                            color="#6c757d",
+                            linewidth=1.5,
+                            linestyle="--",
+                            marker=".",
+                            label="mean, all trials",
+                        )
                     xs = sorted(grouped)
                     means = [float(np.mean(grouped[x])) for x in xs]
                     if len(xs) > 1:
@@ -11515,6 +11599,24 @@ def plot_sweep_diagnostics_matplotlib(
                             label="passivity fail",
                         )
                     for category in categories:
+                        all_grouped_values = [
+                            pair[1] for pair in pairs if str(pair[0]) == category
+                        ]
+                        if all_grouped_values:
+                            all_mean = float(np.mean(all_grouped_values))
+                            xpos = index[category]
+                            ax.plot(
+                                [xpos - 0.30, xpos + 0.30],
+                                [all_mean, all_mean],
+                                color="#6c757d",
+                                linewidth=1.5,
+                                linestyle="--",
+                                label=(
+                                    "mean, all trials"
+                                    if category == categories[0]
+                                    else None
+                                ),
+                            )
                         grouped_values = [
                             pair[1]
                             for pair in pairs
@@ -11540,8 +11642,13 @@ def plot_sweep_diagnostics_matplotlib(
                 if idx == 0 and handles:
                     ax.legend(loc="best", fontsize=9, frameon=True)
             pdf.savefig(fig)
+            image_path = path.parent / (
+                f"{image_prefix}_{safe_filename(metric_name.lower())}_trend.svg"
+            )
+            fig.savefig(image_path, format="svg", bbox_inches="tight")
+            image_paths.append(image_path)
             plt.close(fig)
-    return True
+    return image_paths
 
 
 def plot_sweep_diagnostics_fallback_pdf(
@@ -11557,13 +11664,30 @@ def plot_sweep_diagnostics_fallback_pdf(
         canvas = PdfCanvas(width=930.0, height=625.0)
         title_lines = wrapped_text_lines(f"Sweep error diagnostics: {metric_label}", 98)
         y = draw_wrapped_centered_text(canvas, title_lines, canvas.width / 2, 24, 16, 18, font="F2") + 36
-        canvas.text(52, y, "Best and mean values by swept parameter; passivity failures excluded", size=13, font="F2")
+        canvas.text(
+            52,
+            y,
+            "All-trial trends are retained; passive-only statistics are shown when available",
+            size=13,
+            font="F2",
+        )
         y += 28
         for parameter_name in swept_columns:
             groups: dict[str, dict[str, object]] = {}
             for value, metric_value, _trial, passivity_failed in finite_metric_pairs(rows, parameter_name, metric_name):
-                group = groups.setdefault(str(value), {"values": [], "failed_count": 0, "total_count": 0})
+                group = groups.setdefault(
+                    str(value),
+                    {
+                        "values": [],
+                        "all_values": [],
+                        "failed_count": 0,
+                        "total_count": 0,
+                    },
+                )
                 group["total_count"] = int(group["total_count"]) + 1
+                all_values = group["all_values"]
+                assert isinstance(all_values, list)
+                all_values.append(metric_value)
                 if passivity_failed:
                     group["failed_count"] = int(group["failed_count"]) + 1
                 else:
@@ -11577,6 +11701,7 @@ def plot_sweep_diagnostics_fallback_pdf(
             for value in sorted(groups, key=sort_category_key)[:8]:
                 group = groups[value]
                 values = np.asarray(group["values"], dtype=float)
+                all_values = np.asarray(group["all_values"], dtype=float)
                 failed_count = int(group["failed_count"])
                 total_count = int(group["total_count"])
                 if values.size:
@@ -11590,7 +11715,9 @@ def plot_sweep_diagnostics_fallback_pdf(
                 canvas.text(
                     70,
                     y,
-                    f"{value}: {stats_text}, passivity failed/excluded={failed_count}/{total_count}",
+                    f"{value}: all best/mean={float(np.min(all_values)):.6g}/"
+                    f"{float(np.mean(all_values)):.6g}; passive {stats_text}; "
+                    f"failed={failed_count}/{total_count}",
                     size=10,
                 )
                 y += 14
@@ -11603,19 +11730,249 @@ def plot_sweep_diagnostics_fallback_pdf(
     save_pdf_pages(path, canvases)
 
 
+def sweep_svg_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def plot_sweep_diagnostics_fallback_svgs(
+    plot_dir: Path,
+    image_prefix: str,
+    rows: Sequence[dict[str, object]],
+    swept_columns: Sequence[str],
+    metric_names: Sequence[str],
+    selection_metric: str,
+) -> list[Path]:
+    """Write dependency-free SVG trend plots when Matplotlib is unavailable."""
+
+    image_paths: list[Path] = []
+    columns = 2 if len(swept_columns) > 1 else 1
+    panel_width = 570.0
+    panel_height = 330.0
+    page_width = 40.0 + columns * panel_width
+    page_rows = int(math.ceil(len(swept_columns) / columns))
+    page_height = 105.0 + page_rows * panel_height
+
+    for metric_name in metric_names:
+        metric_label = sweep_diagnostic_metric_label(metric_name, selection_metric)
+        svg = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            (
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="{page_width:.0f}" '
+                f'height="{page_height:.0f}" viewBox="0 0 {page_width:.0f} {page_height:.0f}">'
+            ),
+            '<rect width="100%" height="100%" fill="#ffffff"/>',
+            (
+                f'<text x="{page_width / 2:.1f}" y="30" text-anchor="middle" '
+                'font-family="sans-serif" font-size="20" font-weight="bold">'
+                f'Sweep error diagnostics: {sweep_svg_escape(metric_label)}</text>'
+            ),
+            '<circle cx="32" cy="62" r="5" fill="#1f77b4"/>',
+            '<text x="44" y="67" font-family="sans-serif" font-size="12">passivity OK</text>',
+            '<path d="M 155 57 l 10 10 M 165 57 l -10 10" stroke="#d62728" stroke-width="2"/>',
+            '<text x="173" y="67" font-family="sans-serif" font-size="12">passivity fail</text>',
+            '<line x1="288" y1="62" x2="318" y2="62" stroke="#6c757d" stroke-width="2" stroke-dasharray="6 4"/>',
+            '<text x="326" y="67" font-family="sans-serif" font-size="12">mean, all trials</text>',
+            '<line x1="454" y1="62" x2="484" y2="62" stroke="#ff7f0e" stroke-width="2"/>',
+            '<text x="492" y="67" font-family="sans-serif" font-size="12">mean, passive trials</text>',
+        ]
+
+        for panel_index, parameter_name in enumerate(swept_columns):
+            panel_column = panel_index % columns
+            panel_row = panel_index // columns
+            panel_x = 20.0 + panel_column * panel_width
+            panel_y = 88.0 + panel_row * panel_height
+            chart_left = panel_x + 72.0
+            chart_top = panel_y + 36.0
+            chart_width = panel_width - 105.0
+            chart_height = panel_height - 92.0
+            pairs = finite_metric_pairs(rows, parameter_name, metric_name)
+            svg.extend(
+                [
+                    (
+                        f'<rect x="{panel_x + 8:.1f}" y="{panel_y + 4:.1f}" '
+                        f'width="{panel_width - 16:.1f}" height="{panel_height - 14:.1f}" '
+                        'rx="5" fill="#ffffff" stroke="#d1d5db"/>'
+                    ),
+                    (
+                        f'<text x="{panel_x + panel_width / 2:.1f}" y="{panel_y + 26:.1f}" '
+                        'text-anchor="middle" font-family="sans-serif" font-size="15" '
+                        f'font-weight="bold">{sweep_svg_escape(parameter_name)}</text>'
+                    ),
+                ]
+            )
+            if not pairs:
+                svg.append(
+                    f'<text x="{panel_x + panel_width / 2:.1f}" y="{panel_y + 155:.1f}" '
+                    'text-anchor="middle" font-family="sans-serif" font-size="13" '
+                    'fill="#6b7280">No metric values</text>'
+                )
+                continue
+
+            y_values = np.asarray([pair[1] for pair in pairs], dtype=float)
+            y_min = float(np.min(y_values))
+            y_max = float(np.max(y_values))
+            y_span = y_max - y_min
+            y_padding = 0.08 * y_span if y_span > EPS else max(abs(y_max) * 0.08, 1e-6)
+            y_low = y_min - y_padding
+            y_high = y_max + y_padding
+
+            numeric_values = [csv_number(pair[0]) for pair in pairs]
+            numeric_axis = all(value is not None for value in numeric_values)
+            if numeric_axis:
+                x_raw = [float(value) for value in numeric_values if value is not None]
+                ordered_keys: list[object] = sorted(set(x_raw))
+                x_low = min(x_raw)
+                x_high = max(x_raw)
+
+                def x_position(value: object) -> float:
+                    numeric = float(value)
+                    if x_high <= x_low + EPS:
+                        return chart_left + chart_width / 2.0
+                    return chart_left + chart_width * (numeric - x_low) / (x_high - x_low)
+
+                tick_keys = ordered_keys
+                if len(tick_keys) > 7:
+                    tick_keys = [tick_keys[index] for index in np.linspace(0, len(tick_keys) - 1, 7, dtype=int)]
+            else:
+                ordered_keys = sorted(
+                    {str(pair[0]) for pair in pairs}, key=sort_category_key
+                )
+                category_index = {
+                    str(value): index for index, value in enumerate(ordered_keys)
+                }
+
+                def x_position(value: object) -> float:
+                    if len(ordered_keys) <= 1:
+                        return chart_left + chart_width / 2.0
+                    return chart_left + chart_width * category_index[str(value)] / (
+                        len(ordered_keys) - 1
+                    )
+
+                tick_keys = ordered_keys
+
+            def y_position(value: float) -> float:
+                return chart_top + chart_height * (y_high - value) / (y_high - y_low)
+
+            for tick_index in range(5):
+                fraction = tick_index / 4.0
+                y_value = y_high - fraction * (y_high - y_low)
+                y = chart_top + fraction * chart_height
+                svg.extend(
+                    [
+                        (
+                            f'<line x1="{chart_left:.1f}" y1="{y:.1f}" '
+                            f'x2="{chart_left + chart_width:.1f}" y2="{y:.1f}" '
+                            'stroke="#e5e7eb"/>'
+                        ),
+                        (
+                            f'<text x="{chart_left - 8:.1f}" y="{y + 4:.1f}" '
+                            'text-anchor="end" font-family="sans-serif" font-size="10" '
+                            f'fill="#4b5563">{sweep_svg_escape(metric_text(y_value))}</text>'
+                        ),
+                    ]
+                )
+            svg.extend(
+                [
+                    (
+                        f'<line x1="{chart_left:.1f}" y1="{chart_top:.1f}" '
+                        f'x2="{chart_left:.1f}" y2="{chart_top + chart_height:.1f}" '
+                        'stroke="#6b7280"/>'
+                    ),
+                    (
+                        f'<line x1="{chart_left:.1f}" y1="{chart_top + chart_height:.1f}" '
+                        f'x2="{chart_left + chart_width:.1f}" y2="{chart_top + chart_height:.1f}" '
+                        'stroke="#6b7280"/>'
+                    ),
+                ]
+            )
+
+            visible_ticks = list(tick_keys)
+            if not numeric_axis and len(visible_ticks) > 8:
+                step = int(math.ceil(len(visible_ticks) / 8.0))
+                visible_ticks = visible_ticks[::step]
+            for key in visible_ticks:
+                x = x_position(key)
+                label = str(key)
+                if len(label) > 18:
+                    label = label[:15] + "..."
+                svg.append(
+                    f'<text x="{x:.1f}" y="{chart_top + chart_height + 18:.1f}" '
+                    'text-anchor="middle" font-family="sans-serif" font-size="10" '
+                    f'fill="#4b5563">{sweep_svg_escape(label)}</text>'
+                )
+
+            def mean_polyline(passive_only: bool) -> list[tuple[float, float]]:
+                points: list[tuple[float, float]] = []
+                for key in ordered_keys:
+                    values = [
+                        pair[1]
+                        for pair in pairs
+                        if (
+                            (float(pair[0]) == float(key))
+                            if numeric_axis
+                            else str(pair[0]) == str(key)
+                        )
+                        and (not passive_only or not pair[3])
+                    ]
+                    if values:
+                        points.append((x_position(key), y_position(float(np.mean(values)))))
+                return points
+
+            for passive_only, color, dash in [
+                (False, "#6c757d", ' stroke-dasharray="6 4"'),
+                (True, "#ff7f0e", ""),
+            ]:
+                trend = mean_polyline(passive_only)
+                if len(trend) >= 2:
+                    points_text = " ".join(f"{x:.1f},{y:.1f}" for x, y in trend)
+                    svg.append(
+                        f'<polyline points="{points_text}" fill="none" stroke="{color}" '
+                        f'stroke-width="2"{dash}/>'
+                    )
+
+            for raw_x, y_value, _trial, passivity_failed in pairs:
+                x = x_position(float(raw_x) if numeric_axis else str(raw_x))
+                y = y_position(float(y_value))
+                if passivity_failed:
+                    svg.append(
+                        f'<path d="M {x - 4:.1f} {y - 4:.1f} l 8 8 '
+                        f'M {x + 4:.1f} {y - 4:.1f} l -8 8" '
+                        'stroke="#d62728" stroke-width="2"/>'
+                    )
+                else:
+                    svg.append(
+                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" '
+                        'fill="#1f77b4" fill-opacity="0.78"/>'
+                    )
+
+        svg.append("</svg>")
+        image_path = plot_dir / (
+            f"{image_prefix}_{safe_filename(metric_name.lower())}_trend.svg"
+        )
+        image_path.write_text("\n".join(svg))
+        image_paths.append(image_path)
+    return image_paths
+
+
 def plot_sweep_diagnostics(
     rows: Sequence[dict[str, object]],
     out_dir: Path,
     swept_columns: Sequence[str],
     selection_metric: str,
     prefix: str,
-) -> list[Path]:
+) -> tuple[list[Path], list[Path]]:
     usable_rows = list(rows)
     if not usable_rows or not swept_columns:
-        return []
+        return [], []
     metric_names = sweep_diagnostic_metric_names(usable_rows, selection_metric)
     if not metric_names:
-        return []
+        return [], []
     plot_dir = out_dir / "sweep_diagnostics"
     plot_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = plot_dir / f"{prefix}_error_vs_swept_parameters.pdf"
@@ -11627,13 +11984,15 @@ def plot_sweep_diagnostics(
         metric_names,
         selection_metric,
     )
-    if not plot_sweep_diagnostics_matplotlib(
+    image_paths = plot_sweep_diagnostics_matplotlib(
         pdf_path,
         usable_rows,
         swept_columns,
         metric_names,
         selection_metric,
-    ):
+        prefix,
+    )
+    if image_paths is None:
         plot_sweep_diagnostics_fallback_pdf(
             pdf_path,
             usable_rows,
@@ -11641,7 +12000,15 @@ def plot_sweep_diagnostics(
             metric_names,
             selection_metric,
         )
-    return [pdf_path, stats_path]
+        image_paths = plot_sweep_diagnostics_fallback_svgs(
+            plot_dir,
+            prefix,
+            usable_rows,
+            swept_columns,
+            metric_names,
+            selection_metric,
+        )
+    return [pdf_path, stats_path], image_paths
 
 
 def parse_hidden_layers(text: str) -> list[int]:
@@ -11679,6 +12046,284 @@ def parse_hidden_layer_options(text: str) -> list[str]:
     for option in options:
         parse_hidden_layers(option)
     return options
+
+
+def add_adaptive_search_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add shared sequential hyperparameter-search controls to an optimize parser."""
+
+    parser.add_argument(
+        "--optimize-parameter",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE_OR_RANGE",
+        help=(
+            "Adaptive-search parameter. Repeat as needed. Numeric ranges use "
+            "NAME=LOW:HIGH[:linear|log]; categorical values are comma-separated; "
+            "hidden-layer layouts are semicolon-separated or use "
+            "hidden_layers=D0:D1xW0:W1[:linear|log]."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-initial-trials",
+        type=int,
+        default=6,
+        help="Space-filling trials completed before GP-guided selection. Default: 6.",
+    )
+    parser.add_argument(
+        "--adaptive-candidate-pool",
+        type=int,
+        default=512,
+        help="Candidate configurations considered by adaptive search. Default: 512.",
+    )
+    parser.add_argument(
+        "--adaptive-exploration",
+        type=float,
+        default=1.5,
+        help="Lower-confidence-bound uncertainty multiplier. Default: 1.5.",
+    )
+    parser.add_argument(
+        "--adaptive-hidden-width-step",
+        type=int,
+        default=8,
+        help="Width quantization for a hidden_layers depth/width range. Default: 8.",
+    )
+
+
+def _adaptive_parameter_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_")
+
+
+def parse_adaptive_parameter_specs(
+    raw_specs: Sequence[str],
+    allowed_kinds: dict[str, str],
+) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw in raw_specs:
+        if "=" not in raw:
+            raise ValueError(
+                f"--optimize-parameter must look like NAME=VALUE_OR_RANGE, got {raw!r}"
+            )
+        raw_name, raw_value = raw.split("=", 1)
+        name = _adaptive_parameter_name(raw_name)
+        value_text = raw_value.strip()
+        if name not in allowed_kinds:
+            allowed = ", ".join(sorted(allowed_kinds))
+            raise ValueError(
+                f"Unsupported adaptive parameter {name!r}; available names: {allowed}"
+            )
+        if name in seen:
+            raise ValueError(f"Adaptive parameter {name!r} was specified more than once")
+        if not value_text:
+            raise ValueError(f"Adaptive parameter {name!r} has no values")
+        seen.add(name)
+        declared_kind = allowed_kinds[name]
+
+        if declared_kind == "hidden_layers":
+            match = re.fullmatch(
+                r"(\d+):(\d+)[xX](\d+):(\d+)(?::(linear|log))?",
+                value_text,
+            )
+            if match:
+                depth_low, depth_high, width_low, width_high = (
+                    int(match.group(index)) for index in range(1, 5)
+                )
+                if depth_low <= 0 or depth_high < depth_low:
+                    raise ValueError(
+                        "hidden_layers depth range must be positive and ordered"
+                    )
+                if width_low <= 0 or width_high < width_low:
+                    raise ValueError(
+                        "hidden_layers width range must be positive and ordered"
+                    )
+                specs.append(
+                    {
+                        "name": name,
+                        "kind": "hidden_range",
+                        "depth_low": depth_low,
+                        "depth_high": depth_high,
+                        "width_low": width_low,
+                        "width_high": width_high,
+                        "scale": match.group(5) or "linear",
+                    }
+                )
+                continue
+            values = parse_hidden_layer_options(value_text)
+            specs.append({"name": name, "kind": "categorical", "values": values})
+            continue
+
+        numeric_kind = declared_kind in {"float", "int"}
+        parts = [part.strip() for part in value_text.split(":")]
+        if numeric_kind and len(parts) in {2, 3}:
+            scale = parts[2].lower() if len(parts) == 3 else "linear"
+            if scale not in {"linear", "log"}:
+                raise ValueError(
+                    f"Adaptive range scale for {name!r} must be linear or log"
+                )
+            try:
+                low = float(parts[0])
+                high = float(parts[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid numeric range for {name!r}: {value_text!r}") from exc
+            if not math.isfinite(low) or not math.isfinite(high) or high < low:
+                raise ValueError(f"Adaptive range for {name!r} must be finite and ordered")
+            if scale == "log" and low <= 0.0:
+                raise ValueError(f"Log adaptive range for {name!r} must be positive")
+            if declared_kind == "int" and (not low.is_integer() or not high.is_integer()):
+                raise ValueError(f"Integer adaptive range for {name!r} needs integer bounds")
+            specs.append(
+                {
+                    "name": name,
+                    "kind": declared_kind,
+                    "low": int(low) if declared_kind == "int" else low,
+                    "high": int(high) if declared_kind == "int" else high,
+                    "scale": scale,
+                }
+            )
+            continue
+
+        raw_values = [
+            part.strip()
+            for part in re.split(r"[;,]", value_text)
+            if part.strip()
+        ]
+        if not raw_values:
+            raise ValueError(f"Adaptive parameter {name!r} has no usable values")
+        if declared_kind == "float":
+            values: list[object] = [float(value) for value in raw_values]
+        elif declared_kind == "int":
+            values = [int(value) for value in raw_values]
+        elif declared_kind == "bool":
+            values = []
+            for value in raw_values:
+                lowered = value.lower()
+                if lowered not in {"true", "false"}:
+                    raise ValueError(
+                        f"Boolean adaptive value for {name!r} must be true or false"
+                    )
+                values.append(lowered == "true")
+        else:
+            values = raw_values
+        specs.append({"name": name, "kind": "categorical", "values": values})
+    return specs
+
+
+def _quantize_hidden_width(value: float, low: int, high: int, step: int) -> int:
+    quantized = int(round(value / step) * step)
+    return min(high, max(low, quantized))
+
+
+def build_adaptive_candidate_pool(
+    base_config: dict[str, object],
+    raw_specs: Sequence[str],
+    allowed_kinds: dict[str, str],
+    *,
+    max_trials: int,
+    candidate_pool: int,
+    hidden_width_step: int,
+    seed: int,
+) -> tuple[list[dict[str, object]], list[str], set[str]]:
+    if max_trials <= 0:
+        raise ValueError("--max-trials must be positive for adaptive search")
+    if candidate_pool <= 0:
+        raise ValueError("--adaptive-candidate-pool must be positive")
+    if hidden_width_step <= 0:
+        raise ValueError("--adaptive-hidden-width-step must be positive")
+    specs = parse_adaptive_parameter_specs(raw_specs, allowed_kinds)
+    if not specs:
+        raise ValueError(
+            "--search-mode adaptive requires at least one --optimize-parameter"
+        )
+    pool_count = max(max_trials, candidate_pool)
+    rng = np.random.default_rng(seed)
+    columns = list(base_config)
+    for spec in specs:
+        name = str(spec["name"])
+        if name not in columns:
+            columns.append(name)
+    log_parameters = {
+        str(spec["name"])
+        for spec in specs
+        if spec.get("scale") == "log" and spec.get("kind") in {"float", "int"}
+    }
+
+    sampled_values: dict[str, list[object]] = {}
+    for spec in specs:
+        name = str(spec["name"])
+        kind = str(spec["kind"])
+        if kind in {"float", "int"}:
+            low = float(spec["low"])
+            high = float(spec["high"])
+            permutation = rng.permutation(pool_count)
+            unit = (permutation + rng.random(pool_count)) / pool_count
+            if spec.get("scale") == "log":
+                raw = np.exp(math.log(low) + unit * (math.log(high) - math.log(low)))
+            else:
+                raw = low + unit * (high - low)
+            if kind == "int":
+                sampled_values[name] = [
+                    min(int(high), max(int(low), int(round(value)))) for value in raw
+                ]
+            else:
+                sampled_values[name] = [float(value) for value in raw]
+        elif kind == "hidden_range":
+            depth_low = int(spec["depth_low"])
+            depth_high = int(spec["depth_high"])
+            width_low = int(spec["width_low"])
+            width_high = int(spec["width_high"])
+            depths = rng.integers(depth_low, depth_high + 1, size=pool_count)
+            unit = (rng.permutation(pool_count) + rng.random(pool_count)) / pool_count
+            if spec.get("scale") == "log":
+                widths_raw = np.exp(
+                    math.log(width_low)
+                    + unit * (math.log(width_high) - math.log(width_low))
+                )
+            else:
+                widths_raw = width_low + unit * (width_high - width_low)
+            widths = [
+                _quantize_hidden_width(
+                    float(value), width_low, width_high, hidden_width_step
+                )
+                for value in widths_raw
+            ]
+            sampled_values[name] = [
+                ",".join([str(width)] * int(depth))
+                for depth, width in zip(depths, widths)
+            ]
+        else:
+            values = list(spec["values"])  # type: ignore[arg-type]
+            repeated = [values[index % len(values)] for index in range(pool_count)]
+            rng.shuffle(repeated)
+            sampled_values[name] = repeated
+
+    candidates: list[dict[str, object]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for index in range(pool_count):
+        candidate = dict(base_config)
+        for spec in specs:
+            name = str(spec["name"])
+            candidate[name] = sampled_values[name][index]
+        key = tuple((name, str(candidate.get(name))) for name in columns)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    if len(candidates) < min(max_trials, pool_count):
+        print(
+            f"warning: adaptive ranges produced only {len(candidates)} unique "
+            "configuration(s)",
+            file=sys.stderr,
+        )
+    return candidates, columns, log_parameters
+
+
+def apply_candidate_overrides(
+    namespace: argparse.Namespace,
+    candidate: dict[str, object],
+) -> argparse.Namespace:
+    for name, value in candidate.items():
+        setattr(namespace, name, value)
+    return namespace
 
 
 def summary_metric(summary: dict[str, object], metric_name: str) -> float | None:
@@ -11823,6 +12468,275 @@ def sweep_row_exclusion_reasons(
         if sigma is None or sigma > max_passivity_sigma:
             reasons.append(f"max sigma > {max_passivity_sigma:g}")
     return reasons
+
+
+def _normalized_column(values: np.ndarray) -> np.ndarray:
+    low = float(np.min(values))
+    high = float(np.max(values))
+    if high <= low + EPS:
+        return np.zeros_like(values, dtype=float)
+    return (values - low) / (high - low)
+
+
+def adaptive_candidate_features(
+    candidates: Sequence[dict[str, object]],
+    columns: Sequence[str],
+    log_parameters: set[str] | None = None,
+) -> np.ndarray:
+    if not candidates:
+        return np.zeros((0, 0), dtype=float)
+    log_names = log_parameters or set()
+    feature_columns: list[np.ndarray] = []
+    for name in columns:
+        raw_values = [candidate.get(name) for candidate in candidates]
+        if name == "hidden_layers":
+            depths: list[float] = []
+            mean_widths: list[float] = []
+            total_widths: list[float] = []
+            for raw in raw_values:
+                try:
+                    layers = parse_hidden_layers(str(raw))
+                except (TypeError, ValueError):
+                    layers = [1]
+                depths.append(float(len(layers)))
+                mean_widths.append(math.log(max(float(np.mean(layers)), 1.0)))
+                total_widths.append(math.log(max(float(sum(layers)), 1.0)))
+            feature_columns.extend(
+                [
+                    _normalized_column(np.asarray(depths, dtype=float)),
+                    _normalized_column(np.asarray(mean_widths, dtype=float)),
+                    _normalized_column(np.asarray(total_widths, dtype=float)),
+                ]
+            )
+            continue
+        numeric = [csv_number(value) for value in raw_values]
+        if all(value is not None for value in numeric) and not all(
+            isinstance(value, bool) for value in raw_values
+        ):
+            array = np.asarray([float(value) for value in numeric], dtype=float)
+            if name in log_names and np.all(array > 0.0):
+                array = np.log(array)
+            feature_columns.append(_normalized_column(array))
+            continue
+        categories = sorted({str(value) for value in raw_values})
+        for category in categories:
+            feature_columns.append(
+                np.asarray(
+                    [1.0 if str(value) == category else 0.0 for value in raw_values],
+                    dtype=float,
+                )
+            )
+    if not feature_columns:
+        return np.zeros((len(candidates), 1), dtype=float)
+    matrix = np.column_stack(feature_columns)
+    varying = np.ptp(matrix, axis=0) > EPS
+    if not np.any(varying):
+        return np.zeros((len(candidates), 1), dtype=float)
+    return matrix[:, varying]
+
+
+def _adaptive_constraint_severity(
+    row: dict[str, object],
+    args: argparse.Namespace,
+    violation_scale: float,
+    sigma_scale: float,
+) -> tuple[bool, float]:
+    require_passive = bool(getattr(args, "require_passive", False))
+    max_violations = getattr(args, "max_passivity_violations", None)
+    max_sigma = getattr(args, "max_passivity_sigma", None)
+    if require_passive and max_violations is None:
+        max_violations = 0
+    violations = sweep_row_metric(row, "passivity.violating_points")
+    sigma = sweep_row_metric(row, "passivity.max_singular_value")
+    severity = 0.0
+    feasible = True
+    if max_violations is not None:
+        if violations is None:
+            feasible = False
+            severity += 2.0
+        else:
+            excess = max(0.0, violations - float(max_violations))
+            feasible = feasible and excess <= 0.0
+            severity += excess / max(violation_scale, 1.0)
+    if max_sigma is not None:
+        if sigma is None:
+            feasible = False
+            severity += 2.0
+        else:
+            excess = max(0.0, sigma - float(max_sigma))
+            feasible = feasible and excess <= 0.0
+            severity += excess / max(sigma_scale, EPS)
+    elif require_passive and sigma is not None:
+        # Violating-point count is the formal --require-passive criterion, but
+        # sigma excess supplies a useful continuous direction when every trial
+        # has at least one violation.
+        severity += max(0.0, sigma - (1.0 + DEFAULT_DC_PASSIVITY_TOLERANCE)) / max(
+            sigma_scale, EPS
+        )
+    return feasible, severity
+
+
+def adaptive_observation_targets(
+    rows: Sequence[dict[str, object]],
+    args: argparse.Namespace,
+) -> tuple[list[int], np.ndarray]:
+    usable_indices = [
+        index
+        for index, row in enumerate(rows)
+        if sweep_row_metric(row, args.selection_metric) is not None
+    ]
+    if not usable_indices:
+        return [], np.zeros(0, dtype=float)
+    metrics = np.asarray(
+        [
+            float(sweep_row_metric(rows[index], args.selection_metric))
+            for index in usable_indices
+        ],
+        dtype=float,
+    )
+    metric_normalized = _normalized_column(metrics)
+    violation_excesses = []
+    sigma_excesses = []
+    max_violations = getattr(args, "max_passivity_violations", None)
+    if bool(getattr(args, "require_passive", False)) and max_violations is None:
+        max_violations = 0
+    max_sigma = getattr(args, "max_passivity_sigma", None)
+    for index in usable_indices:
+        row = rows[index]
+        violations = sweep_row_metric(row, "passivity.violating_points")
+        sigma = sweep_row_metric(row, "passivity.max_singular_value")
+        violation_excesses.append(
+            max(0.0, float(violations or 0.0) - float(max_violations or 0.0))
+        )
+        sigma_limit = (
+            float(max_sigma)
+            if max_sigma is not None
+            else 1.0 + DEFAULT_DC_PASSIVITY_TOLERANCE
+        )
+        sigma_excesses.append(max(0.0, float(sigma or 0.0) - sigma_limit))
+    violation_scale = max(max(violation_excesses, default=0.0), 1.0)
+    sigma_scale = max(max(sigma_excesses, default=0.0), 1e-3)
+    targets = []
+    constraints_active = bool(getattr(args, "require_passive", False)) or (
+        getattr(args, "max_passivity_violations", None) is not None
+        or getattr(args, "max_passivity_sigma", None) is not None
+    )
+    for position, index in enumerate(usable_indices):
+        feasible, severity = _adaptive_constraint_severity(
+            rows[index], args, violation_scale, sigma_scale
+        )
+        if constraints_active and not feasible:
+            targets.append(1.0 + severity + 0.05 * metric_normalized[position])
+        else:
+            targets.append(0.9 * metric_normalized[position])
+    return usable_indices, np.asarray(targets, dtype=float)
+
+
+def _adaptive_matern52(lhs: np.ndarray, rhs: np.ndarray, length_scale: float) -> float:
+    distance = float(np.linalg.norm((lhs - rhs) / length_scale))
+    root_five_distance = math.sqrt(5.0) * distance
+    return float(
+        (1.0 + root_five_distance + (5.0 / 3.0) * distance * distance)
+        * math.exp(-root_five_distance)
+    )
+
+
+def select_adaptive_candidate(
+    candidates: Sequence[dict[str, object]],
+    remaining_indices: Sequence[int],
+    selected_indices: Sequence[int],
+    rows: Sequence[dict[str, object]],
+    args: argparse.Namespace,
+    columns: Sequence[str],
+) -> tuple[int, dict[str, object]]:
+    if not remaining_indices:
+        raise ValueError("Adaptive search has no remaining candidates")
+    features = adaptive_candidate_features(
+        candidates,
+        columns,
+        set(getattr(args, "adaptive_log_parameters", set())),
+    )
+    initial_trials = max(1, int(getattr(args, "adaptive_initial_trials", 6)))
+    usable_row_indices, targets = adaptive_observation_targets(rows, args)
+    if len(selected_indices) < initial_trials or len(usable_row_indices) < 2:
+        if not selected_indices:
+            center = np.full(features.shape[1], 0.5, dtype=float)
+            index = min(
+                remaining_indices,
+                key=lambda candidate_index: float(
+                    np.linalg.norm(features[candidate_index] - center)
+                ),
+            )
+        else:
+            selected_features = features[np.asarray(selected_indices, dtype=int)]
+            index = max(
+                remaining_indices,
+                key=lambda candidate_index: float(
+                    np.min(
+                        np.linalg.norm(
+                            selected_features - features[candidate_index], axis=1
+                        )
+                    )
+                ),
+            )
+        return index, {
+            "adaptive_stage": "initial_maximin",
+            "adaptive_predicted_objective": None,
+            "adaptive_uncertainty": None,
+        }
+
+    observed_candidate_indices = [selected_indices[index] for index in usable_row_indices]
+    observed_features = features[np.asarray(observed_candidate_indices, dtype=int)]
+    target_mean = float(np.mean(targets))
+    target_scale = max(float(np.std(targets)), 0.1)
+    normalized_targets = (targets - target_mean) / target_scale
+    length_scale = max(0.15, 0.55 / math.sqrt(max(features.shape[1], 1)))
+    size = len(observed_features)
+    covariance = np.empty((size, size), dtype=float)
+    for row_index in range(size):
+        for col_index in range(size):
+            covariance[row_index, col_index] = _adaptive_matern52(
+                observed_features[row_index],
+                observed_features[col_index],
+                length_scale,
+            )
+    covariance += np.eye(size, dtype=float) * 1e-5
+    try:
+        factor = np.linalg.cholesky(covariance)
+    except np.linalg.LinAlgError:
+        factor = np.linalg.cholesky(covariance + np.eye(size, dtype=float) * 1e-3)
+    alpha = np.linalg.solve(factor.T, np.linalg.solve(factor, normalized_targets))
+    exploration = max(0.0, float(getattr(args, "adaptive_exploration", 1.5)))
+    best_index = int(remaining_indices[0])
+    best_score = float("inf")
+    best_mean = 0.0
+    best_uncertainty = 0.0
+    for candidate_index in remaining_indices:
+        kernel = np.asarray(
+            [
+                _adaptive_matern52(
+                    features[candidate_index], observed, length_scale
+                )
+                for observed in observed_features
+            ],
+            dtype=float,
+        )
+        normalized_mean = float(kernel @ alpha)
+        projected = np.linalg.solve(factor, kernel)
+        normalized_variance = max(0.0, 1.0 - float(projected @ projected))
+        uncertainty = target_scale * math.sqrt(normalized_variance)
+        predicted = target_mean + target_scale * normalized_mean
+        score = predicted - exploration * uncertainty
+        if score < best_score:
+            best_index = int(candidate_index)
+            best_score = score
+            best_mean = predicted
+            best_uncertainty = uncertainty
+    return best_index, {
+        "adaptive_stage": "gp_lcb",
+        "adaptive_predicted_objective": best_mean,
+        "adaptive_uncertainty": best_uncertainty,
+    }
 
 
 def update_sweep_row_from_summary(
@@ -11980,6 +12894,11 @@ def sweep_result_row(
         "trial_seed_mode": getattr(args, "trial_seed_mode", "fixed"),
         "metric": result.get("metric"),
         "selection_metric": args.selection_metric,
+        "adaptive_stage": result.get("adaptive_stage"),
+        "adaptive_predicted_objective": result.get(
+            "adaptive_predicted_objective"
+        ),
+        "adaptive_uncertainty": result.get("adaptive_uncertainty"),
         **candidate,
         "rmse_abs": summary.get("rmse_abs"),
         "max_abs": summary.get("max_abs"),
@@ -12029,6 +12948,15 @@ def run_sweep_command(
     if not candidates:
         raise ValueError("No sweep candidates were generated")
 
+    adaptive_search = str(getattr(args, "mode", "random")).strip().lower() == "adaptive"
+    if adaptive_search:
+        adaptive_initial_trials = int(getattr(args, "adaptive_initial_trials", 6))
+        adaptive_exploration = float(getattr(args, "adaptive_exploration", 1.5))
+        if adaptive_initial_trials <= 0:
+            raise ValueError("--adaptive-initial-trials must be positive")
+        if not math.isfinite(adaptive_exploration) or adaptive_exploration < 0.0:
+            raise ValueError("--adaptive-exploration must be finite and non-negative")
+
     rows: list[dict[str, object]] = []
     best_row: dict[str, object] | None = None
     best_metric: float | None = None
@@ -12043,6 +12971,19 @@ def run_sweep_command(
     live_best_trial: int | None = None
     live_promotion_warning: str | None = None
     jobs = configure_parallel_numeric_threads(getattr(args, "jobs", 1))
+    if adaptive_search and jobs != 1:
+        print(
+            "warning: adaptive search is sequential because each trial depends on "
+            "earlier results; using --jobs 1",
+            file=sys.stderr,
+            flush=True,
+        )
+        jobs = 1
+    planned_trial_count = (
+        min(len(candidates), max(1, int(getattr(args, "max_trials", len(candidates)))))
+        if adaptive_search
+        else len(candidates)
+    )
     if debug_enabled(args):
         debug_label = f"{diagnostics_prefix} sweep"
         debug_print(
@@ -12056,13 +12997,20 @@ def run_sweep_command(
                 "parallel trial debug output may interleave; use --jobs 1 for the cleanest trace",
                 label=debug_label,
             )
-        for idx, candidate in enumerate(candidates, start=1):
+        debug_candidates = candidates[:20] if adaptive_search else candidates
+        for idx, candidate in enumerate(debug_candidates, start=1):
             debug_print(args, f"candidate {idx}: {candidate}", label=debug_label)
+        if len(debug_candidates) < len(candidates):
+            debug_print(
+                args,
+                f"... {len(candidates) - len(debug_candidates)} additional adaptive candidates omitted",
+                label=debug_label,
+            )
     payloads = [
         (sweep_arg_values(args), candidate, str(out_dir), trial_index, args.trial_worst_plots)
         for trial_index, candidate in enumerate(candidates, start=1)
-    ]
-    trial_width = max(1, len(str(len(candidates))))
+    ] if not adaptive_search else []
+    trial_width = max(1, len(str(planned_trial_count)))
     max_epoch_value = csv_number(getattr(args, "epochs", None))
     epoch_width = max(
         len("unknown"),
@@ -12115,7 +13063,7 @@ def run_sweep_command(
         passivity_violations = metric_text(row.get("passivity_violating_points")) or "n/a"
         passivity_max_sigma = metric_text(row.get("passivity_max_singular_value")) or "n/a"
         line = (
-            f"trial complete {trial_index:>{trial_width}}/{len(candidates):>{trial_width}} "
+            f"trial complete {trial_index:>{trial_width}}/{planned_trial_count:>{trial_width}} "
             f"ep={epoch_text:>{epoch_width}} "
             f"{metric_label:>{metric_label_width}}={metric_display:>{metric_width}} "
             f"pv={passivity_violations:>{passivity_violations_width}} "
@@ -12141,7 +13089,35 @@ def run_sweep_command(
         )
         cleanup_trial_dir(trials_dir / f"trial_{trial_index:04d}", args.keep_trial_models)
 
-    if jobs == 1:
+    if adaptive_search:
+        remaining_indices = list(range(len(candidates)))
+        selected_indices: list[int] = []
+        adaptive_columns = list(
+            getattr(args, "adaptive_result_columns", result_columns)
+        )
+        for trial_index in range(1, planned_trial_count + 1):
+            candidate_index, adaptive_diagnostics = select_adaptive_candidate(
+                candidates,
+                remaining_indices,
+                selected_indices,
+                rows,
+                args,
+                adaptive_columns,
+            )
+            remaining_indices.remove(candidate_index)
+            selected_indices.append(candidate_index)
+            candidate = candidates[candidate_index]
+            payload = (
+                sweep_arg_values(args),
+                candidate,
+                str(out_dir),
+                trial_index,
+                args.trial_worst_plots,
+            )
+            result = worker_func(payload)
+            result.update(adaptive_diagnostics)
+            handle_result(result)
+    elif jobs == 1:
         for payload in payloads:
             handle_result(worker_func(payload))
     else:
@@ -12186,11 +13162,99 @@ def run_sweep_command(
         max_passivity_sigma=max_passivity_sigma,
     )
     write_csv(out_dir / results_filename, rows)
+    effective_result_columns = list(
+        getattr(args, "adaptive_result_columns", result_columns)
+    )
+    diagnostic_paths, diagnostic_image_paths = plot_sweep_diagnostics(
+        rows,
+        out_dir,
+        effective_result_columns,
+        args.selection_metric,
+        prefix=diagnostics_prefix,
+    )
+    diagnostic_artifacts = [
+        str(path.relative_to(out_dir))
+        for path in diagnostic_paths
+    ]
+    diagnostic_images = [
+        str(path.relative_to(out_dir))
+        for path in diagnostic_image_paths
+    ]
     if best_row is None or best_metric is None:
-        raise ValueError("No successful sweep trial satisfied the selected metric and passivity criteria")
+        usable_indices, fallback_targets = adaptive_observation_targets(rows, args)
+        fallback_row: dict[str, object] | None = None
+        if usable_indices:
+            target_position = int(np.argmin(fallback_targets))
+            fallback_row = rows[usable_indices[target_position]]
+        fallback_config = (
+            {
+                key: fallback_row[key]
+                for key in effective_result_columns
+                if key in fallback_row and fallback_row[key] not in {None, ""}
+            }
+            if fallback_row is not None
+            else None
+        )
+        fallback_metric = (
+            sweep_row_metric(fallback_row, args.selection_metric)
+            if fallback_row is not None
+            else None
+        )
+        fallback_passivity = (
+            {
+                "max_singular_value": fallback_row.get(
+                    "passivity_max_singular_value"
+                ),
+                "violating_points": fallback_row.get(
+                    "passivity_violating_points"
+                ),
+            }
+            if fallback_row is not None
+            else None
+        )
+        failure_message = (
+            "No successful sweep trial satisfied the selected metric and "
+            "passivity criteria. All completed trials remain in this report and "
+            "the diagnostic artifacts so trends can still be analyzed."
+        )
+        (out_dir / best_config_filename).write_text(
+            json.dumps(
+                {
+                    "status": "no_eligible_trial",
+                    "selection_metric": args.selection_metric,
+                    "require_passive": require_passive,
+                    "max_passivity_violations": max_passivity_violations,
+                    "max_passivity_sigma": max_passivity_sigma,
+                    "best_available_metric": fallback_metric,
+                    "best_available_trial": (
+                        fallback_row.get("trial") if fallback_row else None
+                    ),
+                    "best_available_config": fallback_config,
+                    "best_available_passivity": fallback_passivity,
+                    "best_model_dir": None,
+                    "failure": failure_message,
+                },
+                indent=2,
+            )
+        )
+        write_sweep_markdown(
+            out_dir / summary_filename,
+            rows,
+            selection_metric=args.selection_metric,
+            best_config=None,
+            best_metric=None,
+            diagnostic_artifacts=diagnostic_artifacts,
+            diagnostic_images=diagnostic_images,
+            selection_failure=failure_message,
+            best_available_config=fallback_config,
+            best_available_metric=fallback_metric,
+            best_available_passivity=fallback_passivity,
+        )
+        print(f"warning: {failure_message}", file=sys.stderr, flush=True)
+        return 2
     best_candidate = {
         key: best_row[key]
-        for key in result_columns
+        for key in effective_result_columns
         if key in best_row and best_row[key] not in {None, ""}
     }
 
@@ -12258,16 +13322,6 @@ def run_sweep_command(
             indent=2,
         )
     )
-    diagnostic_artifacts = [
-        str(path.relative_to(out_dir))
-        for path in plot_sweep_diagnostics(
-            rows,
-            out_dir,
-            result_columns,
-            args.selection_metric,
-            prefix=diagnostics_prefix,
-        )
-    ]
     write_sweep_markdown(
         out_dir / summary_filename,
         rows,
@@ -12276,6 +13330,7 @@ def run_sweep_command(
         best_metric=best_metric,
         reproduction_command=reproduction_command,
         diagnostic_artifacts=diagnostic_artifacts,
+        diagnostic_images=diagnostic_images,
     )
     if reproduction_command:
         print("reproduce best model:", flush=True)
