@@ -16,6 +16,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -1672,6 +1673,7 @@ def _print_summary(rows: Sequence[dict[str, object]]) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=os.environ.get("ADS_SURROGATE_CLI_PROG"),
         description=(
             "Parse ADS StatusLevel=4/5 HB or Gain Compression logs and compare "
             "Newton/Krylov solver work."

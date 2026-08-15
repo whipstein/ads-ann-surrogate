@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified command-line dispatcher for the surrogate model backends."""
+"""Primary command-line entry point for the complete surrogate workflow."""
 
 from __future__ import annotations
 
@@ -22,6 +22,18 @@ MODEL_TYPE_ALIASES = {
     "neurotf": "neuro-tf",
 }
 
+WORKFLOW_SCRIPTS = {
+    "points": "generate_points.py",
+    "audit": "audit_dataset.py",
+    "hb-report": "de_generated_scripts/parse_ads_hb_solver_log.py",
+}
+
+WORKFLOW_DESCRIPTIONS = {
+    "points": "generate initial points or suggest adaptive additions",
+    "audit": "audit training and verification MDIF data",
+    "hb-report": "compare ADS HB Newton/Krylov logs and runtimes",
+}
+
 
 def normalize_model_type(value: str) -> str:
     """Return the canonical command-line name for a model family."""
@@ -33,20 +45,56 @@ def normalize_model_type(value: str) -> str:
 def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a DNN, KBNN, or Neuro-TF command through one stable entry point. "
-            "All arguments other than --model are forwarded unchanged to the "
-            "selected backend."
+            "Run point generation, data auditing, model fitting/export, and ADS "
+            "HB log reporting through one stable entry point. Arguments after "
+            "the selected workflow are forwarded unchanged to its implementation."
         ),
         add_help=add_help,
+        usage=(
+            "%(prog)s {points,audit,hb-report} [COMMAND] [OPTIONS]\n"
+            "       %(prog)s --model {dnn,kbnn,neuro-tf} COMMAND [OPTIONS]"
+        ),
         epilog=(
             "Examples:\n"
+            "  python3 surrogate.py points generate --parameter W=1mm:2mm "
+            "--count 24 --out geometries.csv\n"
+            "  python3 surrogate.py audit --mdif data.mdif\n"
             "  python3 surrogate.py --model dnn train "
             "--mdif data.mdif --out-dir outputs/dnn\n"
-            "  python3 surrogate.py --model kbnn optimize --help\n"
-            "  python3 surrogate.py --model neuro-tf export-veriloga --help"
+            "  python3 surrogate.py --model neuro-tf export-veriloga --help\n"
+            "  python3 surrogate.py hb-report baseline.log trial.log"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument(
+        "--model",
+        dest="model_type",
+        required=False,
+        type=normalize_model_type,
+        choices=tuple(MODEL_SCRIPTS),
+        metavar="{dnn,kbnn,neuro-tf}",
+        help="Model family whose backend should receive the command",
+    )
+    parser.add_argument(
+        "workflow",
+        nargs="?",
+        choices=tuple(WORKFLOW_SCRIPTS),
+        metavar="{points,audit,hb-report}",
+        help=(
+            "Non-model workflow command: "
+            + "; ".join(
+                f"{name} = {WORKFLOW_DESCRIPTIONS[name]}"
+                for name in WORKFLOW_SCRIPTS
+            )
+        ),
+    )
+    return parser
+
+
+def build_model_arg_parser() -> argparse.ArgumentParser:
+    """Build the parser used only for model-backend selection."""
+
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--model",
         dest="model_type",
@@ -54,7 +102,6 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         type=normalize_model_type,
         choices=tuple(MODEL_SCRIPTS),
         metavar="{dnn,kbnn,neuro-tf}",
-        help="Model family whose backend should receive the command",
     )
     return parser
 
@@ -64,29 +111,30 @@ def parse_dispatch_args(
 ) -> tuple[argparse.Namespace, list[str]]:
     """Parse only dispatcher arguments and preserve all backend arguments."""
 
-    parser = build_arg_parser(add_help=False)
+    parser = build_model_arg_parser()
     args, backend_args = parser.parse_known_args(list(argv))
     if backend_args[:1] == ["--"]:
         backend_args = backend_args[1:]
     return args, backend_args
 
 
-def dispatch(model_type: str, backend_args: Sequence[str]) -> int:
-    """Execute the selected backend with this interpreter and return its status."""
+def dispatch_script(
+    script_name: str,
+    backend_args: Sequence[str],
+    *,
+    cli_prog: str,
+) -> int:
+    """Execute one internal implementation script and return its exit status."""
 
-    canonical_model_type = normalize_model_type(model_type)
-    script_name = MODEL_SCRIPTS[canonical_model_type]
     script_path = Path(__file__).resolve().parent / script_name
     if not script_path.is_file():
         print(
-            f"error: backend script for {model_type!r} was not found: {script_path}",
+            f"error: command implementation was not found: {script_path}",
             file=sys.stderr,
         )
         return 2
     environment = os.environ.copy()
-    environment["ADS_SURROGATE_CLI_PROG"] = (
-        f"surrogate.py --model {canonical_model_type}"
-    )
+    environment["ADS_SURROGATE_CLI_PROG"] = cli_prog
     completed = subprocess.run(
         [sys.executable or "python3", str(script_path), *map(str, backend_args)],
         check=False,
@@ -95,11 +143,34 @@ def dispatch(model_type: str, backend_args: Sequence[str]) -> int:
     return int(completed.returncode)
 
 
+def dispatch(model_type: str, backend_args: Sequence[str]) -> int:
+    """Execute the selected model backend with this interpreter."""
+
+    canonical_model_type = normalize_model_type(model_type)
+    return dispatch_script(
+        MODEL_SCRIPTS[canonical_model_type],
+        backend_args,
+        cli_prog=f"surrogate.py --model {canonical_model_type}",
+    )
+
+
+def dispatch_workflow(workflow: str, workflow_args: Sequence[str]) -> int:
+    """Execute a non-model workflow through the primary CLI."""
+
+    return dispatch_script(
+        WORKFLOW_SCRIPTS[workflow],
+        workflow_args,
+        cli_prog=f"surrogate.py {workflow}",
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     if not raw_args or raw_args in (["-h"], ["--help"]):
         build_arg_parser().print_help()
         return 0
+    if raw_args[0] in WORKFLOW_SCRIPTS:
+        return dispatch_workflow(raw_args[0], raw_args[1:])
     args, backend_args = parse_dispatch_args(raw_args)
     return dispatch(args.model_type, backend_args)
 

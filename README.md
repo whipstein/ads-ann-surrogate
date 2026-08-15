@@ -7,9 +7,9 @@ parameterized RF/microwave S-parameter MDIF data.
 
 ```mermaid
 flowchart TD
-    POINTS["Generate initial points<br/>generate_points.py"]
+    POINTS["Generate initial points<br/>surrogate.py points generate"]
     SIM["Run EM or ADS simulations<br/>produce training and verification MDIF"]
-    AUDIT["Audit raw MDIF<br/>audit_dataset.py"]
+    AUDIT["Audit raw MDIF<br/>surrogate.py audit"]
     CLI{"Select a model<br/>surrogate.py --model ..."}
 
     DNN["DNN formulation<br/>dnn.py"]
@@ -19,11 +19,11 @@ flowchart TD
     VERIFY["Review accuracy, passivity,<br/>plots, and sweep trends"]
     ACCEPT{"Targets satisfied?"}
 
-    UPDATE["Select additional or extended-range points<br/>generate_points.py suggest-additional"]
+    UPDATE["Select additional or extended-range points<br/>surrogate.py points suggest-additional"]
     SIMNEW["Simulate the added points<br/>append them to training MDIF"]
     REFIT["Refit the selected model"]
 
-    EXPORT["Export the frozen model<br/>through surrogate.py"]
+    EXPORT["Export the frozen model<br/>surrogate.py --model ... export command"]
     ADS["Integrate with ADS<br/>sampled MDIF, HB SDD, Verilog-A, or ANN"]
     COMMON["Shared infrastructure<br/>surrogate_common.py"]
 
@@ -43,22 +43,22 @@ flowchart TD
     COMMON --> FIT
     COMMON --> EXPORT
 
-    click POINTS "#1-generate-initial-points" "Open initial point generation"
-    click SIM "#2-simulate-and-audit-the-dataset" "Open simulation and input-data requirements"
-    click AUDIT "#audit-training-and-verification-data" "Open dataset auditing"
-    click CLI "#unified-model-cli" "Open the unified model CLI"
-    click DNN "#b3-dnn-direct-response-surrogate" "Open the DNN formulation"
-    click KBNN "#b4-kbnn-fitted-coarse-knowledge-based-surrogate" "Open the KBNN formulation"
-    click NTF "#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate" "Open the Neuro-TF formulation"
-    click FIT "#shared-training-and-optimization-workflow" "Open fitting and optimization"
-    click VERIFY "#fitting-output-artifacts" "Open fitting and verification outputs"
-    click ACCEPT "#5-refit-and-iterate" "Open the iteration criteria"
-    click UPDATE "#4-update-or-extend-the-sampling-points" "Open point updating"
-    click SIMNEW "#5-refit-and-iterate" "Open the refitting loop"
-    click REFIT "#5-refit-and-iterate" "Open the refitting loop"
-    click EXPORT "#export-commands" "Open model export commands"
-    click ADS "#choose-the-ads-handoff" "Open ADS integration choices"
-    click COMMON "#repository-layout" "Open the repository layout"
+    click POINTS href "README.md#1-generate-initial-points" "Open initial point generation"
+    click SIM href "README.md#2-simulate-and-audit-the-dataset" "Open simulation and input-data requirements"
+    click AUDIT href "README.md#audit-training-and-verification-data" "Open dataset auditing"
+    click CLI href "README.md#unified-model-cli" "Open the unified model CLI"
+    click DNN href "README.md#b3-dnn-direct-response-surrogate" "Open the DNN formulation"
+    click KBNN href "README.md#b4-kbnn-fitted-coarse-knowledge-based-surrogate" "Open the KBNN formulation"
+    click NTF href "README.md#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate" "Open the Neuro-TF formulation"
+    click FIT href "README.md#shared-training-and-optimization-workflow" "Open fitting and optimization"
+    click VERIFY href "README.md#fitting-output-artifacts" "Open fitting and verification outputs"
+    click ACCEPT href "README.md#5-refit-and-iterate" "Open the iteration criteria"
+    click UPDATE href "README.md#4-update-or-extend-the-sampling-points" "Open point updating"
+    click SIMNEW href "README.md#5-refit-and-iterate" "Open the refitting loop"
+    click REFIT href "README.md#5-refit-and-iterate" "Open the refitting loop"
+    click EXPORT href "README.md#export-commands" "Open model export commands"
+    click ADS href "README.md#choose-the-ads-handoff" "Open ADS integration choices"
+    click COMMON href "README.md#repository-layout" "Open the repository layout"
 ```
 
 Each flowchart block links to the corresponding section when the Markdown
@@ -68,24 +68,25 @@ linked workflow list below. Direct formulation links are also available for
 [KBNN](#b4-kbnn-fitted-coarse-knowledge-based-surrogate), and
 [Neuro-TF](#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate).
 
-The code uses a flat script-first layout. `surrogate.py` is the unified model
-entry point; it selects and runs the DNN, KBNN, or Neuro-TF backend. Shared MDIF
-parsing, metrics, plotting, sweep orchestration, and ADS export helpers live in
-`surrogate_common.py`.
+The code uses a flat script-first layout. `surrogate.py` is the primary entry
+point for the entire workflow: it dispatches point generation, data auditing,
+model fitting and export, and ADS HB log reporting to their internal
+implementations. Shared MDIF parsing, metrics, plotting, sweep orchestration,
+and ADS export helpers live in `surrogate_common.py`.
 
 ## Repository Layout
 
 ```text
 .
-|-- surrogate.py                          Unified model-family CLI dispatcher
+|-- surrogate.py                          Primary CLI and workflow dispatcher
 |-- dnn.py                                DNN backend and implementation
 |-- kbnn.py                               KBNN backend and implementation
 |-- neuro_tf.py                           Neuro-TF backend and implementation
 |-- surrogate_common.py                   Shared training, reporting, and ADS export utilities
-|-- generate_points.py                    Geometry/process point-set generator
-|-- audit_dataset.py                      Raw MDIF passivity and consistency audit
+|-- generate_points.py                    Internal point-generation implementation
+|-- audit_dataset.py                      Internal MDIF-audit implementation
 |-- de_generated_scripts/
-|   `-- parse_ads_hb_solver_log.py        ADS Newton/Krylov status-log comparison utility
+|   `-- parse_ads_hb_solver_log.py        Internal ADS HB log-report implementation
 |-- dnn_sample_training_verification.mdif
 |-- kbnn_sample_fine.mdif
 |-- kbnn_sample_coarse.mdif
@@ -93,6 +94,22 @@ parsing, metrics, plotting, sweep orchestration, and ADS export helpers live in
 |-- MODEL_PLUGIN_API.md                   Guide for adding another model family
 `-- README.md                              Integrated workflow and command reference
 ```
+
+### Primary CLI Routes
+
+All supported repository commands start with `python3 surrogate.py`. The
+dispatcher calls the relevant internal script and returns its exit status:
+
+| Workflow | Primary command |
+| --- | --- |
+| Generate or extend geometry points | `python3 surrogate.py points generate [OPTIONS]` |
+| Select adaptive points | `python3 surrogate.py points suggest-additional [OPTIONS]` |
+| Audit MDIF data | `python3 surrogate.py audit [OPTIONS]` |
+| Fit, optimize, inspect, predict, rerank, or export a model | `python3 surrogate.py --model {dnn,kbnn,neuro-tf} COMMAND [OPTIONS]` |
+| Compare ADS HB solver logs | `python3 surrogate.py hb-report [OPTIONS] LOG [LOG ...]` |
+
+Run `python3 surrogate.py --help` for the routes above, then append `--help` to
+the selected route or model command for its complete option list.
 
 ## Requirements
 
@@ -118,7 +135,7 @@ simulate the generated circuit models. The generated ADS ANN training package mu
 a licensed ADS machine with the ADS Python environment because it imports
 `keysight.ads.ann`.
 
-`generate_points.py` uses Pillow for its automatic PNG coverage matrix. Its
+The `points` workflow uses Pillow for its automatic PNG coverage matrix. Its
 `maximin-lhs`, `latin-hypercube`, and `halton` sampling methods otherwise use
 only the Python standard library. The `sobol` method uses SciPy's Sobol
 implementation when SciPy is available.
@@ -138,8 +155,9 @@ model:
 
 ## 1. Generate Initial Points
 
-Use `generate_points.py` to create geometry/process sample CSVs before running
-EM simulations or assembling MDIF. The default method is `maximin-lhs`, a
+Use `surrogate.py points generate` to create geometry/process sample CSVs
+before running EM simulations or assembling MDIF. The default method is
+`maximin-lhs`, a
 maximin Latin hypercube. For finite surrogate-training campaigns, this is often
 more appropriate than a raw Sobol prefix because every parameter is stratified
 and the script chooses the candidate design with the largest minimum point
@@ -147,7 +165,7 @@ spacing. Sobol remains useful when you want a low-discrepancy sequence that can
 grow naturally in power-of-two batches.
 
 ```bash
-python3 generate_points.py \
+python3 surrogate.py points generate \
   --parameter W=0.40mm:0.80mm \
   --parameter L=1.00mm:1.60mm \
   --count 32 \
@@ -298,7 +316,7 @@ For one combined MDIF containing 160 `dataset=train` blocks and 40
 `dataset=verification` blocks:
 
 ```bash
-python3 audit_dataset.py \
+python3 surrogate.py audit \
   --mdif train_verify.mdif \
   --geometry-json geometries.json \
   --out-dir outputs/train_verify_audit
@@ -309,14 +327,15 @@ Parameter names are inferred from the numeric `VAR` values, so
 numeric metadata variable or to enforce a particular parameter set:
 
 ```bash
-python3 audit_dataset.py \
+python3 surrogate.py audit \
   --mdif train_verify.mdif \
   --geometry-json geometries.json \
   --parameter-names W,L,H,Er,TanD,Roughness \
   --out-dir outputs/train_verify_audit
 ```
 
-Use the JSON written alongside the geometry CSV by `generate_points.py`. Its
+Use the JSON written alongside the geometry CSV by the `points generate`
+command. Its
 declared base-unit parameter bounds—not the minimum and maximum values that
 happen to appear in the sampled training subset—define whether a verification
 point is inside the intended design domain. This avoids false extrapolation
@@ -326,7 +345,7 @@ warnings for sparse LHS, Sobol, Halton, and GP-selected training points.
 uses the combined minimum and maximum declared bounds for each parameter:
 
 ```bash
-python3 audit_dataset.py \
+python3 surrogate.py audit \
   --mdif train_verify.mdif \
   --geometry-json original_geometries.json \
   --geometry-json extended_geometries.json \
@@ -342,7 +361,7 @@ When training and verification are separate files, use the same separation as
 the fitting command:
 
 ```bash
-python3 audit_dataset.py \
+python3 surrogate.py audit \
   --mdif train.mdif \
   --verification-mdif verification.mdif \
   --geometry-json geometries.json \
@@ -352,7 +371,7 @@ python3 audit_dataset.py \
 For an integrated KBNN fit, audit the fine and coarse datasets together:
 
 ```bash
-python3 audit_dataset.py \
+python3 surrogate.py audit \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
   --geometry-json geometries.json \
@@ -481,7 +500,8 @@ is part of fitting—not point generation or ADS integration.
 
 ### Unified Model CLI
 
-Use `surrogate.py` for every model-family command. Select the backend with
+The same primary `surrogate.py` entry point handles every model-family command,
+including all export formats. Select the backend with
 `--model` and leave the selected backend's subcommand and options
 unchanged:
 
@@ -960,7 +980,7 @@ without re-entering the parameter definitions; `geometries.json` is inferred
 from `--existing-points geometries.csv`:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 12 \
   --fit-dir outputs/dnn_model \
   --existing-points geometries.csv \
@@ -1010,7 +1030,7 @@ Assume:
 Request eight additional training geometries with this complete command:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/dnn_adaptive/best_model \
   --existing-points geometries.csv \
@@ -1079,7 +1099,7 @@ Run the following sequence:
 For example:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 6 \
   --fit-dir outputs/dnn_gp_round_1_refit \
   --existing-points geometries.csv \
@@ -1115,7 +1135,7 @@ audit set that never supplies GP error observations.
 For example, if an all-ineligible report identifies one-based trial 7:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
   --existing-points geometries.csv \
@@ -1142,7 +1162,7 @@ the original CSV with `--existing-points`. This example changes only the upper
 `W` bound from `0.80mm` to `1.00mm`:
 
 ```bash
-python3 generate_points.py \
+python3 surrogate.py points generate \
   --parameter W=0.40mm:0.80mm \
   --parameter L=1.00mm:1.60mm \
   --extend-range W=0.40mm:1.00mm \
@@ -1195,7 +1215,7 @@ design, ask for both methods. The `{method}` placeholder is replaced in the
 output path:
 
 ```bash
-python3 generate_points.py \
+python3 surrogate.py points generate \
   --parameter W=0.40mm:0.80mm \
   --parameter L=1.00mm:1.60mm \
   --count 64 \
@@ -1230,7 +1250,7 @@ minimum. Its six-parameter row starts with 32 points: 24 training and 8
 acquisition-verification points.
 
 ```bash
-python3 generate_points.py generate \
+python3 surrogate.py points generate \
   --parameter P1=0:1 --parameter P2=0:1 \
   --parameter P3=0:1 --parameter P4=0:1 \
   --parameter P5=0:1 --parameter P6=0:1 \
@@ -1245,7 +1265,7 @@ Latin-hypercube method. After simulating the initial points and fitting the
 chosen provisional network, request a small next batch:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 6 \
   --fit-dir outputs/dnn_compact \
   --existing-points adaptive_round_0.csv \
@@ -1300,7 +1320,7 @@ sweep root. The promoted model directory contains the winning trial's
 requesting a geometry already present in the simulated MDIF:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 10 \
   --fit-dir outputs/dnn_adaptive/best_model \
   --existing-points geometries.csv \
@@ -1336,7 +1356,7 @@ The point selector is model-family independent. Use the fine-model verification
 metrics under the selected KBNN model:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/kbnn_adaptive/best_model \
   --parameter-json fine_geometries.json \
@@ -1354,7 +1374,7 @@ python3 generate_points.py suggest-additional \
 Use the same workflow with the selected Neuro-TF model:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/neuro_tf_adaptive/best_model \
   --parameter-json geometries.json \
@@ -1377,7 +1397,7 @@ trial identified there. For example, if the report identifies trial 7, point
 directly to that retained trial's metrics:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 10 \
   --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
   --parameter-json geometries.json \
@@ -1407,7 +1427,7 @@ metrics. Pass every earlier point CSV with a repeatable `--existing-points` so
 round 2 cannot suggest them again:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 6 \
   --fit-dir outputs/dnn_gp_round_1_refit \
   --existing-points geometries.csv \
@@ -1441,7 +1461,7 @@ candidate budget and includes the normalized coordinates in the result for
 auditing:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/dnn_six_parameter/best_model \
   --parameter-json six_parameter_geometries.json \
@@ -1516,7 +1536,7 @@ slab. This shared seed step extends the upper `W` bound from `0.80mm` to
 `1.00mm`, retains the original rows, and appends 20 maximin-LHS points:
 
 ```bash
-python3 generate_points.py generate \
+python3 surrogate.py points generate \
   --parameter W=0.40mm:0.80mm \
   --parameter L=1.00mm:1.60mm \
   --extend-range W=0.40mm:1.00mm \
@@ -1535,7 +1555,7 @@ following alternatives for another range-extension refinement batch.
 #### Range Extension With the Non-GP Error-Distance Selector
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/dnn_extended_seed \
   --existing-points geometries_extended_seed.csv \
@@ -1552,7 +1572,7 @@ python3 generate_points.py suggest-additional \
 #### Range Extension With the GP-UCB Selector
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/dnn_extended_seed \
   --existing-points geometries_extended_seed.csv \
@@ -1580,7 +1600,7 @@ Use the legacy selector to concentrate additions around observed high-error
 verification geometries:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/dnn_current \
   --existing-points geometries.csv \
@@ -1601,7 +1621,7 @@ Use GP-UCB over the same unchanged range to balance predicted error against
 uncertainty and point separation:
 
 ```bash
-python3 generate_points.py suggest-additional \
+python3 surrogate.py points suggest-additional \
   --count 8 \
   --fit-dir outputs/dnn_current \
   --existing-points geometries.csv \
@@ -1621,8 +1641,9 @@ with the same existing-point files, candidate count, random seed, metric, and
 batch size. Simulate the two output batches separately; do not combine one
 method's new results into the fit used to judge the other method.
 
-The explicit `generate` subcommand is optional; invoking `generate_points.py`
-without a subcommand uses it automatically.
+The explicit `generate` subcommand after `points` is optional for compatibility,
+but the README uses `surrogate.py points generate` so copied command history is
+unambiguous.
 
 ### Parameter Ranges
 
@@ -1852,10 +1873,9 @@ trial files and compatibility checks under `trial_exports`.
 
 ### Parsing ADS Gain Compression solver logs
 
-The standalone
-`de_generated_scripts/parse_ads_hb_solver_log.py` utility converts the plain
-Status/Summary text from an ADS Gain Compression or HB run into comparable
-tables. It requires only standard Python and does not need to run inside ADS.
+The `surrogate.py hb-report` command converts the plain Status/Summary text from
+an ADS Gain Compression or HB run into comparable tables. Its internal parser
+requires only standard Python and does not need to run inside ADS.
 
 Set the Gain Compression controller's **Freq > Levels > Status level** to `4`
 and copy each model's Status/Summary text into a plain log file. Level 4 is
@@ -1866,7 +1886,7 @@ ignores its additional inner-Krylov residual table to avoid double-counting.
 Compare any number of model logs in one command:
 
 ```bash
-python3 de_generated_scripts/parse_ads_hb_solver_log.py \
+python3 surrogate.py hb-report \
   baseline_status.log direct_y_status.log \
   --labels baseline direct_y \
   --out-dir hb_solver_comparison
@@ -1951,7 +1971,7 @@ For logs without an embedded `Total stopwatch time`, supply independently
 measured times in log order. These values override parsed total timing:
 
 ```bash
-python3 de_generated_scripts/parse_ads_hb_solver_log.py \
+python3 surrogate.py hb-report \
   baseline_status.log trial_status.log \
   --labels baseline trial \
   --wall-clock-seconds 123.4 118.9 \
@@ -4791,7 +4811,7 @@ normative implementation:
 
 | Area | Source |
 | --- | --- |
-| Unified model-family command dispatch | [`surrogate.py`](surrogate.py) |
+| Primary workflow and model-family command dispatch | [`surrogate.py`](surrogate.py) |
 | DNN features, S/Y targets, training, persistence, and commands | [`dnn.py`](dnn.py) |
 | KBNN coarse fitting, identity checks, modes, targets, and composite export | [`kbnn.py`](kbnn.py) |
 | Fixed-pole construction, rational coefficient extraction, and Neuro-TF evaluation | [`neuro_tf.py`](neuro_tf.py) |

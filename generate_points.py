@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -2132,7 +2133,9 @@ def add_parameter_arguments(
 
 
 def build_generate_parser() -> argparse.ArgumentParser:
+    dispatcher_prog = os.environ.get("ADS_SURROGATE_CLI_PROG")
     parser = argparse.ArgumentParser(
+        prog=f"{dispatcher_prog} generate" if dispatcher_prog else None,
         description="Generate geometry/process sample points for ADS surrogate extraction.",
     )
     add_parameter_arguments(parser)
@@ -2199,7 +2202,13 @@ def build_generate_parser() -> argparse.ArgumentParser:
 
 
 def build_suggest_parser() -> argparse.ArgumentParser:
+    dispatcher_prog = os.environ.get("ADS_SURROGATE_CLI_PROG")
     parser = argparse.ArgumentParser(
+        prog=(
+            f"{dispatcher_prog} suggest-additional"
+            if dispatcher_prog
+            else None
+        ),
         description=(
             "Analyze current verification error and suggest targeted additional "
             "geometry/process points for the next EM batch."

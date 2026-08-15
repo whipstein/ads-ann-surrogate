@@ -13,6 +13,7 @@ import csv
 import html
 import json
 import math
+import os
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -1224,6 +1225,7 @@ def coarse_coverage_issues(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=os.environ.get("ADS_SURROGATE_CLI_PROG"),
         description="Audit raw MDIF passivity and train/verification consistency before fitting."
     )
     parser.add_argument("--mdif", required=True, help="Fine or direct-model training/combined MDIF.")

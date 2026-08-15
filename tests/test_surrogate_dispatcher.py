@@ -70,10 +70,47 @@ class SurrogateDispatcherTests(unittest.TestCase):
         self.assertEqual(status, 0)
         for model_type in surrogate.MODEL_SCRIPTS:
             self.assertIn(model_type, output.getvalue())
+        for workflow in surrogate.WORKFLOW_SCRIPTS:
+            self.assertIn(workflow, output.getvalue())
 
     def test_every_model_backend_exists(self) -> None:
         for script_name in surrogate.MODEL_SCRIPTS.values():
             self.assertTrue((ROOT / script_name).is_file())
+
+    def test_every_workflow_implementation_exists(self) -> None:
+        for script_name in surrogate.WORKFLOW_SCRIPTS.values():
+            self.assertTrue((ROOT / script_name).is_file())
+
+    def test_non_model_workflows_forward_arguments_and_primary_prog(self) -> None:
+        cases = (
+            (
+                "points",
+                ["generate", "--count", "24"],
+                ROOT / "generate_points.py",
+            ),
+            ("audit", ["--mdif", "data.mdif"], ROOT / "audit_dataset.py"),
+            (
+                "hb-report",
+                ["baseline.log", "trial.log"],
+                ROOT / "de_generated_scripts" / "parse_ads_hb_solver_log.py",
+            ),
+        )
+        for workflow, forwarded, implementation in cases:
+            with self.subTest(workflow=workflow):
+                completed = mock.Mock(returncode=5)
+                with mock.patch(
+                    "surrogate.subprocess.run", return_value=completed
+                ) as run:
+                    status = surrogate.main([workflow, *forwarded])
+                self.assertEqual(status, 5)
+                self.assertEqual(
+                    run.call_args.args[0],
+                    [sys.executable or "python3", str(implementation), *forwarded],
+                )
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["ADS_SURROGATE_CLI_PROG"],
+                    f"surrogate.py {workflow}",
+                )
 
     def test_generated_export_commands_use_the_dispatcher(self) -> None:
         for model_type, script_name in surrogate.MODEL_SCRIPTS.items():
