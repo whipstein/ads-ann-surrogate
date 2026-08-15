@@ -102,7 +102,7 @@ Use a Python environment with NumPy installed:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install numpy
+python3 -m pip install numpy pillow
 ```
 
 Matplotlib is optional but recommended for publication-quality verification
@@ -118,9 +118,10 @@ simulate the generated circuit models. The generated ADS ANN training package mu
 a licensed ADS machine with the ADS Python environment because it imports
 `keysight.ads.ann`.
 
-`generate_points.py` is pure Python for `maximin-lhs`, `latin-hypercube`, and
-`halton`. Its `sobol` method uses SciPy's Sobol implementation when SciPy is
-available.
+`generate_points.py` uses Pillow for its automatic PNG coverage matrix. Its
+`maximin-lhs`, `latin-hypercube`, and `halton` sampling methods otherwise use
+only the Python standard library. The `sobol` method uses SciPy's Sobol
+implementation when SciPy is available.
 
 The remainder of this README follows the order used to create and deploy a
 model:
@@ -149,11 +150,43 @@ grow naturally in power-of-two batches.
 python3 generate_points.py \
   --parameter W=0.40mm:0.80mm \
   --parameter L=1.00mm:1.60mm \
-  --count 80 \
-  --verification-count 16 \
+  --count 32 \
+  --verification-count 8 \
   --method maximin-lhs \
   --out geometries.csv
 ```
+
+### How Many Initial Points to Generate
+
+Treat each point as one geometry/process setting with a full frequency sweep;
+frequency samples within that sweep do not count as additional geometry points.
+For a one-shot design intended to work without adaptive refinement, use these
+practical initial ranges:
+
+| Geometry parameters | Training points | Verification points |
+| ---: | ---: | ---: |
+| 2 | 20-35 | 8-12 |
+| 3 | 35-60 | 12-18 |
+| 4 | 60-100 | 16-25 |
+| 5 | 100-160 | 25-40 |
+| 6 | 160-250 | 35-55 |
+| 7-8 | 250-450 | 50-90 |
+
+`--count` is the total of both groups, while `--verification-count` specifies
+how many of those points are held out. The two-parameter command above therefore
+creates 24 training and 8 verification points, which falls within the first
+recommended row. These ranges are starting guidance rather than guarantees;
+strong resonances, discontinuous behavior, or broad parameter ranges can
+require adaptive additions after the first fit.
+
+For residual KBNN fits with a useful coarse model, start near the low-to-middle
+end of each range because the fine network is learning the correction to the
+fitted coarse model. A staged KBNN workflow can start with roughly $15d$
+training points, with a minimum of about 30, and $4d$ to $6d$ verification
+points, with a minimum of about 12, where $d$ is the number of geometry
+parameters. Keep the verification set fixed across model comparisons, then add
+training points in targeted batches of about $3d$ to $5d$ using current
+worst-fit regions.
 
 Each generated CSV contains `point_index`, `dataset`, `split_sequence`,
 `train_sequence`, `verification_sequence`, `method`, and one column per
@@ -171,8 +204,8 @@ Every geometry CSV also gets an automatic same-stem JSON file. For example,
 method, point and dataset counts, and each parameter's lower bound, upper bound,
 unit, base-unit bounds, linear/log scale, and coverage-plot filename.
 
-The same command also writes `geometries_parameter_coverage.svg`. This scalable
-pair matrix provides one cell for every ordered parameter pair:
+The same command also writes `geometries_parameter_coverage.png`. This pair
+matrix provides one cell for every ordered parameter pair:
 
 - off-diagonal cells plot one parameter against another, with training points
   in blue and verification points in orange; and
@@ -181,12 +214,12 @@ pair matrix provides one cell for every ordered parameter pair:
 
 Linear and log-scaled parameters are positioned in their normalized design
 coordinates so coverage is visually comparable, while the axes retain the
-declared physical endpoint values and units. Open the SVG directly in a browser
-or Markdown viewer; it does not require Matplotlib. When `--write-split-files`
-is used, one matrix describes the complete combined geometry, so the separate
-train/verification CSVs do not receive duplicate JSON or plot files. Range
-extensions plot the complete original-plus-appended set. Targeted
-additional-point CSVs receive their own JSON and coverage matrix.
+declared physical endpoint values and units. The PNG does not require
+Matplotlib. When `--write-split-files` is used, one matrix describes the
+complete combined geometry, so the separate train/verification CSVs do not
+receive duplicate JSON or plot files. Range extensions plot the complete
+original-plus-appended set. Targeted additional-point CSVs receive their own
+JSON and coverage matrix.
 
 ## 2. Simulate and Audit the Dataset
 
@@ -1020,27 +1053,6 @@ and the original train/verification ratio is retained unless
 point set with a symmetrically wider range. It does not perform the one-sided
 append workflow.
 
-For expensive EM campaigns, treat each point as one geometry/process setting
-with a full frequency sweep. For a one-shot design that is expected to work
-without adaptive refinement, a practical initial design size is:
-
-| Geometry parameters | Training points | Verification points |
-| ---: | ---: | ---: |
-| 2 | 20-35 | 8-12 |
-| 3 | 35-60 | 12-18 |
-| 4 | 60-100 | 16-25 |
-| 5 | 100-160 | 25-40 |
-| 6 | 160-250 | 35-55 |
-| 7-8 | 250-450 | 50-90 |
-
-For residual KBNN fits with a useful coarse model, start near the low-to-middle
-end of each range because the neural network is learning `fine - coarse`
-instead of the full response. A good staged workflow is to start with roughly
-$15d$ training points, with a minimum of about 30, and $4d$ to $6d$
-verification points, with a minimum of about 12. Keep the verification set
-fixed across model comparisons, then grow the training set in targeted batches
-of about $3d$ to $5d$ points using the current worst-fit regions.
-
 To compare the current Sobol-style workflow with the recommended space-filling
 design, ask for both methods. The `{method}` placeholder is replaced in the
 output path:
@@ -1535,7 +1547,7 @@ without a subcommand uses it automatically.
 | <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. A <code>*_train.csv</code> or <code>*_verification.csv</code> split also resolves the combined JSON. | <nobr><code>--existing-points geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
-| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges and a <code>*_parameter_coverage.svg</code> scatter/histogram matrix are written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
+| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges and a <code>*_parameter_coverage.png</code> scatter/histogram matrix are written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to suggested points. Default: <code>targeted</code>. | <nobr><code>--target-dataset train</code></nobr> |
 | <nobr><code>--verification-count INT</code></nobr> | <code>generate</code> | Number of new tail points labeled verification; must be smaller than <code>--count</code>. Default: <code>0</code>, or the original split ratio during a range extension. | <nobr><code>--verification-count 16</code></nobr> |
