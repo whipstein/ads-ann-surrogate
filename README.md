@@ -2138,6 +2138,14 @@ values directly. The default target is S-parameters. For direct Verilog-A use,
 targets, which lets the exported ADS model stamp Y directly and skip a runtime
 S-to-Y matrix inversion at every simulator evaluation.
 
+For the default S-domain fit, passive training data now enables passivity-aware
+loss and a saved-model safeguard automatically. Reciprocity is enforced by
+default, tying each $S_{ij}$/$S_{ji}$ pair exactly. Both operations are folded into the
+last neural layer, so the saved model and every existing export path retain the
+same inference cost and file format. Direct-Y fitting is rejected when
+$\mathbf I+\mathbf S$ is too ill-conditioned to produce a meaningful learning
+target; use S-domain output for ideal or nearly lossless through structures.
+
 The trainer automatically floors zero-variance output scaler columns to a
 representative response scale, which prevents constant terms such as an exactly
 zero isolation path from becoming large admittance errors in direct-Y models.
@@ -2245,8 +2253,9 @@ python3 surrogate.py --model dnn optimize \
   --optimize-parameter learning_rate=1e-4:1e-2:log \
   --optimize-parameter batch_size=64:512:log \
   --optimize-parameter activation=tanh,relu \
-  --optimize-parameter freq_transform=log,log-linear \
+  --optimize-parameter freq_transform=log,linear,log-linear \
   --optimize-parameter 'hidden_layers=1:4x32:256:log' \
+  --optimize-parameter passivity_penalty=1:30:log \
   --adaptive-initial-trials 8 \
   --adaptive-candidate-pool 768 \
   --adaptive-exploration 1.5 \
@@ -2256,7 +2265,7 @@ python3 surrogate.py --model dnn optimize \
   --require-passive
 ```
 
-Here, only the five named domains vary. Options such as `--epochs`,
+Here, only the six named domains vary. Options such as `--epochs`,
 `--patience`, `--output-domain`, and `--target-z0` retain their normal values
 unless they are also supplied through `--optimize-parameter`. To test specific
 architectures instead of uniform-width depth/width combinations, use an
@@ -2273,7 +2282,7 @@ python3 surrogate.py --model dnn optimize \
   --mdif train_verify.mdif \
   --out-dir dnn_sweep \
   --parameter-names W,L,H \
-  --freq-transforms log,log-linear \
+  --freq-transforms log,linear,log-linear \
   --hidden-layers '64,64;128,128,64;256,128,64' \
   --activations tanh,relu \
   --learning-rates 0.001,0.002,0.005 \
@@ -2290,8 +2299,11 @@ Use `--sparam-weights` to make some S-parameters matter less during training
 and sweep selection. The same weight is applied to the real and imaginary
 columns for each selected S-parameter. Rules are applied left to right, so later
 rules override earlier broad rules. Weights are normalized internally so their
-average across S-parameter labels is 1.0 before they are applied to the
-training loss and scale-sensitive weighted metrics.
+average across S-parameter labels is 1.0. For DNN training, the implementation
+also compensates for each output standard deviation, so a requested weight is
+a weight on physical S- or Y-response error rather than an accidental weight
+on standardized coordinates. Scale-sensitive weighted verification metrics use
+the requested normalized weights directly.
 
 Examples:
 
@@ -2345,6 +2357,71 @@ self-contained Verilog-A and sampled-MDIF exports. Native ADS ANN export
 re-trains through the ADS API, which does not expose per-sample loss weights;
 use the local Verilog-A or sampled-MDIF path when these frequency priorities
 must be preserved exactly.
+
+##### Passive and reciprocal DNN fitting
+
+The recommended S-domain behavior is enabled by default:
+
+```bash
+python3 surrogate.py --model dnn train \
+  --mdif train_verify.mdif \
+  --out-dir dnn_model \
+  --parameter-names W,L \
+  --passivity-mode auto \
+  --passivity-penalty 10 \
+  --passivity-margin 0.001 \
+  --reciprocity-mode enforce
+```
+
+`--passivity-mode auto` first audits only the positive-frequency training
+blocks. If they form a complete passive S-matrix, the DNN loss penalizes the
+amount by which the largest singular value exceeds
+$1-\texttt{passivity-margin}$. The penalty combines the mean squared excess
+with an RMS-of-squared-excess term, so a narrow violation is not hidden by a
+large frequency grid. After training, any remaining sampled training-domain
+overshoot is removed by the uniform factor
+
+$$
+\alpha
+=\min\!\left(
+1,
+\frac{1-\texttt{passivity-margin}}
+     {\max_{(\mathbf p,f)\in\mathcal D_{\mathrm{train}}}
+      \sigma_{\max}(\widehat{\mathbf S}(\mathbf p,f))}
+\right).
+$$
+
+This last factor is folded into the existing linear output layer. It does not
+add an SVD or any other operation to prediction, Verilog-A, sampled MDIF, or
+ADS HB evaluation. Verification points are never used in the passivity loss,
+early-stage audit, or final scale; their independent passivity result remains in
+`verification_summary.json`. `--passivity-mode enforce` applies the same
+training-domain behavior even when the source data are non-passive, while
+`off` disables both the loss and safeguard. If contraction is larger than you
+are willing to accept, inspect `rf_response_scale` and optimize
+`passivity_penalty` rather than silently accepting the RF error tradeoff.
+
+`--reciprocity-mode enforce`, the default, folds the exact projection
+
+$$
+\widehat S_{ij}\leftarrow
+\widehat S_{ji}\leftarrow
+\frac{\widehat S_{ij}+\widehat S_{ji}}{2}
+$$
+
+into the last layer regardless of source-data mismatch. Use `auto` when the
+projection should be conditional on the source data's relative
+$S_{ij}$/$S_{ji}$ disagreement satisfying `--reciprocity-tolerance`; `off`
+leaves the two response entries independent.
+
+Direct-Y fitting cannot use the S-domain passivity loss or folded contraction.
+It also becomes numerically meaningless for structures near a lossless through,
+where $\mathbf I+\mathbf S$ is singular or nearly singular. Before fitting,
+`--max-y-condition` therefore checks
+$\kappa(\mathbf I+\mathbf S)$ over the positive-frequency training rows and
+stops with the exact source block, frequency, and parameters when the default
+$10^{10}$ limit is exceeded. Use `--output-domain s` in that case. Raising the
+limit is an expert override, not a way to repair unbounded Y targets.
 
 Useful selection metrics:
 
@@ -2754,14 +2831,20 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable diagnostic output and command tracebacks. Sweeps also print the candidate list and retain failed-trial tracebacks; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs. Early stopping may stop before this value. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
 | <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses $\log_{10}(f_{\mathrm{Hz}})$, `linear` uses raw Hz, and `log-linear` uses both. Default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
-| <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. Default: `log,log-linear`. | <nobr><code>--freq-transforms log,log-linear</code></nobr> |
+| <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. Default: `log,linear,log-linear`. | <nobr><code>--freq-transforms log,linear,log-linear</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `128,128,64`; sweep default: `64,64;128,128,64;128,128,128;256,128,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 128,128,64</code></nobr> |
 | <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
 | <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates to try. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--output-domain {s,y}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Training target domain. `s` predicts S-parameters and is compatible with every export path. `y` converts the MDIF S-data to admittance targets using `--target-z0`; this is the fastest formulation for direct Verilog-A solve speed. Default: `s`. | <nobr><code>--output-domain y</code></nobr> |
+| <nobr><code>--max-y-condition FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Reject direct-Y fitting when the worst training-row $\kappa(\mathbf I+\mathbf S)$ exceeds this value. The error identifies the block, frequency, and parameters. Default: $10^{10}$. | <nobr><code>--max-y-condition 1e8</code></nobr> |
+| <nobr><code>--output-domain {s,y}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Training target domain. `s` predicts S-parameters and supports automatic reciprocity/passivity protection. `y` converts the MDIF S-data to admittance targets using `--target-z0`, but is rejected for ill-conditioned conversions and cannot use S-domain passivity enforcement. Default: `s`. | <nobr><code>--output-domain s</code></nobr> |
+| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Saved S-domain response target below unit maximum singular value. The final training-only safeguard uses $1-\text{margin}$. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.0001</code></nobr> |
+| <nobr><code>--passivity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` protects complete passive positive-frequency training data; `enforce` always protects an S-domain complete matrix; `off` disables the passivity loss and folded safeguard. Verification data remain independent. Default: `auto`. | <nobr><code>--passivity-mode auto</code></nobr> |
+| <nobr><code>--passivity-penalty FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Non-negative weight for the differentiable largest-singular-value loss. It may also be varied with `--optimize-parameter passivity_penalty=...`. Final sampled training-domain contraction still provides the safeguard. Default: `10`. | <nobr><code>--passivity-penalty 10</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
 | <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
+| <nobr><code>--reciprocity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `enforce` always ties reciprocal pairs; `auto` ties them only when positive-frequency training data pass the tolerance; `off` keeps independent outputs. The projection is folded into the last layer. Default: `enforce`. | <nobr><code>--reciprocity-mode enforce</code></nobr> |
+| <nobr><code>--reciprocity-tolerance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum relative $S_{ij}$/$S_{ji}$ source-data mismatch accepted by reciprocity `auto` mode. Default: $10^{-6}$. | <nobr><code>--reciprocity-tolerance 1e-5</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Random seed for data splitting, model initialization, minibatch order, ADS ANN data preparation, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--target-z0 FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Reference impedance used only when `--output-domain y` converts S-parameters into Y-parameter training targets. Use the same value as the MDIF option line reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
 | <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification S/Y plot pairs to generate. In a sweep it applies to a final `--retrain-best`; otherwise the promoted trial retains its `--trial-worst-plots` output. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
@@ -2780,7 +2863,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
 | <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget; in `random` mode it limits the sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
-| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. DNN supports `freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `output_domain`, `target_z0`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter learning_rate=1e-4:1e-2:log</code></nobr> |
+| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. DNN supports `freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `passivity_penalty`, `output_domain`, `target_z0`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter passivity_penalty=1:30:log</code></nobr> |
 | <nobr><code>--overwrite</code></nobr> | <code>rerank-sweep</code> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
 | <nobr><code>--promote-best</code></nobr> | <code>rerank-sweep</code> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
 | <nobr><code>--replace-current-best</code></nobr> | <code>rerank-sweep</code> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
@@ -4355,10 +4438,9 @@ verification data exists, checked training loss is used. `--loss-interval`
 controls how often the complete datasets are evaluated, and `--patience` is
 the number of epochs since the best checked epoch before early stopping.
 
-For DNN and KBNN, the scaled-domain training objective is a weighted mean
-squared error. If sample $k$ is at frequency $f_k$, output column $q$ belongs to
-S-parameter $\ell(q)$, and $e_{kq}$ is the scaled prediction error, the reported
-objective is
+KBNN uses a scaled-coordinate weighted mean-squared error. If sample $k$ is at
+frequency $f_k$, output column $q$ belongs to S-parameter $\ell(q)$, and
+$e_{kq}$ is the scaled prediction error, its response objective is
 
 $$
 \mathcal L
@@ -4367,11 +4449,25 @@ $$
 w_f(f_k)\,w_s(\ell(q))\,e_{kq}^2.
 $$
 
-The same S-parameter weight is applied to the real and imaginary columns.
-Raw S-parameter weights are normalized to mean one over S-parameters. Raw
-frequency weights are normalized to mean one over RF training rows. This keeps
-the average gradient scale roughly unchanged when relative priorities change.
-Zero weights are permitted as long as at least one weight remains positive.
+For DNN, let $\epsilon_{kq}$ instead be the physical S- or Y-response component
+error and let $\sigma_q$ be that output column's training standard deviation.
+The DNN multiplies the requested response weight by $\sigma_q^2$ before applying
+it to $e_{kq}=\epsilon_{kq}/\sigma_q$. Apart from a single positive
+renormalization constant, its optimized response loss is therefore
+
+$$
+\mathcal L_{\mathrm{DNN,response}}
+\propto
+\sum_{k=1}^{K}\sum_{q=1}^{Q}
+w_f(f_k)\,w_s(\ell(q))\,\epsilon_{kq}^2.
+$$
+
+This prevents output standardization from silently changing the requested
+relative S-parameter priorities. The same S-parameter weight applies to the
+real and imaginary columns. Raw S-parameter weights are normalized to mean one
+over S-parameters, and raw frequency weights are normalized to mean one over
+RF training rows. Zero weights are permitted as long as at least one remains
+positive.
 
 Neuro-TF uses frequency weights in the per-geometry rational least-squares
 stage described below. Its neural coefficient map then uses unweighted scaled
@@ -4430,10 +4526,67 @@ $$
 =(\mathbf I-Z_0\mathbf Y)(\mathbf I+Z_0\mathbf Y)^{-1}.
 $$
 
-The implementation solves the transposed matrix relation with `numpy.linalg.solve`
-and falls back to a pseudoinverse when the system is singular. A Y-domain
-model fixes its reference impedance through `--target-z0`; export must use the
-same value.
+The implementation solves the transposed matrix relation with
+`numpy.linalg.solve`. Before constructing Y targets, it evaluates
+$\kappa(\mathbf I+\mathbf S)$ for every positive-frequency training row and
+rejects the fit when the maximum exceeds `--max-y-condition`. This avoids
+training on huge, numerically arbitrary Y values produced by an ideal or nearly
+lossless through. A Y-domain model fixes its reference impedance through
+`--target-z0`; export must use the same value.
+
+#### Response structure and passivity
+
+For a complete S-domain matrix, `--passivity-mode auto` enables structural
+handling only when the positive-frequency training data have no passivity
+violations. For predicted training sample $k$, define
+
+$$
+e_k
+=\max\!\left(
+0,
+\sigma_{\max}(\widehat{\mathbf S}_k)
+-(1-m)
+\right),
+$$
+
+where $m$ is `--passivity-margin`. With normalized frequency sample weight
+$w_k$, the additional differentiable objective is
+
+$$
+\mathcal L_{\mathrm{passive}}
+=\lambda\left[
+\operatorname{mean}_k(w_ke_k^2)
++\sqrt{\operatorname{mean}_k\!\left((w_ke_k^2)^2\right)}
+\right],
+$$
+
+where $\lambda$ is `--passivity-penalty`. The gradient of the largest singular
+value uses its leading left and right singular vectors. The first term shapes
+all violating samples; the second emphasizes narrow spikes without a
+discontinuous hard maximum.
+
+After restoring the early-stopping checkpoint, the implementation measures the
+largest singular value over the positive-frequency training predictions. If it
+still exceeds $1-m$, it multiplies every RF S output by the uniform factor
+
+$$
+\alpha=\frac{1-m}{\max_k\sigma_{\max}(\widehat{\mathbf S}_k)}.
+$$
+
+The multiplication is represented as a raw-output linear projection and folded
+algebraically into the existing final weight matrix and bias. No runtime SVD,
+projection, or extra layer is added to the saved model or exports. Metadata
+records the source passivity, passivity before and after the safeguard, and
+`rf_response_scale`. Verification data never determine $\alpha$.
+
+By default, `--reciprocity-mode enforce` constructs a projection that replaces
+each predicted $S_{ij}$ and $S_{ji}$ real/imaginary pair by their average. This
+projection is also folded into the final linear layer, producing bit-identical
+reciprocal outputs without changing inference cost. `auto` first requires the
+source response to satisfy `--reciprocity-tolerance`, and `off` disables the
+projection. S-domain
+passivity enforcement is unavailable for direct-Y output because a uniform
+linear projection in Y does not impose the required bounded S-matrix.
 
 #### Consequences
 
@@ -4441,9 +4594,11 @@ The DNN has no rational frequency structure and no coarse prior. It can model
 arbitrary smooth response shapes represented by the data, but frequency and
 geometry interpolation are learned simultaneously. It therefore commonly
 needs more full-wave geometries than KBNN when a useful coarse model exists,
-and it offers less structural frequency regularization than Neuro-TF. No RF
-passivity or reciprocity constraint is embedded in the loss; these properties
-are measured on predictions and may be required during sweep selection.
+and it offers less structural frequency regularization than Neuro-TF. The
+S-domain implementation preserves reciprocal source structure exactly and
+protects passive source data on the sampled training domain. Verification and
+unsampled interpolation remain independently measured, so `--require-passive`
+is still useful during optimization.
 
 #### Persistence and inference
 
@@ -4855,7 +5010,7 @@ Thus scaling changes the ADS unit convention without changing the fitted model.
 | Prior model | None | Frozen fitted S-domain DNN | Fixed rational basis |
 | Typical strength | Maximum response flexibility | Efficient correction when useful coarse data exists | Compact broadband frequency representation |
 | Main risk | Data demand and unconstrained frequency interpolation | Bias or error inherited from coarse model and mode choice | Insufficient pole order/basis placement or nonsmooth coefficient map |
-| RF passivity enforcement | None | None | Automatic sampled training-domain contraction for passive source data; verification remains independent |
+| RF passivity enforcement | S-domain singular-value loss plus automatic sampled training-domain contraction for passive source data; verification remains independent | None | Automatic sampled training-domain contraction for passive source data; verification remains independent |
 | Exact DC | Separate Appendix A model | Separate fine-data Appendix A model | Separate Appendix A model |
 
 ### B.9 References and implementation provenance

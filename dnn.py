@@ -77,6 +77,7 @@ from surrogate_common import (  # noqa: E402
     parse_parameter_scale_spec,
     parse_sparam_weights,
     parse_text_options,
+    passivity_summary,
     progress_interval_from_args,
     plot_sweep_diagnostics,
     plot_worst_case_fits,
@@ -112,7 +113,7 @@ from surrogate_common import (  # noqa: E402
 )
 
 
-VERSION = "0.2.0-rc2"
+VERSION = "0.2.0-rc3"
 DNN_SWEEP_RESULT_COLUMNS = ["freq_transform", "hidden_layers", "activation", "learning_rate"]
 _MDIF_BLOCK_CACHE: dict[tuple[str, int, int], list[MDIFBlock]] = {}
 _SAMPLE_CACHE: dict[tuple[object, ...], tuple[np.ndarray, np.ndarray]] = {}
@@ -292,6 +293,215 @@ def fit_output_standardizer(
         if bool(is_floored)
     ]
     return scaler, floored_columns, floor
+
+
+def physical_response_output_weights(
+    labels: Sequence[str],
+    sparam_weights: dict[str, float],
+    output_scaler: Standardizer,
+) -> np.ndarray:
+    """Preserve requested raw-response weights after output standardization."""
+
+    if output_scaler.std is None:
+        raise ValueError("Output standardizer must be fitted before weighting")
+    requested = output_weights_from_sparam_weights(labels, sparam_weights)
+    weights = requested * np.asarray(output_scaler.std, dtype=float) ** 2
+    mean = float(np.mean(weights))
+    if not math.isfinite(mean) or mean <= EPS:
+        raise ValueError("Physical response output weights must have a positive mean")
+    return weights / mean
+
+
+def dnn_reciprocity_summary(
+    blocks: Sequence[MDIFBlock],
+    labels: Sequence[str],
+) -> dict[str, float | int | bool | None]:
+    """Measure relative Sij/Sji disagreement for a complete S-matrix."""
+
+    try:
+        nports = infer_complete_sparameter_ports(labels)
+    except ValueError:
+        return {
+            "nports": None,
+            "comparable": False,
+            "max_abs_error": None,
+            "relative_error": None,
+        }
+    max_error = 0.0
+    max_reference = 0.0
+    for block in blocks:
+        for row in range(1, nports + 1):
+            for col in range(row + 1, nports + 1):
+                forward = np.asarray(block.sparams[f"S{row}{col}"], dtype=complex)
+                reverse = np.asarray(block.sparams[f"S{col}{row}"], dtype=complex)
+                max_error = max(max_error, float(np.max(np.abs(forward - reverse))))
+                max_reference = max(
+                    max_reference,
+                    float(np.max(np.abs(forward))),
+                    float(np.max(np.abs(reverse))),
+                )
+    return {
+        "nports": int(nports),
+        "comparable": True,
+        "max_abs_error": max_error,
+        "relative_error": max_error / max(max_reference, EPS),
+    }
+
+
+def dnn_reciprocity_projection(
+    labels: Sequence[str],
+) -> np.ndarray:
+    """Return a raw real/imag output projection that ties reciprocal entries."""
+
+    nports = infer_complete_sparameter_ports(labels)
+    output_count = 2 * len(labels)
+    projection = np.eye(output_count, dtype=float)
+    indices = {label: index for index, label in enumerate(labels)}
+    for row in range(1, nports + 1):
+        for col in range(row + 1, nports + 1):
+            first = indices[f"S{row}{col}"]
+            second = indices[f"S{col}{row}"]
+            for offset in (0, len(labels)):
+                a = first + offset
+                b = second + offset
+                projection[a, a] = 0.5
+                projection[b, a] = 0.5
+                projection[a, b] = 0.5
+                projection[b, b] = 0.5
+    return projection
+
+
+def fold_raw_output_projection(
+    mlp: MLP,
+    output_scaler: Standardizer,
+    projection: np.ndarray,
+) -> None:
+    """Fold a raw-domain linear projection into the scaled MLP output layer."""
+
+    if output_scaler.mean is None or output_scaler.std is None:
+        raise ValueError("Output standardizer must be fitted before projection")
+    matrix = np.asarray(projection, dtype=float)
+    output_count = mlp.weights[-1].shape[1]
+    if matrix.shape != (output_count, output_count):
+        raise ValueError(
+            f"Expected a {output_count}x{output_count} output projection, got "
+            f"{matrix.shape}"
+        )
+    std = np.asarray(output_scaler.std, dtype=float)
+    mean = np.asarray(output_scaler.mean, dtype=float)
+    scaled_projection = std[:, None] * matrix / std[None, :]
+    scaled_offset = (mean @ matrix - mean) / std
+    mlp.weights[-1] = mlp.weights[-1] @ scaled_projection
+    mlp.biases[-1] = mlp.biases[-1] @ scaled_projection + scaled_offset
+
+
+def make_s_passivity_loss_gradient(
+    output_scaler: Standardizer,
+    labels: Sequence[str],
+    target_sigma: float,
+    penalty: float,
+):
+    """Build a differentiable sampled S-matrix passivity penalty callback."""
+
+    if output_scaler.mean is None or output_scaler.std is None:
+        raise ValueError("Output standardizer must be fitted before passivity loss")
+    nports, rows, cols = sparam_matrix_index_arrays(labels)
+    mean = np.asarray(output_scaler.mean, dtype=float)
+    std = np.asarray(output_scaler.std, dtype=float)
+    penalty_value = float(penalty)
+    target_value = float(target_sigma)
+
+    def callback(
+        predicted_scaled: np.ndarray,
+        _truth_scaled: np.ndarray,
+        sample_weights: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
+        predicted = np.asarray(predicted_scaled, dtype=float)
+        weights = np.asarray(sample_weights, dtype=float).reshape(-1)
+        raw = predicted * std[None, :] + mean[None, :]
+        values = columns_to_complex(raw)
+        matrices = np.zeros((len(values), nports, nports), dtype=complex)
+        matrices[:, rows, cols] = values
+        left, singular_values, right_h = np.linalg.svd(
+            matrices,
+            full_matrices=False,
+        )
+        sigma = singular_values[:, 0]
+        excess = np.maximum(0.0, sigma - target_value)
+        weighted_excess_squared = weights * excess**2
+        # The mean term shapes every violating sample.  The RMS-of-squared-
+        # excess term emphasizes narrow singular-value spikes without the
+        # noisy, discontinuous batch-to-batch behavior of a hard maximum.
+        excess_rms = float(np.sqrt(np.mean(weighted_excess_squared**2)))
+        loss = penalty_value * float(
+            np.mean(weighted_excess_squared) + excess_rms
+        )
+        gradient = np.zeros_like(predicted)
+        active = excess > 0.0
+        if not np.any(active) or penalty_value <= 0.0:
+            return loss, gradient
+        top_gradient = np.einsum(
+            "bi,bj->bij",
+            left[:, :, 0],
+            right_h[:, 0, :],
+        )
+        factor = 2.0 * penalty_value * weights * excess * (
+            1.0 / len(predicted)
+            + weighted_excess_squared
+            / (len(predicted) * max(excess_rms, np.finfo(float).tiny))
+        )
+        top_gradient *= factor[:, None, None]
+        value_gradient = top_gradient[:, rows, cols]
+        raw_gradient = np.concatenate(
+            [value_gradient.real, value_gradient.imag],
+            axis=1,
+        )
+        gradient = raw_gradient * std[None, :]
+        return loss, gradient
+
+    return callback
+
+
+def direct_y_conditioning_summary(
+    blocks: Sequence[MDIFBlock],
+    labels: Sequence[str],
+) -> dict[str, object]:
+    """Assess conditioning of the S-to-Y matrix inverse over RF source rows."""
+
+    nports = infer_complete_sparameter_ports(labels)
+    identity = np.eye(nports, dtype=complex)
+    maximum_condition = 0.0
+    minimum_singular = float("inf")
+    worst: dict[str, object] | None = None
+    for block in blocks:
+        values = block_sparameter_values(block, labels)
+        matrices = values_to_matrix(values, labels, nports)
+        singular_values = np.linalg.svd(
+            identity[None, :, :] + matrices,
+            compute_uv=False,
+        )
+        conditions = singular_values[:, 0] / np.maximum(
+            singular_values[:, -1],
+            np.finfo(float).tiny,
+        )
+        index = int(np.argmax(conditions))
+        condition = float(conditions[index])
+        minimum_singular = min(
+            minimum_singular,
+            float(np.min(singular_values[:, -1])),
+        )
+        if condition > maximum_condition:
+            maximum_condition = condition
+            worst = {
+                "source_block": int(block.source_index) + 1,
+                "frequency_hz": float(block.freq_hz[index]),
+                "parameters": dict(block.params),
+            }
+    return {
+        "max_condition_number_i_plus_s": maximum_condition,
+        "min_singular_value_i_plus_s": minimum_singular,
+        "worst_case": worst,
+    }
 
 
 def block_targets(
@@ -516,6 +726,88 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         infer_complete_sparameter_ports(labels)
     hidden_layers = parse_hidden_layers(args.hidden_layers)
     progress_interval = progress_interval_from_args(args)
+    fit_train_blocks = positive_frequency_blocks(train_blocks)
+    fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
+    source_rf_passivity = passivity_summary(fit_train_blocks, labels)
+    source_rf_reciprocity = dnn_reciprocity_summary(fit_train_blocks, labels)
+
+    passivity_mode = str(getattr(args, "passivity_mode", "auto"))
+    passivity_margin = float(getattr(args, "passivity_margin", 1e-3))
+    passivity_penalty = float(getattr(args, "passivity_penalty", 10.0))
+    if passivity_mode not in {"auto", "enforce", "off"}:
+        raise ValueError(f"Unsupported passivity mode {passivity_mode!r}")
+    if (
+        not math.isfinite(passivity_margin)
+        or passivity_margin < 0.0
+        or passivity_margin >= 1.0
+    ):
+        raise ValueError("--passivity-margin must be finite and in [0, 1)")
+    if not math.isfinite(passivity_penalty) or passivity_penalty < 0.0:
+        raise ValueError("--passivity-penalty must be finite and non-negative")
+    source_passivity_available = source_rf_passivity["nports"] is not None
+    source_is_passive = (
+        source_passivity_available
+        and source_rf_passivity["violating_points"] == 0
+    )
+    passivity_requested = passivity_mode == "enforce" or (
+        passivity_mode == "auto" and source_is_passive
+    )
+    if passivity_mode == "enforce" and not source_passivity_available:
+        raise ValueError(
+            "--passivity-mode enforce requires a complete S-parameter matrix"
+        )
+    if passivity_mode == "enforce" and output_domain != "s":
+        raise ValueError(
+            "--passivity-mode enforce is only available for --output-domain s; "
+            "direct-Y output cannot fold an exact S-domain safeguard into the "
+            "saved linear output layer"
+        )
+    passivity_enforced = passivity_requested and output_domain == "s"
+    passivity_unavailable_reason = (
+        "Direct-Y output does not support the S-domain passivity penalty and "
+        "folded contraction; verification passivity is still reported"
+        if passivity_requested and output_domain != "s"
+        else None
+    )
+    passivity_target_sigma = 1.0 - passivity_margin
+
+    reciprocity_mode = str(getattr(args, "reciprocity_mode", "enforce"))
+    reciprocity_tolerance = float(getattr(args, "reciprocity_tolerance", 1e-6))
+    if reciprocity_mode not in {"auto", "enforce", "off"}:
+        raise ValueError(f"Unsupported reciprocity mode {reciprocity_mode!r}")
+    if not math.isfinite(reciprocity_tolerance) or reciprocity_tolerance < 0.0:
+        raise ValueError("--reciprocity-tolerance must be finite and non-negative")
+    reciprocity_comparable = bool(source_rf_reciprocity["comparable"])
+    source_reciprocity_error = source_rf_reciprocity["relative_error"]
+    reciprocity_enforced = reciprocity_mode == "enforce" or (
+        reciprocity_mode == "auto"
+        and reciprocity_comparable
+        and source_reciprocity_error is not None
+        and float(source_reciprocity_error) <= reciprocity_tolerance
+    )
+    if reciprocity_mode == "enforce" and not reciprocity_comparable:
+        raise ValueError(
+            "--reciprocity-mode enforce requires a complete S-parameter matrix"
+        )
+
+    max_y_condition = float(getattr(args, "max_y_condition", 1e10))
+    if not math.isfinite(max_y_condition) or max_y_condition <= 1.0:
+        raise ValueError("--max-y-condition must be finite and greater than 1")
+    y_conditioning = None
+    if output_domain == "y":
+        y_conditioning = direct_y_conditioning_summary(fit_train_blocks, labels)
+        observed_condition = float(
+            y_conditioning["max_condition_number_i_plus_s"]
+        )
+        if observed_condition > max_y_condition:
+            worst = y_conditioning.get("worst_case")
+            raise ValueError(
+                "Direct-Y fitting is numerically unsafe because I + S is nearly "
+                f"singular: maximum condition number {observed_condition:.6g} "
+                f"exceeds --max-y-condition {max_y_condition:.6g}; worst case "
+                f"{worst}. Use --output-domain s or raise the limit only after "
+                "checking the resulting Y-target dynamic range."
+            )
     dc_model, dc_history, dc_metadata = train_dc_conductance_model(
         train_blocks,
         verify_blocks,
@@ -540,8 +832,6 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
             getattr(args, "dc_open_resistance", DEFAULT_DC_OPEN_RESISTANCE_OHM)
         ),
     )
-    fit_train_blocks = positive_frequency_blocks(train_blocks)
-    fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
     x_train, y_train = make_feature_target_samples(
         fit_train_blocks,
         parameter_names,
@@ -574,7 +864,11 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
     mlp = MLP(layer_sizes, activation=args.activation, seed=args.seed)
     sparam_weights = parse_sparam_weights(labels, getattr(args, "sparam_weights", None))
     normalized_sparam_weights = normalize_sparam_weights(labels, sparam_weights)
-    output_weights = output_weights_from_sparam_weights(labels, sparam_weights)
+    output_weights = physical_response_output_weights(
+        labels,
+        sparam_weights,
+        y_scaler,
+    )
     frequency_weight_spec = getattr(args, "frequency_weights", None)
     raw_frequency_weights = frequency_weights_from_blocks(
         fit_train_blocks,
@@ -595,6 +889,16 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         )
     else:
         normalized_verify_frequency_weights = None
+    passivity_loss_gradient = (
+        make_s_passivity_loss_gradient(
+            y_scaler,
+            labels,
+            passivity_target_sigma,
+            passivity_penalty,
+        )
+        if passivity_enforced and passivity_penalty > 0.0
+        else None
+    )
     history = mlp.train(
         x_train_scaled,
         y_train_scaled,
@@ -615,7 +919,14 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
             progress_interval,
         ),
         progress_interval=progress_interval,
+        extra_loss_gradient=passivity_loss_gradient,
     )
+    if reciprocity_enforced:
+        fold_raw_output_projection(
+            mlp,
+            y_scaler,
+            dnn_reciprocity_projection(labels),
+        )
     model = DNN(
         mlp=mlp,
         x_scaler=x_scaler,
@@ -632,6 +943,30 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
         dc_model=dc_model,
     )
+    predicted_train_before_scale = model.predict_blocks(fit_train_blocks)
+    predicted_train_passivity_before_scale = passivity_summary(
+        predicted_train_before_scale,
+        labels,
+    )
+    rf_response_scale = 1.0
+    if passivity_enforced:
+        predicted_sigma = predicted_train_passivity_before_scale[
+            "max_singular_value"
+        ]
+        if predicted_sigma is None or not math.isfinite(float(predicted_sigma)):
+            raise ValueError("Could not assess the fitted DNN response for passivity")
+        if float(predicted_sigma) > passivity_target_sigma:
+            rf_response_scale = passivity_target_sigma / float(predicted_sigma)
+            fold_raw_output_projection(
+                mlp,
+                y_scaler,
+                rf_response_scale * np.eye(2 * len(labels), dtype=float),
+            )
+    predicted_train_passivity_after_scale = passivity_summary(
+        model.predict_blocks(fit_train_blocks),
+        labels,
+    )
+    max_abs_training_target = float(np.max(np.abs(y_train)))
     metadata = {
         "training_blocks": len(train_blocks),
         "verification_blocks": len(verify_blocks),
@@ -644,8 +979,13 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         "verify_values": sorted(parse_csv_set(args.verify_values)),
         "sparam_weights": sparam_weights,
         "normalized_sparam_weights": normalized_sparam_weights,
+        "scaled_output_loss_weights": {
+            name: float(weight)
+            for name, weight in zip(output_column_names(labels), output_weights)
+        },
         "sparam_weight_mean": sparam_weight_mean(labels, sparam_weights),
-        "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training, so the average normalized weight is 1.0.",
+        "sparam_weight_normalization": "Requested response weights are combined with squared output standard deviations and renormalized before training, so standardized-coordinate MSE is proportional to the requested physical response-domain MSE.",
+        "response_loss_domain": f"physical_{output_domain}_components",
         "frequency_weights": frequency_weight_spec,
         "frequency_weight_mean": frequency_weight_mean,
         "frequency_weight_min": float(np.min(raw_frequency_weights)),
@@ -653,6 +993,25 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples, so the average normalized weight is 1.0.",
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
+        "max_abs_training_target": max_abs_training_target,
+        "direct_y_conditioning": y_conditioning,
+        "max_y_condition": max_y_condition,
+        "reciprocity_mode": reciprocity_mode,
+        "reciprocity_tolerance": reciprocity_tolerance,
+        "reciprocity_enforced": reciprocity_enforced,
+        "source_rf_reciprocity": source_rf_reciprocity,
+        "passivity_mode": passivity_mode,
+        "passivity_margin": passivity_margin,
+        "passivity_penalty": passivity_penalty,
+        "passivity_target_sigma": passivity_target_sigma,
+        "passivity_requested": passivity_requested,
+        "passivity_enforced": passivity_enforced,
+        "passivity_unavailable_reason": passivity_unavailable_reason,
+        "source_rf_passivity": source_rf_passivity,
+        "predicted_train_passivity_before_scale": predicted_train_passivity_before_scale,
+        "rf_response_scale": rf_response_scale,
+        "predicted_train_passivity_after_scale": predicted_train_passivity_after_scale,
+        "passivity_assessment_scope": "positive-frequency training blocks only",
         **dc_metadata,
         "dc_model_history_rows": len(dc_history),
     }
@@ -773,10 +1132,36 @@ def command_train(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "sparam_weights": metadata["sparam_weights"],
         "normalized_sparam_weights": metadata["normalized_sparam_weights"],
+        "scaled_output_loss_weights": metadata["scaled_output_loss_weights"],
+        "response_loss_domain": metadata["response_loss_domain"],
         "frequency_weights": metadata["frequency_weights"],
         "frequency_weight_mean": metadata["frequency_weight_mean"],
         "output_scaler_floor": metadata["output_scaler_floor"],
         "floored_output_columns": metadata["floored_output_columns"],
+        "max_abs_training_target": metadata["max_abs_training_target"],
+        "direct_y_conditioning": metadata["direct_y_conditioning"],
+        "max_y_condition": metadata["max_y_condition"],
+        "reciprocity_mode": metadata["reciprocity_mode"],
+        "reciprocity_tolerance": metadata["reciprocity_tolerance"],
+        "reciprocity_enforced": metadata["reciprocity_enforced"],
+        "source_rf_reciprocity": metadata["source_rf_reciprocity"],
+        "passivity_mode": metadata["passivity_mode"],
+        "passivity_margin": metadata["passivity_margin"],
+        "passivity_penalty": metadata["passivity_penalty"],
+        "passivity_target_sigma": metadata["passivity_target_sigma"],
+        "passivity_requested": metadata["passivity_requested"],
+        "passivity_enforced": metadata["passivity_enforced"],
+        "passivity_unavailable_reason": metadata[
+            "passivity_unavailable_reason"
+        ],
+        "source_rf_passivity": metadata["source_rf_passivity"],
+        "rf_response_scale": metadata["rf_response_scale"],
+        "predicted_train_passivity_before_scale": metadata[
+            "predicted_train_passivity_before_scale"
+        ],
+        "predicted_train_passivity_after_scale": metadata[
+            "predicted_train_passivity_after_scale"
+        ],
     }
     plot_context = model_settings_title(
         "DNN",
@@ -825,13 +1210,45 @@ def command_train(args: argparse.Namespace) -> int:
                 "dc_model_verify_s_max_abs_error": metadata.get(
                     "dc_model_verify_s_max_abs_error"
                 ),
+                "response_loss_domain": metadata["response_loss_domain"],
+                "reciprocity_enforced": metadata["reciprocity_enforced"],
+                "source_rf_reciprocity": metadata["source_rf_reciprocity"],
+                "passivity_enforced": metadata["passivity_enforced"],
+                "passivity_unavailable_reason": metadata[
+                    "passivity_unavailable_reason"
+                ],
+                "source_rf_passivity": metadata["source_rf_passivity"],
+                "rf_response_scale": metadata["rf_response_scale"],
+                "predicted_train_passivity_before_scale": metadata[
+                    "predicted_train_passivity_before_scale"
+                ],
+                "predicted_train_passivity_after_scale": metadata[
+                    "predicted_train_passivity_after_scale"
+                ],
             }
         )
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
     else:
-        summary = {"warning": "No verification blocks were available"}
+        summary = {
+            "warning": "No verification blocks were available",
+            "response_loss_domain": metadata["response_loss_domain"],
+            "reciprocity_enforced": metadata["reciprocity_enforced"],
+            "source_rf_reciprocity": metadata["source_rf_reciprocity"],
+            "passivity_enforced": metadata["passivity_enforced"],
+            "passivity_unavailable_reason": metadata[
+                "passivity_unavailable_reason"
+            ],
+            "source_rf_passivity": metadata["source_rf_passivity"],
+            "rf_response_scale": metadata["rf_response_scale"],
+            "predicted_train_passivity_before_scale": metadata[
+                "predicted_train_passivity_before_scale"
+            ],
+            "predicted_train_passivity_after_scale": metadata[
+                "predicted_train_passivity_after_scale"
+            ],
+        }
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
@@ -866,11 +1283,17 @@ def command_train(args: argparse.Namespace) -> int:
             "layer_sizes": model.mlp.layer_sizes,
             "sparam_weights": metadata["sparam_weights"],
             "normalized_sparam_weights": metadata["normalized_sparam_weights"],
+            "scaled_output_loss_weights": metadata[
+                "scaled_output_loss_weights"
+            ],
             "sparam_weight_mean": metadata["sparam_weight_mean"],
             "frequency_weights": metadata["frequency_weights"],
             "frequency_weight_mean": metadata["frequency_weight_mean"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
+            "reciprocity_enforced": metadata["reciprocity_enforced"],
+            "passivity_enforced": metadata["passivity_enforced"],
+            "rf_response_scale": metadata["rf_response_scale"],
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
@@ -933,6 +1356,15 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "layer_sizes": model.mlp.layer_sizes,
             "output_domain": model.output_domain,
             "target_z0": model.target_z0,
+            "source_model_passivity_enforced": source_metadata.get(
+                "passivity_enforced"
+            ),
+            "source_model_rf_response_scale": source_metadata.get(
+                "rf_response_scale"
+            ),
+            "source_model_reciprocity_enforced": source_metadata.get(
+                "reciprocity_enforced"
+            ),
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_metadata": dc_metadata,
             "dc_is_separate_from_fitted_response": True,
@@ -1188,6 +1620,15 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
             "fully_self_contained": True,
             "training_output_domain": model.output_domain,
             "training_target_z0": model.target_z0,
+            "source_model_passivity_enforced": source_metadata.get(
+                "passivity_enforced"
+            ),
+            "source_model_rf_response_scale": source_metadata.get(
+                "rf_response_scale"
+            ),
+            "source_model_reciprocity_enforced": source_metadata.get(
+                "reciprocity_enforced"
+            ),
             "dc_resistance_source_kind": dc_metadata.get(
                 "dc_resistance_source_kind"
             ),
@@ -1398,6 +1839,15 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
             "model_family": "direct_dnn",
             "training_output_domain": model.output_domain,
             "training_target_z0": model.target_z0,
+            "source_model_passivity_enforced": source_metadata.get(
+                "passivity_enforced"
+            ),
+            "source_model_rf_response_scale": source_metadata.get(
+                "rf_response_scale"
+            ),
+            "source_model_reciprocity_enforced": source_metadata.get(
+                "reciprocity_enforced"
+            ),
             "dc_metadata": dc_metadata,
         },
         extra_notes=default_notes,
@@ -1444,6 +1894,15 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "model_family": "direct_dnn",
                 "training_output_domain": "y",
                 "training_target_z0": direct_y_trial.target_z0,
+                "source_model_passivity_enforced": direct_y_trial_metadata.get(
+                    "passivity_enforced"
+                ),
+                "source_model_rf_response_scale": direct_y_trial_metadata.get(
+                    "rf_response_scale"
+                ),
+                "source_model_reciprocity_enforced": direct_y_trial_metadata.get(
+                    "reciprocity_enforced"
+                ),
                 "trial_parent_module_name": manifest["module_name"],
                 "trial_parent_model_dir": str(model_dir),
                 "trial_purpose": (
@@ -1543,6 +2002,7 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
             "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options)[0],
             "activation": parse_text_options(args.activation_options)[0],
             "learning_rate": parse_float_options(args.learning_rates)[0],
+            "passivity_penalty": float(args.passivity_penalty),
         }
         candidates, columns, log_parameters = build_adaptive_candidate_pool(
             base_config,
@@ -1555,6 +2015,7 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
                 "hidden_layers": "hidden_layers",
                 "learning_rate": "float",
                 "output_domain": "str",
+                "passivity_penalty": "float",
                 "patience": "int",
                 "target_z0": "float",
             },
@@ -1621,6 +2082,12 @@ def namespace_for_trial(
         seed=trial_seed,
         output_domain=args.output_domain,
         target_z0=args.target_z0,
+        max_y_condition=args.max_y_condition,
+        passivity_mode=args.passivity_mode,
+        passivity_margin=args.passivity_margin,
+        passivity_penalty=args.passivity_penalty,
+        reciprocity_mode=args.reciprocity_mode,
+        reciprocity_tolerance=args.reciprocity_tolerance,
         worst_plots=plots,
         sparam_weights=args.sparam_weights,
         frequency_weights=args.frequency_weights,
@@ -1846,6 +2313,56 @@ def add_data_args(parser: argparse.ArgumentParser) -> None:
         default="s",
         help="Training target domain: S-parameters (s) or direct admittance Y-parameters (y)",
     )
+    parser.add_argument(
+        "--max-y-condition",
+        type=float,
+        default=1e10,
+        help=(
+            "Reject direct-Y fitting when cond(I + S) exceeds this limit; "
+            "near-singular conversion targets are not numerically learnable "
+            "(default: 1e10)"
+        ),
+    )
+    parser.add_argument(
+        "--passivity-mode",
+        choices=["auto", "enforce", "off"],
+        default="auto",
+        help=(
+            "S-domain passivity handling. auto protects a passive training set, "
+            "enforce always protects it, and off disables the protection"
+        ),
+    )
+    parser.add_argument(
+        "--passivity-margin",
+        type=float,
+        default=1e-3,
+        help="Target margin below unit maximum singular value (default: 0.001)",
+    )
+    parser.add_argument(
+        "--passivity-penalty",
+        type=float,
+        default=10.0,
+        help=(
+            "Weight of the differentiable S-matrix passivity loss; may also be "
+            "an adaptive --optimize-parameter (default: 10)"
+        ),
+    )
+    parser.add_argument(
+        "--reciprocity-mode",
+        choices=["auto", "enforce", "off"],
+        default="enforce",
+        help=(
+            "Reciprocity handling. enforce always ties Sij/Sji, auto ties them "
+            "only for reciprocal training data, and off leaves them independent "
+            "(default: enforce)"
+        ),
+    )
+    parser.add_argument(
+        "--reciprocity-tolerance",
+        type=float,
+        default=1e-6,
+        help="Maximum relative training-data mismatch accepted by reciprocity auto mode",
+    )
     parser.add_argument("--patience", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
@@ -1893,7 +2410,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--freq-transform-options",
         "--freq-transform",
         dest="freq_transform_options",
-        default="log,log-linear",
+        default="log,linear,log-linear",
         help="Comma-separated frequency transforms; --freq-transform is the single-value train-compatible form.",
     )
     sweep.add_argument(

@@ -6514,6 +6514,11 @@ class MLP:
         progress_interval: int = 25,
         sample_weights: np.ndarray | None = None,
         val_sample_weights: np.ndarray | None = None,
+        extra_loss_gradient: Callable[
+            [np.ndarray, np.ndarray, np.ndarray],
+            tuple[float, np.ndarray],
+        ]
+        | None = None,
     ) -> list[dict[str, float]]:
         if output_weights is None:
             output_weights = np.ones(y_train.shape[1], dtype=float)
@@ -6597,6 +6602,21 @@ class MLP:
                 if weighted_samples:
                     delta *= sample_weights[indices, None]
                 delta *= scale_base / len(xb)
+                if extra_loss_gradient is not None:
+                    _extra_loss, extra_delta = extra_loss_gradient(
+                        pred,
+                        yb,
+                        sample_weights[indices],
+                    )
+                    extra_delta = np.asarray(extra_delta, dtype=float)
+                    if extra_delta.shape != delta.shape:
+                        raise ValueError(
+                            "Extra-loss gradient shape does not match the MLP output: "
+                            f"{extra_delta.shape} versus {delta.shape}"
+                        )
+                    if np.any(~np.isfinite(extra_delta)):
+                        raise ValueError("Extra-loss gradient contains non-finite values")
+                    delta += extra_delta
                 grad_w: list[np.ndarray | None] = [None] * n_layers
                 grad_b: list[np.ndarray | None] = [None] * n_layers
                 for layer in reversed(range(n_layers)):
@@ -6649,20 +6669,31 @@ class MLP:
                     )
                 continue
 
+            train_prediction = self.predict(x_train)
             train_loss = mse(
-                self.predict(x_train),
+                train_prediction,
                 y_train,
                 output_weights=output_weights,
                 sample_weights=sample_weights,
             )
+            if extra_loss_gradient is not None:
+                extra_train_loss, _extra_train_gradient = extra_loss_gradient(
+                    train_prediction,
+                    y_train,
+                    sample_weights,
+                )
+                train_loss += float(extra_train_loss)
+            val_prediction = (
+                self.predict(x_val) if x_val is not None and y_val is not None else None
+            )
             val_loss = (
                 mse(
-                    self.predict(x_val),
+                    val_prediction,
                     y_val,
                     output_weights=output_weights,
                     sample_weights=val_sample_weights,
                 )
-                if x_val is not None and y_val is not None
+                if val_prediction is not None and y_val is not None
                 else train_loss
             )
             history.append({"epoch": float(epoch), "train_loss": train_loss, "val_loss": val_loss})
