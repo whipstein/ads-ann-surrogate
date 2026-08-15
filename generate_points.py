@@ -2256,12 +2256,12 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--acquisition",
         choices=["error-distance", "gp-ucb"],
-        default="error-distance",
+        default="gp-ucb",
         help=(
             "Candidate scoring method. gp-ucb fits a Matérn-5/2 Gaussian process "
             "to log geometry-level error; error-distance retains the original "
             "radial error-focus and novelty selector without fitting a GP. "
-            "Default: error-distance."
+            "Default: gp-ucb."
         ),
     )
     parser.add_argument(

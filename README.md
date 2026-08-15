@@ -156,6 +156,38 @@ python3 generate_points.py \
   --out geometries.csv
 ```
 
+### How Many Points for the Default GP-UCB Workflow
+
+The default adaptive workflow can begin substantially below a one-shot design
+because it refits the surrogate and acquires new points in multiple rounds. For
+a lean initial campaign, use
+
+$$
+n_{\mathrm{train}}=\max(4d,12),\qquad
+n_{\mathrm{acq}}=\max(d+2,6),
+$$
+
+where $d$ is the number of geometry parameters and $n_{\mathrm{acq}}$ is the
+fixed verification set used to construct geometry-level GP error observations.
+Then request roughly $d$ to $2d$ new training points per GP-UCB round:
+
+| Geometry parameters | Initial training | Acquisition verification | Initial `--count` | GP-UCB points per round |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 12 | 6 | 18 | 2-4 |
+| 3 | 12 | 6 | 18 | 3-6 |
+| 4 | 16 | 6 | 22 | 4-8 |
+| 5 | 20 | 7 | 27 | 5-10 |
+| 6 | 24 | 8 | 32 | 6-12 |
+| 7 | 28 | 9 | 37 | 7-14 |
+| 8 | 32 | 10 | 42 | 8-16 |
+
+These are intentionally lean starting counts, not one-shot coverage
+guarantees. Use the low end of the GP batch range for expensive simulations and
+the high end when the posterior remains uncertain in several separated
+regions. The acquisition-verification points influence GP selection, so they
+are not an unbiased final test set; reserve a separate final audit set that is
+never supplied to `suggest-additional`.
+
 ### How Many Points for the Initial Non-GP Design
 
 Treat each point as one geometry/process setting with a full frequency sweep;
@@ -858,9 +890,13 @@ extension workflow:
 
 | Update method | Acquisition option | Use it when |
 | --- | --- | --- |
-| Non-GP error-distance | `--acquisition error-distance` | You want a direct, local refinement around measured high-error verification points without fitting an error-surface model. This remains the default. |
-| Gaussian-process UCB | `--acquisition gp-ucb` | You want to balance predicted error, posterior uncertainty, and distance from existing points. |
+| Gaussian-process UCB | `--acquisition gp-ucb` | **Default.** Use it to balance predicted error, posterior uncertainty, and distance from existing points. |
+| Non-GP error-distance | `--acquisition error-distance` | Use it for direct, local refinement around measured high-error verification points without fitting an error-surface model. |
 | One-sided range extension | `generate --extend-range` | A declared parameter bound must move outward and the new slab needs guaranteed coverage before error-directed refinement. |
+
+Quick links: [GP-UCB sizing table](#how-many-points-for-the-default-gp-ucb-workflow),
+[non-GP batch-size table](#non-gp-error-distance-batch-size-table), and
+[one-sided range extension](#extending-an-existing-parameter-range).
 
 The dimension table in Section 1 gives the cumulative dataset target for this
 non-GP path. The smaller table below sizes each individual error-distance
@@ -869,11 +905,31 @@ the rest of the simulation budget.
 
 ### Non-GP Error-Distance Additional Points
 
-The non-GP method is not removed or deprecated. It is the default acquisition
-used by `suggest-additional`, although specifying
-`--acquisition error-distance` explicitly makes command history unambiguous.
-It requires a completed fit with `verification_metrics.csv`, but it does not fit
-a Gaussian process and does not depend on a particular neural-network size.
+The non-GP method is not removed or deprecated, but GP-UCB is now the default.
+Select this alternative explicitly with `--acquisition error-distance`. It
+requires a completed fit with `verification_metrics.csv`, but it does not fit a
+Gaussian process and does not depend on a particular neural-network size.
+
+#### Non-GP Error-Distance Batch-Size Table
+
+Use smaller batches than the cumulative dataset table in Section 1 because the
+selector is repairing observed error rather than covering the entire domain
+from scratch:
+
+| Geometry parameters | First error-distance batch | Later batches |
+| ---: | ---: | ---: |
+| 2 | 4-8 | 2-4 |
+| 3 | 6-12 | 3-6 |
+| 4 | 8-16 | 4-8 |
+| 5 | 10-20 | 5-10 |
+| 6 | 12-24 | 6-12 |
+| 7-8 | 14-32 | 7-16 |
+
+Equivalently, start with roughly $2d$ to $4d$ points, then use $d$ to $2d$
+per later round. Prefer the low end when EM simulation is expensive or errors
+are concentrated in one region; prefer the high end when several separated
+regions have large error. This method adds training points only, so keep the
+original verification set fixed.
 
 For every candidate geometry $\mathbf p$, the selector constructs a local focus
 score from the measured geometry-level verification errors:
@@ -898,26 +954,6 @@ number of parameters, and $\nu$ is `--novelty-power`. Candidates closer than
 `--min-distance` are rejected. After each point is chosen, it becomes occupied
 before the next point is selected, so one batch does not collapse onto a single
 verification geometry.
-
-Use smaller batches than the initial-design table because the selector is
-repairing observed error rather than covering the entire domain from scratch.
-The following is practical starting guidance:
-
-| Geometry parameters | First error-distance batch | Later batches |
-| ---: | ---: | ---: |
-| 2 | 4-8 | 2-4 |
-| 3 | 6-12 | 3-6 |
-| 4 | 8-16 | 4-8 |
-| 5 | 10-20 | 5-10 |
-| 6 | 12-24 | 6-12 |
-| 7-8 | 14-32 | 7-16 |
-
-Equivalently, start with roughly $2d$ to $4d$ points, then use $d$ to $2d$
-per later round. Prefer the low end when EM simulation is expensive or errors
-are concentrated in one region; prefer the high end when several separated
-regions have large error. Stop growing the batch if the verification metric no
-longer improves after refitting. This method adds training points only—the
-original verification set should remain fixed.
 
 For a six-parameter model, this requests a 12-point first correction batch
 without re-entering the parameter definitions; `geometries.json` is inferred
@@ -955,6 +991,10 @@ and writes the next physical data points to simulate.
 The GP workflow requires an existing DNN, KBNN, or Neuro-TF fit containing
 `verification_metrics.csv`; it cannot choose an informed first design before
 any verification errors exist.
+
+Use the [default GP-UCB sizing table](#how-many-points-for-the-default-gp-ucb-workflow)
+in Section 1 for both the lean initial training/verification split and the
+recommended number of new points per acquisition round.
 
 #### First GP Addition Round
 
@@ -1185,11 +1225,9 @@ likelihood unless `--gp-length-scale` is supplied.
 the exact target construction, covariance, posterior, batch acquisition,
 diagnostics, limitations, and references.
 
-There is no enforced $8d$ or power-of-two initial-point minimum. For six
-geometry parameters, a cost-conscious first trial can start with 32 points: 24
-training and 8 acquisition-validation points. This is intentionally lean and
-should be grown adaptively; it is not a guarantee that 32 points can resolve
-every six-dimensional response.
+The GP sizing table in Section 1 does not enforce an $8d$ or power-of-two initial-point
+minimum. Its six-parameter row starts with 32 points: 24 training and 8
+acquisition-verification points.
 
 ```bash
 python3 generate_points.py generate \
@@ -1240,8 +1278,9 @@ than missing data.
 The suggested CSV records `predicted_error`, `gp_log_uncertainty`, and
 `gp_upper_confidence_error`. Its companion JSON records the fitted length
 scale, observation count, likelihood, noise variance, and exploration weight.
-The original `error-distance` selector remains the default acquisition mode
-until this alternative has been validated against the target EM/model flow.
+GP-UCB is the default acquisition mode. Use
+`--acquisition error-distance` whenever a controlled comparison or direct local
+error-focused refinement is preferred.
 
 ### Copyable Adaptive Point-Generation Examples
 
@@ -1609,7 +1648,7 @@ without a subcommand uses it automatically.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: original <code>error-distance</code> or Matérn-5/2 <code>gp-ucb</code>. Default: <code>error-distance</code>. | <nobr><code>--acquisition gp-ucb</code></nobr> |
+| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: non-GP <code>error-distance</code> or Matérn-5/2 <code>gp-ucb</code>. Default: <code>gp-ucb</code>. | <nobr><code>--acquisition error-distance</code></nobr> |
 | <nobr><code>--exploration-weight FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative GP-UCB multiplier $\kappa$ on posterior log-error uncertainty. Default: <code>2.0</code>. | <nobr><code>--exploration-weight 2.5</code></nobr> |
 | <nobr><code>--gp-error-floor FLOAT</code></nobr> | <code>suggest-additional</code> | Positive floor applied before taking the natural logarithm of geometry error. Default: <code>1e-12</code>. | <nobr><code>--gp-error-floor 1e-9</code></nobr> |
 | <nobr><code>--gp-length-scale FLOAT</code></nobr> | <code>suggest-additional</code> | Optional positive Matérn-5/2 length scale in normalized geometry coordinates. When omitted, it is selected by log marginal likelihood. | <nobr><code>--gp-length-scale 0.4</code></nobr> |

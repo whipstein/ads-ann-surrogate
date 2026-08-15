@@ -12,6 +12,11 @@ import generate_points as POINTS
 
 
 class GaussianAdaptivePointTests(unittest.TestCase):
+    def test_gp_ucb_is_the_default_acquisition(self) -> None:
+        parser = POINTS.build_suggest_parser()
+        args = parser.parse_args(["--count", "2"])
+        self.assertEqual(args.acquisition, "gp-ucb")
+
     def test_split_points_csv_uses_single_combined_geometry_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -243,8 +248,6 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     "4",
                     "--verification-metrics",
                     str(metrics),
-                    "--acquisition",
-                    "gp-ucb",
                     "--candidate-count",
                     "96",
                     "--lhs-candidates",
@@ -388,6 +391,8 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                             "24",
                             "--lhs-candidates",
                             "3",
+                            "--acquisition",
+                            "error-distance",
                             "--out",
                             str(output),
                         ]
