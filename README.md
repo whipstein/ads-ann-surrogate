@@ -156,7 +156,7 @@ python3 generate_points.py \
   --out geometries.csv
 ```
 
-### How Many Initial Points to Generate
+### How Many Points for the Initial Non-GP Design
 
 Treat each point as one geometry/process setting with a full frequency sweep;
 frequency samples within that sweep do not count as additional geometry points.
@@ -178,6 +178,11 @@ creates 24 training and 8 verification points, which falls within the first
 recommended row. These ranges are starting guidance rather than guarantees;
 strong resonances, discontinuous behavior, or broad parameter ranges can
 require adaptive additions after the first fit.
+
+For the non-GP workflow, the table can also be treated as a cumulative dataset
+target: generate the whole range initially, or start smaller and approach it
+through error-distance training batches after each fit. It is not a
+recommendation to add the full table amount during every update round.
 
 For residual KBNN fits with a useful coarse model, start near the low-to-middle
 end of each range because the fine network is learning the correction to the
@@ -846,7 +851,99 @@ trial.
 
 ## 4. Update or Extend the Sampling Points
 
-After the initial fit, use its geometry-level verification errors to select new EM points. Simulate the returned points before continuing to the refit stage. Range extension and legacy selection are alternatives within this same stage.
+After the initial fit, use its geometry-level verification errors to select new
+EM points. Simulate the returned points before continuing to the refit stage.
+There are two fully supported error-directed selectors plus the separate range
+extension workflow:
+
+| Update method | Acquisition option | Use it when |
+| --- | --- | --- |
+| Non-GP error-distance | `--acquisition error-distance` | You want a direct, local refinement around measured high-error verification points without fitting an error-surface model. This remains the default. |
+| Gaussian-process UCB | `--acquisition gp-ucb` | You want to balance predicted error, posterior uncertainty, and distance from existing points. |
+| One-sided range extension | `generate --extend-range` | A declared parameter bound must move outward and the new slab needs guaranteed coverage before error-directed refinement. |
+
+The dimension table in Section 1 gives the cumulative dataset target for this
+non-GP path. The smaller table below sizes each individual error-distance
+addition batch so that the model can be refitted and reassessed before spending
+the rest of the simulation budget.
+
+### Non-GP Error-Distance Additional Points
+
+The non-GP method is not removed or deprecated. It is the default acquisition
+used by `suggest-additional`, although specifying
+`--acquisition error-distance` explicitly makes command history unambiguous.
+It requires a completed fit with `verification_metrics.csv`, but it does not fit
+a Gaussian process and does not depend on a particular neural-network size.
+
+For every candidate geometry $\mathbf p$, the selector constructs a local focus
+score from the measured geometry-level verification errors:
+
+$$
+F(\mathbf p)=\sum_i e_i^q
+\exp\!\left(-\frac{\lVert\mathbf p-\mathbf x_i\rVert_2^2}{2r^2}\right),
+$$
+
+where $e_i$ is the selected error metric at verification geometry
+$\mathbf x_i$, $r$ is `--focus-radius`, and $q$ is `--focus-power`. It then
+balances error focus against separation from already simulated and newly
+selected points:
+
+$$
+A(\mathbf p)=F(\mathbf p)
+\left[\min\!\left(1,\frac{D(\mathbf p)}{\sqrt d}\right)\right]^{\nu},
+$$
+
+where $D(\mathbf p)$ is the nearest normalized geometry distance, $d$ is the
+number of parameters, and $\nu$ is `--novelty-power`. Candidates closer than
+`--min-distance` are rejected. After each point is chosen, it becomes occupied
+before the next point is selected, so one batch does not collapse onto a single
+verification geometry.
+
+Use smaller batches than the initial-design table because the selector is
+repairing observed error rather than covering the entire domain from scratch.
+The following is practical starting guidance:
+
+| Geometry parameters | First error-distance batch | Later batches |
+| ---: | ---: | ---: |
+| 2 | 4-8 | 2-4 |
+| 3 | 6-12 | 3-6 |
+| 4 | 8-16 | 4-8 |
+| 5 | 10-20 | 5-10 |
+| 6 | 12-24 | 6-12 |
+| 7-8 | 14-32 | 7-16 |
+
+Equivalently, start with roughly $2d$ to $4d$ points, then use $d$ to $2d$
+per later round. Prefer the low end when EM simulation is expensive or errors
+are concentrated in one region; prefer the high end when several separated
+regions have large error. Stop growing the batch if the verification metric no
+longer improves after refitting. This method adds training points only—the
+original verification set should remain fixed.
+
+For a six-parameter model, this requests a 12-point first correction batch
+without re-entering the parameter definitions; `geometries.json` is inferred
+from `--existing-points geometries.csv`:
+
+```bash
+python3 generate_points.py suggest-additional \
+  --count 12 \
+  --fit-dir outputs/dnn_model \
+  --existing-points geometries.csv \
+  --acquisition error-distance \
+  --candidate-method maximin-lhs \
+  --candidate-count 2400 \
+  --metric evm_pct \
+  --focus-radius 0.25 \
+  --focus-power 1.0 \
+  --novelty-power 1.0 \
+  --min-distance 0.05 \
+  --target-dataset train \
+  --out outputs/error_distance_round_1.csv
+```
+
+Then simulate the returned rows, append their results only to the training
+MDIF, refit the same provisional model, and run the command again against the
+new `verification_metrics.csv`. Add every earlier point CSV through another
+`--existing-points` option so no previous geometry can be selected again.
 
 ### Using GP to Determine Additional Points
 
@@ -1066,26 +1163,6 @@ python3 generate_points.py \
   --method maximin-lhs \
   --out geometries_{method}.csv
 ```
-
-### Legacy Error-Distance Additional Points
-
-The older `error-distance` method remains available for comparison. It ranks
-verification points by error and scores candidates by proximity to high-error
-regions and distance from existing points. The following command intentionally
-omits `--acquisition` and therefore uses the legacy default:
-
-```bash
-python3 generate_points.py suggest-additional \
-  --count 12 \
-  --fit-dir outputs/dnn_model \
-  --existing-points geometries.csv \
-  --out targeted_additional_points.csv
-```
-
-The suggested-point CSV uses `dataset=targeted` by default and includes the
-nearest high-error verification source, distance from existing points, and
-acquisition score. A companion `*_fit_error_regions.csv` file ranks the current
-verification points by the selected metric, which defaults to `evm_pct`.
 
 ### Gaussian-Process Adaptive Loop
 
@@ -1416,7 +1493,7 @@ Simulate the appended rows, include their results in the training and
 verification MDIF, and refit over the expanded domain. Then use one of the two
 following alternatives for another range-extension refinement batch.
 
-#### Range Extension With the Legacy Error-Distance Selector
+#### Range Extension With the Non-GP Error-Distance Selector
 
 ```bash
 python3 generate_points.py suggest-additional \
@@ -1458,7 +1535,7 @@ the new slab.
 
 When the parameter ranges are unchanged, omit the slab-generation step.
 
-#### Standard Addition With the Legacy Error-Distance Selector
+#### Standard Addition With the Non-GP Error-Distance Selector
 
 Use the legacy selector to concentrate additions around observed high-error
 verification geometries:

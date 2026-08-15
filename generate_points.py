@@ -2260,7 +2260,8 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         help=(
             "Candidate scoring method. gp-ucb fits a Matérn-5/2 Gaussian process "
             "to log geometry-level error; error-distance retains the original "
-            "Gaussian focus/novelty selector. Default: error-distance."
+            "radial error-focus and novelty selector without fitting a GP. "
+            "Default: error-distance."
         ),
     )
     parser.add_argument(
