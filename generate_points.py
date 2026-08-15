@@ -647,17 +647,22 @@ def write_parameter_coverage_png(
         grouped_points[coverage_split_group(split_value)].append(coordinates)
 
     dimension_count = len(parameters)
-    cell_size = 174
-    left_margin = 105
-    right_margin = 24
-    top_margin = 104
-    bottom_margin = 60
-    width = max(520, left_margin + dimension_count * cell_size + right_margin)
+    render_scale = 2
+
+    def px(value: float) -> int:
+        return int(round(render_scale * value))
+
+    cell_size = px(174)
+    left_margin = px(105)
+    right_margin = px(24)
+    top_margin = px(104)
+    bottom_margin = px(60)
+    width = max(px(520), left_margin + dimension_count * cell_size + right_margin)
     height = top_margin + dimension_count * cell_size + bottom_margin
-    plot_inset_left = 20
-    plot_inset_right = 10
-    plot_inset_top = 10
-    plot_inset_bottom = 25
+    plot_inset_left = px(20)
+    plot_inset_right = px(10)
+    plot_inset_top = px(10)
+    plot_inset_bottom = px(25)
     training_color = (37, 99, 235, 255)
     verification_color = (249, 115, 22, 255)
     background_color = (248, 250, 252, 255)
@@ -672,9 +677,9 @@ def write_parameter_coverage_png(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        title_font = ImageFont.load_default(size=19)
-        label_font = ImageFont.load_default(size=11)
-        tick_font = ImageFont.load_default(size=9)
+        title_font = ImageFont.load_default(size=px(19))
+        label_font = ImageFont.load_default(size=px(11))
+        tick_font = ImageFont.load_default(size=px(9))
     except TypeError:  # Pillow versions before scalable built-in fonts.
         title_font = ImageFont.load_default()
         label_font = title_font
@@ -683,34 +688,39 @@ def write_parameter_coverage_png(
     image = Image.new("RGBA", (width, height), background_color)
     draw = ImageDraw.Draw(image)
     draw.text(
-        (left_margin, 12),
+        (left_margin, px(12)),
         f"Parameter coverage: {geometry_path.name}",
         font=title_font,
         fill=title_color,
     )
     draw.text(
-        (left_margin, 42),
+        (left_margin, px(42)),
         f"{len(grouped_points['training'])} training point(s), "
         f"{len(grouped_points['verification'])} verification point(s)",
         font=label_font,
         fill=tick_color,
     )
     draw.ellipse(
-        (left_margin - 4, 68, left_margin + 4, 76),
+        (left_margin - px(4), px(68), left_margin + px(4), px(76)),
         fill=training_color,
     )
     draw.text(
-        (left_margin + 10, 66),
+        (left_margin + px(10), px(66)),
         "Training",
         font=label_font,
         fill=text_color,
     )
     draw.ellipse(
-        (left_margin + 78, 68, left_margin + 86, 76),
+        (
+            left_margin + px(78),
+            px(68),
+            left_margin + px(86),
+            px(76),
+        ),
         fill=verification_color,
     )
     draw.text(
-        (left_margin + 92, 66),
+        (left_margin + px(92), px(66)),
         "Verification",
         font=label_font,
         fill=text_color,
@@ -719,7 +729,7 @@ def write_parameter_coverage_png(
     for column, parameter in enumerate(parameters):
         center_x = left_margin + column * cell_size + cell_size / 2
         draw.text(
-            (center_x, 92),
+            (center_x, px(92)),
             coverage_axis_label(parameter),
             font=label_font,
             fill=title_color,
@@ -728,7 +738,7 @@ def write_parameter_coverage_png(
     for row_index, parameter in enumerate(parameters):
         center_y = top_margin + row_index * cell_size + cell_size / 2
         draw.text(
-            (left_margin - 11, center_y),
+            (left_margin - px(11), center_y),
             coverage_axis_label(parameter),
             font=label_font,
             fill=title_color,
@@ -749,7 +759,7 @@ def write_parameter_coverage_png(
                 (cell_x, cell_y, cell_x + cell_size, cell_y + cell_size),
                 fill=cell_color,
                 outline=border_color,
-                width=1,
+                width=px(1),
             )
             draw.line(
                 (
@@ -759,7 +769,7 @@ def write_parameter_coverage_png(
                     plot_bottom,
                 ),
                 fill=grid_color,
-                width=1,
+                width=px(1),
             )
             draw.line(
                 (
@@ -769,12 +779,12 @@ def write_parameter_coverage_png(
                     plot_top + plot_height / 2,
                 ),
                 fill=grid_color,
-                width=1,
+                width=px(1),
             )
             draw.rectangle(
                 (plot_left, plot_top, plot_right, plot_bottom),
                 outline=axis_color,
-                width=1,
+                width=px(1),
             )
 
             if row_index == column_index:
@@ -805,9 +815,9 @@ def write_parameter_coverage_png(
                         bar_height = plot_height * count / maximum_count
                         histogram_draw.rectangle(
                             (
-                                plot_left + bin_index * bar_width + 1,
+                                plot_left + bin_index * bar_width + px(1),
                                 plot_bottom - bar_height,
-                                plot_left + (bin_index + 1) * bar_width - 1,
+                                plot_left + (bin_index + 1) * bar_width - px(1),
                                 plot_bottom,
                             ),
                             fill=(*color[:3], 132),
@@ -824,26 +834,26 @@ def write_parameter_coverage_png(
                         point_y = plot_bottom - point[row_index] * plot_height
                         draw.ellipse(
                             (
-                                point_x - 3,
-                                point_y - 3,
-                                point_x + 3,
-                                point_y + 3,
+                                point_x - px(3),
+                                point_y - px(3),
+                                point_x + px(3),
+                                point_y + px(3),
                             ),
                             fill=color,
                             outline=(255, 255, 255, 255),
-                            width=1,
+                            width=px(1),
                         )
 
             if row_index == dimension_count - 1:
                 draw.text(
-                    (plot_left, cell_y + cell_size - 9),
+                    (plot_left, cell_y + cell_size - px(9)),
                     coverage_tick_label(x_parameter, 0.0),
                     font=tick_font,
                     fill=tick_color,
                     anchor="ls",
                 )
                 draw.text(
-                    (plot_right, cell_y + cell_size - 9),
+                    (plot_right, cell_y + cell_size - px(9)),
                     coverage_tick_label(x_parameter, 1.0),
                     font=tick_font,
                     fill=tick_color,
@@ -851,14 +861,14 @@ def write_parameter_coverage_png(
                 )
             if column_index == 0 and row_index != column_index:
                 draw.text(
-                    (plot_left - 4, plot_bottom),
+                    (plot_left - px(4), plot_bottom),
                     coverage_tick_label(y_parameter, 0.0),
                     font=tick_font,
                     fill=tick_color,
                     anchor="rm",
                 )
                 draw.text(
-                    (plot_left - 4, plot_top),
+                    (plot_left - px(4), plot_top),
                     coverage_tick_label(y_parameter, 1.0),
                     font=tick_font,
                     fill=tick_color,

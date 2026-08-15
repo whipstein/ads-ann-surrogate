@@ -269,12 +269,13 @@ matrix provides one cell for every ordered parameter pair:
 
 Linear and log-scaled parameters are positioned in their normalized design
 coordinates so coverage is visually comparable, while the axes retain the
-declared physical endpoint values and units. The PNG does not require
-Matplotlib. When `--write-split-files` is used, one matrix describes the
-complete combined geometry, so the separate train/verification CSVs do not
-receive duplicate JSON or plot files. Range extensions plot the complete
-original-plus-appended set. Targeted additional-point CSVs receive their own
-JSON and coverage matrix.
+declared physical endpoint values and units. The PNG uses a two-times
+high-resolution canvas so it opens at a document-scale size in normal image
+viewers, and it does not require Matplotlib. When `--write-split-files` is
+used, one matrix describes the complete combined geometry, so the separate
+train/verification CSVs do not receive duplicate JSON or plot files. Range
+extensions plot the complete original-plus-appended set. Targeted
+additional-point CSVs receive their own JSON and coverage matrix.
 
 ## 2. Simulate and Audit the Dataset
 

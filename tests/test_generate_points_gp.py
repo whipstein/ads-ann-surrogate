@@ -314,7 +314,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(coverage_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             with Image.open(coverage_path) as coverage_image:
                 self.assertEqual(coverage_image.format, "PNG")
-                self.assertEqual(coverage_image.size, (651, 686))
+                self.assertEqual(coverage_image.size, (1302, 1372))
                 color_counts = coverage_image.convert("RGB").getcolors(
                     maxcolors=coverage_image.width * coverage_image.height
                 )
