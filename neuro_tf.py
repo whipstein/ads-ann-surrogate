@@ -18,7 +18,7 @@ import numpy as np
 
 from surrogate_common import *  # noqa: F401,F403,E402
 
-VERSION = "0.2.0-rc2"
+VERSION = "0.2.0-rc3"
 
 def build_fixed_poles(
     blocks: Sequence[MDIFBlock],
@@ -131,10 +131,324 @@ def fit_all_coefficients(
     return np.asarray(rows, dtype=float)
 
 
+def flatten_coefficients(coeffs: np.ndarray) -> np.ndarray:
+    """Flatten complex S-parameter coefficients into the persisted real layout."""
+
+    complex_flat = np.asarray(coeffs, dtype=complex).reshape(-1)
+    return np.concatenate([complex_flat.real, complex_flat.imag])
+
+
 def unflatten_coefficients(row: np.ndarray, n_sparams: int, n_coeffs: int) -> np.ndarray:
     half = n_sparams * n_coeffs
     complex_flat = row[:half] + 1j * row[half : 2 * half]
     return complex_flat.reshape(n_sparams, n_coeffs)
+
+
+def build_response_conditioning_transform(
+    blocks: Sequence[MDIFBlock],
+    poles: np.ndarray,
+    f_scale: float,
+    frequency_weights: np.ndarray | None = None,
+    ridge: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
+    """Build a coefficient transform whose Euclidean error is response error.
+
+    If ``B`` is the weighted rational basis, its ridge-augmented form is
+    ``B_aug = [B; sqrt(ridge) I]`` and ``B_aug = Q R``. A raw coefficient
+    column ``c`` is represented during NN training as ``R c``. Consequently,
+    ``||R dc||_2 == ||B_aug dc||_2`` while the orthonormal ``Q`` prevents small
+    latent errors from being amplified by an ill-conditioned pole/residue
+    basis. Coefficients use row-major storage in this module, so the returned
+    encoder and decoder operate on the right of a coefficient row.
+    """
+
+    frequencies = np.concatenate(
+        [np.asarray(block.freq_hz, dtype=float).reshape(-1) for block in blocks]
+    )
+    basis = rational_basis(frequencies, poles, f_scale)
+    if frequency_weights is not None:
+        weights = np.asarray(frequency_weights, dtype=float).reshape(-1)
+        if weights.shape != (basis.shape[0],):
+            raise ValueError(
+                f"Expected {basis.shape[0]} conditioning frequency weights, got "
+                f"{weights.shape}"
+            )
+        if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
+            raise ValueError(
+                "Conditioning frequency weights must be finite and non-negative"
+            )
+        basis = basis * np.sqrt(weights)[:, None]
+    if not math.isfinite(float(ridge)) or float(ridge) < 0.0:
+        raise ValueError("Conditioning ridge must be finite and non-negative")
+    n_coeffs = basis.shape[1]
+    response_basis = basis
+    if ridge > 0.0:
+        basis = np.vstack(
+            [
+                basis,
+                math.sqrt(float(ridge)) * np.eye(n_coeffs, dtype=complex),
+            ]
+        )
+    if basis.shape[0] < n_coeffs:
+        raise ValueError(
+            "Neuro-TF needs at least order + 1 fitted RF frequency rows to "
+            f"condition an order-{len(poles)} rational basis; got "
+            f"{basis.shape[0]} rows. Reduce --order or add RF frequencies."
+        )
+    rank = int(np.linalg.matrix_rank(basis))
+    if rank < n_coeffs:
+        raise ValueError(
+            "The Neuro-TF rational basis is rank deficient on the fitted RF "
+            f"frequency grid (rank {rank} of {n_coeffs}). Reduce --order or "
+            "provide a broader frequency grid."
+        )
+    _q, upper = np.linalg.qr(basis, mode="reduced")
+    encoder = upper.T
+    decoder = np.linalg.solve(encoder, np.eye(n_coeffs, dtype=complex))
+    diagnostics: dict[str, float | int] = {
+        "frequency_rows": int(response_basis.shape[0]),
+        "conditioning_rows": int(basis.shape[0]),
+        "coefficient_count": int(n_coeffs),
+        "rank": rank,
+        "ridge": float(ridge),
+        "basis_condition_number": float(np.linalg.cond(response_basis)),
+        "conditioning_matrix_condition_number": float(np.linalg.cond(basis)),
+        "decoder_condition_number": float(np.linalg.cond(decoder)),
+    }
+    return encoder, decoder, diagnostics
+
+
+def transform_coefficient_rows(
+    rows: np.ndarray,
+    n_sparams: int,
+    n_coeffs: int,
+    transform: np.ndarray,
+) -> np.ndarray:
+    """Apply one complex right-side transform to every S-parameter row."""
+
+    values = np.asarray(rows, dtype=float)
+    transformed = []
+    for row in values:
+        coeffs = unflatten_coefficients(row, n_sparams, n_coeffs)
+        transformed.append(flatten_coefficients(coeffs @ transform))
+    return np.asarray(transformed, dtype=float)
+
+
+def real_coefficient_transform(
+    complex_transform: np.ndarray,
+    n_sparams: int,
+) -> np.ndarray:
+    """Return the real matrix equivalent of a repeated complex transform."""
+
+    transform = np.asarray(complex_transform, dtype=complex)
+    if transform.ndim != 2 or transform.shape[0] != transform.shape[1]:
+        raise ValueError("Coefficient transform must be a square matrix")
+    n_coeffs = transform.shape[0]
+    complex_matrix = np.zeros(
+        (n_sparams * n_coeffs, n_sparams * n_coeffs),
+        dtype=complex,
+    )
+    for index in range(n_sparams):
+        start = index * n_coeffs
+        complex_matrix[start : start + n_coeffs, start : start + n_coeffs] = transform
+    return np.block(
+        [
+            [complex_matrix.real, complex_matrix.imag],
+            [-complex_matrix.imag, complex_matrix.real],
+        ]
+    )
+
+
+def response_equivalent_standardizer(data: np.ndarray) -> Standardizer:
+    """Center each latent output but apply one scale to preserve its metric."""
+
+    values = np.asarray(data, dtype=float)
+    scaler = Standardizer()
+    scaler.mean = np.mean(values, axis=0)
+    scale = float(np.sqrt(np.mean((values - scaler.mean) ** 2)))
+    if not math.isfinite(scale) or scale < EPS:
+        scale = 1.0
+    scaler.std = np.full(values.shape[1], scale, dtype=float)
+    return scaler
+
+
+def fold_output_transform_into_mlp(
+    mlp: MLP,
+    output_scaler: Standardizer,
+    real_transform: np.ndarray,
+) -> Standardizer:
+    """Fold inverse scaling and a linear decoder into the MLP output layer.
+
+    After this operation the network directly emits decoded raw coefficients.
+    An identity standardizer is returned so all existing model and export code
+    continues to consume the established raw coefficient representation.
+    """
+
+    if output_scaler.mean is None or output_scaler.std is None:
+        raise ValueError("Output standardizer must be fitted before folding")
+    transform = np.asarray(real_transform, dtype=float)
+    output_count = mlp.weights[-1].shape[1]
+    if transform.shape != (output_count, output_count):
+        raise ValueError(
+            f"Expected a {output_count}x{output_count} output transform, got "
+            f"{transform.shape}"
+        )
+    scaled_transform = output_scaler.std[:, None] * transform
+    mlp.weights[-1] = mlp.weights[-1] @ scaled_transform
+    mlp.biases[-1] = mlp.biases[-1] @ scaled_transform + output_scaler.mean @ transform
+    identity = Standardizer()
+    identity.mean = np.zeros(output_count, dtype=float)
+    identity.std = np.ones(output_count, dtype=float)
+    return identity
+
+
+def reciprocity_summary(
+    blocks: Sequence[MDIFBlock],
+    sparam_labels: Sequence[str],
+) -> dict[str, float | int | bool | None]:
+    """Measure Sij/Sji agreement for a complete S-parameter matrix."""
+
+    nports = infer_nports(sparam_labels)
+    if nports is None:
+        return {
+            "nports": None,
+            "comparable": False,
+            "max_abs_error": None,
+            "relative_error": None,
+        }
+    max_error = 0.0
+    max_reference = 0.0
+    for block in blocks:
+        for row in range(1, nports + 1):
+            for col in range(row + 1, nports + 1):
+                forward = np.asarray(block.sparams[f"S{row}{col}"], dtype=complex)
+                reverse = np.asarray(block.sparams[f"S{col}{row}"], dtype=complex)
+                max_error = max(max_error, float(np.max(np.abs(forward - reverse))))
+                max_reference = max(
+                    max_reference,
+                    float(np.max(np.abs(forward))),
+                    float(np.max(np.abs(reverse))),
+                )
+    relative_error = max_error / max(max_reference, EPS)
+    return {
+        "nports": int(nports),
+        "comparable": True,
+        "max_abs_error": max_error,
+        "relative_error": relative_error,
+    }
+
+
+def reciprocity_projection(
+    sparam_labels: Sequence[str],
+    n_coeffs: int,
+) -> np.ndarray:
+    """Build a real output projection that exactly ties reciprocal S entries."""
+
+    nports = infer_nports(sparam_labels)
+    if nports is None:
+        raise ValueError(
+            "Reciprocity enforcement requires a complete S-parameter matrix"
+        )
+    n_complex = len(sparam_labels) * n_coeffs
+    projection = np.eye(2 * n_complex, dtype=float)
+    label_indices = {label: index for index, label in enumerate(sparam_labels)}
+    for row in range(1, nports + 1):
+        for col in range(row + 1, nports + 1):
+            first_label = label_indices[f"S{row}{col}"]
+            second_label = label_indices[f"S{col}{row}"]
+            for coefficient in range(n_coeffs):
+                first = first_label * n_coeffs + coefficient
+                second = second_label * n_coeffs + coefficient
+                for offset in (0, n_complex):
+                    a = first + offset
+                    b = second + offset
+                    projection[a, a] = 0.5
+                    projection[b, a] = 0.5
+                    projection[a, b] = 0.5
+                    projection[b, b] = 0.5
+    return projection
+
+
+def apply_output_projection(mlp: MLP, projection: np.ndarray) -> None:
+    """Fold a raw-output linear projection into an already decoded MLP."""
+
+    matrix = np.asarray(projection, dtype=float)
+    output_count = mlp.weights[-1].shape[1]
+    if matrix.shape != (output_count, output_count):
+        raise ValueError(
+            f"Expected a {output_count}x{output_count} output projection, got "
+            f"{matrix.shape}"
+        )
+    mlp.weights[-1] = mlp.weights[-1] @ matrix
+    mlp.biases[-1] = mlp.biases[-1] @ matrix
+
+
+def apply_rf_response_scale(mlp: MLP, scale: float) -> None:
+    """Fold a uniform RF S-matrix contraction into the coefficient network."""
+
+    value = float(scale)
+    if not math.isfinite(value) or value <= 0.0 or value > 1.0:
+        raise ValueError("RF response scale must be finite and in (0, 1]")
+    mlp.weights[-1] *= value
+    mlp.biases[-1] *= value
+
+
+def blocks_from_coefficient_rows(
+    template_blocks: Sequence[MDIFBlock],
+    coefficient_rows: np.ndarray,
+    sparam_labels: Sequence[str],
+    poles: np.ndarray,
+    f_scale: float,
+) -> list[MDIFBlock]:
+    """Evaluate fitted coefficient rows on matching template frequency grids."""
+
+    if len(template_blocks) != len(coefficient_rows):
+        raise ValueError(
+            "Coefficient-row count does not match the template block count"
+        )
+    n_coeffs = len(poles) + 1
+    predicted: list[MDIFBlock] = []
+    for block, row in zip(template_blocks, coefficient_rows):
+        coeffs = unflatten_coefficients(row, len(sparam_labels), n_coeffs)
+        values = evaluate_coefficients(coeffs, block.freq_hz, poles, f_scale)
+        predicted.append(
+            MDIFBlock(
+                params=dict(block.params),
+                freq_hz=np.asarray(block.freq_hz, dtype=float).copy(),
+                sparams={
+                    label: np.asarray(values[index], dtype=complex)
+                    for index, label in enumerate(sparam_labels)
+                },
+                source_index=block.source_index,
+            )
+        )
+    return predicted
+
+
+def compact_response_summary(
+    truth_blocks: Sequence[MDIFBlock],
+    predicted_blocks: Sequence[MDIFBlock],
+    sparam_labels: Sequence[str],
+) -> dict[str, object]:
+    """Summarize the rational stage without creating report artifacts."""
+
+    errors: list[np.ndarray] = []
+    for truth, predicted in zip(truth_blocks, predicted_blocks):
+        for label in sparam_labels:
+            errors.append(
+                np.abs(
+                    np.asarray(predicted.sparams[label], dtype=complex)
+                    - np.asarray(truth.sparams[label], dtype=complex)
+                )
+            )
+    flat_error = np.concatenate(errors) if errors else np.asarray([], dtype=float)
+    return {
+        "rmse_abs": (
+            float(np.sqrt(np.mean(flat_error**2))) if flat_error.size else None
+        ),
+        "max_abs": float(np.max(flat_error)) if flat_error.size else None,
+        "passivity": passivity_summary(predicted_blocks, sparam_labels),
+    }
 
 
 def evaluate_coefficients(
@@ -376,6 +690,10 @@ def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], 
         seed=trial_seed,
         worst_plots=plots,
         frequency_weights=args.frequency_weights,
+        passivity_mode=args.passivity_mode,
+        passivity_margin=args.passivity_margin,
+        reciprocity_mode=args.reciprocity_mode,
+        reciprocity_tolerance=args.reciprocity_tolerance,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
     ), candidate)
@@ -546,6 +864,8 @@ def command_train(args: argparse.Namespace) -> int:
     )
     fit_train_blocks = positive_frequency_blocks(train_blocks)
     fit_verify_blocks = positive_frequency_blocks(verify_blocks) if verify_blocks else []
+    source_rf_passivity = passivity_summary(fit_train_blocks, sparam_labels)
+    source_rf_reciprocity = reciprocity_summary(fit_train_blocks, sparam_labels)
     frequency_weight_spec = getattr(args, "frequency_weights", None)
     raw_frequency_weights = frequency_weights_from_blocks(
         fit_train_blocks,
@@ -568,7 +888,7 @@ def command_train(args: argparse.Namespace) -> int:
         normalized_verify_frequency_weights = None
     poles, f_scale = build_fixed_poles(fit_train_blocks, args.order, args.pole_damping)
     x_train = parameter_matrix(fit_train_blocks, parameter_names)
-    y_train = fit_all_coefficients(
+    raw_y_train = fit_all_coefficients(
         fit_train_blocks,
         sparam_labels,
         poles,
@@ -579,7 +899,7 @@ def command_train(args: argparse.Namespace) -> int:
 
     if fit_verify_blocks:
         x_verify = parameter_matrix(fit_verify_blocks, parameter_names)
-        y_verify = fit_all_coefficients(
+        raw_y_verify = fit_all_coefficients(
             fit_verify_blocks,
             sparam_labels,
             poles,
@@ -589,14 +909,71 @@ def command_train(args: argparse.Namespace) -> int:
         )
     else:
         x_verify = None
-        y_verify = None
+        raw_y_verify = None
+
+    rational_fit_train_summary = compact_response_summary(
+        fit_train_blocks,
+        blocks_from_coefficient_rows(
+            fit_train_blocks,
+            raw_y_train,
+            sparam_labels,
+            poles,
+            f_scale,
+        ),
+        sparam_labels,
+    )
+    rational_fit_verify_summary = (
+        compact_response_summary(
+            fit_verify_blocks,
+            blocks_from_coefficient_rows(
+                fit_verify_blocks,
+                raw_y_verify,
+                sparam_labels,
+                poles,
+                f_scale,
+            ),
+            sparam_labels,
+        )
+        if raw_y_verify is not None
+        else None
+    )
+
+    coefficient_encoder, coefficient_decoder, conditioning_diagnostics = (
+        build_response_conditioning_transform(
+            fit_train_blocks,
+            poles,
+            f_scale,
+            frequency_weights=normalized_frequency_weights,
+            ridge=args.ridge,
+        )
+    )
+    n_coeffs = len(poles) + 1
+    n_sparams = len(sparam_labels)
+    y_train = transform_coefficient_rows(
+        raw_y_train,
+        n_sparams,
+        n_coeffs,
+        coefficient_encoder,
+    )
+    y_verify = (
+        transform_coefficient_rows(
+            raw_y_verify,
+            n_sparams,
+            n_coeffs,
+            coefficient_encoder,
+        )
+        if raw_y_verify is not None
+        else None
+    )
 
     x_scaler = Standardizer().fit(x_train)
-    y_scaler = Standardizer().fit(y_train)
+    latent_y_scaler = response_equivalent_standardizer(y_train)
     x_train_scaled = x_scaler.transform(x_train)
-    y_train_scaled = y_scaler.transform(y_train)
+    y_train_scaled = latent_y_scaler.transform(y_train)
     x_verify_scaled = x_scaler.transform(x_verify) if x_verify is not None else None
-    y_verify_scaled = y_scaler.transform(y_verify) if y_verify is not None else None
+    y_verify_scaled = (
+        latent_y_scaler.transform(y_verify) if y_verify is not None else None
+    )
 
     layer_sizes = [x_train.shape[1], *hidden_layers, y_train.shape[1]]
     mlp = MLP(layer_sizes, activation=args.activation, seed=args.seed)
@@ -618,6 +995,33 @@ def command_train(args: argparse.Namespace) -> int:
         ),
         progress_interval=progress_interval,
     )
+    real_decoder = real_coefficient_transform(coefficient_decoder, n_sparams)
+    y_scaler = fold_output_transform_into_mlp(
+        mlp,
+        latent_y_scaler,
+        real_decoder,
+    )
+    reciprocity_mode = str(getattr(args, "reciprocity_mode", "auto"))
+    reciprocity_tolerance = float(getattr(args, "reciprocity_tolerance", 1e-6))
+    if not math.isfinite(reciprocity_tolerance) or reciprocity_tolerance < 0.0:
+        raise ValueError("--reciprocity-tolerance must be finite and non-negative")
+    reciprocity_comparable = bool(source_rf_reciprocity["comparable"])
+    source_reciprocity_error = source_rf_reciprocity["relative_error"]
+    reciprocity_enforced = reciprocity_mode == "enforce" or (
+        reciprocity_mode == "auto"
+        and reciprocity_comparable
+        and source_reciprocity_error is not None
+        and float(source_reciprocity_error) <= reciprocity_tolerance
+    )
+    if reciprocity_mode == "enforce" and not reciprocity_comparable:
+        raise ValueError(
+            "--reciprocity-mode enforce requires a complete S-parameter matrix"
+        )
+    if reciprocity_enforced:
+        apply_output_projection(
+            mlp,
+            reciprocity_projection(sparam_labels, n_coeffs),
+        )
     model = NeuroTF(
         mlp=mlp,
         x_scaler=x_scaler,
@@ -632,6 +1036,47 @@ def command_train(args: argparse.Namespace) -> int:
         dc_resistance_source_kind=str(dc_metadata["dc_resistance_source_kind"]),
         dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
         dc_model=dc_model,
+    )
+
+    passivity_mode = str(getattr(args, "passivity_mode", "auto"))
+    passivity_margin = float(getattr(args, "passivity_margin", 1e-3))
+    if (
+        not math.isfinite(passivity_margin)
+        or passivity_margin < 0.0
+        or passivity_margin >= 1.0
+    ):
+        raise ValueError("--passivity-margin must be finite and in [0, 1)")
+    source_passivity_available = source_rf_passivity["nports"] is not None
+    source_is_passive = (
+        source_passivity_available
+        and source_rf_passivity["violating_points"] == 0
+    )
+    passivity_enforced = passivity_mode == "enforce" or (
+        passivity_mode == "auto" and source_is_passive
+    )
+    if passivity_mode == "enforce" and not source_passivity_available:
+        raise ValueError(
+            "--passivity-mode enforce requires a complete S-parameter matrix"
+        )
+    predicted_train_before_scale = model.predict_blocks(fit_train_blocks)
+    predicted_rf_passivity_before_scale = passivity_summary(
+        predicted_train_before_scale,
+        sparam_labels,
+    )
+    rf_response_scale = 1.0
+    passivity_target_sigma = 1.0 - passivity_margin
+    if passivity_enforced:
+        predicted_sigma = predicted_rf_passivity_before_scale["max_singular_value"]
+        if predicted_sigma is None or not math.isfinite(float(predicted_sigma)):
+            raise ValueError(
+                "Could not assess the fitted Neuro-TF response for passivity"
+            )
+        if float(predicted_sigma) > passivity_target_sigma:
+            rf_response_scale = passivity_target_sigma / float(predicted_sigma)
+            apply_rf_response_scale(mlp, rf_response_scale)
+    predicted_rf_passivity_after_scale = passivity_summary(
+        model.predict_blocks(fit_train_blocks),
+        sparam_labels,
     )
 
     out_dir = Path(args.out_dir)
@@ -649,6 +1094,26 @@ def command_train(args: argparse.Namespace) -> int:
         "frequency_weight_min": float(np.min(raw_frequency_weights)),
         "frequency_weight_max": float(np.max(raw_frequency_weights)),
         "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples before weighted rational least squares.",
+        "coefficient_training_representation": "qr_conditioned_rational_response",
+        "coefficient_training_loss_domain": "weighted_complex_sparameter_response",
+        "coefficient_training_output_scale": float(latent_y_scaler.std[0]),
+        "coefficient_decoder_folded_into_output_layer": True,
+        "coefficient_conditioning": conditioning_diagnostics,
+        "rational_fit_train_summary": rational_fit_train_summary,
+        "rational_fit_verification_summary": rational_fit_verify_summary,
+        "reciprocity_mode": reciprocity_mode,
+        "reciprocity_tolerance": reciprocity_tolerance,
+        "reciprocity_enforced": reciprocity_enforced,
+        "source_rf_reciprocity": source_rf_reciprocity,
+        "passivity_mode": passivity_mode,
+        "passivity_margin": passivity_margin,
+        "passivity_target_sigma": passivity_target_sigma,
+        "passivity_enforced": passivity_enforced,
+        "source_rf_passivity": source_rf_passivity,
+        "predicted_train_passivity_before_scale": predicted_rf_passivity_before_scale,
+        "rf_response_scale": rf_response_scale,
+        "predicted_train_passivity_after_scale": predicted_rf_passivity_after_scale,
+        "passivity_assessment_scope": "positive-frequency training blocks only",
         **dc_metadata,
         "dc_model_history_rows": len(dc_history),
     }
@@ -672,6 +1137,34 @@ def command_train(args: argparse.Namespace) -> int:
         "pole_damping": args.pole_damping,
         "ridge": args.ridge,
         "f_scale": f_scale,
+        "coefficient_training_representation": metadata[
+            "coefficient_training_representation"
+        ],
+        "coefficient_training_loss_domain": metadata[
+            "coefficient_training_loss_domain"
+        ],
+        "coefficient_training_output_scale": metadata[
+            "coefficient_training_output_scale"
+        ],
+        "coefficient_conditioning": metadata["coefficient_conditioning"],
+        "rational_fit_train_summary": metadata["rational_fit_train_summary"],
+        "rational_fit_verification_summary": metadata[
+            "rational_fit_verification_summary"
+        ],
+        "reciprocity_mode": metadata["reciprocity_mode"],
+        "reciprocity_enforced": metadata["reciprocity_enforced"],
+        "source_rf_reciprocity": metadata["source_rf_reciprocity"],
+        "passivity_mode": metadata["passivity_mode"],
+        "passivity_margin": metadata["passivity_margin"],
+        "passivity_enforced": metadata["passivity_enforced"],
+        "source_rf_passivity": metadata["source_rf_passivity"],
+        "rf_response_scale": metadata["rf_response_scale"],
+        "predicted_train_passivity_before_scale": metadata[
+            "predicted_train_passivity_before_scale"
+        ],
+        "predicted_train_passivity_after_scale": metadata[
+            "predicted_train_passivity_after_scale"
+        ],
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
         "dc_port_paths": metadata["dc_port_paths"],
@@ -771,13 +1264,44 @@ def command_train(args: argparse.Namespace) -> int:
                 "dc_model_verify_s_max_abs_error": metadata.get(
                     "dc_model_verify_s_max_abs_error"
                 ),
+                "coefficient_training_representation": metadata[
+                    "coefficient_training_representation"
+                ],
+                "coefficient_conditioning": metadata["coefficient_conditioning"],
+                "rational_fit_verification_summary": metadata[
+                    "rational_fit_verification_summary"
+                ],
+                "reciprocity_enforced": metadata["reciprocity_enforced"],
+                "source_rf_reciprocity": metadata["source_rf_reciprocity"],
+                "passivity_enforced": metadata["passivity_enforced"],
+                "source_rf_passivity": metadata["source_rf_passivity"],
+                "rf_response_scale": metadata["rf_response_scale"],
+                "predicted_train_passivity_before_scale": metadata[
+                    "predicted_train_passivity_before_scale"
+                ],
+                "predicted_train_passivity_after_scale": metadata[
+                    "predicted_train_passivity_after_scale"
+                ],
             }
         )
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
     else:
-        summary = {"warning": "No verification blocks were available"}
+        summary = {
+            "warning": "No verification blocks were available",
+            "coefficient_training_representation": metadata[
+                "coefficient_training_representation"
+            ],
+            "coefficient_conditioning": metadata["coefficient_conditioning"],
+            "rational_fit_train_summary": metadata["rational_fit_train_summary"],
+            "reciprocity_enforced": metadata["reciprocity_enforced"],
+            "passivity_enforced": metadata["passivity_enforced"],
+            "rf_response_scale": metadata["rf_response_scale"],
+            "predicted_train_passivity_after_scale": metadata[
+                "predicted_train_passivity_after_scale"
+            ],
+        }
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
@@ -1142,6 +1666,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--order", type=int, default=10, help="Number of fixed rational poles")
     train.add_argument("--pole-damping", type=float, default=0.18)
     train.add_argument("--ridge", type=float, default=1e-8, help="Least-squares ridge for TF fitting")
+    train.add_argument(
+        "--passivity-mode",
+        choices=["auto", "enforce", "off"],
+        default="auto",
+        help=(
+            "RF passivity handling. auto contracts the fitted RF response only "
+            "when the positive-frequency training data is passive; enforce "
+            "always contracts it; off leaves the fitted response unchanged."
+        ),
+    )
+    train.add_argument(
+        "--passivity-margin",
+        type=float,
+        default=1e-3,
+        help="Target margin below sigma_max=1 when passivity is enforced. Default: 0.001",
+    )
+    train.add_argument(
+        "--reciprocity-mode",
+        choices=["auto", "enforce", "off"],
+        default="auto",
+        help=(
+            "Reciprocity handling. auto ties Sij/Sji when the training data is "
+            "reciprocal; enforce always ties them; off trains them independently."
+        ),
+    )
+    train.add_argument(
+        "--reciprocity-tolerance",
+        type=float,
+        default=1e-6,
+        help="Maximum relative Sij/Sji disagreement accepted by auto mode.",
+    )
     train.add_argument("--hidden-layers", default="64,64")
     train.add_argument("--activation", choices=["tanh", "relu"], default="tanh")
     train.add_argument("--epochs", type=int, default=2000)
@@ -1227,6 +1782,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument(
         "--frequency-weights",
         help="Frequency loss/selection weights, e.g. 'default=1;1GHz=5;2GHz:4GHz=3'.",
+    )
+    sweep.add_argument(
+        "--passivity-mode",
+        choices=["auto", "enforce", "off"],
+        default="auto",
+        help="Passivity handling passed to every trial; see train --passivity-mode.",
+    )
+    sweep.add_argument(
+        "--passivity-margin",
+        type=float,
+        default=1e-3,
+        help="Target margin below sigma_max=1 when passivity is enforced.",
+    )
+    sweep.add_argument(
+        "--reciprocity-mode",
+        choices=["auto", "enforce", "off"],
+        default="auto",
+        help="Reciprocity handling passed to every trial.",
+    )
+    sweep.add_argument(
+        "--reciprocity-tolerance",
+        type=float,
+        default=1e-6,
+        help="Maximum relative Sij/Sji disagreement accepted by auto mode.",
     )
     sweep.add_argument("--jobs", type=int, default=1, help="Number of sweep trials to train in parallel")
     sweep.add_argument(

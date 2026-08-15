@@ -588,7 +588,11 @@ python3 surrogate.py --model neuro-tf train \
 ```
 
 See the [Neuro-TF command reference](#neuro-tf-command-reference) for rational
-orders, pole controls, optimization, prediction, and export options.
+orders, pole controls, passivity/reciprocity handling, optimization, prediction,
+and export options. Neuro-TF trains in a response-conditioned coefficient basis
+by default; raw pole/residue coefficients are produced only after the learned
+map, so an ill-conditioned rational basis cannot hide a large S-parameter error
+behind a small coefficient loss.
 
 ### Shared Training and Optimization Workflow
 
@@ -3543,8 +3547,11 @@ $$
 $$
 
 The rational transfer functions use fixed stable poles, so coefficient
-extraction for each geometry is linear least squares. The neural network then
-learns the geometry-to-coefficients map.
+extraction for each geometry is linear least squares. The neural network learns
+a QR-conditioned coefficient map whose loss is proportional to weighted complex
+S-parameter error on the training frequency grid. The decoder is folded into
+the final neural layer after training, preserving the raw coefficient interface
+used by every existing predictor and exporter.
 
 #### Expected MDIF Shape
 
@@ -3587,12 +3594,22 @@ python3 surrogate.py --model neuro-tf train \
   --out-dir neuro_tf_model \
   --parameter-names W,L \
   --order 10 \
-  --hidden-layers 64,64
+  --hidden-layers 64,64 \
+  --passivity-mode auto \
+  --reciprocity-mode auto
 ```
+
+With the default `auto` modes, reciprocal training data causes reciprocal
+coefficient rows to be tied exactly. If the positive-frequency training data is
+passive, the complete fitted RF response is uniformly contracted only as much
+as needed to reach `--passivity-margin`. Nonreciprocal or nonpassive source data
+is left unchanged. Use `enforce` or `off` when that automatic behavior is not
+appropriate for the device.
 
 Outputs:
 
-- `model.npz` and `metadata.json`: trained Neuro-TF model
+- `model.npz` and `metadata.json`: trained Neuro-TF model plus rational-stage,
+  conditioning, reciprocity, and pre/post-contraction passivity diagnostics
 - `training_summary.md`: settings, metrics, plot links, and copyable
   self-contained Verilog-A and sampled ADS MDIF export commands
 - `predicted_verification.mdif`: model predictions at verification points
@@ -3667,6 +3684,15 @@ python3 surrogate.py --model neuro-tf optimize \
 To weight specific frequency bands during coefficient fitting and model
 selection, add a normal option such as
 `--frequency-weights 'default=1;2GHz:4GHz=5'`.
+
+The default `--passivity-mode auto` makes a passive training set a structural
+requirement for the saved Neuro-TF rather than relying on a lucky optimize
+candidate. `--require-passive` remains useful: it checks the independent
+verification response and rejects a trial if interpolation outside the fitted
+training geometries still violates passivity. If the source training data is
+itself nonpassive, auto mode deliberately does not conceal it; audit or correct
+that data, or explicitly request `--passivity-mode enforce` if contraction is
+the intended modeling policy.
 
 ##### Discrete grid or random optimization
 
@@ -3856,10 +3882,14 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
 | <nobr><code>--order INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of fixed stable rational poles used for each S-parameter transfer function. Higher values can fit sharper frequency behavior but increase coefficient count and NN output dimension. Default: `10`. | <nobr><code>--order 12</code></nobr> |
 | <nobr><code>--orders LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated rational pole counts. `--order` accepts one train-compatible value. Default: `6,10,14`. | <nobr><code>--orders 8,10,12,16</code></nobr> |
+| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Target margin below $\sigma_{\max}=1$ when passivity contraction is active. The saved RF coefficients are scaled toward zero by one common factor only when needed. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.001</code></nobr> |
+| <nobr><code>--passivity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` contracts only when the positive-frequency training data is passive; `enforce` contracts any complete fitted S-matrix; `off` preserves the unconstrained response. Assessment and scaling use training blocks only, never verification blocks. Default: `auto`. | <nobr><code>--passivity-mode auto</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
 | <nobr><code>--pole-damping FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Real-part damping factor for the fixed pole grid. Larger values make poles more damped and smoother; smaller values can follow sharper resonances but may be more sensitive. Default: `0.18`. | <nobr><code>--pole-damping 0.18</code></nobr> |
 | <nobr><code>--pole-dampings LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated pole damping values. `--pole-damping` accepts one train-compatible value. Default: `0.12,0.18,0.28`. | <nobr><code>--pole-dampings 0.12,0.18,0.28</code></nobr> |
 | <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
+| <nobr><code>--reciprocity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` ties every fitted $S_{ij}$/$S_{ji}$ coefficient pair when the source training response is reciprocal; `enforce` always ties a complete S-matrix; `off` leaves ordered entries independent. Default: `auto`. | <nobr><code>--reciprocity-mode auto</code></nobr> |
+| <nobr><code>--reciprocity-tolerance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum relative source $S_{ij}$/$S_{ji}$ disagreement accepted by reciprocity auto-detection. Must be finite and non-negative. Default: `1e-6`. | <nobr><code>--reciprocity-tolerance 1e-6</code></nobr> |
 | <nobr><code>--ridge FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Ridge regularization used during linear least-squares TF coefficient fitting. Increase this if coefficient fits become noisy or ill-conditioned. Default: `1e-8`. | <nobr><code>--ridge 1e-8</code></nobr> |
 | <nobr><code>--ridges LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated coefficient-fit ridge values. `--ridge` accepts one train-compatible value; `--ridge-values` remains an alias. Default: `1e-10,1e-8,1e-6`. | <nobr><code>--ridges 1e-10,1e-8,1e-6</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Random seed for data splitting, model initialization, minibatch order, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
@@ -4615,35 +4645,118 @@ changes the extracted coefficient targets themselves. Coefficient extraction
 uses positive frequencies only.
 
 Each geometry's coefficient matrices are flattened by S-parameter, with the
-constant coefficient followed by its pole coefficients. All real coefficients
-are concatenated before all imaginary coefficients. For $L$ ordered
+constant coefficient followed by its pole coefficients. All real coordinates
+are concatenated before all imaginary coordinates. For $L$ ordered
 S-parameters and $K$ poles, the neural target dimension is $2L(K+1)$.
 
-#### Geometry-to-coefficient MLP and evaluation
+#### Response-conditioned neural coordinates
 
-The neural map is
+Directly standardizing raw pole/residue coefficients is numerically unsafe:
+columns of the rational basis can be nearly dependent, so a small coefficient
+loss may correspond to a large response error. Neuro-TF instead builds the
+weighted, ridge-augmented rational basis over all positive-frequency training
+rows and computes its reduced QR factorization:
 
 $$
-\mathcal R(\mathbf C(\mathbf p))
-=\operatorname{inverse\_scale}\!\left(
+\widetilde{\mathbf B}
+=\begin{bmatrix}
+\mathbf W_f^{1/2}\mathbf B\\
+\sqrt{\lambda}\mathbf I
+\end{bmatrix}
+=\mathbf Q\mathbf R,
+\qquad
+\mathbf Q^{\mathrm H}\mathbf Q=\mathbf I.
+$$
+
+For every extracted coefficient vector $\mathbf c$, the actual neural target is
+
+$$
+\mathbf z=\mathbf R\mathbf c.
+$$
+
+This makes latent error exactly equal to weighted response error on that grid:
+
+$$
+\left\|\Delta\mathbf z\right\|_2
+=\left\|\mathbf R\Delta\mathbf c\right\|_2
+=\left\|\widetilde{\mathbf B}\Delta\mathbf c\right\|_2.
+$$
+
+The real and imaginary latent coordinates are centered independently, but one
+common RMS scale is applied to every output. Using separate standard deviations
+for every coordinate would distort the response-equivalent metric again. The
+trained map is therefore
+
+$$
+\widehat{\mathbf c}(\mathbf p)
+=\mathbf R^{-1}
+\operatorname{inverse\_common\_scale}\!\left(
 \operatorname{MLP}(\operatorname{scale}(\mathbf p))
 \right).
 $$
 
-Frequency is not a neural input. At prediction, the coefficient row is
+After training, the inverse common scale and $\mathbf R^{-1}$ decoder are folded
+algebraically into the MLP's last affine layer. The persisted network therefore
+emits the original raw coefficient layout. Existing prediction, sampled MDIF,
+ADS HB, and Verilog-A implementations require no runtime QR transform and no
+new model format.
+
+Frequency is not a neural input. At prediction, the decoded coefficient row is
 unflattened and multiplied by the rational basis evaluated at each requested
-frequency. This makes evaluation on a new frequency grid inexpensive and keeps
-the geometry-to-network map lower dimensional than direct row-wise regression
-when many frequency samples are present.
+frequency. This keeps the geometry-to-network map lower dimensional than direct
+row-wise regression when many frequency samples are present.
+
+#### Reciprocity and sampled passivity controls
+
+`--reciprocity-mode auto` measures relative $S_{ij}$/$S_{ji}$ disagreement in
+the positive-frequency training data. When it is within
+`--reciprocity-tolerance`, the final output projection applies
+
+$$
+\widehat{\mathbf c}_{ij}
+\leftarrow
+\frac{\widehat{\mathbf c}_{ij}+\widehat{\mathbf c}_{ji}}{2},
+\qquad
+\widehat{\mathbf c}_{ji}\leftarrow\widehat{\mathbf c}_{ij}.
+$$
+
+This projection is also folded into the last neural layer, so reciprocity is
+exact in every export. Auto mode does not tie genuinely nonreciprocal data.
+
+For a complete S-matrix, `--passivity-mode auto` first requires the source RF
+training rows to be passive. It then evaluates the fitted model on those same
+training geometries and frequencies. If the largest singular value is
+$\sigma_\star$ and the requested margin is $m$, the saved RF model uses
+
+$$
+\alpha
+=\min\!\left(1,\frac{1-m}{\sigma_\star}\right),
+\qquad
+\widehat{\mathbf S}_{\mathrm{saved}}
+=\alpha\widehat{\mathbf S}_{\mathrm{fit}}.
+$$
+
+Multiplying all rational coefficients by the same $\alpha$ makes every assessed
+training response passive without changing phase, reciprocity, pole locations,
+or the separate exact-DC model. Verification blocks are not used to select
+$\alpha$. Therefore `--require-passive` remains an independent check of unseen
+geometries. The contraction is a sampled-domain guarantee, not a proof over all
+continuous parameter and frequency values; validate the intended export grid.
 
 #### Important implementation boundaries
 
 - The pole set is generated once from the training band; this implementation
   does not relocate poles with vector fitting.
 - Pole tracking across geometries is unnecessary because poles are fixed.
-- The common pole basis provides stable denominators, but arbitrary learned
-  complex coefficients do not by themselves guarantee passivity, reciprocity,
-  real-time conjugate symmetry, or a minimal realization.
+- QR conditioning prevents ill-conditioned raw coefficients from defining the
+  neural loss, but it cannot repair an inadequate rational pole basis.
+- Auto reciprocity is exact after its output projection. Auto passivity is
+  enforced on sampled training rows through one uniform contraction; it is not
+  a continuous-domain bounded-real synthesis or a minimal realization.
+- `metadata.json` reports rational-only train/verification error, basis
+  condition number, reciprocity detection, and passivity before/after scaling.
+  A large rational-only error means order, damping, or the formulation—not NN
+  size—is the current bottleneck.
 - Accuracy is determined jointly by rational order, pole damping, frequency
   weighting, ridge regularization, geometry coverage, and MLP capacity.
 - Direct export evaluates the fixed-pole equation; it does not sample and
@@ -4652,8 +4765,11 @@ when many frequency samples are present.
 #### Persistence and export
 
 In addition to the normal MLP arrays, `model.npz` stores the real and imaginary
-parts of every pole and $f_{\mathrm{scale}}$. `metadata.json` stores the pole count,
-coefficient count per S-parameter, damping, ridge value, and fit configuration.
+parts of every pole and $f_{\mathrm{scale}}$. The conditioned decoder,
+reciprocity projection, and optional passivity scale are already folded into
+the saved last layer. `metadata.json` stores the pole count, coefficient count
+per S-parameter, damping, ridge value, conditioning diagnostics, rational-stage
+error, structural-control decisions, and fit configuration.
 Verilog-A and ADS HB exports evaluate the coefficient MLP, reconstruct the
 rational S-matrix at simulator frequency, convert it to Y, and stamp the same
 N-port relation used by the other families.
@@ -4733,13 +4849,13 @@ Thus scaling changes the ADS unit convention without changing the fitted model.
 | Property | DNN | KBNN | Neuro-TF |
 | --- | --- | --- | --- |
 | Neural input | Parameters plus frequency features | Parameters, frequency features, and optionally fitted coarse S | Parameters only |
-| Neural target | Complex S or Y at each RF row | Fine complex S or fine-minus-fitted-coarse complex S | Complex rational coefficients per geometry |
+| Neural target | Complex S or Y at each RF row | Fine complex S or fine-minus-fitted-coarse complex S | QR-conditioned rational response coordinates per geometry |
 | RF neural samples per geometry | Number of positive-frequency rows | Number of positive-frequency rows | One |
 | Frequency structure | Learned directly | Learned directly around coarse knowledge | Fixed stable pole basis |
 | Prior model | None | Frozen fitted S-domain DNN | Fixed rational basis |
 | Typical strength | Maximum response flexibility | Efficient correction when useful coarse data exists | Compact broadband frequency representation |
 | Main risk | Data demand and unconstrained frequency interpolation | Bias or error inherited from coarse model and mode choice | Insufficient pole order/basis placement or nonsmooth coefficient map |
-| RF passivity enforcement | None | None | None |
+| RF passivity enforcement | None | None | Automatic sampled training-domain contraction for passive source data; verification remains independent |
 | Exact DC | Separate Appendix A model | Separate fine-data Appendix A model | Separate Appendix A model |
 
 ### B.9 References and implementation provenance
