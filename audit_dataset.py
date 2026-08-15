@@ -21,6 +21,7 @@ from typing import Sequence
 
 import numpy as np
 
+from generate_points import parameter_specs_from_geometry_metadata
 from surrogate_common import (
     MDIFBlock,
     infer_nports,
@@ -52,6 +53,13 @@ class AuditRecord:
     header: SourceHeader
 
 
+@dataclass
+class GeometryDomain:
+    source_paths: list[Path]
+    parameters: dict[str, dict[str, object]]
+    inferred: bool
+
+
 def issue(
     severity: str,
     code: str,
@@ -72,6 +80,82 @@ def issue(
         "message": message,
     }
     return row
+
+
+def is_geometry_metadata_json(path: Path) -> bool:
+    """Return whether a JSON file has the generated-geometry metadata shape."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("schema_version") == 1
+        and isinstance(payload.get("geometry_file"), str)
+        and isinstance(payload.get("parameters"), list)
+        and payload["parameters"]
+    )
+
+
+def resolve_geometry_domain(
+    explicit_paths: Sequence[str],
+    mdif_paths: Sequence[Path],
+) -> GeometryDomain | None:
+    """Load and merge declared parameter bounds from geometry-generation JSON."""
+
+    inferred = not explicit_paths
+    if explicit_paths:
+        source_paths = [Path(path).expanduser() for path in explicit_paths]
+    else:
+        candidates = [path.with_suffix(".json") for path in mdif_paths]
+        source_paths = [
+            path
+            for path in dict.fromkeys(candidates)
+            if path.is_file() and is_geometry_metadata_json(path)
+        ]
+    source_paths = list(dict.fromkeys(source_paths))
+    if not source_paths:
+        return None
+
+    merged: dict[str, dict[str, object]] = {}
+    for source_path in source_paths:
+        specs = parameter_specs_from_geometry_metadata(source_path)
+        for spec in specs:
+            key = normalize_name(spec.name).lower()
+            current = merged.get(key)
+            if current is None:
+                merged[key] = {
+                    "name": spec.name,
+                    "lower_base_units": float(spec.lower),
+                    "upper_base_units": float(spec.upper),
+                    "unit": spec.unit,
+                    "scale": spec.scale,
+                    "source_files": [str(source_path)],
+                }
+                continue
+            if current["scale"] != spec.scale:
+                raise ValueError(
+                    f"Geometry metadata disagrees on the scale for {spec.name!r}: "
+                    f"{current['scale']!r} versus {spec.scale!r} in {source_path}"
+                )
+            current["lower_base_units"] = min(
+                float(current["lower_base_units"]),
+                float(spec.lower),
+            )
+            current["upper_base_units"] = max(
+                float(current["upper_base_units"]),
+                float(spec.upper),
+            )
+            sources = list(current["source_files"])
+            if str(source_path) not in sources:
+                sources.append(str(source_path))
+            current["source_files"] = sources
+    return GeometryDomain(
+        source_paths=source_paths,
+        parameters=merged,
+        inferred=inferred,
+    )
 
 
 def scan_mdif_headers(path: Path) -> list[SourceHeader]:
@@ -670,6 +754,154 @@ def format_number(value: object) -> str:
     return str(value)
 
 
+ISSUE_RECOMMENDATIONS = {
+    "RANDOM_HOLDOUT_USED": (
+        "Add explicit train/verification labels through the split VAR, or pass a "
+        "separate --verification-mdif. Otherwise confirm that the reproducible "
+        "random holdout is intentional."
+    ),
+    "DUPLICATE_GEOMETRY": (
+        "Review dataset_duplicates.csv and remove redundant blocks, or confirm "
+        "that the repeated simulations are intentional and equivalent."
+    ),
+    "NEIGHBOR_RESPONSE_OUTLIER": (
+        "Inspect the named block pair in dataset_neighbor_consistency.csv and the "
+        "source MDIF. Confirm whether the jump is a real resonance or a failed "
+        "simulation, port-order error, or geometry-metadata mismatch."
+    ),
+    "VERIFICATION_OUTSIDE_TRAIN_RANGE": (
+        "Pass the original generated geometry metadata through --geometry-json so "
+        "coverage uses the intended domain. If no geometry JSON exists, expand the "
+        "training range or treat these metrics explicitly as extrapolation."
+    ),
+    "VERIFICATION_OUTSIDE_GEOMETRY_RANGE": (
+        "Correct the verification geometry if it is invalid, or regenerate/extend "
+        "the geometry domain and pass the updated JSON before treating this point "
+        "as an in-range verification sample."
+    ),
+    "FINE_OUTSIDE_COARSE_TRAIN_RANGE": (
+        "Add coarse-model training points that cover the full fine-data parameter "
+        "range before fitting a residual or prior-input KBNN."
+    ),
+    "INCONSISTENT_FREQUENCY_GRIDS": (
+        "Compare dataset_frequency_grids.csv with the intended sweep setup. Align "
+        "the grids when the difference is accidental; otherwise confirm that each "
+        "important frequency region still has adequate training coverage."
+    ),
+    "MISSING_REFERENCE_IMPEDANCE": (
+        "Declare the intended R reference impedance in every MDIF ACDATA option "
+        "line so conversions and comparisons do not depend on an implicit value."
+    ),
+    "NO_VERIFICATION_BLOCKS": (
+        "Add blocks labeled as verification, or pass --verification-mdif, before "
+        "using the audit or fitting metrics to judge generalization."
+    ),
+}
+
+
+def issue_location(row: dict[str, object]) -> str:
+    """Return a compact human-readable location for one audit issue."""
+
+    parts: list[str] = []
+    dataset = str(row.get("dataset") or "")
+    role = str(row.get("role") or "")
+    if dataset or role:
+        parts.append("/".join(value for value in (dataset, role) if value))
+    source_file = str(row.get("source_file") or "")
+    if source_file:
+        parts.append(Path(source_file).name)
+    block = row.get("block")
+    if block not in (None, ""):
+        parts.append(f"block {block}")
+    frequency = row.get("frequency_hz")
+    if frequency not in (None, ""):
+        parts.append(f"{format_number(frequency)} Hz")
+    return ", ".join(parts)
+
+
+def summarize_issue_reasons(
+    problems: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Group issue rows into concise verdict reasons with corrective guidance."""
+
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for row in problems:
+        key = (str(row.get("severity") or ""), str(row.get("code") or "UNKNOWN"))
+        grouped.setdefault(key, []).append(row)
+
+    severity_order = {"ERROR": 0, "WARNING": 1}
+    reasons: list[dict[str, object]] = []
+    for (severity, code), rows in sorted(
+        grouped.items(),
+        key=lambda item: (severity_order.get(item[0][0], 2), item[0][1]),
+    ):
+        messages = list(
+            dict.fromkeys(
+                str(row.get("message") or "No explanation supplied.")
+                for row in rows
+            )
+        )
+        locations = list(
+            dict.fromkeys(
+                location
+                for row in rows
+                if (location := issue_location(row))
+            )
+        )
+        reasons.append(
+            {
+                "severity": severity,
+                "code": code,
+                "count": len(rows),
+                "reason": messages[0],
+                "representative_messages": messages[:5],
+                "affected_examples": locations[:5],
+                "additional_message_count": max(0, len(messages) - 5),
+                "additional_location_count": max(0, len(locations) - 5),
+                "recommendation": ISSUE_RECOMMENDATIONS.get(
+                    code,
+                    "Review the listed source rows in dataset_issues.csv and correct "
+                    "or explicitly accept the condition before relying on the model.",
+                ),
+            }
+        )
+    return reasons
+
+
+def print_verdict_reasons(reasons: Sequence[dict[str, object]]) -> None:
+    """Print actionable issue details immediately below the CLI verdict."""
+
+    if not reasons:
+        return
+    print("verdict reasons:")
+    for reason in reasons:
+        count = int(reason["count"])
+        print(
+            f"  - {reason['severity']} {reason['code']} "
+            f"({count} occurrence{'s' if count != 1 else ''})"
+        )
+        messages = list(reason["representative_messages"])
+        for index, message in enumerate(messages):
+            label = "reason" if index == 0 else "additional detail"
+            print(f"    {label}: {message}")
+        if int(reason["additional_message_count"]):
+            print(
+                "    additional detail: "
+                f"{reason['additional_message_count']} more distinct message(s) in "
+                "dataset_issues.csv"
+            )
+        locations = list(reason["affected_examples"])
+        if locations:
+            print(f"    affected: {'; '.join(str(value) for value in locations)}")
+        if int(reason["additional_location_count"]):
+            print(
+                "    affected: "
+                f"{reason['additional_location_count']} more location(s) in "
+                "dataset_issues.csv"
+            )
+        print(f"    action: {reason['recommendation']}")
+
+
 def audit_records(
     records: Sequence[AuditRecord],
     parameter_names: Sequence[str],
@@ -831,13 +1063,13 @@ def audit_records(
 def parameter_coverage(
     records: Sequence[AuditRecord],
     parameter_names: Sequence[str],
+    geometry_domain: GeometryDomain | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     rows: list[dict[str, object]] = []
     problems: list[dict[str, object]] = []
     for kind in sorted({record.dataset_kind for record in records}):
         kind_records = [record for record in records if record.dataset_kind == kind]
         for name_index, name in enumerate(parameter_names):
-            ranges: dict[str, tuple[float, float, int]] = {}
             role_values: dict[str, list[float]] = {}
             for role in ("train", "verification"):
                 values = []
@@ -848,35 +1080,112 @@ def parameter_coverage(
                     if vector is not None:
                         values.append(float(vector[name_index]))
                 role_values[role] = values
-                if values:
-                    ranges[role] = (min(values), max(values), len(values))
-                    rows.append(
-                        {
-                            "dataset": kind,
-                            "parameter": name,
-                            "role": role,
-                            "minimum_base_units": min(values),
-                            "maximum_base_units": max(values),
-                            "unique_values": len(set(values)),
-                            "blocks": len(values),
-                        }
-                    )
-            if "train" in ranges and role_values["verification"]:
-                train_min, train_max, _ = ranges["train"]
-                outside = [
+
+            train_values = role_values["train"]
+            verification_values = role_values["verification"]
+            train_bounds = (
+                (min(train_values), max(train_values)) if train_values else None
+            )
+            domain_parameter = (
+                geometry_domain.parameters.get(normalize_name(name).lower())
+                if geometry_domain is not None
+                else None
+            )
+            if domain_parameter is not None:
+                coverage_min = float(domain_parameter["lower_base_units"])
+                coverage_max = float(domain_parameter["upper_base_units"])
+                coverage_basis = "geometry_generation_json"
+                coverage_sources = ", ".join(
+                    Path(str(path)).name
+                    for path in domain_parameter["source_files"]
+                )
+            elif train_bounds is not None:
+                coverage_min, coverage_max = train_bounds
+                coverage_basis = "observed_training_extrema"
+                coverage_sources = ""
+            else:
+                coverage_min = None
+                coverage_max = None
+                coverage_basis = "unavailable"
+                coverage_sources = ""
+
+            def outside_bounds(value: float, lower: float, upper: float) -> bool:
+                below = value < lower and not math.isclose(
+                    value,
+                    lower,
+                    rel_tol=1.0e-10,
+                    abs_tol=1.0e-15,
+                )
+                above = value > upper and not math.isclose(
+                    value,
+                    upper,
+                    rel_tol=1.0e-10,
+                    abs_tol=1.0e-15,
+                )
+                return below or above
+
+            outside_observed = (
+                [
                     value
-                    for value in role_values["verification"]
-                    if value < train_min or value > train_max
+                    for value in verification_values
+                    if outside_bounds(value, train_bounds[0], train_bounds[1])
                 ]
-                if outside:
-                    problems.append(
-                        issue(
-                            "WARNING",
-                            "VERIFICATION_OUTSIDE_TRAIN_RANGE",
-                            f"{len(outside)} {kind} verification block(s) have {name} outside "
-                            f"the training range [{train_min:.9g}, {train_max:.9g}].",
-                        )
+                if train_bounds is not None
+                else []
+            )
+            outside_coverage = (
+                [
+                    value
+                    for value in verification_values
+                    if outside_bounds(value, coverage_min, coverage_max)
+                ]
+                if coverage_min is not None and coverage_max is not None
+                else []
+            )
+
+            for role in ("train", "verification"):
+                values = role_values[role]
+                if not values:
+                    continue
+                rows.append(
+                    {
+                        "dataset": kind,
+                        "parameter": name,
+                        "role": role,
+                        "minimum_base_units": min(values),
+                        "maximum_base_units": max(values),
+                        "unique_values": len(set(values)),
+                        "blocks": len(values),
+                        "coverage_basis": coverage_basis,
+                        "coverage_source_files": coverage_sources,
+                        "coverage_minimum_base_units": coverage_min,
+                        "coverage_maximum_base_units": coverage_max,
+                        "verification_outside_observed_training": (
+                            len(outside_observed) if role == "verification" else ""
+                        ),
+                        "verification_outside_coverage": (
+                            len(outside_coverage) if role == "verification" else ""
+                        ),
+                    }
+                )
+
+            if outside_coverage:
+                if domain_parameter is not None:
+                    code = "VERIFICATION_OUTSIDE_GEOMETRY_RANGE"
+                    message = (
+                        f"{len(outside_coverage)} {kind} verification block(s) have "
+                        f"{name} outside the declared geometry generation range "
+                        f"[{coverage_min:.9g}, {coverage_max:.9g}] from "
+                        f"{coverage_sources}."
                     )
+                else:
+                    code = "VERIFICATION_OUTSIDE_TRAIN_RANGE"
+                    message = (
+                        f"{len(outside_coverage)} {kind} verification block(s) have "
+                        f"{name} outside the observed training range "
+                        f"[{coverage_min:.9g}, {coverage_max:.9g}]."
+                    )
+                problems.append(issue("WARNING", code, message))
     return rows, problems
 
 
@@ -921,6 +1230,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verification-mdif", help="Optional separate fine/direct verification MDIF.")
     parser.add_argument("--coarse-mdif", help="Optional KBNN coarse training/combined MDIF.")
     parser.add_argument("--coarse-verification-mdif", help="Optional separate KBNN coarse verification MDIF.")
+    parser.add_argument(
+        "--geometry-json",
+        action="append",
+        default=[],
+        help=(
+            "Generated geometry metadata JSON whose declared parameter bounds define "
+            "coverage. Repeat for extended campaigns. When omitted, valid same-stem "
+            "JSON files beside the supplied MDIFs are used automatically."
+        ),
+    )
     parser.add_argument("--out-dir", default="dataset_audit", help="Audit artifact directory. Default: dataset_audit.")
     parser.add_argument("--parameter-names", help="Comma-separated geometry/process VAR names. Default: infer from the fine data.")
     parser.add_argument("--split-var", default="dataset", help="VAR that identifies train and verification blocks. Default: dataset.")
@@ -972,6 +1291,17 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     train_values = parse_csv_set(args.train_values)
     verify_values = parse_csv_set(args.verify_values)
+    mdif_paths = [
+        Path(path)
+        for path in (
+            args.mdif,
+            args.verification_mdif,
+            args.coarse_mdif,
+            args.coarse_verification_mdif,
+        )
+        if path
+    ]
+    geometry_domain = resolve_geometry_domain(args.geometry_json, mdif_paths)
     records: list[AuditRecord] = []
     problems: list[dict[str, object]] = []
     next_record_id = 1
@@ -1005,11 +1335,27 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         problems.extend(load_problems)
 
     requested_names = args.parameter_names
+    if requested_names is None and geometry_domain is not None:
+        requested_names = ",".join(
+            str(parameter["name"])
+            for parameter in geometry_domain.parameters.values()
+        )
     parameter_names = infer_parameter_names(
         [record.block for record in fine_records],
         requested=requested_names,
         split_var=args.split_var,
     )
+    if geometry_domain is not None:
+        missing_geometry_parameters = [
+            name
+            for name in parameter_names
+            if normalize_name(name).lower() not in geometry_domain.parameters
+        ]
+        if missing_geometry_parameters:
+            raise ValueError(
+                "Geometry metadata does not declare the audited parameter(s): "
+                + ", ".join(missing_geometry_parameters)
+            )
     label_sets = Counter(
         tuple(sorted(record.block.sparams, key=sparam_sort_key)) for record in fine_records
     )
@@ -1100,7 +1446,11 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         minimum_relative_jump=args.neighbor_min_relative_jump,
     )
     problems.extend(neighbor_problems)
-    coverage_rows, coverage_problems = parameter_coverage(records, parameter_names)
+    coverage_rows, coverage_problems = parameter_coverage(
+        records,
+        parameter_names,
+        geometry_domain,
+    )
     problems.extend(coverage_problems)
     problems.extend(coarse_coverage_issues(records, parameter_names))
 
@@ -1139,6 +1489,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         verdict = "WARNING"
     else:
         verdict = "PASS"
+    verdict_reasons = summarize_issue_reasons(problems)
 
     issues_path = out_dir / "dataset_issues.csv"
     blocks_path = out_dir / "dataset_blocks.csv"
@@ -1158,6 +1509,21 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     write_csv(duplicates_path, duplicate_rows)
     write_csv(neighbors_path, neighbor_rows)
     plot_written = svg_passivity_plot(plot_path, block_rows, 1.0 + args.passivity_tolerance)
+    geometry_domain_summary = (
+        {
+            "source": "geometry_generation_json",
+            "selection": "inferred_same_stem" if geometry_domain.inferred else "explicit",
+            "source_files": [str(path) for path in geometry_domain.source_paths],
+            "parameters": list(geometry_domain.parameters.values()),
+        }
+        if geometry_domain is not None
+        else {
+            "source": "observed_training_extrema",
+            "selection": "no_geometry_json",
+            "source_files": [],
+            "parameters": [],
+        }
+    )
 
     summary: dict[str, object] = {
         "verdict": verdict,
@@ -1187,8 +1553,10 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         },
         "reference_impedance_ohm": z0_values,
         "frequency_grid_count": len(grid_rows),
+        "coverage_domain": geometry_domain_summary,
         "issue_counts": dict(severity_counts),
         "issue_code_counts": dict(Counter(str(row["code"]) for row in problems)),
+        "verdict_reasons": verdict_reasons,
         "artifacts": {
             "report": markdown_path.name,
             "issues": issues_path.name,
@@ -1212,14 +1580,85 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         "model is fitted. A raw-data PASS does not guarantee that an unconstrained "
         "neural interpolation will remain passive between samples.",
         "",
-        "## Summary",
+        "## Why this verdict was issued",
         "",
     ]
+    if verdict_reasons:
+        markdown.append(
+            f"The `{verdict}` verdict is caused by the following grouped audit "
+            "conditions. Each reason includes the practical next step; "
+            f"[{issues_path.name}]({issues_path.name}) contains every individual row."
+        )
+        for reason in verdict_reasons:
+            count = int(reason["count"])
+            markdown.extend(
+                [
+                    "",
+                    f"### {reason['severity']}: `{reason['code']}`",
+                    "",
+                    f"**Occurrences:** {count}",
+                    "",
+                    f"**Reason:** {reason['reason']}",
+                ]
+            )
+            messages = list(reason["representative_messages"])[1:]
+            if messages:
+                markdown.extend(["", "Additional representative details:", ""])
+                markdown.extend(f"- {message}" for message in messages)
+            if int(reason["additional_message_count"]):
+                markdown.append(
+                    f"- {reason['additional_message_count']} more distinct message(s) "
+                    f"are recorded in [{issues_path.name}]({issues_path.name})."
+                )
+            locations = list(reason["affected_examples"])
+            if locations:
+                markdown.extend(
+                    [
+                        "",
+                        "**Affected examples:** "
+                        + "; ".join(str(value) for value in locations),
+                    ]
+                )
+            if int(reason["additional_location_count"]):
+                markdown.append(
+                    f"{reason['additional_location_count']} more affected location(s) "
+                    f"are recorded in [{issues_path.name}]({issues_path.name})."
+                )
+            markdown.extend(
+                [
+                    "",
+                    f"**Recommended action:** {reason['recommendation']}",
+                ]
+            )
+    else:
+        markdown.append(
+            "The audit found no error or warning conditions, so the raw dataset "
+            "received a `PASS` verdict."
+        )
+    markdown.extend(
+        [
+            "",
+            "## Summary",
+            "",
+        ]
+    )
     markdown.extend(
         markdown_table(
             ["Check", "Result"],
             [
                 ["Parameters", ", ".join(parameter_names)],
+                [
+                    "Coverage range source",
+                    (
+                        "geometry-generation JSON: "
+                        + ", ".join(
+                            Path(str(path)).name
+                            for path in geometry_domain_summary["source_files"]
+                        )
+                        if geometry_domain is not None
+                        else "observed training extrema (no geometry JSON supplied or inferred)"
+                    ),
+                ],
                 ["Ports", nports if nports is not None else "incomplete matrix"],
                 ["Fine training blocks", role_counts.get(("fine", "train"), 0)],
                 ["Fine verification blocks", role_counts.get(("fine", "verification"), 0)],
@@ -1297,10 +1736,58 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     else:
         markdown.append("No structural, split, duplicate, coverage, or passivity issues were found.")
 
+    markdown.extend(["", "## Declared geometry domain", ""])
+    if geometry_domain is not None:
+        markdown.append(
+            "Verification coverage is checked against these declared generation "
+            "bounds, not against the sampled training-point extrema."
+        )
+        markdown.append("")
+        markdown.extend(
+            markdown_table(
+                [
+                    "Parameter",
+                    "Minimum (base units)",
+                    "Maximum (base units)",
+                    "Scale",
+                    "Source JSON",
+                ],
+                [
+                    [
+                        parameter["name"],
+                        format_number(parameter["lower_base_units"]),
+                        format_number(parameter["upper_base_units"]),
+                        parameter["scale"],
+                        ", ".join(
+                            Path(str(path)).name
+                            for path in parameter["source_files"]
+                        ),
+                    ]
+                    for parameter in geometry_domain.parameters.values()
+                ],
+            )
+        )
+    else:
+        markdown.append(
+            "No geometry-generation JSON was supplied or inferred. Verification "
+            "coverage therefore uses the observed training-point extrema. Pass "
+            "`--geometry-json geometries.json` to use the intended generated domain."
+        )
+
     markdown.extend(["", "## Parameter coverage", ""])
     markdown.extend(
         markdown_table(
-            ["Dataset", "Parameter", "Role", "Minimum (base units)", "Maximum (base units)", "Unique values"],
+            [
+                "Dataset",
+                "Parameter",
+                "Role",
+                "Observed minimum",
+                "Observed maximum",
+                "Coverage basis",
+                "Coverage minimum",
+                "Coverage maximum",
+                "Verification outside coverage",
+            ],
             [
                 [
                     row["dataset"],
@@ -1308,7 +1795,10 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
                     row["role"],
                     format_number(row["minimum_base_units"]),
                     format_number(row["maximum_base_units"]),
-                    row["unique_values"],
+                    row["coverage_basis"],
+                    format_number(row["coverage_minimum_base_units"]),
+                    format_number(row["coverage_maximum_base_units"]),
+                    row["verification_outside_coverage"],
                 ]
                 for row in coverage_rows
             ],
@@ -1357,9 +1847,11 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
             "sampling near resonances, or model capacity—not necessarily corrupt data.",
             "- Train/verification overlap invalidates verification metrics. Conflicting "
             "duplicate geometries are stronger evidence of bad simulation or metadata.",
-            "- Verification points outside the training range test extrapolation rather than "
-            "interpolation. For KBNN, fine points outside the coarse training range also "
-            "force the fitted coarse model to extrapolate.",
+            "- Verification points outside the declared geometry-generation range test "
+            "extrapolation rather than interpolation. When no geometry JSON is available, "
+            "the observed training extrema are used as a conservative fallback. For KBNN, "
+            "fine points outside the coarse training range also force the fitted coarse "
+            "model to extrapolate.",
             "- Multiple frequency grids are supported, but a low-coverage grid or missing "
             "resonance band can bias the loss. Review `dataset_frequency_grids.csv`.",
             "",
@@ -1386,6 +1878,23 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         f"coarse train={role_counts.get(('coarse', 'train'), 0)}, "
         f"coarse verification={role_counts.get(('coarse', 'verification'), 0)}"
     )
+    if geometry_domain is not None:
+        selection = "inferred" if geometry_domain.inferred else "explicit"
+        print(
+            f"coverage domain: geometry JSON ({selection}): "
+            + ", ".join(str(path) for path in geometry_domain.source_paths)
+        )
+        for parameter in geometry_domain.parameters.values():
+            print(
+                f"  {parameter['name']}: "
+                f"[{format_number(parameter['lower_base_units'])}, "
+                f"{format_number(parameter['upper_base_units'])}] base units"
+            )
+    else:
+        print(
+            "coverage domain: observed training extrema; pass --geometry-json "
+            "geometries.json to use declared generation bounds"
+        )
     print(
         f"raw passivity: {len(violation_rows)} violating row(s) "
         f"(RF={len(rf_violation_rows)}, DC={len(dc_violation_rows)}), "
@@ -1396,6 +1905,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         f"issues: {severity_counts.get('ERROR', 0)} error(s), "
         f"{severity_counts.get('WARNING', 0)} warning(s)"
     )
+    print_verdict_reasons(verdict_reasons)
     print(f"report: {markdown_path}")
     exit_code = 1 if severity_counts["ERROR"] else 0
     if args.fail_on_warnings and severity_counts["WARNING"]:

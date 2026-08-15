@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import json
 import tempfile
@@ -8,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 import audit_dataset as AUDIT
+import generate_points as POINTS
 from surrogate_common import MDIFBlock, write_mdif
 
 
@@ -32,6 +34,29 @@ def passive_block(
             "S22": np.full(count, 0.1 + 0.0j),
         },
     )
+
+
+def generated_geometry_json(root: Path, stem: str = "geometries") -> Path:
+    geometry_csv = root / f"{stem}.csv"
+    with contextlib.redirect_stdout(io.StringIO()):
+        status = POINTS.main(
+            [
+                "generate",
+                "--parameter",
+                "W=0:4",
+                "--count",
+                "6",
+                "--verification-count",
+                "1",
+                "--lhs-candidates",
+                "2",
+                "--out",
+                str(geometry_csv),
+            ]
+        )
+    if status != 0:
+        raise AssertionError(f"geometry generation failed with status {status}")
+    return geometry_csv.with_suffix(".json")
 
 
 class DatasetAuditTests(unittest.TestCase):
@@ -66,6 +91,7 @@ class DatasetAuditTests(unittest.TestCase):
             self.assertEqual(summary["block_counts"]["fine_train"], 2)
             self.assertEqual(summary["block_counts"]["fine_verification"], 1)
             self.assertEqual(summary["passivity"]["violating_rows"], 0)
+            self.assertEqual(summary["verdict_reasons"], [])
             self.assertTrue((out_dir / "dataset_audit.md").is_file())
             self.assertTrue((out_dir / "dataset_passivity.svg").is_file())
 
@@ -114,7 +140,8 @@ class DatasetAuditTests(unittest.TestCase):
                 ],
                 LABELS,
             )
-            with contextlib.redirect_stdout(io.StringIO()):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
                 status = AUDIT.main(
                     [
                         "--mdif",
@@ -131,6 +158,27 @@ class DatasetAuditTests(unittest.TestCase):
             codes = summary["issue_code_counts"]
             self.assertGreater(codes["INCONSISTENT_FREQUENCY_GRIDS"], 0)
             self.assertGreater(codes["VERIFICATION_OUTSIDE_TRAIN_RANGE"], 0)
+            output = stdout.getvalue()
+            self.assertIn("dataset audit: WARNING", output)
+            self.assertIn("verdict reasons:", output)
+            self.assertIn("WARNING INCONSISTENT_FREQUENCY_GRIDS", output)
+            self.assertIn("fine data uses 2 distinct frequency grids", output)
+            self.assertIn("action: Compare dataset_frequency_grids.csv", output)
+            self.assertIn("WARNING VERIFICATION_OUTSIDE_TRAIN_RANGE", output)
+
+            reasons = {
+                reason["code"]: reason for reason in summary["verdict_reasons"]
+            }
+            grid_reason = reasons["INCONSISTENT_FREQUENCY_GRIDS"]
+            self.assertEqual(grid_reason["severity"], "WARNING")
+            self.assertEqual(grid_reason["count"], 1)
+            self.assertIn("distinct frequency grids", grid_reason["reason"])
+            self.assertIn("dataset_frequency_grids.csv", grid_reason["recommendation"])
+
+            report = (out_dir / "dataset_audit.md").read_text()
+            self.assertIn("## Why this verdict was issued", report)
+            self.assertIn("### WARNING: `INCONSISTENT_FREQUENCY_GRIDS`", report)
+            self.assertIn("**Recommended action:**", report)
 
     def test_fine_range_outside_coarse_training_range_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -173,6 +221,130 @@ class DatasetAuditTests(unittest.TestCase):
                 summary["issue_code_counts"]["FINE_OUTSIDE_COARSE_TRAIN_RANGE"],
                 0,
             )
+
+    def test_geometry_json_defines_verification_coverage_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mdif = root / "combined.mdif"
+            out_dir = root / "audit"
+            geometry_json = generated_geometry_json(root)
+            write_mdif(
+                mdif,
+                [
+                    passive_block(1.0, "train"),
+                    passive_block(2.0, "train"),
+                    passive_block(3.0, "verification"),
+                ],
+                LABELS,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = AUDIT.main(
+                    [
+                        "--mdif",
+                        str(mdif),
+                        "--geometry-json",
+                        str(geometry_json),
+                        "--out-dir",
+                        str(out_dir),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            summary = json.loads((out_dir / "dataset_audit.json").read_text())
+            self.assertEqual(summary["verdict"], "PASS")
+            self.assertEqual(summary["parameter_names"], ["W"])
+            self.assertNotIn(
+                "VERIFICATION_OUTSIDE_TRAIN_RANGE",
+                summary["issue_code_counts"],
+            )
+            self.assertEqual(
+                summary["coverage_domain"]["source"],
+                "geometry_generation_json",
+            )
+            self.assertEqual(summary["coverage_domain"]["selection"], "explicit")
+            self.assertIn("coverage domain: geometry JSON (explicit)", stdout.getvalue())
+
+            with (out_dir / "dataset_parameter_coverage.csv").open(newline="") as stream:
+                coverage = list(csv.DictReader(stream))
+            verification = next(row for row in coverage if row["role"] == "verification")
+            self.assertEqual(verification["coverage_basis"], "geometry_generation_json")
+            self.assertEqual(verification["verification_outside_observed_training"], "1")
+            self.assertEqual(verification["verification_outside_coverage"], "0")
+
+    def test_same_stem_geometry_json_is_inferred(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mdif = root / "campaign.mdif"
+            out_dir = root / "audit"
+            generated_geometry_json(root, stem="campaign")
+            write_mdif(
+                mdif,
+                [
+                    passive_block(1.0, "train"),
+                    passive_block(2.0, "train"),
+                    passive_block(3.0, "verification"),
+                ],
+                LABELS,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = AUDIT.main(
+                    [
+                        "--mdif",
+                        str(mdif),
+                        "--out-dir",
+                        str(out_dir),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            summary = json.loads((out_dir / "dataset_audit.json").read_text())
+            self.assertEqual(summary["verdict"], "PASS")
+            self.assertEqual(
+                summary["coverage_domain"]["selection"],
+                "inferred_same_stem",
+            )
+
+    def test_verification_outside_geometry_json_range_still_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mdif = root / "combined.mdif"
+            out_dir = root / "audit"
+            geometry_json = generated_geometry_json(root)
+            write_mdif(
+                mdif,
+                [
+                    passive_block(1.0, "train"),
+                    passive_block(2.0, "train"),
+                    passive_block(5.0, "verification"),
+                ],
+                LABELS,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = AUDIT.main(
+                    [
+                        "--mdif",
+                        str(mdif),
+                        "--geometry-json",
+                        str(geometry_json),
+                        "--out-dir",
+                        str(out_dir),
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            summary = json.loads((out_dir / "dataset_audit.json").read_text())
+            self.assertEqual(summary["verdict"], "WARNING")
+            self.assertEqual(
+                summary["issue_code_counts"]["VERIFICATION_OUTSIDE_GEOMETRY_RANGE"],
+                1,
+            )
+            self.assertNotIn(
+                "VERIFICATION_OUTSIDE_TRAIN_RANGE",
+                summary["issue_code_counts"],
+            )
+            self.assertIn("declared geometry generation range", stdout.getvalue())
 
 
 if __name__ == "__main__":

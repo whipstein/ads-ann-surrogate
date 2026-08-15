@@ -216,6 +216,7 @@ For one combined MDIF containing 160 `dataset=train` blocks and 40
 ```bash
 python3 audit_dataset.py \
   --mdif train_verify.mdif \
+  --geometry-json geometries.json \
   --out-dir outputs/train_verify_audit
 ```
 
@@ -226,9 +227,32 @@ numeric metadata variable or to enforce a particular parameter set:
 ```bash
 python3 audit_dataset.py \
   --mdif train_verify.mdif \
+  --geometry-json geometries.json \
   --parameter-names W,L,H,Er,TanD,Roughness \
   --out-dir outputs/train_verify_audit
 ```
+
+Use the JSON written alongside the geometry CSV by `generate_points.py`. Its
+declared base-unit parameter bounds—not the minimum and maximum values that
+happen to appear in the sampled training subset—define whether a verification
+point is inside the intended design domain. This avoids false extrapolation
+warnings for sparse LHS, Sobol, Halton, and GP-selected training points.
+
+`--geometry-json` can be repeated when the campaign was extended. The audit
+uses the combined minimum and maximum declared bounds for each parameter:
+
+```bash
+python3 audit_dataset.py \
+  --mdif train_verify.mdif \
+  --geometry-json original_geometries.json \
+  --geometry-json extended_geometries.json \
+  --out-dir outputs/train_verify_audit
+```
+
+If the MDIF and geometry metadata share a stem and directory, such as
+`campaign.mdif` and `campaign.json`, the JSON is detected automatically.
+Otherwise, pass it explicitly. Without an applicable geometry JSON, the audit
+falls back to the observed training extrema and says so in the CLI and report.
 
 When training and verification are separate files, use the same separation as
 the fitting command:
@@ -237,6 +261,7 @@ the fitting command:
 python3 audit_dataset.py \
   --mdif train.mdif \
   --verification-mdif verification.mdif \
+  --geometry-json geometries.json \
   --out-dir outputs/data_audit
 ```
 
@@ -246,6 +271,7 @@ For an integrated KBNN fit, audit the fine and coarse datasets together:
 python3 audit_dataset.py \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
+  --geometry-json geometries.json \
   --out-dir outputs/kbnn_data_audit
 ```
 
@@ -266,15 +292,22 @@ The audit performs these checks:
   inconsistent port counts, reference impedances, and frequency grids;
 - detects redundant or conflicting duplicate geometries and any
   train/verification overlap;
-- compares verification parameter coverage with the training range;
+- compares verification parameter coverage with the declared geometry-generation
+  range, falling back to observed training extrema only when no geometry JSON is
+  supplied or inferred;
 - ranks abrupt S-response changes between nearest training geometries; and
 - optionally checks reciprocity with `--expect-reciprocal`.
 
-The command prints a short verdict and writes:
+The command prints the verdict followed by one actionable explanation per error
+or warning code. Each explanation includes its occurrence count, representative
+message, affected source/block/frequency examples when available, and a
+recommended response. It also writes:
 
-- `dataset_audit.md`: integrated report with an inset passivity plot and the
-  most important findings;
-- `dataset_audit.json`: machine-readable verdict and issue counts;
+- `dataset_audit.md`: integrated report with a **Why this verdict was issued**
+  section, recommended actions, an inset passivity plot, and the detailed
+  findings;
+- `dataset_audit.json`: machine-readable verdict, issue counts, structured
+  `verdict_reasons` entries, and the selected coverage-domain source and bounds;
 - `dataset_passivity.csv`: every block/frequency singular-value calculation;
 - `dataset_blocks.csv`: passivity, grid, format, and geometry summary per block;
 - `dataset_issues.csv`: every error and warning with source block/frequency;
@@ -285,8 +318,23 @@ The command prints a short verdict and writes:
 `FAIL` and exit status 1 mean the raw dataset contains a definite problem such
 as non-passive S-data, conflicting duplicates, missing data, or split leakage.
 `WARNING` and exit status 0 mean the raw values are usable but deserve review,
-for example because verification extrapolates beyond training. Use
-`--fail-on-warnings` for CI-style strict checking.
+for example because verification lies beyond the declared geometry-generation
+range. A verification value outside only the sampled training extrema is still
+reported in the coverage CSV for diagnosis, but does not create a warning when
+it remains inside the declared range. Use `--fail-on-warnings` for CI-style
+strict checking.
+
+For example, a frequency-grid warning now identifies both the reason and what
+to inspect:
+
+```text
+dataset audit: WARNING
+issues: 0 error(s), 1 warning(s)
+verdict reasons:
+  - WARNING INCONSISTENT_FREQUENCY_GRIDS (1 occurrence)
+    reason: fine data uses 2 distinct frequency grids. Variable grids are supported, but missing or inconsistent sweeps can create uneven fitting coverage.
+    action: Compare dataset_frequency_grids.csv with the intended sweep setup. Align accidental differences or confirm adequate coverage.
+```
 
 Most importantly, a raw-data `PASS` changes the diagnosis: if all DNN and KBNN
 fits remain non-passive while every supplied S-matrix is passive, the dataset
@@ -302,6 +350,7 @@ or a passivity-preserving formulation.
 | --- | --- | --- |
 | <nobr><code>--coarse-mdif PATH</code></nobr> | Optional KBNN coarse training or combined MDIF. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
 | <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse verification MDIF; requires <code>--coarse-mdif</code>. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--geometry-json PATH</code></nobr> | Geometry-generation metadata whose declared bounds define verification coverage. Repeat for extended campaigns. A valid same-stem JSON beside an MDIF is inferred when this option is omitted. | <nobr><code>--geometry-json geometries.json</code></nobr> |
 | <nobr><code>--mdif PATH</code></nobr> | Required direct-model or KBNN fine training/combined MDIF. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
 | <nobr><code>--parameter-names NAMES</code></nobr> | Optional comma-separated geometry variables. By default they are inferred from common numeric <code>VAR</code> values. | <nobr><code>--parameter-names W,L,H</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate direct/fine verification MDIF. Every block in <code>--mdif</code> is then treated as training. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
