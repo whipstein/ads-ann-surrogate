@@ -426,7 +426,13 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="neurotf_best_config.json",
         summary_filename="neurotf_sweep_summary.md",
         diagnostics_prefix="neurotf",
-        train_command_prefix=[sys.executable, "neuro_tf.py", "train"],
+        train_command_prefix=[
+            sys.executable,
+            "surrogate.py",
+            "--model",
+            "neuro-tf",
+            "train",
+        ],
     )
     best_dir = Path(args.out_dir) / "best_model"
     if status == 0:
@@ -452,6 +458,7 @@ def neurotf_export_commands(
         model_dir,
         template_mdif,
         include_veriloga=True,
+        model_type="neuro-tf",
     )
 
 
@@ -1113,6 +1120,7 @@ def command_inspect(args: argparse.Namespace) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=os.environ.get("ADS_SURROGATE_CLI_PROG"),
         description="Train and evaluate a Neuro-TF surrogate from generic S-parameter MDIF data."
     )
     sub = parser.add_subparsers(dest="command", required=True)

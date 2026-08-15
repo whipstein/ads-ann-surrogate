@@ -17,6 +17,7 @@ import concurrent.futures
 import itertools
 import json
 import math
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -669,6 +670,7 @@ def dnn_export_commands(
         model_dir,
         template_mdif,
         include_veriloga=True,
+        model_type="dnn",
     )
 
 
@@ -1672,7 +1674,13 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="dnn_best_config.json",
         summary_filename="dnn_sweep_summary.md",
         diagnostics_prefix="dnn",
-        train_command_prefix=[sys.executable, "dnn.py", "train"],
+        train_command_prefix=[
+            sys.executable,
+            "surrogate.py",
+            "--model",
+            "dnn",
+            "train",
+        ],
     )
     best_dir = Path(args.out_dir) / "best_model"
     if status == 0:
@@ -1850,6 +1858,7 @@ def add_data_args(parser: argparse.ArgumentParser) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=os.environ.get("ADS_SURROGATE_CLI_PROG"),
         description="Train and evaluate a direct deep neural-network S-parameter surrogate from MDIF data."
     )
     sub = parser.add_subparsers(dest="command", required=True)

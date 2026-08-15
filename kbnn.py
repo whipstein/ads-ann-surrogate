@@ -1645,6 +1645,7 @@ def kbnn_export_commands(
         model_dir,
         template_mdif,
         include_veriloga=True,
+        model_type="kbnn",
     )
 
 
@@ -2846,7 +2847,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         ):
             setattr(reproduction_args, name, getattr(args, name, None))
     reproduction_command = single_model_train_command(
-        [sys.executable, "kbnn.py", "train"],
+        [sys.executable, "surrogate.py", "--model", "kbnn", "train"],
         reproduction_args,
         Path(prepared_args.out_dir) / "reproduced_model",
     )
@@ -3081,6 +3082,7 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=os.environ.get("ADS_SURROGATE_CLI_PROG"),
         description="Fit a coarse S-domain DNN and fine knowledge-based neural network as one Verilog-A-ready workflow."
     )
     sub = parser.add_subparsers(dest="command", required=True)

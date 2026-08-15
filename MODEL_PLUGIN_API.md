@@ -5,9 +5,10 @@ front end. A model script imports shared infrastructure from
 `surrogate_common.py` while keeping its fitting, prediction, and CLI logic in
 one root-level file.
 
-There is no dynamic plugin discovery layer. Add a uniquely named Python script
-beside `dnn.py`, `kbnn.py`, and `neuro_tf.py`, then add its workflow and command
-reference to the integrated `README.md`.
+There is no dynamic plugin discovery layer. Add a uniquely named Python backend
+beside `dnn.py`, `kbnn.py`, and `neuro_tf.py`, register its public model type in
+`surrogate.py`, then add its workflow and command reference to the integrated
+`README.md`.
 
 ## Flat Layout
 
@@ -15,20 +16,23 @@ For a new model named `my_model`, add:
 
 ```text
 .
+|-- surrogate.py
 |-- surrogate_common.py
 |-- my_model.py
 |-- my_model_sample_training_verification.mdif
 `-- README.md
 ```
 
-`my_model.py` is both the implementation and command entry point. Import the
-shared APIs directly:
+`my_model.py` is the implementation and executable backend. Import the shared
+APIs directly:
 
 ```python
 #!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -67,6 +71,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+```
+
+Register the backend in `surrogate.py` so users keep one stable entry point:
+
+```python
+MODEL_SCRIPTS = {
+    "dnn": "dnn.py",
+    "kbnn": "kbnn.py",
+    "neuro-tf": "neuro_tf.py",
+    "my-model": "my_model.py",
+}
+```
+
+The resulting command form is:
+
+```bash
+python3 surrogate.py --model my-model train --mdif input.mdif --out-dir outputs/my_model
 ```
 
 ## Shared Data Types
@@ -416,7 +437,13 @@ def command_sweep(args: argparse.Namespace) -> int:
         best_config_filename="my_model_best_config.json",
         summary_filename="my_model_sweep_summary.md",
         diagnostics_prefix="my_model",
-        train_command_prefix=[sys.executable, "my_model.py", "train"],
+        train_command_prefix=[
+            sys.executable,
+            "surrogate.py",
+            "--model",
+            "my-model",
+            "train",
+        ],
     )
 ```
 
@@ -439,7 +466,10 @@ Every plugin should expose a parser and `main()`:
 
 ```python
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="My model MDIF trainer")
+    parser = argparse.ArgumentParser(
+        prog=os.environ.get("ADS_SURROGATE_CLI_PROG"),
+        description="My model MDIF trainer",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     train = sub.add_parser("train")

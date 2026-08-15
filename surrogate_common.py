@@ -10777,17 +10777,29 @@ def build_training_export_commands(
     template_mdif: str | Path | None = None,
     *,
     include_veriloga: bool = False,
+    model_type: str | None = None,
 ) -> list[tuple[str, str]]:
     """Build export commands whose paths are relative to the repository root."""
 
     resolved_script_path = script_path.resolve()
     repository_root = resolved_script_path.parent
     resolved_model_dir = model_dir.resolve()
-    command_script_path = repository_relative_path(
-        resolved_script_path,
-        repository_root,
-    )
     command_python = Path(sys.executable).name or "python3"
+    if model_type is None:
+        command_prefix = [
+            command_python,
+            repository_relative_path(resolved_script_path, repository_root),
+        ]
+    else:
+        command_prefix = [
+            command_python,
+            repository_relative_path(
+                repository_root / "surrogate.py",
+                repository_root,
+            ),
+            "--model",
+            model_type,
+        ]
     command_model_dir = repository_relative_path(
         resolved_model_dir,
         repository_root,
@@ -10831,8 +10843,7 @@ def build_training_export_commands(
         )
         hb_module_name = f"{normalize_name(resolved_model_dir.name) or resolved_script_path.stem}_hb"
         ads_hb_argv = [
-            command_python,
-            command_script_path,
+            *command_prefix,
             "export-ads-hb",
             "--model-dir",
             command_model_dir,
@@ -10868,8 +10879,7 @@ def build_training_export_commands(
             )
         )
         veriloga_argv = [
-            command_python,
-            command_script_path,
+            *command_prefix,
             "export-veriloga",
             "--model-dir",
             command_model_dir,
@@ -10910,8 +10920,7 @@ def build_training_export_commands(
         template_path = candidate if candidate.exists() else None
     if template_path is not None:
         sampled_argv = [
-            command_python,
-            command_script_path,
+            *command_prefix,
             "export-ads-mdif",
             "--model-dir",
             command_model_dir,

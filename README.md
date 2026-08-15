@@ -1,45 +1,89 @@
 # ADS ANN Surrogate Models
 
 This repository contains offline Python tools for building surrogate models from
-parameterized RF/microwave S-parameter MDIF data. The typical workflow is:
+parameterized RF/microwave S-parameter MDIF data.
 
-1. Export or assemble MDIF blocks for a swept device geometry or process corner.
-2. Train a compact surrogate model that maps geometry/process variables and
-   frequency to complex network response.
-3. Verify the model against held-out MDIF blocks with numeric metrics,
-   passivity checks, and worst-case plots.
-4. Use the trained model to predict new MDIF data or export an ADS-ready
-   package for circuit-level simulation and optimization.
+## Repository Workflow
 
-The code uses a flat script-first layout: each modeling approach has one
-root-level entry point, while shared MDIF parsing, metrics, plotting, sweep
-orchestration, and ADS export helpers live in `surrogate_common.py`.
+```mermaid
+flowchart TD
+    POINTS["Generate initial points<br/>generate_points.py"]
+    SIM["Run EM or ADS simulations<br/>produce training and verification MDIF"]
+    AUDIT["Audit raw MDIF<br/>audit_dataset.py"]
+    CLI{"Select a model<br/>surrogate.py --model ..."}
 
-## What It Builds
+    DNN["DNN formulation<br/>dnn.py"]
+    KBNN["KBNN formulation<br/>kbnn.py"]
+    NTF["Neuro-TF formulation<br/>neuro_tf.py"]
+    FIT["Train or optimize<br/>write model and verification artifacts"]
+    VERIFY["Review accuracy, passivity,<br/>plots, and sweep trends"]
+    ACCEPT{"Targets satisfied?"}
 
-The repository provides three surrogate-model front ends:
+    UPDATE["Select additional or extended-range points<br/>generate_points.py suggest-additional"]
+    SIMNEW["Simulate the added points<br/>append them to training MDIF"]
+    REFIT["Refit the selected model"]
 
-| Model | Entry point | Best fit for | Basic idea |
-| --- | --- | --- | --- |
-| DNN | `dnn.py` | General parameterized S-parameter fitting when you want a direct neural response model. | A multilayer perceptron predicts S-parameters, or optionally Y-parameters, from geometry/process variables plus frequency features. |
-| KBNN | `kbnn.py` | Cases where a fast coarse model or lower-fidelity EM result is available. | A neural network learns the correction from coarse/prior response to fine/target response, or uses the coarse response as an input. |
-| Neuro-TF | `neuro_tf.py` | Smooth frequency responses where a rational transfer-function structure is useful. | Fixed stable poles define rational transfer functions; a neural network maps geometry/process variables to the fitted coefficients. |
+    EXPORT["Export the frozen model<br/>through surrogate.py"]
+    ADS["Integrate with ADS<br/>sampled MDIF, HB SDD, Verilog-A, or ANN"]
+    COMMON["Shared infrastructure<br/>surrogate_common.py"]
 
-All three tools read MDIF, train models, run sweeps, write verification
-artifacts, predict new response blocks, and export sampled ADS MDIF packages or
-self-contained Verilog-A n-ports. All three also export self-contained, linear
-ADS SDD subnetworks for harmonic balance. DNN and KBNN additionally support
-native ADS ANN package generation.
+    POINTS --> SIM --> AUDIT --> CLI
+    CLI --> DNN
+    CLI --> KBNN
+    CLI --> NTF
+    DNN --> FIT
+    KBNN --> FIT
+    NTF --> FIT
+    FIT --> VERIFY --> ACCEPT
+    ACCEPT -->|Needs improvement| UPDATE
+    UPDATE --> SIMNEW --> REFIT --> VERIFY
+    ACCEPT -->|Accepted| EXPORT --> ADS
+
+    COMMON -->|shared support| AUDIT
+    COMMON --> FIT
+    COMMON --> EXPORT
+
+    click POINTS "#1-generate-initial-points" "Open initial point generation"
+    click SIM "#2-simulate-and-audit-the-dataset" "Open simulation and input-data requirements"
+    click AUDIT "#audit-training-and-verification-data" "Open dataset auditing"
+    click CLI "#unified-model-cli" "Open the unified model CLI"
+    click DNN "#b3-dnn-direct-response-surrogate" "Open the DNN formulation"
+    click KBNN "#b4-kbnn-fitted-coarse-knowledge-based-surrogate" "Open the KBNN formulation"
+    click NTF "#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate" "Open the Neuro-TF formulation"
+    click FIT "#shared-training-and-optimization-workflow" "Open fitting and optimization"
+    click VERIFY "#fitting-output-artifacts" "Open fitting and verification outputs"
+    click ACCEPT "#5-refit-and-iterate" "Open the iteration criteria"
+    click UPDATE "#4-update-or-extend-the-sampling-points" "Open point updating"
+    click SIMNEW "#5-refit-and-iterate" "Open the refitting loop"
+    click REFIT "#5-refit-and-iterate" "Open the refitting loop"
+    click EXPORT "#export-commands" "Open model export commands"
+    click ADS "#choose-the-ads-handoff" "Open ADS integration choices"
+    click COMMON "#repository-layout" "Open the repository layout"
+```
+
+Each flowchart block links to the corresponding section when the Markdown
+renderer permits Mermaid links. The same destinations are available in the
+linked workflow list below. Direct formulation links are also available for
+[DNN](#b3-dnn-direct-response-surrogate),
+[KBNN](#b4-kbnn-fitted-coarse-knowledge-based-surrogate), and
+[Neuro-TF](#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate).
+
+The code uses a flat script-first layout. `surrogate.py` is the unified model
+entry point; it selects and runs the DNN, KBNN, or Neuro-TF backend. Shared MDIF
+parsing, metrics, plotting, sweep orchestration, and ADS export helpers live in
+`surrogate_common.py`.
 
 ## Repository Layout
 
 ```text
 .
-|-- dnn.py                                Direct DNN CLI and implementation
-|-- kbnn.py                               KBNN CLI and implementation
-|-- neuro_tf.py                           Neuro-TF CLI and implementation
+|-- surrogate.py                          Unified model-family CLI dispatcher
+|-- dnn.py                                DNN backend and implementation
+|-- kbnn.py                               KBNN backend and implementation
+|-- neuro_tf.py                           Neuro-TF backend and implementation
 |-- surrogate_common.py                   Shared training, reporting, and ADS export utilities
 |-- generate_points.py                    Geometry/process point-set generator
+|-- audit_dataset.py                      Raw MDIF passivity and consistency audit
 |-- de_generated_scripts/
 |   `-- parse_ads_hb_solver_log.py        ADS Newton/Krylov status-log comparison utility
 |-- dnn_sample_training_verification.mdif
@@ -78,37 +122,20 @@ a licensed ADS machine with the ADS Python environment because it imports
 `halton`. Its `sobol` method uses SciPy's Sobol implementation when SciPy is
 available.
 
-## Input Data
+The remainder of this README follows the order used to create and deploy a
+model:
 
-Input data is expected to be MDIF with one block per parameter point. Each block
-should provide numeric geometry or process values as `VAR` entries and an
-`ACDATA` table containing frequency and complex S-parameters:
+1. [generate an initial geometry set](#1-generate-initial-points);
+2. [simulate it and audit the training/verification data](#2-simulate-and-audit-the-dataset);
+3. [fit and optimize DNN, KBNN, or Neuro-TF](#3-fit-and-optimize-a-model);
+4. [select additional or extended-range points](#4-update-or-extend-the-sampling-points)
+   from the fitted-model error;
+5. [simulate those additions and refit](#5-refit-and-iterate) until the held-out
+   targets are met; and
+6. [export the frozen model](#6-export-and-integrate-with-ads) using the
+   appropriate ADS integration method.
 
-```text
-VAR dataset=train
-VAR W=0.40mm
-VAR L=1.20mm
-BEGIN ACDATA
-% Freq S11 S12 S21 S22
-# Hz S RI R 50
-1.0e9  0.1 0.0  0.0 0.0  0.8 -0.1  0.1 0.0
-2.0e9  0.2 0.0  0.0 0.0  0.6 -0.2  0.2 0.0
-END
-```
-
-The parser supports `RI`, `MA`, and `DB` complex pair formats. Header names may
-use logical S-parameter labels such as `S11` or explicit real/imaginary columns
-such as `S11R S11I`.
-
-For combined training and verification files, use a split variable such as
-`dataset=train` and `dataset=verification`. If no split values are present, the
-trainers can reserve a holdout fraction of blocks for verification. For KBNN,
-pass the coarse/prior MDIF together with the fine MDIF. The integrated workflow
-first fits and saves an S-domain coarse DNN, then evaluates that frozen DNN at
-every fine training and verification point. This matches the two-network model
-that will be embedded in a self-contained export.
-
-## Point Generation
+## 1. Generate Initial Points
 
 Use `generate_points.py` to create geometry/process sample CSVs before running
 EM simulations or assembling MDIF. The default method is `maximin-lhs`, a
@@ -146,6 +173,584 @@ unit, base-unit bounds, and linear/log scale. When `--write-split-files` is
 used, the one JSON describes the complete combined geometry; the separate
 train/verification CSVs do not receive duplicate JSON files. Targeted
 additional-point CSVs receive their own JSON files.
+
+## 2. Simulate and Audit the Dataset
+
+Input data is expected to be MDIF with one block per parameter point. Each block
+should provide numeric geometry or process values as `VAR` entries and an
+`ACDATA` table containing frequency and complex S-parameters:
+
+```text
+VAR dataset=train
+VAR W=0.40mm
+VAR L=1.20mm
+BEGIN ACDATA
+% Freq S11 S12 S21 S22
+# Hz S RI R 50
+1.0e9  0.1 0.0  0.0 0.0  0.8 -0.1  0.1 0.0
+2.0e9  0.2 0.0  0.0 0.0  0.6 -0.2  0.2 0.0
+END
+```
+
+The parser supports `RI`, `MA`, and `DB` complex pair formats. Header names may
+use logical S-parameter labels such as `S11` or explicit real/imaginary columns
+such as `S11R S11I`.
+
+For combined training and verification files, use a split variable such as
+`dataset=train` and `dataset=verification`. If no split values are present, the
+trainers can reserve a holdout fraction of blocks for verification. For KBNN,
+pass the coarse/prior MDIF together with the fine MDIF. The integrated workflow
+first fits and saves an S-domain coarse DNN, then evaluates that frozen DNN at
+every fine training and verification point. This matches the two-network model
+that will be embedded in a self-contained export.
+
+### Audit Training and Verification Data
+
+Run the model-independent dataset audit before another optimization when every
+trial fails passivity. Unlike `inspect-mdif`, this command evaluates every raw
+S-matrix and checks whether the split is internally suitable for modeling.
+
+For one combined MDIF containing 160 `dataset=train` blocks and 40
+`dataset=verification` blocks:
+
+```bash
+python3 audit_dataset.py \
+  --mdif train_verify.mdif \
+  --out-dir outputs/train_verify_audit
+```
+
+Parameter names are inferred from the numeric `VAR` values, so
+`--parameter-names` is normally unnecessary. Supply it only to exclude another
+numeric metadata variable or to enforce a particular parameter set:
+
+```bash
+python3 audit_dataset.py \
+  --mdif train_verify.mdif \
+  --parameter-names W,L,H,Er,TanD,Roughness \
+  --out-dir outputs/train_verify_audit
+```
+
+When training and verification are separate files, use the same separation as
+the fitting command:
+
+```bash
+python3 audit_dataset.py \
+  --mdif train.mdif \
+  --verification-mdif verification.mdif \
+  --out-dir outputs/data_audit
+```
+
+For an integrated KBNN fit, audit the fine and coarse datasets together:
+
+```bash
+python3 audit_dataset.py \
+  --mdif fine_train_verify.mdif \
+  --coarse-mdif coarse_train_verify.mdif \
+  --out-dir outputs/kbnn_data_audit
+```
+
+Add `--coarse-verification-mdif coarse_verification.mdif` when the coarse split
+also uses separate files. The original coarse frequency and geometry points do
+not need to equal the fine grid because KBNN evaluates a fitted coarse DNN at
+the fine points. The audit instead warns when the fine parameter domain extends
+outside the coarse training domain and therefore forces coarse-model
+extrapolation.
+
+The audit performs these checks:
+
+- reconstructs every complete S-matrix and calculates its largest singular
+  value at every DC and RF frequency;
+- reports DC and RF passivity violations separately using
+  $\sigma_{\max}(\mathbf S)\leq 1+\epsilon$;
+- detects nonfinite data, missing S-parameters, invalid frequency ordering,
+  inconsistent port counts, reference impedances, and frequency grids;
+- detects redundant or conflicting duplicate geometries and any
+  train/verification overlap;
+- compares verification parameter coverage with the training range;
+- ranks abrupt S-response changes between nearest training geometries; and
+- optionally checks reciprocity with `--expect-reciprocal`.
+
+The command prints a short verdict and writes:
+
+- `dataset_audit.md`: integrated report with an inset passivity plot and the
+  most important findings;
+- `dataset_audit.json`: machine-readable verdict and issue counts;
+- `dataset_passivity.csv`: every block/frequency singular-value calculation;
+- `dataset_blocks.csv`: passivity, grid, format, and geometry summary per block;
+- `dataset_issues.csv`: every error and warning with source block/frequency;
+- `dataset_duplicates.csv`: duplicate-response comparisons;
+- `dataset_neighbor_consistency.csv`: ranked local response jumps; and
+- parameter-coverage and frequency-grid CSVs.
+
+`FAIL` and exit status 1 mean the raw dataset contains a definite problem such
+as non-passive S-data, conflicting duplicates, missing data, or split leakage.
+`WARNING` and exit status 0 mean the raw values are usable but deserve review,
+for example because verification extrapolates beyond training. Use
+`--fail-on-warnings` for CI-style strict checking.
+
+Most importantly, a raw-data `PASS` changes the diagnosis: if all DNN and KBNN
+fits remain non-passive while every supplied S-matrix is passive, the dataset
+is not by itself proof of the problem. An unconstrained neural network can
+leave the passive set between sampled geometries or frequencies. In that case,
+inspect the nearest-neighbor outliers and coverage first, then investigate
+output-domain conditioning, frequency sampling near resonances, architecture,
+or a passivity-preserving formulation.
+
+#### Audit Input Options
+
+| Option | Description | Example |
+| --- | --- | --- |
+| <nobr><code>--coarse-mdif PATH</code></nobr> | Optional KBNN coarse training or combined MDIF. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
+| <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse verification MDIF; requires <code>--coarse-mdif</code>. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
+| <nobr><code>--mdif PATH</code></nobr> | Required direct-model or KBNN fine training/combined MDIF. | <nobr><code>--mdif train_verify.mdif</code></nobr> |
+| <nobr><code>--parameter-names NAMES</code></nobr> | Optional comma-separated geometry variables. By default they are inferred from common numeric <code>VAR</code> values. | <nobr><code>--parameter-names W,L,H</code></nobr> |
+| <nobr><code>--verification-mdif PATH</code></nobr> | Optional separate direct/fine verification MDIF. Every block in <code>--mdif</code> is then treated as training. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
+
+#### Audit Split Options
+
+| Option | Description | Example |
+| --- | --- | --- |
+| <nobr><code>--holdout-fraction FLOAT</code></nobr> | Fitter-compatible random holdout used only when a combined MDIF has no recognized training values. Default: <code>0.2</code>. | <nobr><code>--holdout-fraction 0.25</code></nobr> |
+| <nobr><code>--seed INT</code></nobr> | Random-holdout seed. Default: <code>1234</code>. | <nobr><code>--seed 42</code></nobr> |
+| <nobr><code>--split-var NAME</code></nobr> | Split <code>VAR</code> name. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
+| <nobr><code>--train-values VALUES</code></nobr> | Comma-separated training labels. Default: <code>train,training</code>. | <nobr><code>--train-values train</code></nobr> |
+| <nobr><code>--verify-values VALUES</code></nobr> | Comma-separated verification labels. Default: <code>verify,verification,test,validation</code>. | <nobr><code>--verify-values verification</code></nobr> |
+
+#### Audit Criteria Options
+
+| Option | Description | Example |
+| --- | --- | --- |
+| <nobr><code>--expect-reciprocal</code></nobr> | Treat an S-matrix reciprocity mismatch as an error. Leave disabled for intentionally nonreciprocal devices. | <nobr><code>--expect-reciprocal</code></nobr> |
+| <nobr><code>--frequency-abs-tolerance-hz FLOAT</code></nobr> | Absolute frequency-grid comparison tolerance in hertz. Default: <code>1e-3</code>. | <nobr><code>--frequency-abs-tolerance-hz 1</code></nobr> |
+| <nobr><code>--frequency-rel-tolerance FLOAT</code></nobr> | Relative frequency-grid comparison tolerance. Default: <code>1e-10</code>. | <nobr><code>--frequency-rel-tolerance 1e-9</code></nobr> |
+| <nobr><code>--neighbor-min-relative-jump FLOAT</code></nobr> | Minimum relative response RMSE eligible for a nearest-neighbor warning. Default: <code>0.05</code>. | <nobr><code>--neighbor-min-relative-jump 0.1</code></nobr> |
+| <nobr><code>--neighbor-outlier-factor FLOAT</code></nobr> | Warning threshold multiplier above the median nearest-neighbor response jump. Default: <code>5</code>. | <nobr><code>--neighbor-outlier-factor 8</code></nobr> |
+| <nobr><code>--parameter-abs-tolerance FLOAT</code></nobr> | Base-unit absolute tolerance for duplicate-geometry detection. Default: <code>1e-15</code>. | <nobr><code>--parameter-abs-tolerance 1e-12</code></nobr> |
+| <nobr><code>--parameter-rel-tolerance FLOAT</code></nobr> | Relative tolerance for duplicate-geometry detection. Default: <code>1e-10</code>. | <nobr><code>--parameter-rel-tolerance 1e-9</code></nobr> |
+| <nobr><code>--passivity-tolerance FLOAT</code></nobr> | Checks <code>sigma_max &lt;= 1 + tolerance</code>. Default: <code>1e-6</code>. | <nobr><code>--passivity-tolerance 1e-5</code></nobr> |
+| <nobr><code>--reciprocity-tolerance FLOAT</code></nobr> | Maximum absolute <code>abs(Sij-Sji)</code> when reciprocity is required. Default: <code>1e-3</code>. | <nobr><code>--reciprocity-tolerance 1e-4</code></nobr> |
+| <nobr><code>--response-abs-tolerance FLOAT</code></nobr> | Absolute duplicate-response conflict tolerance. Default: <code>1e-6</code>. | <nobr><code>--response-abs-tolerance 1e-5</code></nobr> |
+| <nobr><code>--response-rel-tolerance FLOAT</code></nobr> | Relative duplicate-response conflict tolerance. Default: <code>1e-4</code>. | <nobr><code>--response-rel-tolerance 1e-3</code></nobr> |
+
+#### Audit Output Options
+
+| Option | Description | Example |
+| --- | --- | --- |
+| <nobr><code>--fail-on-warnings</code></nobr> | Return exit status 1 for warnings as well as errors. | <nobr><code>--fail-on-warnings</code></nobr> |
+| <nobr><code>--out-dir PATH</code></nobr> | Artifact directory. Default: <code>dataset_audit</code>. | <nobr><code>--out-dir outputs/data_audit</code></nobr> |
+
+## 3. Fit and Optimize a Model
+
+Choose one model family for the initial fit, validate its held-out response,
+and then optimize only the settings that materially affect the result. DNN,
+KBNN, and Neuro-TF are deliberately grouped here because model-family choice
+is part of fitting—not point generation or ADS integration.
+
+### Unified Model CLI
+
+Use `surrogate.py` for every model-family command. Select the backend with
+`--model` and leave the selected backend's subcommand and options
+unchanged:
+
+```text
+python3 surrogate.py --model {dnn,kbnn,neuro-tf} SUBCOMMAND [OPTIONS]
+```
+
+For example, these commands display the model-specific training help:
+
+```bash
+python3 surrogate.py --model dnn train --help
+python3 surrogate.py --model kbnn train --help
+python3 surrogate.py --model neuro-tf train --help
+```
+
+`neuro_tf` and `neurotf` are accepted as aliases for `neuro-tf`. The dispatcher
+uses the current Python interpreter, preserves relative paths from the calling
+directory, forwards all remaining arguments without modification, and returns
+the selected backend's exit status. The backend files remain directly
+executable for development and compatibility, but generated reports and the
+commands in this README use the unified entry point.
+
+### Choose a Model Family
+
+| Model | Entry point | Best fit for | Basic idea |
+| --- | --- | --- | --- |
+| DNN | `surrogate.py --model dnn` | General parameterized S-parameter fitting when you want a direct neural response model. | A multilayer perceptron predicts S-parameters, or optionally Y-parameters, from geometry/process variables plus frequency features. |
+| KBNN | `surrogate.py --model kbnn` | Cases where a fast coarse model or lower-fidelity EM result is available. | A neural network learns the correction from coarse/prior response to fine/target response, or uses the coarse response as an input. |
+| Neuro-TF | `surrogate.py --model neuro-tf` | Smooth frequency responses where a rational transfer-function structure is useful. | Fixed stable poles define rational transfer functions; a neural network maps geometry/process variables to the fitted coefficients. |
+
+All three tools read MDIF, train models, run sweeps, write verification
+artifacts, predict new response blocks, and export sampled ADS MDIF packages or
+self-contained Verilog-A n-ports. All three also export self-contained, linear
+ADS SDD subnetworks for harmonic balance. DNN and KBNN additionally support
+native ADS ANN package generation.
+
+### DNN
+
+Use the direct neural response model for a general-purpose first fit:
+
+```bash
+python3 surrogate.py --model dnn train \
+  --mdif dnn_sample_training_verification.mdif \
+  --out-dir outputs/dnn_model \
+  --parameter-names W,L \
+  --hidden-layers 128,128,64
+```
+
+See the [DNN command reference](#dnn-command-reference) for prediction,
+optimization, weighting, reranking, and export options.
+
+### KBNN
+
+Use the integrated fitted-coarse workflow when lower-fidelity data are available:
+
+```bash
+python3 surrogate.py --model kbnn train \
+  --mdif kbnn_sample_fine.mdif \
+  --coarse-mdif kbnn_sample_coarse.mdif \
+  --out-dir outputs/kbnn_model \
+  --parameter-names W,L \
+  --mode residual
+```
+
+This command fits and saves the coarse DNN first, evaluates that frozen model
+at every fine-data geometry and positive frequency, and then fits the fine
+correction network. Both saved networks are required by the composite model and
+its self-contained exports.
+
+See the [KBNN command reference](#kbnn-command-reference) for coarse/fine
+fitting, optimization, prediction, and composite export options.
+
+### Neuro-TF
+
+Use the fixed-pole rational formulation for smooth frequency responses:
+
+```bash
+python3 surrogate.py --model neuro-tf train \
+  --mdif neuro_tf_sample_training_verification.mdif \
+  --out-dir outputs/neuro_tf_model \
+  --parameter-names W,L \
+  --order 10
+```
+
+See the [Neuro-TF command reference](#neuro-tf-command-reference) for rational
+orders, pole controls, optimization, prediction, and export options.
+
+### Shared Training and Optimization Workflow
+
+#### Train and optimize option naming
+
+Optimize/sweep commands use plural names for candidate lists and accept the
+matching train option for a single candidate. This makes a train command easy
+to reuse: change `train` to `optimize`, keep singular options when their value
+should stay fixed, and pluralize only the settings that should be swept.
+Existing `*-options` spellings remain supported as compatibility aliases.
+
+| Train or one optimize value | Multiple optimize values |
+| --- | --- |
+| `--activation relu` | `--activations tanh,relu` |
+| `--learning-rate 0.002` | `--learning-rates 0.001,0.002,0.005` |
+| `--freq-transform log` | `--freq-transforms log,linear` |
+| `--hidden-layers 64,64` | `--hidden-layers '32;64;64,64'` |
+| `--order 10` | `--orders 6,10,14` |
+| `--pole-damping 0.18` | `--pole-dampings 0.12,0.18,0.28` |
+| `--ridge 1e-8` | `--ridges 1e-10,1e-8,1e-6` |
+| KBNN `--mode residual` | KBNN `--modes residual,prior-input` |
+
+Use `--search-mode adaptive|grid|random` for the optimize search strategy.
+Legacy `--mode grid|random` commands remain valid; on KBNN optimize commands,
+`--mode plain|residual|prior-input` now has the same model meaning as it does
+for `train`.
+
+Run a discrete random sweep and keep the best completed model:
+
+```bash
+python3 surrogate.py --model dnn optimize \
+  --mdif train_verify.mdif \
+  --out-dir outputs/dnn_sweep \
+  --parameter-names W,L,H \
+  --search-mode random \
+  --max-trials 40 \
+  --selection-metric weighted_evm_pct \
+  --require-passive
+```
+
+#### Running Adaptive Hyperparameter Optimization
+
+Use `--search-mode adaptive` when a grid is too large and random trials are not
+learning from previous results. Specify only the settings that should vary with
+repeatable `--optimize-parameter` options. Unspecified model settings stay at
+the first value supplied through their normal optimize option, including the
+documented default when that option is omitted.
+
+The practical workflow is:
+
+1. Start from a working `train` command and change `train` to `optimize`.
+2. Add `--search-mode adaptive`.
+3. Add one repeatable `--optimize-parameter NAME=DOMAIN` option for every
+   setting that should vary. Leave fixed settings on their normal train-style
+   options.
+4. Set the actual fitting budget with `--max-trials`. A useful first run is
+   24–40 trials, with 6–8 initial space-filling trials.
+5. Choose the performance objective with `--selection-metric` and add
+   `--require-passive` when passivity is mandatory.
+
+`--adaptive-candidate-pool` is the number of unevaluated configurations made
+available to the optimizer; it is not the number of models fitted.
+`--max-trials` is the fitting budget. `--adaptive-initial-trials` controls how
+many maximin-separated trials run before GP guidance, and
+`--adaptive-exploration` controls how strongly the later lower-confidence-bound
+selection favors uncertain regions. Adaptive fitting is sequential and forces
+one job because every new selection uses the preceding trial results.
+
+Supported adaptive domains by model are:
+
+| Model | `--optimize-parameter` names |
+| --- | --- |
+| DNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `learning_rate`, `output_domain`, `patience`, `target_z0` |
+| KBNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `include_coarse_input`, `learning_rate`, `mode`, `patience` |
+| Neuro-TF | `activation`, `batch_size`, `epochs`, `hidden_layers`, `learning_rate`, `order`, `patience`, `pole_damping`, `ridge` |
+
+This example searches learning rate, activation, and neural architecture while
+requiring a passive result:
+
+```bash
+python3 surrogate.py --model dnn optimize \
+  --mdif train_verify.mdif \
+  --out-dir outputs/dnn_adaptive \
+  --parameter-names W,L,H \
+  --search-mode adaptive \
+  --optimize-parameter learning_rate=1e-4:1e-2:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter 'hidden_layers=1:4x32:256:log' \
+  --adaptive-initial-trials 8 \
+  --adaptive-candidate-pool 768 \
+  --adaptive-exploration 1.5 \
+  --max-trials 32 \
+  --selection-metric weighted_evm_pct \
+  --require-passive
+```
+
+For a one-parameter study, provide only one range and fix the architecture with
+the normal train-compatible option:
+
+```bash
+python3 surrogate.py --model dnn optimize \
+  --mdif train_verify.mdif \
+  --out-dir outputs/dnn_learning_rate \
+  --parameter-names W,L,H \
+  --hidden-layers 128,128,64 \
+  --activation tanh \
+  --search-mode adaptive \
+  --optimize-parameter learning_rate=2e-4:8e-3:log \
+  --max-trials 20 \
+  --selection-metric rmse_abs \
+  --require-passive
+```
+
+Domain syntax:
+
+| Domain type | Syntax | Example |
+| --- | --- | --- |
+| Linear numeric range | `NAME=LOW:HIGH` or `NAME=LOW:HIGH:linear` | `batch_size=64:512` |
+| Logarithmic numeric range | `NAME=LOW:HIGH:log` | `learning_rate=1e-4:1e-2:log` |
+| Categorical choices | `NAME=VALUE1,VALUE2,...` | `activation=tanh,relu` |
+| Explicit hidden layouts | `hidden_layers=LAYOUT1;LAYOUT2;...` | `hidden_layers=64,64;128,128,64;256,128,64` |
+| Hidden depth/width range | `hidden_layers=MIN_DEPTH:MAX_DEPTHxMIN_WIDTH:MAX_WIDTH[:SCALE]`, where scale is `linear` or `log` | `hidden_layers=1:4x32:256:log` |
+
+Integer parameters such as Neuro-TF `order`, `batch_size`, `epochs`, and
+`patience` are sampled as integers. A structured hidden-layer range creates
+uniform-width networks; widths are rounded to `--adaptive-hidden-width-step`,
+which defaults to 8. Use explicit layouts when tapered networks are important.
+Quote hidden-layer domains in the shell because semicolons are command
+separators.
+
+The search begins with maximin-separated configurations, then fits a small
+Matérn-5/2 GP to a feasibility-aware objective and selects each later trial by
+a lower confidence bound. With `--require-passive` or a passivity limit,
+eligible trials are ranked by `--selection-metric`; until one exists,
+passivity-violation count and singular-value excess guide the search. Adaptive
+search is sequential, so it uses one job even if a larger `--jobs` value is
+given.
+
+After the command finishes, open the model-specific Markdown report in the
+chosen output directory:
+
+| Model | Trial results | Markdown report | Selection JSON |
+| --- | --- | --- | --- |
+| DNN | `dnn_sweep_results.csv` | `dnn_sweep_summary.md` | `dnn_best_config.json` |
+| KBNN | `kbnn_sweep_results.csv` | `kbnn_sweep_summary.md` | `kbnn_best_config.json` |
+| Neuro-TF | `neurotf_sweep_results.csv` | `neurotf_sweep_summary.md` | `neurotf_best_config.json` |
+
+The report contains the ranked trial table, adaptive search stage and
+uncertainty, inline trend plots, and links to the detailed diagnostics. When an
+eligible winner exists, `best_model/` contains the promoted model and the
+report includes a copyable command for reproducing it by itself.
+
+If every completed trial fails training or the passivity constraints, the
+command returns a nonzero status and does not promote `best_model/`, but it
+still writes the normal results CSV, best-config JSON, Markdown sweep summary,
+diagnostic PDF, inline SVG trend plots, and diagnostic CSV. The Markdown
+identifies the closest available ineligible trial and embeds the trend plots
+directly in the report. Diagnostic plots retain all trial points, and the CSV
+contains both passive-only statistics and `all_*` statistics so trends are
+visible even when the passive subset is empty.
+
+### Fitting Output Artifacts
+
+A normal `train` run writes:
+
+- `model.npz` and `metadata.json` with the trained RF model state and assumptions.
+- `dc_model.npz` and `dc_model.json` with the separate geometry-to-DC model
+  and its extraction diagnostics.
+- `predicted_verification.mdif` for held-out verification blocks.
+- `verification_metrics.csv` with per-block and per-S-parameter errors,
+  including EVM.
+- `verification_summary.json` with global errors and passivity summary data.
+- `training_history.csv` and `training_history.pdf` with train/verification
+  loss history and convergence plots.
+- `dc_training_history.csv` and `dc_training_history.pdf` with convergence of
+  the independent geometry-only DC model.
+- `training_summary.md` with a human-readable run summary and copyable export
+  commands using paths relative to the repository root.
+- `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
+  and error views.
+- `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
+
+An integrated residual or prior-input KBNN run also writes a complete coarse
+DNN package under `coarse_model/` and a `composite_model_manifest.json` that
+identifies and hashes both saved networks for later Verilog-A or ADS HB extraction.
+The reported circuit-export commands include an explicit default module name and a
+single `--parameter-input-scales 1.0` value applied to every fitted parameter.
+A new model's saved DC network is self-contained, so its report does not add
+`--dc-mdif` or export-time open-threshold overrides. Legacy-model commands add
+`--dc-open-threshold 1e12` and `--dc-open-resistance 1e19`. When the fit saved
+an explicit path selection, commands also include `--dc-port-paths`. These
+values are easy to edit before export.
+
+#### Distinct DC Point
+
+DC is a separate, geometry-dependent model derived only from the actual
+exact-zero-frequency S-matrix in each fitted MDIF block.
+It is not a target of the RF DNN, KBNN, or Neuro-TF. Zero-Hz rows are removed
+before RF neural training and rational fitting, so changing DC data cannot
+change RF weights, poles, sweep ranking, or the positive-frequency response.
+
+Declare the only viable DC connections with `--dc-port-paths`. For example,
+`--dc-port-paths 1-2,3-4` extracts and stamps independent paths between ports
+1–2 and 3–4. Every undeclared path remains open at DC. Use `1-ground` for a
+port-to-simulator-reference path. Omitting the option instead fits both the real
+and imaginary component of every ordered DC S-parameter: `S11.real`,
+`S11.imag`, …, `SNN.imag`. The complete complex S matrix is then converted to Y
+for electrical stamping. This does not discard information in an intermediate
+real-Y projection and imposes no resistor-graph or reciprocity constraint.
+Reports therefore show `dc_port_paths: []` for this unrestricted mode and list
+all modeled entries separately under `dc_sparameter_entries` and
+`dc_matrix_entries`; the empty path list does not mean S-parameters were omitted.
+When `--dc-mdif` is supplied without `--dc-port-paths`, this full-complex-S mode is
+also used to upgrade an older saved path-only DC model. Repeat an explicit
+`--dc-port-paths` value when a restricted resistor topology is intentional.
+Export stops with upgrade guidance if an older model saved the former automatic
+path graph but no source MDIF is available; it never silently presents that
+subset as a full-complex-S result.
+
+1. Each finite exact-zero-Hz S-matrix is checked for passivity using its largest
+   singular value. Rows above $1+10^{-6}$ are ignored.
+2. With no path option, both components of every ordered $S_{ij}$ value are fitted
+   directly. No intermediate real-Y projection is used.
+3. With an explicit path option, the S matrix is converted to Y and all declared
+   branches are solved together with a non-negative least-squares projection
+   onto that resistor graph.
+4. In explicit-path mode, conductances below the reciprocal of
+   `--dc-open-threshold` are represented by the reciprocal of
+   `--dc-open-resistance`. The natural logarithm of each positive branch
+   conductance is then fitted by a small geometry-only MLP.
+5. The saved diagnostics include the measured-S → extracted-Y → model-Y →
+   reconstructed-S round-trip error, filtered-row counts, matrix/path errors,
+   and train/verification errors.
+
+The DC MLP reuses the command's hidden-layer layout, activation, epoch, batch,
+learning-rate, patience, seed, and progress settings, but it has its own scaler,
+weights, history, and loss. Its inputs are geometry/process parameters only;
+frequency, RF samples, KBNN coarse responses, and S-parameter/frequency loss
+weights are not inputs to the DC fit.
+
+Every training and verification geometry must contain at least one exact-zero-
+Hz row. Non-passive or non-finite zero-Hz rows are discarded, and a geometry
+with no usable passive DC row is excluded from the separate DC fit. Fitting
+stops only when no usable passive DC geometries remain. A missing zero-Hz row
+in a training block is still an error. The lowest positive frequency is never substituted,
+and the RF response is never extrapolated to DC. RF verification metrics,
+worst-case plots, sweep ranking, and passivity selection use only positive-
+frequency rows. `predicted_verification.mdif` still contains both the separately
+predicted DC point and all RF points, while `verification_summary.json` reports
+the DC network's own train/verification round-trip errors separately.
+
+At exactly zero Hz, prediction and sampled-MDIF export evaluate only the saved
+geometry-to-DC model. Sampled ADS exports
+prepend this zero-Hz point automatically. Direct Verilog-A exports embed the DC
+MLP and electrically enable its branch matrix only at zero frequency. Positive
+frequencies use the RF model. The exporter selects DC or fitted Y
+coefficients before an unconditional current contribution, so `ddt()` is never
+placed in a conditional and the generated source remains legal for ADS
+Verilog-A. Export also verifies that DC came from exact-zero-frequency data.
+ADS HB exports make the same DC/RF separation in the SDD frequency weights:
+the geometry-dependent exact-DC matrix or explicit-path network is used only at
+$f=0$, and the fitted RF surrogate is used only at non-zero spectral frequencies.
+
+To export an older fitted model without retraining it, pass the original DC data
+directly to `export-veriloga`, `export-ads-hb`, or `export-ads-mdif`:
+
+```bash
+python3 surrogate.py --model dnn export-veriloga \
+  --model-dir dnn_model \
+  --out-dir dnn_model/veriloga_export \
+  --dc-mdif training_with_dc.mdif \
+  --dc-port-paths 1-2,3-4 \
+  --dc-open-threshold 1e12 \
+  --dc-open-resistance 1e19
+```
+
+`--dc-mdif` validates a saved geometry-dependent DC network directly against
+the supplied exact-DC rows. If it differs by more than $10^{-4}$ in maximum
+absolute S-parameter error, or if the saved model is legacy, export fits a new
+DC-only full-complex-S or explicit-path network from that MDIF. This never changes
+or refits the RF model. The export manifest records `dc_mdif_action` plus the topology and final
+DC-model S-parameter errors. An explicit resistor-path export is rejected if its
+maximum absolute S-parameter error remains above $10^{-3}$, because that means the
+declared topology cannot reproduce the data. The unrestricted complex-S mode
+has no topology/projection mismatch: it receives a larger export-only network
+and convergence budget, and any remaining interpolation error is reported as
+`dc_mdif_warning` without preventing the requested export.
+For a combined training/verification MDIF, export reuses the fitted model's
+`--split-var`, `--train-values`, and `--verify-values` metadata and fits or
+validates DC from the training split only. Verification blocks are never added
+to the DC optimizer; any verification blocks that do contain usable DC may be
+reported as validation during the original model fit, while verification blocks
+without DC are skipped. Missing-DC errors identify one-based `ACDATA` block
+positions in the original MDIF.
+
+For an integrated residual or prior-input KBNN, the composite Verilog-A and ADS
+HB components use the DC conductance surrogate fitted only from the fine-data
+MDIF and bypass both fine and coarse RF networks at zero Hz. The coarse model
+and coarse MDIF are not used to calculate composite DC. Native ADS ANN
+retraining excludes zero-Hz rows,
+but its generated ANN alone does not implement the distinct resistor branch;
+use the direct Verilog-A or sampled-MDIF handoff when DC behavior is required.
+
+Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
+per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
+directory. At completion, each sweep prints a copyable standalone `train`
+command for the winning configuration; the same command is saved in the
+best-configuration JSON and Markdown summary. The sweep summary and the
+promoted model's `training_summary.md` also contain export commands resolved to
+`best_model/`. DNN and KBNN sweep results can be reranked after the fact to
+choose a different passive or weighted-error winner without repeating every
+trial.
+
+## 4. Update or Extend the Sampling Points
+
+After the initial fit, use its geometry-level verification errors to select new EM points. Simulate the returned points before continuing to the refit stage. Range extension and legacy selection are alternatives within this same stage.
 
 ### Using GP to Determine Additional Points
 
@@ -889,222 +1494,57 @@ without a subcommand uses it automatically.
 | <nobr><code>--novelty-power FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative exponent applied to distance from existing and suggested points. Default: <code>1.0</code>. | <nobr><code>--novelty-power 2</code></nobr> |
 | <nobr><code>--verification-metrics PATH</code></nobr> | <code>suggest-additional</code> | Direct path to <code>verification_metrics.csv</code>; overrides <code>--fit-dir</code>. | <nobr><code>--verification-metrics trial/verification_metrics.csv</code></nobr> |
 
-## Quick Start
+## 5. Refit and Iterate
 
-From the repository root, inspect a sample MDIF before training:
+Append the newly simulated blocks to the training MDIF, retain an independent
+verification or audit set, and rerun the same model family and fitting objective
+used in step 3. Keeping those choices fixed makes the effect of the added data
+measurable instead of confounding it with an architecture change.
 
-```bash
-python3 dnn.py inspect-mdif --mdif dnn_sample_training_verification.mdif
-python3 kbnn.py inspect-mdif --mdif kbnn_sample_fine.mdif
-python3 neuro_tf.py inspect-mdif --mdif neuro_tf_sample_training_verification.mdif
-```
+For each adaptive round:
 
-Train a direct DNN model:
+1. Simulate every geometry written by `suggest-additional`.
+2. Add those results to the training split; do not move the final audit set into
+   training.
+3. Rerun the original `train` command, or repeat `optimize` when hyperparameter
+   selection itself must be reconsidered.
+4. Compare the new `verification_summary.json`, passivity results, and worst-case
+   plots with the preceding round.
+5. Request another small point batch only while held-out performance continues
+   to improve meaningfully.
 
-```bash
-python3 dnn.py train \
-  --mdif dnn_sample_training_verification.mdif \
-  --out-dir outputs/dnn_model \
-  --parameter-names W,L \
-  --hidden-layers 128,128,64
-```
+The point CSV written in one round also has a companion JSON, so the next
+`suggest-additional` command can reuse its parameter names, ranges, units, and
+linear/log scaling without re-entering `--parameter` values. Pass all prior point
+CSVs with repeatable `--existing-points` options to prevent reselection.
 
-Fit the coarse DNN and fine KBNN together as one residual-model workflow:
+Once the error and passivity targets are satisfied on data that did not
+participate in acquisition, freeze the selected model directory and proceed to
+ADS export.
 
-```bash
-python3 kbnn.py train \
-  --mdif kbnn_sample_fine.mdif \
-  --coarse-mdif kbnn_sample_coarse.mdif \
-  --out-dir outputs/kbnn_model \
-  --parameter-names W,L \
-  --mode residual
-```
+## 6. Export and Integrate with ADS
 
-Train a Neuro-TF model:
+Use the validated, frozen model from step 5. The fitting report already
+contains copyable relative-path export commands with editable module-name and
+common parameter-scaling flags.
 
-```bash
-python3 neuro_tf.py train \
-  --mdif neuro_tf_sample_training_verification.mdif \
-  --out-dir outputs/neuro_tf_model \
-  --parameter-names W,L \
-  --order 10
-```
-
-Complete DNN, KBNN, and Neuro-TF command references are integrated below.
-
-## Common Workflows
-
-### Train and optimize option naming
-
-Optimize/sweep commands use plural names for candidate lists and accept the
-matching train option for a single candidate. This makes a train command easy
-to reuse: change `train` to `optimize`, keep singular options when their value
-should stay fixed, and pluralize only the settings that should be swept.
-Existing `*-options` spellings remain supported as compatibility aliases.
-
-| Train or one optimize value | Multiple optimize values |
-| --- | --- |
-| `--activation relu` | `--activations tanh,relu` |
-| `--learning-rate 0.002` | `--learning-rates 0.001,0.002,0.005` |
-| `--freq-transform log` | `--freq-transforms log,linear` |
-| `--hidden-layers 64,64` | `--hidden-layers '32;64;64,64'` |
-| `--order 10` | `--orders 6,10,14` |
-| `--pole-damping 0.18` | `--pole-dampings 0.12,0.18,0.28` |
-| `--ridge 1e-8` | `--ridges 1e-10,1e-8,1e-6` |
-| KBNN `--mode residual` | KBNN `--modes residual,prior-input` |
-
-Use `--search-mode adaptive|grid|random` for the optimize search strategy.
-Legacy `--mode grid|random` commands remain valid; on KBNN optimize commands,
-`--mode plain|residual|prior-input` now has the same model meaning as it does
-for `train`.
-
-Run a discrete random sweep and keep the best completed model:
-
-```bash
-python3 dnn.py optimize \
-  --mdif train_verify.mdif \
-  --out-dir outputs/dnn_sweep \
-  --parameter-names W,L,H \
-  --search-mode random \
-  --max-trials 40 \
-  --selection-metric weighted_evm_pct \
-  --require-passive
-```
-
-### Running Adaptive Hyperparameter Optimization
-
-Use `--search-mode adaptive` when a grid is too large and random trials are not
-learning from previous results. Specify only the settings that should vary with
-repeatable `--optimize-parameter` options. Unspecified model settings stay at
-the first value supplied through their normal optimize option, including the
-documented default when that option is omitted.
-
-The practical workflow is:
-
-1. Start from a working `train` command and change `train` to `optimize`.
-2. Add `--search-mode adaptive`.
-3. Add one repeatable `--optimize-parameter NAME=DOMAIN` option for every
-   setting that should vary. Leave fixed settings on their normal train-style
-   options.
-4. Set the actual fitting budget with `--max-trials`. A useful first run is
-   24–40 trials, with 6–8 initial space-filling trials.
-5. Choose the performance objective with `--selection-metric` and add
-   `--require-passive` when passivity is mandatory.
-
-`--adaptive-candidate-pool` is the number of unevaluated configurations made
-available to the optimizer; it is not the number of models fitted.
-`--max-trials` is the fitting budget. `--adaptive-initial-trials` controls how
-many maximin-separated trials run before GP guidance, and
-`--adaptive-exploration` controls how strongly the later lower-confidence-bound
-selection favors uncertain regions. Adaptive fitting is sequential and forces
-one job because every new selection uses the preceding trial results.
-
-Supported adaptive domains by model are:
-
-| Model | `--optimize-parameter` names |
-| --- | --- |
-| DNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `learning_rate`, `output_domain`, `patience`, `target_z0` |
-| KBNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `include_coarse_input`, `learning_rate`, `mode`, `patience` |
-| Neuro-TF | `activation`, `batch_size`, `epochs`, `hidden_layers`, `learning_rate`, `order`, `patience`, `pole_damping`, `ridge` |
-
-This example searches learning rate, activation, and neural architecture while
-requiring a passive result:
-
-```bash
-python3 dnn.py optimize \
-  --mdif train_verify.mdif \
-  --out-dir outputs/dnn_adaptive \
-  --parameter-names W,L,H \
-  --search-mode adaptive \
-  --optimize-parameter learning_rate=1e-4:1e-2:log \
-  --optimize-parameter activation=tanh,relu \
-  --optimize-parameter 'hidden_layers=1:4x32:256:log' \
-  --adaptive-initial-trials 8 \
-  --adaptive-candidate-pool 768 \
-  --adaptive-exploration 1.5 \
-  --max-trials 32 \
-  --selection-metric weighted_evm_pct \
-  --require-passive
-```
-
-For a one-parameter study, provide only one range and fix the architecture with
-the normal train-compatible option:
-
-```bash
-python3 dnn.py optimize \
-  --mdif train_verify.mdif \
-  --out-dir outputs/dnn_learning_rate \
-  --parameter-names W,L,H \
-  --hidden-layers 128,128,64 \
-  --activation tanh \
-  --search-mode adaptive \
-  --optimize-parameter learning_rate=2e-4:8e-3:log \
-  --max-trials 20 \
-  --selection-metric rmse_abs \
-  --require-passive
-```
-
-Domain syntax:
-
-| Domain type | Syntax | Example |
-| --- | --- | --- |
-| Linear numeric range | `NAME=LOW:HIGH` or `NAME=LOW:HIGH:linear` | `batch_size=64:512` |
-| Logarithmic numeric range | `NAME=LOW:HIGH:log` | `learning_rate=1e-4:1e-2:log` |
-| Categorical choices | `NAME=VALUE1,VALUE2,...` | `activation=tanh,relu` |
-| Explicit hidden layouts | `hidden_layers=LAYOUT1;LAYOUT2;...` | `hidden_layers=64,64;128,128,64;256,128,64` |
-| Hidden depth/width range | `hidden_layers=MIN_DEPTH:MAX_DEPTHxMIN_WIDTH:MAX_WIDTH[:SCALE]`, where scale is `linear` or `log` | `hidden_layers=1:4x32:256:log` |
-
-Integer parameters such as Neuro-TF `order`, `batch_size`, `epochs`, and
-`patience` are sampled as integers. A structured hidden-layer range creates
-uniform-width networks; widths are rounded to `--adaptive-hidden-width-step`,
-which defaults to 8. Use explicit layouts when tapered networks are important.
-Quote hidden-layer domains in the shell because semicolons are command
-separators.
-
-The search begins with maximin-separated configurations, then fits a small
-Matérn-5/2 GP to a feasibility-aware objective and selects each later trial by
-a lower confidence bound. With `--require-passive` or a passivity limit,
-eligible trials are ranked by `--selection-metric`; until one exists,
-passivity-violation count and singular-value excess guide the search. Adaptive
-search is sequential, so it uses one job even if a larger `--jobs` value is
-given.
-
-After the command finishes, open the model-specific Markdown report in the
-chosen output directory:
-
-| Model | Trial results | Markdown report | Selection JSON |
-| --- | --- | --- | --- |
-| DNN | `dnn_sweep_results.csv` | `dnn_sweep_summary.md` | `dnn_best_config.json` |
-| KBNN | `kbnn_sweep_results.csv` | `kbnn_sweep_summary.md` | `kbnn_best_config.json` |
-| Neuro-TF | `neurotf_sweep_results.csv` | `neurotf_sweep_summary.md` | `neurotf_best_config.json` |
-
-The report contains the ranked trial table, adaptive search stage and
-uncertainty, inline trend plots, and links to the detailed diagnostics. When an
-eligible winner exists, `best_model/` contains the promoted model and the
-report includes a copyable command for reproducing it by itself.
-
-If every completed trial fails training or the passivity constraints, the
-command returns a nonzero status and does not promote `best_model/`, but it
-still writes the normal results CSV, best-config JSON, Markdown sweep summary,
-diagnostic PDF, inline SVG trend plots, and diagnostic CSV. The Markdown
-identifies the closest available ineligible trial and embeds the trend plots
-directly in the report. Diagnostic plots retain all trial points, and the CSV
-contains both passive-only statistics and `all_*` statistics so trends are
-visible even when the passive subset is empty.
+### Optional Prediction Before Export
 
 Predict a new set of parameter/frequency blocks after training:
 
 ```bash
-python3 dnn.py predict \
+python3 surrogate.py --model dnn predict \
   --model-dir outputs/dnn_model \
   --mdif new_parameter_blocks.mdif \
   --out-mdif predicted.mdif
 ```
 
+### Export Commands
+
 Export any trained model family as a sampled ADS MDIF package:
 
 ```bash
-python3 dnn.py export-ads-mdif \
+python3 surrogate.py --model dnn export-ads-mdif \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_ads_mdif \
   --template-mdif ads_sweep_template.mdif
@@ -1113,7 +1553,7 @@ python3 dnn.py export-ads-mdif \
 Export any trained model family as a direct Verilog-A n-port:
 
 ```bash
-python3 dnn.py export-veriloga \
+python3 surrogate.py --model dnn export-veriloga \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_veriloga \
   --module-name my_dnn_4port \
@@ -1124,7 +1564,7 @@ For a passive, power-independent component that ADS can use directly in
 harmonic balance, export the HB-native SDD subnetwork instead:
 
 ```bash
-python3 dnn.py export-ads-hb \
+python3 surrogate.py --model dnn export-ads-hb \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_ads_hb \
   --module-name my_dnn_4port_hb \
@@ -1153,25 +1593,16 @@ full parameter/frequency range. Frequencies outside the fitted range remain
 model extrapolation, just as an under-ranged S-parameter dataset would require
 an extrapolation policy.
 
-Residual and prior-input KBNNs use a frozen coarse DNN during fitting and at
-runtime. The integrated KBNN command fits the coarse model once, saves it under
-`coarse_model/`, fits the fine network from its predictions, and retains both
-models for one self-contained Verilog-A component or ADS HB subnetwork:
+Residual and prior-input KBNNs use the packaged frozen coarse DNN at runtime.
+The composite exporters find and validate that saved network automatically:
 
 ```bash
-python3 kbnn.py train \
-  --mdif fine_train_verify.mdif \
-  --coarse-mdif coarse_train_verify.mdif \
-  --out-dir outputs/kbnn_model \
-  --parameter-names W,L \
-  --mode residual
-
-python3 kbnn.py export-veriloga \
+python3 surrogate.py --model kbnn export-veriloga \
   --model-dir outputs/kbnn_model \
   --out-dir outputs/kbnn_veriloga \
   --module-name my_kbnn_4port
 
-python3 kbnn.py export-ads-hb \
+python3 surrogate.py --model kbnn export-ads-hb \
   --model-dir outputs/kbnn_model \
   --out-dir outputs/kbnn_ads_hb \
   --module-name my_kbnn_4port_hb
@@ -1185,7 +1616,7 @@ packaged `coarse_model/` directory and verifies its saved file hashes.
 Export a DNN or KBNN dataset for native ADS ANN extraction:
 
 ```bash
-python3 dnn.py export-ads-ann \
+python3 surrogate.py --model dnn export-ads-ann \
   --mdif train_verify.mdif \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_ads_ann \
@@ -1196,159 +1627,7 @@ The ADS ANN export writes a portable package plus `train_ads_ann.py`; run that
 script with ADS Python on the ADS machine to produce the native `.inc`, `.c`,
 `.equation`, `.struc`, and `.scale` artifacts.
 
-## Output Artifacts
-
-A normal `train` run writes:
-
-- `model.npz` and `metadata.json` with the trained RF model state and assumptions.
-- `dc_model.npz` and `dc_model.json` with the separate geometry-to-DC model
-  and its extraction diagnostics.
-- `predicted_verification.mdif` for held-out verification blocks.
-- `verification_metrics.csv` with per-block and per-S-parameter errors,
-  including EVM.
-- `verification_summary.json` with global errors and passivity summary data.
-- `training_history.csv` and `training_history.pdf` with train/verification
-  loss history and convergence plots.
-- `dc_training_history.csv` and `dc_training_history.pdf` with convergence of
-  the independent geometry-only DC model.
-- `training_summary.md` with a human-readable run summary and copyable export
-  commands using paths relative to the repository root.
-- `worst_case_plots/*.pdf` with S-parameter Smith/complex, magnitude, phase,
-  and error views.
-- `worst_case_y_plots/*.pdf` with real/imaginary Y-parameter diagnostics.
-
-An integrated residual or prior-input KBNN run also writes a complete coarse
-DNN package under `coarse_model/` and a `composite_model_manifest.json` that
-identifies and hashes both saved networks for later Verilog-A or ADS HB extraction.
-The reported circuit-export commands include an explicit default module name and a
-single `--parameter-input-scales 1.0` value applied to every fitted parameter.
-A new model's saved DC network is self-contained, so its report does not add
-`--dc-mdif` or export-time open-threshold overrides. Legacy-model commands add
-`--dc-open-threshold 1e12` and `--dc-open-resistance 1e19`. When the fit saved
-an explicit path selection, commands also include `--dc-port-paths`. These
-values are easy to edit before export.
-
-### Distinct DC Point
-
-DC is a separate, geometry-dependent model derived only from the actual
-exact-zero-frequency S-matrix in each fitted MDIF block.
-It is not a target of the RF DNN, KBNN, or Neuro-TF. Zero-Hz rows are removed
-before RF neural training and rational fitting, so changing DC data cannot
-change RF weights, poles, sweep ranking, or the positive-frequency response.
-
-Declare the only viable DC connections with `--dc-port-paths`. For example,
-`--dc-port-paths 1-2,3-4` extracts and stamps independent paths between ports
-1–2 and 3–4. Every undeclared path remains open at DC. Use `1-ground` for a
-port-to-simulator-reference path. Omitting the option instead fits both the real
-and imaginary component of every ordered DC S-parameter: `S11.real`,
-`S11.imag`, …, `SNN.imag`. The complete complex S matrix is then converted to Y
-for electrical stamping. This does not discard information in an intermediate
-real-Y projection and imposes no resistor-graph or reciprocity constraint.
-Reports therefore show `dc_port_paths: []` for this unrestricted mode and list
-all modeled entries separately under `dc_sparameter_entries` and
-`dc_matrix_entries`; the empty path list does not mean S-parameters were omitted.
-When `--dc-mdif` is supplied without `--dc-port-paths`, this full-complex-S mode is
-also used to upgrade an older saved path-only DC model. Repeat an explicit
-`--dc-port-paths` value when a restricted resistor topology is intentional.
-Export stops with upgrade guidance if an older model saved the former automatic
-path graph but no source MDIF is available; it never silently presents that
-subset as a full-complex-S result.
-
-1. Each finite exact-zero-Hz S-matrix is checked for passivity using its largest
-   singular value. Rows above $1+10^{-6}$ are ignored.
-2. With no path option, both components of every ordered $S_{ij}$ value are fitted
-   directly. No intermediate real-Y projection is used.
-3. With an explicit path option, the S matrix is converted to Y and all declared
-   branches are solved together with a non-negative least-squares projection
-   onto that resistor graph.
-4. In explicit-path mode, conductances below the reciprocal of
-   `--dc-open-threshold` are represented by the reciprocal of
-   `--dc-open-resistance`. The natural logarithm of each positive branch
-   conductance is then fitted by a small geometry-only MLP.
-5. The saved diagnostics include the measured-S → extracted-Y → model-Y →
-   reconstructed-S round-trip error, filtered-row counts, matrix/path errors,
-   and train/verification errors.
-
-The DC MLP reuses the command's hidden-layer layout, activation, epoch, batch,
-learning-rate, patience, seed, and progress settings, but it has its own scaler,
-weights, history, and loss. Its inputs are geometry/process parameters only;
-frequency, RF samples, KBNN coarse responses, and S-parameter/frequency loss
-weights are not inputs to the DC fit.
-
-Every training and verification geometry must contain at least one exact-zero-
-Hz row. Non-passive or non-finite zero-Hz rows are discarded, and a geometry
-with no usable passive DC row is excluded from the separate DC fit. Fitting
-stops only when no usable passive DC geometries remain. A missing zero-Hz row
-in a training block is still an error. The lowest positive frequency is never substituted,
-and the RF response is never extrapolated to DC. RF verification metrics,
-worst-case plots, sweep ranking, and passivity selection use only positive-
-frequency rows. `predicted_verification.mdif` still contains both the separately
-predicted DC point and all RF points, while `verification_summary.json` reports
-the DC network's own train/verification round-trip errors separately.
-
-At exactly zero Hz, prediction and sampled-MDIF export evaluate only the saved
-geometry-to-DC model. Sampled ADS exports
-prepend this zero-Hz point automatically. Direct Verilog-A exports embed the DC
-MLP and electrically enable its branch matrix only at zero frequency. Positive
-frequencies use the RF model. The exporter selects DC or fitted Y
-coefficients before an unconditional current contribution, so `ddt()` is never
-placed in a conditional and the generated source remains legal for ADS
-Verilog-A. Export also verifies that DC came from exact-zero-frequency data.
-ADS HB exports make the same DC/RF separation in the SDD frequency weights:
-the geometry-dependent exact-DC matrix or explicit-path network is used only at
-$f=0$, and the fitted RF surrogate is used only at non-zero spectral frequencies.
-
-To export an older fitted model without retraining it, pass the original DC data
-directly to `export-veriloga`, `export-ads-hb`, or `export-ads-mdif`:
-
-```bash
-python3 dnn.py export-veriloga \
-  --model-dir dnn_model \
-  --out-dir dnn_model/veriloga_export \
-  --dc-mdif training_with_dc.mdif \
-  --dc-port-paths 1-2,3-4 \
-  --dc-open-threshold 1e12 \
-  --dc-open-resistance 1e19
-```
-
-`--dc-mdif` validates a saved geometry-dependent DC network directly against
-the supplied exact-DC rows. If it differs by more than $10^{-4}$ in maximum
-absolute S-parameter error, or if the saved model is legacy, export fits a new
-DC-only full-complex-S or explicit-path network from that MDIF. This never changes
-or refits the RF model. The export manifest records `dc_mdif_action` plus the topology and final
-DC-model S-parameter errors. An explicit resistor-path export is rejected if its
-maximum absolute S-parameter error remains above $10^{-3}$, because that means the
-declared topology cannot reproduce the data. The unrestricted complex-S mode
-has no topology/projection mismatch: it receives a larger export-only network
-and convergence budget, and any remaining interpolation error is reported as
-`dc_mdif_warning` without preventing the requested export.
-For a combined training/verification MDIF, export reuses the fitted model's
-`--split-var`, `--train-values`, and `--verify-values` metadata and fits or
-validates DC from the training split only. Verification blocks are never added
-to the DC optimizer; any verification blocks that do contain usable DC may be
-reported as validation during the original model fit, while verification blocks
-without DC are skipped. Missing-DC errors identify one-based `ACDATA` block
-positions in the original MDIF.
-
-For an integrated residual or prior-input KBNN, the composite Verilog-A and ADS
-HB components use the DC conductance surrogate fitted only from the fine-data
-MDIF and bypass both fine and coarse RF networks at zero Hz. The coarse model
-and coarse MDIF are not used to calculate composite DC. Native ADS ANN
-retraining excludes zero-Hz rows,
-but its generated ANN alone does not implement the distinct resistor branch;
-use the direct Verilog-A or sampled-MDIF handoff when DC behavior is required.
-
-Sweep runs add result CSVs, best-configuration JSON, Markdown summaries,
-per-trial loss-vs-epoch plots, diagnostic plots, and a promoted `best_model/`
-directory. At completion, each sweep prints a copyable standalone `train`
-command for the winning configuration; the same command is saved in the
-best-configuration JSON and Markdown summary. The sweep summary and the
-promoted model's `training_summary.md` also contain export commands resolved to
-`best_model/`. DNN and KBNN sweep results can be reranked after the fact to
-choose a different passive or weighted-error winner without repeating every
-trial.
-
-## ADS Integration Paths
+### Choose the ADS Handoff
 
 Choose the ADS handoff based on the level of simulator integration you need:
 
@@ -1603,17 +1882,26 @@ or parameterized separately.
 
 New model families can reuse the common support layer by following
 [MODEL_PLUGIN_API.md](MODEL_PLUGIN_API.md). Add one root-level model script and
-call shared helpers for MDIF I/O, splitting, metrics, plots, sweep
-orchestration, summaries, and ADS package generation.
+register it in the unified `surrogate.py` dispatcher. The backend can call
+shared helpers for MDIF I/O, splitting, metrics, plots, sweep orchestration,
+summaries, and ADS package generation.
 
 ---
 
-# Integrated Command Reference
+# Detailed Command Reference
+
+The lifecycle above is the recommended reading order. This reference is
+grouped under model fitting and optimization for option lookup; each model
+entry also retains its prediction and export subcommands so one CLI remains
+documented in one place.
+
+## Model Fitting and Optimization Commands
 
 The following sections contain the complete command references for all three
-model types. Every command is intended to run from the repository root.
+model types. Every command uses `surrogate.py --model ...` and is intended
+to run from the repository root.
 
-## DNN
+### DNN Command Reference
 
 This is the direct DNN companion to the Neuro-TF and KBNN prototypes. It trains
 a deep multilayer perceptron from parameterized S-parameter MDIF data.
@@ -1638,7 +1926,7 @@ The trainer automatically floors zero-variance output scaler columns to a
 representative response scale, which prevents constant terms such as an exactly
 zero isolation path from becoming large admittance errors in direct-Y models.
 
-### Expected MDIF Shape
+#### Expected MDIF Shape
 
 Each block should contain numeric geometry variables as `VAR` values and an
 ACDATA table. Use a split variable such as `dataset=train` or
@@ -1659,22 +1947,22 @@ END
 Supported pair formats in the option line are `RI`, `MA`, and `DB`. Header
 names may be logical names (`S11`) or explicit columns (`S11R S11I`).
 
-### Inspect MDIF
+#### Inspect MDIF
 
 Use `inspect-mdif` first when you want to confirm block count, S-parameter
 labels, inferred numeric variables, split values, and frequency span.
 
 ```bash
-python3 dnn.py inspect-mdif \
+python3 surrogate.py --model dnn inspect-mdif \
   --mdif train_verify.mdif
 ```
 
-### Usage
+#### Usage
 
 Train one DNN model with `train`:
 
 ```bash
-python3 dnn.py train \
+python3 surrogate.py --model dnn train \
   --mdif train_verify.mdif \
   --out-dir dnn_model \
   --parameter-names W,L \
@@ -1715,7 +2003,7 @@ chosen settings, final loss values, verification metrics, passivity summary,
 links to the generated S- and Y-parameter worst-case plots, and copyable
 self-contained Verilog-A and sampled ADS MDIF export commands.
 
-### Sweeping / Optimizing
+#### Sweeping / Optimizing
 
 Use `sweep` or its alias `optimize` to try multiple DNN configurations. The
 command writes `dnn_sweep_results.csv` and `dnn_sweep_summary.md`, chooses the
@@ -1725,7 +2013,7 @@ trials finish. When the sweep completes, it prints a copyable standalone
 `train` command for the winning configuration and records that command in
 `dnn_best_config.json` and `dnn_sweep_summary.md`.
 
-#### Adaptive range optimization
+##### Adaptive range optimization
 
 This is the recommended command when the useful values are not already known
 as a short discrete list. It searches continuous learning-rate and integer
@@ -1733,7 +2021,7 @@ batch-size ranges, categorical activations, and the hidden-layer depth/width
 space:
 
 ```bash
-python3 dnn.py optimize \
+python3 surrogate.py --model dnn optimize \
   --mdif train_verify.mdif \
   --out-dir dnn_adaptive \
   --parameter-names W,L,H \
@@ -1759,13 +2047,13 @@ architectures instead of uniform-width depth/width combinations, use an
 explicit domain such as
 `--optimize-parameter 'hidden_layers=64,64;128,128,64;256,128,64'`.
 
-#### Discrete grid or random optimization
+##### Discrete grid or random optimization
 
 Use the plural list options with `grid` or `random` when the complete candidate
 set is already known. This is the original discrete optimization method:
 
 ```bash
-python3 dnn.py optimize \
+python3 surrogate.py --model dnn optimize \
   --mdif train_verify.mdif \
   --out-dir dnn_sweep \
   --parameter-names W,L,H \
@@ -1811,7 +2099,7 @@ Available selectors:
 - Wildcards such as `S1*` or `S*1`
 - Explicit groups such as `S11,S22,S33,S44`
 
-#### Frequency weighting
+##### Frequency weighting
 
 Use `--frequency-weights` with DNN, KBNN, or Neuro-TF training and sweep
 commands to prioritize particular frequencies or bands. Rules are separated by
@@ -1889,7 +2177,7 @@ DNN sweep, parsed MDIF blocks and prepared feature/target matrices are cached
 inside each process, so repeated trials with the same data and frequency
 transform do not rebuild the same training arrays.
 
-### Post-Run Sweep Reranking
+#### Post-Run Sweep Reranking
 
 Passivity is computed and saved for every sweep trial, regardless of the
 selection metric used during the original run. If you later decide that the
@@ -1897,7 +2185,7 @@ best model should be the lowest-error passive candidate, rerank the existing
 sweep instead of rerunning the whole optimization:
 
 ```bash
-python3 dnn.py rerank-sweep \
+python3 surrogate.py --model dnn rerank-sweep \
   --sweep-dir dnn_sweep \
   --selection-metric weighted_evm_pct \
   --require-passive
@@ -1912,7 +2200,7 @@ If the original sweep used `--keep-trial-models`, the selected model can be
 copied without retraining:
 
 ```bash
-python3 dnn.py rerank-sweep \
+python3 surrogate.py --model dnn rerank-sweep \
   --sweep-dir dnn_sweep \
   --selection-metric weighted_evm_pct \
   --require-passive \
@@ -1924,12 +2212,12 @@ configuration, but the script cannot copy deleted `model.npz` files. In that
 case, retrain only the selected configuration rather than rerunning the full
 sweep.
 
-### Predict
+#### Predict
 
 Predict new parameter blocks after training:
 
 ```bash
-python3 dnn.py predict \
+python3 surrogate.py --model dnn predict \
   --model-dir dnn_model \
   --mdif new_parameter_blocks.mdif \
   --out-mdif predicted.mdif
@@ -1938,7 +2226,7 @@ python3 dnn.py predict \
 For prediction, the input MDIF must provide the geometry `VAR`s and frequency
 grid. Placeholder S-parameter columns are acceptable; their values are ignored.
 
-### ADS MDIF Export
+#### ADS MDIF Export
 
 After training, export a parameterized S-parameter table that ADS can use
 directly through an MDIF-capable data-based n-port or data access component.
@@ -1948,7 +2236,7 @@ geometry `VAR`s and frequency grids you want available in ADS. Placeholder
 S-parameter values are accepted and ignored.
 
 ```bash
-python3 dnn.py export-ads-mdif \
+python3 surrogate.py --model dnn export-ads-mdif \
   --model-dir dnn_model \
   --out-dir ads_export \
   --template-mdif ads_sweep_template.mdif
@@ -1957,7 +2245,7 @@ python3 dnn.py export-ads-mdif \
 You can also generate a rectangular parameter/frequency grid directly:
 
 ```bash
-python3 dnn.py export-ads-mdif \
+python3 surrogate.py --model dnn export-ads-mdif \
   --model-dir dnn_model \
   --out-dir ads_export \
   --parameter-grid W=0.40mm:0.80mm:9 \
@@ -1976,14 +2264,14 @@ at that file, and drive the same schematic variable names as the MDIF `VAR`s`.
 For optimization, constrain ADS variables inside the exported grid; ADS will
 interpolate between sampled points rather than evaluate the neural network.
 
-### ADS ANN Export
+#### ADS ANN Export
 
 Use `export-ads-ann` when you want ADS ANN to train/extract the neural model
 natively and emit the ADS ANN artifacts, including Verilog-A-oriented `.inc`,
 C `.c`, text equation `.equation`, `.struc`, and `.scale` files.
 
 ```bash
-python3 dnn.py export-ads-ann \
+python3 surrogate.py --model dnn export-ads-ann \
   --mdif train_verify.mdif \
   --model-dir dnn_sweep/best_model \
   --out-dir dnn_ads_ann \
@@ -2046,13 +2334,13 @@ Schematic use:
 5. Validate the wrapper in an S-parameter or AC simulation before circuit
    optimization.
 
-### ADS Harmonic-Balance Passive Network Export
+#### ADS Harmonic-Balance Passive Network Export
 
 Use `export-ads-hb` when the fitted structure must behave like a linear
 S-parameter network inside harmonic balance:
 
 ```bash
-python3 dnn.py export-ads-hb \
+python3 surrogate.py --model dnn export-ads-hb \
   --model-dir dnn_model \
   --out-dir dnn_ads_hb \
   --module-name my_dnn_4port_hb \
@@ -2078,7 +2366,7 @@ sizes, weights, and seed. Change only the output directory and response domain,
 and set the reference impedance used by the MDIF:
 
 ```bash
-python3 dnn.py train \
+python3 surrogate.py --model dnn train \
   --mdif train_verify.mdif \
   --out-dir dnn_model_direct_y_trial \
   --parameter-names W,L \
@@ -2094,7 +2382,7 @@ Then export the unchanged S-domain baseline and the separately trained trial
 together:
 
 ```bash
-python3 dnn.py export-ads-hb \
+python3 surrogate.py --model dnn export-ads-hb \
   --model-dir dnn_model \
   --direct-y-trial-model-dir dnn_model_direct_y_trial \
   --out-dir dnn_ads_hb \
@@ -2134,7 +2422,7 @@ or impedance mismatch. Differences found in comparable training metadata are
 recorded under `direct_y_comparison.training_metadata_differences` so the timing
 trial does not silently combine unrelated fitting changes.
 
-### Direct Verilog-A Export
+#### Direct Verilog-A Export
 
 Use `export-veriloga` when you want to embed the trained local DNN weights
 directly in a Verilog-A n-port instead of exporting a sampled MDIF table or
@@ -2146,7 +2434,7 @@ Y-parameters, so the generated Verilog-A stamps admittance directly instead of
 performing a complex S-to-Y matrix inversion during every simulator evaluation:
 
 ```bash
-python3 dnn.py train \
+python3 surrogate.py --model dnn train \
   --mdif train_verify.mdif \
   --out-dir dnn_y_model \
   --parameter-names W,L \
@@ -2155,7 +2443,7 @@ python3 dnn.py train \
 ```
 
 ```bash
-python3 dnn.py export-veriloga \
+python3 surrogate.py --model dnn export-veriloga \
   --model-dir dnn_y_model \
   --out-dir dnn_veriloga \
   --module-name my_dnn_4port
@@ -2196,7 +2484,7 @@ use `--parameter-input-scales 1um`. The generated Verilog-A divides every
 fitted parameter by its generated input-scale parameter before evaluating the
 network.
 
-### ADS Note
+#### ADS Note
 
 The `export-ads-mdif` command is the lowest-risk direct ADS handoff. It exports
 the trained DNN response onto a dense parameter/frequency table, so ADS can use
@@ -2208,12 +2496,12 @@ validated in the target ADS Verilog-A compiler. The `export-ads-ann` command is
 the native ADS ANN handoff for generating ADS ANN
 Verilog-A/C/equation artifacts on an ADS machine.
 
-### Options Reference
+#### Options Reference
 
 Options are grouped by purpose below. Rows are alphabetical within each table;
 the **Subcommands** column includes accepted command aliases.
 
-#### Files, data, and outputs
+##### Files, data, and outputs
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2228,7 +2516,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. S-parameter values are ignored. Use this when you already know the ADS optimization grid. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
 
-#### Data selection and loss weighting
+##### Data selection and loss weighting
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2240,7 +2528,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--train-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
 | <nobr><code>--verify-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated values of `--split-var` that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
 
-#### Model architecture and fitting
+##### Model architecture and fitting
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2262,7 +2550,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--target-z0 FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Reference impedance used only when `--output-domain y` converts S-parameters into Y-parameter training targets. Use the same value as the MDIF option line reference impedance. Default: `50.0`. | <nobr><code>--target-z0 50</code></nobr> |
 | <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification S/Y plot pairs to generate. In a sweep it applies to a final `--retrain-best`; otherwise the promoted trial retains its `--trial-worst-plots` output. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
 
-#### Sweep and model selection
+##### Sweep and model selection
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2288,7 +2576,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
 | <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
 
-#### Export and ADS integration
+##### Export and ADS integration
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2312,7 +2600,7 @@ the **Subcommands** column includes accepted command aliases.
 
 ---
 
-## KBNN
+### KBNN Command Reference
 
 This is the KBNN companion to the Neuro-TF prototype. It trains a neural model
 from a fine/target S-parameter MDIF and, for knowledge-based modes, the
@@ -2344,7 +2632,7 @@ The trainer automatically floors zero-variance output scaler columns to a
 representative response scale, which prevents constant residual or isolation
 terms from becoming oversized learned delta-S errors in exported models.
 
-### Expected MDIF Shape
+#### Expected MDIF Shape
 
 Fine and coarse MDIF files use the same generic block structure as the Neuro-TF
 trainer. Supply them together with `--mdif` and `--coarse-mdif`. The integrated
@@ -2367,22 +2655,22 @@ KBNN evaluates the fitted coarse DNN directly at every fine-data geometry and
 frequency point. The original coarse grid therefore does not need to match the
 fine grid, provided the fitted DNN is valid across the fine model's domain.
 
-### Inspect MDIF
+#### Inspect MDIF
 
 Use `inspect-mdif` first when you want to confirm block count, S-parameter
 labels, inferred numeric variables, split values, and frequency span.
 
 ```bash
-python3 kbnn.py inspect-mdif \
+python3 surrogate.py --model kbnn inspect-mdif \
   --mdif fine_train_verify.mdif
 ```
 
-### Usage
+#### Usage
 
 Train one KBNN model with `train`:
 
 ```bash
-python3 kbnn.py train \
+python3 surrogate.py --model kbnn train \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
   --out-dir kbnn_model \
@@ -2437,7 +2725,7 @@ predictions are appended to the input. Prior-input mode always uses the
 predictions as inputs. The KBNN metadata records relative and absolute coarse
 model paths plus file hashes for later prediction and export.
 
-### Sweeping / Optimizing
+#### Sweeping / Optimizing
 
 Use `sweep` or its alias `optimize` to try multiple KBNN configurations. The
 command writes `kbnn_sweep_results.csv` and `kbnn_sweep_summary.md`, chooses
@@ -2447,14 +2735,14 @@ trials finish. When the sweep completes, it prints a copyable standalone
 `train` command for the winning configuration and records that command in
 `kbnn_best_config.json` and `kbnn_sweep_summary.md`.
 
-#### Adaptive range optimization
+##### Adaptive range optimization
 
 For an integrated KBNN, pass `--coarse-mdif` as usual. The coarse DNN is fitted
 once, frozen, and reused while the adaptive optimizer trials different fine
 model configurations:
 
 ```bash
-python3 kbnn.py optimize \
+python3 surrogate.py --model kbnn optimize \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
   --out-dir kbnn_adaptive \
@@ -2484,13 +2772,13 @@ domains above apply to the fine network. Use `--coarse-model-dir` in place of
 `--coarse-mdif` only when intentionally reusing a previously fitted coarse
 network.
 
-#### Discrete grid or random optimization
+##### Discrete grid or random optimization
 
 Use the plural list options when the KBNN modes and network configurations are
 already known as a finite candidate set:
 
 ```bash
-python3 kbnn.py optimize \
+python3 surrogate.py --model kbnn optimize \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
   --out-dir kbnn_sweep \
@@ -2604,7 +2892,7 @@ matrices are cached inside each process. Repeated trials with the same data,
 mode, coarse-input setting, and frequency transform reuse those arrays instead
 of rebuilding them.
 
-### Post-Run Sweep Reranking
+#### Post-Run Sweep Reranking
 
 Passivity is computed and saved for every sweep trial, regardless of the
 selection metric used during the original run. If you later decide that the
@@ -2612,7 +2900,7 @@ best model should be the lowest-error passive candidate, rerank the existing
 sweep instead of rerunning the whole optimization:
 
 ```bash
-python3 kbnn.py rerank-sweep \
+python3 surrogate.py --model kbnn rerank-sweep \
   --sweep-dir kbnn_sweep \
   --selection-metric weighted_evm_pct \
   --require-passive
@@ -2628,7 +2916,7 @@ If the original sweep used `--keep-trial-models`, the selected model can be
 copied without retraining:
 
 ```bash
-python3 kbnn.py rerank-sweep \
+python3 surrogate.py --model kbnn rerank-sweep \
   --sweep-dir kbnn_sweep \
   --selection-metric weighted_evm_pct \
   --require-passive \
@@ -2640,12 +2928,12 @@ configuration, but the script cannot copy deleted `model.npz` files. In that
 case, retrain only the selected configuration rather than rerunning the full
 sweep.
 
-### Predict
+#### Predict
 
 Predict new parameter blocks after training:
 
 ```bash
-python3 kbnn.py predict \
+python3 surrogate.py --model kbnn predict \
   --model-dir kbnn_model \
   --mdif new_fine_shape.mdif \
   --out-mdif predicted.mdif
@@ -2657,7 +2945,7 @@ then the recorded absolute path. If the coarse model was moved separately, pass
 its new path with
 `--coarse-model-dir`; the saved model and metadata hashes must still match.
 
-### ADS MDIF Export
+#### ADS MDIF Export
 
 After training, export a parameterized S-parameter table that ADS can use
 directly through an MDIF-capable data-based n-port or data access component.
@@ -2669,7 +2957,7 @@ geometry `VAR`s and frequency grids you want available in ADS. Placeholder
 fine S-parameter values are accepted and ignored.
 
 ```bash
-python3 kbnn.py export-ads-mdif \
+python3 surrogate.py --model kbnn export-ads-mdif \
   --model-dir kbnn_model \
   --out-dir ads_export \
   --template-mdif ads_sweep_template.mdif
@@ -2680,7 +2968,7 @@ exporter evaluates the packaged coarse DNN at every generated point. If that
 model was moved separately, provide its new path with `--coarse-model-dir`.
 
 ```bash
-python3 kbnn.py export-ads-mdif \
+python3 surrogate.py --model kbnn export-ads-mdif \
   --model-dir kbnn_model \
   --out-dir ads_export \
   --parameter-grid W=0.40mm:0.80mm:9 \
@@ -2699,14 +2987,14 @@ at that file, and drive the same schematic variable names as the MDIF `VAR`s`.
 For optimization, constrain ADS variables inside the exported grid; ADS will
 interpolate between sampled points rather than evaluate the neural network.
 
-### ADS ANN Export
+#### ADS ANN Export
 
 Use `export-ads-ann` when you want ADS ANN to train/extract the neural model
 natively and emit the ADS ANN artifacts, including Verilog-A-oriented `.inc`,
 C `.c`, text equation `.equation`, `.struc`, and `.scale` files.
 
 ```bash
-python3 kbnn.py export-ads-ann \
+python3 surrogate.py --model kbnn export-ads-ann \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
   --model-dir kbnn_sweep/best_model \
@@ -2785,13 +3073,13 @@ Schematic use:
 5. Validate the wrapper in an S-parameter or AC simulation before circuit
    optimization.
 
-### ADS Harmonic-Balance Passive Network Export
+#### ADS Harmonic-Balance Passive Network Export
 
 Use `export-ads-hb` to package the fitted fine KBNN and its exact frozen coarse
 DNN as one linear ADS subnetwork:
 
 ```bash
-python3 kbnn.py export-ads-hb \
+python3 surrogate.py --model kbnn export-ads-hb \
   --model-dir kbnn_model \
   --out-dir kbnn_ads_hb \
   --module-name my_kbnn_4port_hb \
@@ -2807,7 +3095,7 @@ generated S-to-Y conversion followed by an explicit current stamp. The DC
 conductance is stamped by a separate branch, and no external coarse hooks,
 implicit port-current unknowns, or power parameter remain.
 
-### Direct Verilog-A Export
+#### Direct Verilog-A Export
 
 Use `export-veriloga` when you want a self-contained Verilog-A n-port instead
 of exporting a sampled MDIF table or retraining with ADS ANN. A residual or
@@ -2820,7 +3108,7 @@ Fit the coarse DNN once and optimize the fine KBNN in one command. Supply
 `--parameter-names` explicitly so both model inputs have the same order:
 
 ```bash
-python3 kbnn.py optimize \
+python3 surrogate.py --model kbnn optimize \
   --mdif fine_train_verify.mdif \
   --coarse-mdif coarse_train_verify.mdif \
   --out-dir kbnn_sweep \
@@ -2840,7 +3128,7 @@ Finally, export the composite model. The packaged relative coarse-model path is
 used automatically, so `best_model/` can be moved as one unit:
 
 ```bash
-python3 kbnn.py export-veriloga \
+python3 surrogate.py --model kbnn export-veriloga \
   --model-dir kbnn_sweep/best_model \
   --out-dir kbnn_veriloga \
   --module-name my_kbnn_4port
@@ -2892,7 +3180,7 @@ use `--parameter-input-scales 1um`. The generated Verilog-A divides every
 fitted parameter by its generated input-scale parameter before evaluating both
 the fine and embedded coarse networks.
 
-### ADS Note
+#### ADS Note
 
 The `export-ads-mdif` command is the lowest-risk direct ADS handoff. It exports
 the trained KBNN response onto a dense parameter/frequency table, so ADS can use
@@ -2905,12 +3193,12 @@ harmonic balance. The `export-ads-ann` command is
 the native ADS ANN handoff for generating ADS ANN Verilog-A/C/equation
 artifacts on an ADS machine.
 
-### Options Reference
+#### Options Reference
 
 Options are grouped by purpose below. Rows are alphabetical within each table;
 the **Subcommands** column includes accepted command aliases.
 
-#### Files, data, and outputs
+##### Files, data, and outputs
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2927,7 +3215,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. Fine S-parameter values are ignored. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
 
-#### Data selection and loss weighting
+##### Data selection and loss weighting
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2941,7 +3229,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--train-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated split values that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
 | <nobr><code>--verify-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated split values that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
 
-#### Model architecture and fitting
+##### Model architecture and fitting
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -2976,7 +3264,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Random seed for data splitting, model initialization, minibatch order, ADS ANN data preparation, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification S/Y plot pairs to generate. In a sweep it applies to a final `--retrain-best`; otherwise the promoted trial retains its `--trial-worst-plots` output. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
 
-#### Sweep and model selection
+##### Sweep and model selection
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3002,7 +3290,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
 | <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
 
-#### Export and ADS integration
+##### Export and ADS integration
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3027,7 +3315,7 @@ the **Subcommands** column includes accepted command aliases.
 
 ---
 
-## Neuro-TF
+### Neuro-TF Command Reference
 
 This is a self-contained prototype for training a Neuro-transfer-function
 surrogate from parameterized S-parameter MDIF data.
@@ -3046,7 +3334,7 @@ The rational transfer functions use fixed stable poles, so coefficient
 extraction for each geometry is linear least squares. The neural network then
 learns the geometry-to-coefficients map.
 
-### Expected MDIF Shape
+#### Expected MDIF Shape
 
 Each block should contain numeric geometry variables as `VAR` values and an
 ACDATA table. Use a split variable such as `dataset=train` or
@@ -3067,22 +3355,22 @@ END
 Supported pair formats in the option line are `RI`, `MA`, and `DB`. Header
 names may be logical names (`S11`) or explicit columns (`S11R S11I`).
 
-### Inspect MDIF
+#### Inspect MDIF
 
 Use `inspect-mdif` first when you want to confirm block count, S-parameter
 labels, inferred numeric variables, split values, and frequency span.
 
 ```bash
-python3 neuro_tf.py inspect-mdif \
+python3 surrogate.py --model neuro-tf inspect-mdif \
   --mdif train_verify.mdif
 ```
 
-### Usage
+#### Usage
 
 Train one Neuro-TF model with `train`:
 
 ```bash
-python3 neuro_tf.py train \
+python3 surrogate.py --model neuro-tf train \
   --mdif train_verify.mdif \
   --out-dir neuro_tf_model \
   --parameter-names W,L \
@@ -3125,7 +3413,7 @@ chosen settings, final loss values, verification metrics, passivity summary,
 links to the generated S- and Y-parameter worst-case plots, and copyable
 self-contained Verilog-A and sampled ADS MDIF export commands.
 
-### Sweeping / Optimizing
+#### Sweeping / Optimizing
 
 Use `sweep` or its alias `optimize` to try multiple rational orders and neural
 network settings. The command writes `neurotf_sweep_results.csv` and
@@ -3136,14 +3424,14 @@ it prints a copyable standalone `train` command for the winning configuration
 and records that command in `neurotf_best_config.json` and
 `neurotf_sweep_summary.md`.
 
-#### Adaptive range optimization
+##### Adaptive range optimization
 
 Neuro-TF can adapt both the rational transfer-function fit and the neural
 coefficient model. This example searches pole count, damping, ridge
 regularization, learning rate, activation, and hidden-layer structure:
 
 ```bash
-python3 neuro_tf.py optimize \
+python3 surrogate.py --model neuro-tf optimize \
   --mdif train_verify.mdif \
   --out-dir neuro_tf_adaptive \
   --parameter-names W,L,H \
@@ -3168,13 +3456,13 @@ To weight specific frequency bands during coefficient fitting and model
 selection, add a normal option such as
 `--frequency-weights 'default=1;2GHz:4GHz=5'`.
 
-#### Discrete grid or random optimization
+##### Discrete grid or random optimization
 
 Use the plural list options when the rational and network candidates are
 already known as a finite set:
 
 ```bash
-python3 neuro_tf.py optimize \
+python3 surrogate.py --model neuro-tf optimize \
   --mdif train_verify.mdif \
   --out-dir neuro_tf_sweep \
   --parameter-names W,L,H \
@@ -3225,24 +3513,24 @@ Passivity-failing trials are shown in red on those plots. Passive-only grouped
 statistics remain available, while dashed all-trial means and `all_*` CSV
 columns preserve trends when every trial fails passivity.
 
-### Predict
+#### Predict
 
 Predict new parameter blocks after training:
 
 ```bash
-python3 neuro_tf.py predict \
+python3 surrogate.py --model neuro-tf predict \
   --model-dir neuro_tf_model \
   --mdif new_parameter_blocks.mdif \
   --out-mdif predicted.mdif
 ```
 
-### ADS Harmonic-Balance Passive Network Export
+#### ADS Harmonic-Balance Passive Network Export
 
 Export the trained coefficient network and fixed-pole response as one linear
 ADS HB subnetwork:
 
 ```bash
-python3 neuro_tf.py export-ads-hb \
+python3 surrogate.py --model neuro-tf export-ads-hb \
   --model-dir neuro_tf_model \
   --out-dir neuro_tf_ads_hb \
   --module-name my_neuro_tf_4port_hb \
@@ -3256,13 +3544,13 @@ separate explicit branch stamps DC conductance only at zero frequency. The
 model remains linear and power independent; the fixed poles provide the
 frequency dependence, not signal-amplitude dependence.
 
-### Direct Verilog-A Export
+#### Direct Verilog-A Export
 
 Export the saved geometry-to-coefficient network and its fixed rational poles
 as one self-contained Verilog-A n-port:
 
 ```bash
-python3 neuro_tf.py export-veriloga \
+python3 surrogate.py --model neuro-tf export-veriloga \
   --model-dir neuro_tf_model \
   --out-dir neuro_tf_veriloga \
   --module-name my_neuro_tf_4port \
@@ -3287,13 +3575,13 @@ This export is intended for S-parameter and small-signal AC analysis. Validate
 it against `predicted_verification.mdif` with the target ADS Verilog-A compiler
 before using it in optimization.
 
-### Export Sampled ADS MDIF
+#### Export Sampled ADS MDIF
 
 Export the fitted fixed-pole Neuro-TF response on either the exact geometry and
 frequency blocks of a template MDIF or an explicit parameter/frequency grid:
 
 ```bash
-python3 neuro_tf.py export-ads-mdif \
+python3 surrogate.py --model neuro-tf export-ads-mdif \
   --model-dir neuro_tf_model \
   --out-dir neuro_tf_ads_export \
   --template-mdif ads_sweep_template.mdif
@@ -3304,7 +3592,7 @@ The command writes `surrogate_ads.mdif`, `ads_model_manifest.json`, and
 parameter blocks and frequency grids are used. Instead of `--template-mdif`,
 repeat `--parameter-grid` once for each model parameter and supply `--freqs`.
 
-### ADS Note
+#### ADS Note
 
 Use `export-ads-mdif` for the lowest-risk interpolation-based handoff,
 `export-ads-hb` for an integrated harmonic-balance component, or
@@ -3312,12 +3600,12 @@ Use `export-ads-mdif` for the lowest-risk interpolation-based handoff,
 network and fixed-pole response. Both direct packages are self-contained; the
 sampled MDIF remains useful as a simulator-independent cross-check.
 
-### Options Reference
+#### Options Reference
 
 Options are grouped by purpose below. Rows are alphabetical within each table;
 the **Subcommands** column includes accepted command aliases.
 
-#### Files, data, and outputs
+##### Files, data, and outputs
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3330,7 +3618,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | MDIF whose parameter/frequency blocks define the export sampling grid. Mutually exclusive in practice with the explicit-grid form. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
 
-#### Data selection and loss weighting
+##### Data selection and loss weighting
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3341,7 +3629,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--train-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Comma-separated values of `--split-var` that identify training blocks. Default: `train,training`. | <nobr><code>--train-values train,training</code></nobr> |
 | <nobr><code>--verify-values LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Comma-separated values of `--split-var` that identify verification blocks. Default: `verify,verification,test,validation`. | <nobr><code>--verify-values verification,test</code></nobr> |
 
-#### Model architecture and fitting
+##### Model architecture and fitting
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3365,7 +3653,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Random seed for data splitting, model initialization, minibatch order, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification fits to render as PDFs. Each selected case gets an S-parameter plot and a Y-parameter implementation-view plot. Ranking uses max absolute complex response error, with RMSE also reported in the title and plot index CSV. Use `0` to skip plot generation. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
 
-#### Sweep and model selection
+##### Sweep and model selection
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3386,7 +3674,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--trial-seed-mode {fixed,indexed}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Controls the seed used inside each sweep trial. `fixed` uses `--seed` for every trial so repeated candidates compare directly across sweeps. `indexed` restores the older `--seed + trial_number` behavior. Default: `fixed`. | <nobr><code>--trial-seed-mode fixed</code></nobr> |
 | <nobr><code>--trial-worst-plots INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of lightweight worst-case S/Y PDF pairs generated and linked for each sweep trial. Default: `1`. | <nobr><code>--trial-worst-plots 1</code></nobr> |
 
-#### Export and ADS integration
+##### Export and ADS integration
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
@@ -3399,6 +3687,8 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--parameter-grid SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Explicit grid for one model parameter. Repeat once per parameter; requires `--freqs`. | <nobr><code>--parameter-grid W=0.4mm:0.8mm:9</code></nobr> |
 | <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used for every geometry/process parameter: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
 | <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
+
+# Technical Appendices
 
 ## Appendix A: Exact-DC Extraction and Export Method
 
@@ -3624,7 +3914,7 @@ inferred path representation, the exporter requires the original MDIF so it can
 reconstruct information that is not present in the old saved model:
 
 ```bash
-python3 dnn.py export-veriloga \
+python3 surrogate.py --model dnn export-veriloga \
   --model-dir dnn_model \
   --out-dir dnn_model/veriloga_export \
   --dc-mdif training_with_dc.mdif
@@ -4310,6 +4600,7 @@ normative implementation:
 
 | Area | Source |
 | --- | --- |
+| Unified model-family command dispatch | [`surrogate.py`](surrogate.py) |
 | DNN features, S/Y targets, training, persistence, and commands | [`dnn.py`](dnn.py) |
 | KBNN coarse fitting, identity checks, modes, targets, and composite export | [`kbnn.py`](kbnn.py) |
 | Fixed-pole construction, rational coefficient extraction, and Neuro-TF evaluation | [`neuro_tf.py`](neuro_tf.py) |
