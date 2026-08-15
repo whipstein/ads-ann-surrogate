@@ -38,9 +38,19 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 )
 
             train_points = root / "geometries_train.csv"
+            coverage_plot = root / "geometries_parameter_coverage.svg"
             self.assertTrue(train_points.is_file())
             self.assertTrue(geometries.with_suffix(".json").is_file())
+            self.assertTrue(coverage_plot.is_file())
             self.assertFalse(train_points.with_suffix(".json").exists())
+            self.assertFalse(
+                (root / "geometries_train_parameter_coverage.svg").exists()
+            )
+            metadata = json.loads(geometries.with_suffix(".json").read_text())
+            self.assertEqual(
+                metadata["parameter_coverage_plot"],
+                coverage_plot.name,
+            )
             parser = POINTS.build_suggest_parser()
             args = parser.parse_args(
                 [
@@ -140,6 +150,13 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             )
             self.assertEqual(metadata["parameters"][0]["range"]["unit"], "mm")
             self.assertEqual(metadata["parameters"][1]["scale"], "log")
+            self.assertTrue(
+                (root / "additional_parameter_coverage.svg").is_file()
+            )
+            self.assertEqual(
+                metadata["parameter_coverage_plot"],
+                "additional_parameter_coverage.svg",
+            )
             self.assertIn("parameter domain:", stdout.getvalue())
 
     def test_gp_ucb_prefers_high_error_or_uncertain_regions(self) -> None:
@@ -264,8 +281,12 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                             "a=0:1",
                             "--parameter",
                             "b=0:1",
+                            "--parameter",
+                            "c=1:100:log",
                             "--count",
                             "12",
+                            "--verification-count",
+                            "3",
                             "--lhs-candidates",
                             "4",
                             "--out",
@@ -276,6 +297,24 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 )
             metadata = json.loads(output.with_suffix(".json").read_text())
             self.assertEqual(metadata["method"], "maximin-lhs")
+            coverage_path = Path(temp_dir) / "initial_parameter_coverage.svg"
+            self.assertTrue(coverage_path.is_file())
+            self.assertEqual(
+                metadata["parameter_coverage_plot"],
+                coverage_path.name,
+            )
+            coverage_svg = coverage_path.read_text()
+            self.assertEqual(
+                coverage_svg.count('data-plot-kind="histogram"'),
+                3,
+            )
+            self.assertEqual(
+                coverage_svg.count('data-plot-kind="scatter"'),
+                6,
+            )
+            self.assertIn('data-series="training"', coverage_svg)
+            self.assertIn('data-series="verification"', coverage_svg)
+            self.assertIn("c (log)", coverage_svg)
 
     def test_minimax_lhs_alias_is_canonicalized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

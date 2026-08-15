@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import math
 import random
@@ -562,6 +563,273 @@ def geometry_metadata_path(path: Path) -> Path:
     return metadata_path
 
 
+def geometry_coverage_plot_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}_parameter_coverage.svg")
+
+
+def coverage_axis_label(parameter: ParameterSpec) -> str:
+    details = [value for value in (parameter.unit, parameter.scale if parameter.scale == "log" else "") if value]
+    return (
+        f"{parameter.name} ({', '.join(details)})"
+        if details
+        else parameter.name
+    )
+
+
+def coverage_tick_label(parameter: ParameterSpec, coordinate: float) -> str:
+    value = map_unit_point(coordinate, parameter)
+    unit_scale = UNIT_SCALES.get(parameter.unit, 1.0)
+    displayed = value / unit_scale
+    if math.isclose(displayed, 0.0, abs_tol=1.0e-15):
+        displayed = 0.0
+    return f"{displayed:.4g}"
+
+
+def coverage_split_group(value: object) -> str:
+    token = normalize_key(value)
+    if token in {"verification", "verify", "validation", "test"}:
+        return "verification"
+    return "training"
+
+
+def write_parameter_coverage_svg(
+    geometry_path: Path,
+    parameters: Sequence[ParameterSpec],
+    rows: Sequence[dict[str, object]],
+    split_var: str,
+    *,
+    bare_values: str = "parameter-units",
+) -> Path:
+    """Write a dependency-free scatter/histogram matrix for generated points."""
+
+    if not parameters:
+        raise ValueError("A parameter coverage plot requires at least one parameter")
+
+    grouped_points: dict[str, list[list[float]]] = {
+        "training": [],
+        "verification": [],
+    }
+    for row_index, row in enumerate(rows, start=1):
+        coordinates: list[float] = []
+        for parameter in parameters:
+            raw_value = lookup_row_value(row, parameter.name)
+            if raw_value is None or str(raw_value).strip() == "":
+                raise ValueError(
+                    f"Could not plot geometry row {row_index}: missing parameter "
+                    f"{parameter.name!r}"
+                )
+            try:
+                value = parse_observed_value(
+                    raw_value,
+                    parameter,
+                    bare_values=bare_values,
+                )
+                coordinate = unit_coordinate_for_value(value, parameter)
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Could not plot geometry row {row_index} parameter "
+                    f"{parameter.name!r}: {raw_value!r}"
+                ) from exc
+            if not math.isfinite(coordinate) or not -1.0e-8 <= coordinate <= 1.0 + 1.0e-8:
+                raise ValueError(
+                    f"Could not plot geometry row {row_index}: parameter "
+                    f"{parameter.name!r} is outside the declared range"
+                )
+            coordinates.append(min(1.0, max(0.0, coordinate)))
+        split_value = lookup_row_value(row, split_var) or "train"
+        grouped_points[coverage_split_group(split_value)].append(coordinates)
+
+    dimension_count = len(parameters)
+    cell_size = 174
+    left_margin = 105
+    right_margin = 24
+    top_margin = 104
+    bottom_margin = 60
+    width = left_margin + dimension_count * cell_size + right_margin
+    height = top_margin + dimension_count * cell_size + bottom_margin
+    plot_inset_left = 20
+    plot_inset_right = 10
+    plot_inset_top = 10
+    plot_inset_bottom = 25
+    training_color = "#2563eb"
+    verification_color = "#f97316"
+    output_path = geometry_coverage_plot_path(geometry_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
+            'aria-labelledby="coverage-title coverage-description">'
+        ),
+        '<title id="coverage-title">Parameter coverage matrix</title>',
+        (
+            '<desc id="coverage-description">Pairwise parameter scatter plots with '
+            'overlaid training and verification histograms on the diagonal.</desc>'
+        ),
+        "<style>",
+        "text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }",
+        ".cell { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }",
+        ".grid { stroke: #e2e8f0; stroke-width: 1; }",
+        ".axis-label { fill: #0f172a; font-size: 11px; font-weight: 600; }",
+        ".tick { fill: #64748b; font-size: 8px; }",
+        "</style>",
+        f'<rect width="{width}" height="{height}" fill="#f8fafc"/>',
+        (
+            f'<text x="{left_margin}" y="28" fill="#0f172a" font-size="19" '
+            f'font-weight="700">Parameter coverage: {html.escape(geometry_path.name)}</text>'
+        ),
+        (
+            f'<text x="{left_margin}" y="50" fill="#475569" font-size="11">'
+            f'{len(grouped_points["training"])} training point(s), '
+            f'{len(grouped_points["verification"])} verification point(s)</text>'
+        ),
+        (
+            f'<circle cx="{left_margin}" cy="72" r="4" fill="{training_color}"/>'
+            f'<text x="{left_margin + 10}" y="76" fill="#334155" font-size="11">Training</text>'
+        ),
+        (
+            f'<circle cx="{left_margin + 82}" cy="72" r="4" fill="{verification_color}"/>'
+            f'<text x="{left_margin + 92}" y="76" fill="#334155" font-size="11">Verification</text>'
+        ),
+    ]
+
+    for column, parameter in enumerate(parameters):
+        center_x = left_margin + column * cell_size + cell_size / 2
+        lines.append(
+            f'<text class="axis-label" x="{center_x:.3f}" y="95" '
+            f'text-anchor="middle">{html.escape(coverage_axis_label(parameter))}</text>'
+        )
+    for row_index, parameter in enumerate(parameters):
+        center_y = top_margin + row_index * cell_size + cell_size / 2
+        lines.append(
+            f'<text class="axis-label" x="{left_margin - 11}" y="{center_y:.3f}" '
+            f'text-anchor="end" dominant-baseline="middle">'
+            f'{html.escape(coverage_axis_label(parameter))}</text>'
+        )
+
+    for row_index, y_parameter in enumerate(parameters):
+        for column_index, x_parameter in enumerate(parameters):
+            cell_x = left_margin + column_index * cell_size
+            cell_y = top_margin + row_index * cell_size
+            plot_left = cell_x + plot_inset_left
+            plot_right = cell_x + cell_size - plot_inset_right
+            plot_top = cell_y + plot_inset_top
+            plot_bottom = cell_y + cell_size - plot_inset_bottom
+            plot_width = plot_right - plot_left
+            plot_height = plot_bottom - plot_top
+            plot_kind = "histogram" if row_index == column_index else "scatter"
+            lines.append(
+                f'<g data-row-parameter="{html.escape(y_parameter.name, quote=True)}" '
+                f'data-column-parameter="{html.escape(x_parameter.name, quote=True)}" '
+                f'data-plot-kind="{plot_kind}">'
+            )
+            lines.append(
+                f'<rect class="cell" x="{cell_x}" y="{cell_y}" '
+                f'width="{cell_size}" height="{cell_size}"/>'
+            )
+            lines.extend(
+                [
+                    (
+                        f'<line class="grid" x1="{plot_left + plot_width / 2:.3f}" '
+                        f'y1="{plot_top}" x2="{plot_left + plot_width / 2:.3f}" '
+                        f'y2="{plot_bottom}"/>'
+                    ),
+                    (
+                        f'<line class="grid" x1="{plot_left}" '
+                        f'y1="{plot_top + plot_height / 2:.3f}" x2="{plot_right}" '
+                        f'y2="{plot_top + plot_height / 2:.3f}"/>'
+                    ),
+                    (
+                        f'<rect x="{plot_left}" y="{plot_top}" width="{plot_width}" '
+                        f'height="{plot_height}" fill="none" stroke="#94a3b8" '
+                        'stroke-width="0.8"/>'
+                    ),
+                ]
+            )
+
+            if plot_kind == "histogram":
+                largest_group = max(len(points) for points in grouped_points.values())
+                bin_count = max(5, min(18, int(math.ceil(math.sqrt(max(1, largest_group))))))
+                histograms: dict[str, list[int]] = {}
+                maximum_count = 1
+                for group_name, points in grouped_points.items():
+                    counts = [0] * bin_count
+                    for point in points:
+                        bin_index = min(
+                            bin_count - 1,
+                            int(point[column_index] * bin_count),
+                        )
+                        counts[bin_index] += 1
+                    histograms[group_name] = counts
+                    maximum_count = max(maximum_count, *counts)
+                bar_width = plot_width / bin_count
+                for group_name, color in (
+                    ("training", training_color),
+                    ("verification", verification_color),
+                ):
+                    for bin_index, count in enumerate(histograms[group_name]):
+                        if count == 0:
+                            continue
+                        bar_height = plot_height * count / maximum_count
+                        lines.append(
+                            f'<rect data-series="{group_name}" '
+                            f'x="{plot_left + bin_index * bar_width + 0.6:.3f}" '
+                            f'y="{plot_bottom - bar_height:.3f}" '
+                            f'width="{max(0.5, bar_width - 1.2):.3f}" '
+                            f'height="{bar_height:.3f}" fill="{color}" '
+                            'fill-opacity="0.52"/>'
+                        )
+            else:
+                for group_name, color in (
+                    ("training", training_color),
+                    ("verification", verification_color),
+                ):
+                    for point in grouped_points[group_name]:
+                        point_x = plot_left + point[column_index] * plot_width
+                        point_y = plot_bottom - point[row_index] * plot_height
+                        lines.append(
+                            f'<circle data-series="{group_name}" cx="{point_x:.3f}" '
+                            f'cy="{point_y:.3f}" r="3.1" fill="{color}" '
+                            'fill-opacity="0.82" stroke="#ffffff" stroke-width="0.55"/>'
+                        )
+
+            if row_index == dimension_count - 1:
+                lines.extend(
+                    [
+                        (
+                            f'<text class="tick" x="{plot_left}" y="{cell_y + cell_size - 8}" '
+                            f'text-anchor="start">{html.escape(coverage_tick_label(x_parameter, 0.0))}</text>'
+                        ),
+                        (
+                            f'<text class="tick" x="{plot_right}" y="{cell_y + cell_size - 8}" '
+                            f'text-anchor="end">{html.escape(coverage_tick_label(x_parameter, 1.0))}</text>'
+                        ),
+                    ]
+                )
+            if column_index == 0 and plot_kind == "scatter":
+                lines.extend(
+                    [
+                        (
+                            f'<text class="tick" x="{plot_left - 4}" y="{plot_bottom}" '
+                            f'text-anchor="end" dominant-baseline="middle">'
+                            f'{html.escape(coverage_tick_label(y_parameter, 0.0))}</text>'
+                        ),
+                        (
+                            f'<text class="tick" x="{plot_left - 4}" y="{plot_top}" '
+                            f'text-anchor="end" dominant-baseline="middle">'
+                            f'{html.escape(coverage_tick_label(y_parameter, 1.0))}</text>'
+                        ),
+                    ]
+                )
+            lines.append("</g>")
+
+    lines.append("</svg>")
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
+
+
 def metadata_number(value: float) -> float:
     return float(f"{value:.12g}")
 
@@ -592,6 +860,7 @@ def write_geometry_metadata(
     method: str,
     extra: dict[str, object] | None = None,
     decimal_places: int | None = None,
+    bare_values: str = "parameter-units",
 ) -> Path:
     split_counts: dict[str, int] = {}
     for row in rows:
@@ -613,6 +882,15 @@ def write_geometry_metadata(
         metadata["decimal_places"] = decimal_places
     if extra:
         metadata.update(extra)
+
+    coverage_plot_path = write_parameter_coverage_svg(
+        geometry_path,
+        parameters,
+        rows,
+        split_var,
+        bare_values=bare_values,
+    )
+    metadata["parameter_coverage_plot"] = coverage_plot_path.name
 
     metadata_path = geometry_metadata_path(geometry_path)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -810,7 +1088,7 @@ def write_points_csv(
         method=method,
         decimal_places=decimal_places,
     )
-    written = [path, metadata_path]
+    written = [path, metadata_path, geometry_coverage_plot_path(path)]
     if write_split_files:
         split_values = ["train", "verification"] if verification_count else ["train"]
         for split_value in split_values:
@@ -989,9 +1267,10 @@ def write_range_extension_csv(
         generation_kind="range_extension",
         method=method,
         decimal_places=decimal_places,
+        bare_values=bare_values,
         extra=extension_metadata,
     )
-    written = [path, metadata_path]
+    written = [path, metadata_path, geometry_coverage_plot_path(path)]
     if write_split_files:
         for split_value in split_counts:
             split_rows = [
@@ -2460,6 +2739,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     print(f"wrote {out_path}")
     print(f"wrote {metadata_path}")
+    print(f"wrote {geometry_coverage_plot_path(out_path)}")
     print(f"wrote {analysis_path}")
     return 0
 

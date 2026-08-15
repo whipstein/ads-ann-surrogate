@@ -169,10 +169,24 @@ CSV rows remain unchanged.
 Every geometry CSV also gets an automatic same-stem JSON file. For example,
 `geometries.csv` produces `geometries.json`. The JSON records the generation
 method, point and dataset counts, and each parameter's lower bound, upper bound,
-unit, base-unit bounds, and linear/log scale. When `--write-split-files` is
-used, the one JSON describes the complete combined geometry; the separate
-train/verification CSVs do not receive duplicate JSON files. Targeted
-additional-point CSVs receive their own JSON files.
+unit, base-unit bounds, linear/log scale, and coverage-plot filename.
+
+The same command also writes `geometries_parameter_coverage.svg`. This scalable
+pair matrix provides one cell for every ordered parameter pair:
+
+- off-diagonal cells plot one parameter against another, with training points
+  in blue and verification points in orange; and
+- diagonal cells overlay training and verification histograms for that
+  parameter.
+
+Linear and log-scaled parameters are positioned in their normalized design
+coordinates so coverage is visually comparable, while the axes retain the
+declared physical endpoint values and units. Open the SVG directly in a browser
+or Markdown viewer; it does not require Matplotlib. When `--write-split-files`
+is used, one matrix describes the complete combined geometry, so the separate
+train/verification CSVs do not receive duplicate JSON or plot files. Range
+extensions plot the complete original-plus-appended set. Targeted
+additional-point CSVs receive their own JSON and coverage matrix.
 
 ## 2. Simulate and Audit the Dataset
 
@@ -1521,7 +1535,7 @@ without a subcommand uses it automatically.
 | <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a repeatable CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. A <code>*_train.csv</code> or <code>*_verification.csv</code> split also resolves the combined JSON. | <nobr><code>--existing-points geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
-| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges is written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
+| <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Output CSV path; a same-stem JSON containing parameter ranges and a <code>*_parameter_coverage.svg</code> scatter/histogram matrix are written automatically. For multiple generation methods, use <code>{method}</code> or let the script add a method suffix. A range extension defaults to <code>&lt;existing&gt;_extended.csv</code>. | <nobr><code>--out geometries_{method}.csv</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
 | <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to suggested points. Default: <code>targeted</code>. | <nobr><code>--target-dataset train</code></nobr> |
 | <nobr><code>--verification-count INT</code></nobr> | <code>generate</code> | Number of new tail points labeled verification; must be smaller than <code>--count</code>. Default: <code>0</code>, or the original split ratio during a range extension. | <nobr><code>--verification-count 16</code></nobr> |
