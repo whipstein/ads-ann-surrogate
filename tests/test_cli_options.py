@@ -358,6 +358,44 @@ class OptionsJSONTests(unittest.TestCase):
         self.assertIn("COLUMN NOT FOUND: weighted_evm_pct", report)
         self.assertIn("weighted_* values are fit-summary metrics", report)
 
+    def test_explain_and_update_captures_options_without_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(Path(temp_dir), {"schema_version": 1})
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), self.assertRaises(
+                SystemExit
+            ) as stopped:
+                parse_args_with_options_json(
+                    example_parser(),
+                    [
+                        "train",
+                        "--options-json",
+                        str(config),
+                        "--mdif",
+                        "data/already_used.mdif",
+                        "--epochs",
+                        "750",
+                        "--frequency-weights",
+                        "default=1;2GHz=4",
+                        "--explain-options",
+                        "--update-options-json",
+                    ],
+                    model="dnn",
+                )
+            payload = json.loads(config.read_text())
+
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(
+            payload["models"]["dnn"]["commands"]["train"],
+            {
+                "mdif": "data/already_used.mdif",
+                "epochs": 750,
+                "frequency_weights": "default=1;2GHz=4",
+            },
+        )
+        self.assertIn("command was not executed", stdout.getvalue())
+        self.assertIn("updated", stdout.getvalue())
+
     def test_points_main_commits_update_after_command_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.write_config(Path(temp_dir), {"schema_version": 1})

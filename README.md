@@ -320,7 +320,63 @@ but `points suggest-additional` needs a per-geometry row metric such as
 `metric: evm_pct` or `metric: auto`. The point selector still applies the saved
 `normalized_sparam_weight` column, so `evm_pct` respects the fit's S-parameter
 weights. `--explain-options` always exits without generating points, fitting a
-model, writing outputs, or updating the options JSON.
+model, or writing model/workflow outputs. By itself it does not update the
+options JSON; combine it with `--update-options-json` to capture settings only.
+
+### Build or Repair the JSON After Earlier Work
+
+The options JSON does not have to describe every command you have ever run. To
+continue from existing geometries and model results, it only needs pointers to
+those artifacts plus the settings for the current and future commands. If no
+file exists yet, create the structure once:
+
+```bash
+python3 surrogate.py options init --out options.json
+```
+
+Then replay the important parts of an earlier command with both
+`--explain-options` and `--update-options-json`. This captures the explicit
+options at the correct JSON location without executing the command:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn optimize \
+  --mdif data/train_verify.mdif \
+  --out-dir outputs/dnn_optimize \
+  --selection-metric weighted_evm_pct \
+  --explain-options \
+  --update-options-json
+```
+
+Repeat that pattern once for each earlier command whose settings you want to
+retain. For example, the following repairs and captures the additional-point
+configuration that is causing the `weighted_evm_pct` error:
+
+```bash
+python3 surrogate.py --options-json options.json points suggest-additional \
+  --fit-dir outputs/dnn_optimize/best_model \
+  --existing-points geometries.csv \
+  --parameter-json geometries.json \
+  --count 8 \
+  --metric auto \
+  --out additional_points.csv \
+  --explain-options \
+  --update-options-json
+```
+
+The command does not generate points. It writes those values under
+`workflows.points.commands.suggest-additional`, replacing a bad exact-scope
+`metric` value. `--parameter-json` is optional when `geometries.json` is the
+same-stem companion of `geometries.csv`, but supplying it during recovery makes
+the intended source unambiguous. Review the printed parameter-domain and
+metrics checks, then run the saved configuration normally:
+
+```bash
+python3 surrogate.py --options-json options.json points suggest-additional
+```
+
+Do not copy `selection_metric: weighted_evm_pct` into the point section.
+`selection_metric` belongs to `models.commands.optimize`; the point section
+uses `metric: auto` or a per-geometry metric such as `evm_pct`.
 
 ### Update the JSON from a Completed Command
 
@@ -382,6 +438,8 @@ The update behavior is deliberately bounded:
   already inherited from the JSON remain at their existing broader scopes;
 - options are written to the narrowest exact command section and are never
   automatically promoted to `models.commands` or another common scope;
+- when combined with `--explain-options`, explicit settings are saved after
+  parsing and preflight reporting without executing the selected command;
 - the file is replaced atomically after the command completes, including a
   completed audit whose data verdict is `FAIL`; parse errors and runtime
   failures do not modify it; and
@@ -5948,10 +6006,10 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 
 | Option | Applies to | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- | --- |
-| `--explain-options`, `--show-options` | Every executable model/data workflow | Prints every effective value and its CLI, exact JSON, or parser-default source, performs additional-point input checks when applicable, and exits without executing. It cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options`  | Not stored (CLI control) |
+| `--explain-options`, `--show-options` | Every executable model/data workflow | Prints every effective value and its CLI, exact JSON, or parser-default source, performs additional-point input checks when applicable, and exits without executing. Combine with `--update-options-json` to capture explicit settings without running the command. It cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options`  | Not stored (CLI control) |
 | `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help`  | Not stored (CLI control) |
 | `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init`, which creates the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model`  | Not stored (CLI control) |
-| `--update-options-json` | Every executable model/data workflow | After a completed command, atomically saves explicitly supplied CLI options into the selected exact command section of `--options-json`. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --update-options-json`  | Not stored (CLI control) |
+| `--update-options-json` | Every executable model/data workflow | Atomically saves explicitly supplied CLI options into the selected exact command section after completion, or immediately without execution when combined with `--explain-options`. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --explain-options --update-options-json`  | Not stored (CLI control) |
 | `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help`  | Not stored (CLI control) |
 
 ### D.3 Starter options JSON generation
@@ -6323,6 +6381,7 @@ on the primary entry point:
 | Stage | Copyable command |
 | --- | --- |
 | Inspect resolved configuration | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options` |
+| Capture a command without running | `python3 surrogate.py --options-json options.json points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --count 8 --metric auto --explain-options --update-options-json` |
 | Generate | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 32 --verification-count 8 --out geometries.csv` |
 | Audit | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |

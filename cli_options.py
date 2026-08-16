@@ -25,8 +25,9 @@ OPTIONS_JSON_HELP = (
     "options take precedence."
 )
 UPDATE_OPTIONS_JSON_HELP = (
-    "After a successful command, save explicitly supplied CLI options into "
-    "the exact model/workflow command section of --options-json."
+    "Save explicitly supplied CLI options into the exact model/workflow command "
+    "section of --options-json after a successful command; combine with "
+    "--explain-options to capture settings without running the command."
 )
 EXPLAIN_OPTIONS_HELP = (
     "Show the effective options, their CLI/JSON/default sources, and conditional "
@@ -1342,11 +1343,6 @@ def parse_args_with_options_json(
             raise OptionsJSONError(
                 "--update-options-json requires --options-json PATH"
             )
-        if update_requested and explain_requested:
-            raise OptionsJSONError(
-                "--update-options-json cannot be combined with --explain-options "
-                "because the diagnostic does not run the command"
-            )
         selected_command = command
         if selected_command is None:
             registered: set[str] = set()
@@ -1387,6 +1383,15 @@ def parse_args_with_options_json(
                 selected_command,
             )
         args = parser.parse_args(clean_args)
+        args.update_options_json = update_requested
+        args._options_json_update_requested = update_requested
+        args._options_json_update_parser = parser
+        args._options_json_update_argv = clean_args
+        args._options_json_update_model = model
+        args._options_json_update_workflow = workflow
+        args._options_json_update_command = normalize_command_name(
+            selected_command or command or ""
+        )
         if explain_requested:
             print_effective_options(
                 parser,
@@ -1398,16 +1403,12 @@ def parse_args_with_options_json(
                 json_sources=json_sources,
                 required_actions=required_actions,
             )
-            parser.exit(0)
-        args.update_options_json = update_requested
-        args._options_json_update_requested = update_requested
-        args._options_json_update_parser = parser
-        args._options_json_update_argv = clean_args
-        args._options_json_update_model = model
-        args._options_json_update_workflow = workflow
-        args._options_json_update_command = normalize_command_name(
-            selected_command or command or ""
-        )
+            capture_status = (
+                finalize_options_json_update(args, 0)
+                if update_requested
+                else 0
+            )
+            parser.exit(capture_status)
         return args
     except OptionsJSONError as exc:
         parser.error(str(exc))
