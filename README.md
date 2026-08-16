@@ -243,6 +243,7 @@ as multiple `--parameter`, `--geometry-json`, or `--existing-points` options.
           "existing_points": ["geometries.csv"],
           "count": 8,
           "acquisition": "gp-ucb",
+          "metric": "auto",
           "out": "additional_points.csv"
         }
       }
@@ -280,6 +281,46 @@ python3 surrogate.py --options-json options.json --model dnn optimize \
   --max-trials 80 \
   --out-dir outputs/dnn_optimize_80_trials
 ```
+
+### Inspect the Effective Options Before Running
+
+Add `--explain-options` (short alias: `--show-options`) to any selected command
+to see exactly what its backend would receive without running it:
+
+```bash
+python3 surrogate.py --options-json options.json points suggest-additional \
+  --explain-options
+```
+
+The report lists every effective option after type conversion and precedence,
+labels its source as an explicit CLI flag, an exact JSON path, or the parser
+default, and identifies required options that are still missing. A configured
+`null` is reported as “JSON null ignored” so it cannot be mistaken for a value
+that reached the command. For
+`points suggest-additional`, it also performs two read-only preflight checks:
+
+- it shows whether the parameter domain comes from repeatable `--parameter`
+  values, `--parameter-json`, or a companion JSON inferred from
+  `--existing-points`; and
+- it resolves the `verification_metrics.csv` path and checks whether the
+  selected `--metric` column exists.
+
+A typical excerpt looks like:
+
+```text
+--count          = 8       [JSON: workflows.points.commands.suggest-additional.count]
+--fit-dir        = "..."   [JSON: workflows.points.commands.suggest-additional.fit_dir]
+--metric         = "auto"  [JSON: workflows.points.commands.suggest-additional.metric]
+--parameter-json = null    [parser default]
+```
+
+This is particularly useful if an option was placed at the wrong JSON scope.
+For example, `selection_metric: weighted_evm_pct` is valid for model selection,
+but `points suggest-additional` needs a per-geometry row metric such as
+`metric: evm_pct` or `metric: auto`. The point selector still applies the saved
+`normalized_sparam_weight` column, so `evm_pct` respects the fit's S-parameter
+weights. `--explain-options` always exits without generating points, fitting a
+model, writing outputs, or updating the options JSON.
 
 ### Update the JSON from a Completed Command
 
@@ -362,7 +403,7 @@ The update behavior is deliberately bounded:
 | KBNN coarse data | `models.kbnn.commands.fit.coarse_mdif` | KBNN-only, so it belongs below the KBNN model node. |
 | Audit data and declared geometry domain | `workflows.audit.common.mdif` and `geometry_json` | `geometry_json` may be an array when the range was extended in multiple campaigns. |
 | Training and optimization outputs | `models.MODEL.commands.train.out_dir` and `models.MODEL.commands.optimize.out_dir` | Keep these model-specific to avoid DNN, KBNN, and Neuro-TF writing into the same directory. |
-| Export input, output, and module settings | `models.MODEL.commands.EXACT_EXPORT_COMMAND` | For example, use `models.dnn.commands.export-veriloga`; exact scope avoids applying unsupported options to other exporters. |
+| Export input, output, and module settings | `models.MODEL.commands.EXACT_EXPORT_COMMAND` | Replace both placeholders, for example with `models.dnn.commands.export-veriloga`; exact scope avoids applying unsupported options to other exporters. |
 
 Parameter ranges are intentionally defined for point generation, not model
 fitting. The model is fitted to the parameter values actually present in the
@@ -5876,6 +5917,10 @@ In the tables below, **all models** means `dnn`, `kbnn`, and `neuro-tf`.
 An option marked **fit** applies to both `train` and `optimize` unless a narrower
 subcommand is named. Options described as repeatable may be supplied more than
 once; comma separation is supported only where the option description says so.
+The **Options JSON location** column gives the recommended path for that option;
+replace `MODEL` with `dnn`, `kbnn`, or `neuro-tf`, and replace a braced command
+list with the exact command being configured. JSON uses underscore keys in the
+examples, although hyphenated keys are accepted too.
 
 ### D.1 Complete command catalog
 
@@ -5901,24 +5946,26 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 
 ### D.2 Dispatcher options
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help` |
-| `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init`, which creates the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model` |
-| `--update-options-json` | Every executable model/data workflow | After a completed command, atomically saves explicitly supplied CLI options into the selected exact command section of `--options-json`. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --update-options-json` |
-| `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--explain-options`, `--show-options` | Every executable model/data workflow | Prints every effective value and its CLI, exact JSON, or parser-default source, performs additional-point input checks when applicable, and exits without executing. It cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options`  | Not stored (CLI control) |
+| `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help`  | Not stored (CLI control) |
+| `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init`, which creates the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model`  | Not stored (CLI control) |
+| `--update-options-json` | Every executable model/data workflow | After a completed command, atomically saves explicitly supplied CLI options into the selected exact command section of `--options-json`. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --update-options-json`  | Not stored (CLI control) |
+| `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help`  | Not stored (CLI control) |
 
 ### D.3 Starter options JSON generation
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--out PATH` | `options init`, `options generate` | Output path for the generated starter document. Parent directories are created. Default: `options.json`. | `--out config/options.json` |
-| `--overwrite` | `options init`, `options generate` | Allows an existing output file to be replaced. Without this flag, generation stops instead of overwriting user settings. | `--overwrite` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--out PATH` | `options init`, `options generate` | Output path for the generated starter document. Parent directories are created. Default: `options.json`. | `--out config/options.json`  | Not stored (CLI control) |
+| `--overwrite` | `options init`, `options generate` | Allows an existing output file to be replaced. Without this flag, generation stops instead of overwriting user settings. | `--overwrite`  | Not stored (CLI control) |
 
 ### D.4 Options JSON schema and precedence
 
 The full reusable-options explanation and recommended groups are in
-[Reusable Options JSON](#reusable-options-json), and the copyable template is
+[Configure the Workflow with `options.json`](#configure-the-workflow-with-optionsjson),
+and the copyable template is
 [`options.example.json`](options.example.json).
 
 Generate the canonical starting structure with:
@@ -5959,55 +6006,55 @@ rejects unknown keys or invalid values before doing work.
 Options are alphabetized. The **generate** and **suggest** labels below mean
 `points generate` and `points suggest-additional`.
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--bare-values {parameter-units,base-units}` | Generate, suggest | Interprets unitless values read from existing CSV, MDIF, or metrics. Default: `parameter-units`. | `--bare-values parameter-units` |
-| `--count INT` | Generate, suggest | Number of new points. Required for suggestions and ordinary generation; a range extension can infer a density-based recommendation when omitted. | `--count 12` |
-| `--decimal-places INT` | Generate, suggest | Rounds newly generated values in their declared units; allowed range is 0 through 15. | `--decimal-places 4` |
-| `--existing-points PATH` | Generate | Original CSV retained and appended when `--extend-range` is used. | `--existing-points geometries.csv` |
-| `--extend-range NAME=LOW:HIGH` | Generate | Extends exactly one existing parameter on one side and samples only the added slab. Requires `--existing-points`. | `--extend-range W=0.4mm:1.0mm` |
-| `--include-normalized` | Generate, suggest | Adds `u_NAME` unit-cube coordinate columns. | `--include-normalized` |
-| `--lhs-candidates INT` | Generate, suggest | Candidate Latin-hypercube designs tested by maximin LHS. Default: `64`. | `--lhs-candidates 128` |
-| `--method NAME` | Generate | Repeatable or comma-separated initial-design method: `maximin-lhs`, `minimax-lhs` alias, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--method maximin-lhs --method sobol` |
-| `--no-scramble` | Generate, suggest | Disables Sobol scrambling; scrambling is enabled by default. | `--no-scramble` |
-| `--out PATH` | Generate | Combined output CSV. Use `{method}` when generating multiple methods. The default is `generated_points.csv`, or an inferred `_extended.csv` name. | `--out geometries.csv` |
-| `--parameter NAME=LOW:HIGH[:SCALE]` | Generate; optional suggest override | Repeat once per parameter. `SCALE` is `linear` or `log`; linear is the default. Suggestions normally recover this domain from the companion JSON. | `--parameter R=1:100:log` |
-| `--range-factor NAME=FACTOR` | Generate, suggest | Expands a declared parameter span about its center before sampling. Repeat for multiple parameters. | `--range-factor W=1.5` |
-| `--seed INT` | Generate, suggest | Random seed. Default: `1234`. | `--seed 42` |
-| `--skip INT` | Generate, suggest | Skips leading Sobol or Halton sequence points. Default: `0`. | `--skip 32` |
-| `--split-var NAME` | Generate, suggest | CSV column used for dataset labels. Default: `dataset`. | `--split-var dataset` |
-| `--verification-count INT` | Generate | Number of new tail points labeled verification. Default: `0`; range extension preserves the original split ratio when omitted. | `--verification-count 8` |
-| `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files; JSON and coverage PNG remain combined. | `--write-split-files` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--bare-values {parameter-units,base-units}` | Generate, suggest | Interprets unitless values read from existing CSV, MDIF, or metrics. Default: `parameter-units`. | `--bare-values parameter-units`  | `workflows.points.commands.{generate,suggest-additional}.bare_values` |
+| `--count INT` | Generate, suggest | Number of new points. Required for suggestions and ordinary generation; a range extension can infer a density-based recommendation when omitted. | `--count 12`  | `workflows.points.commands.{generate,suggest-additional}.count` |
+| `--decimal-places INT` | Generate, suggest | Rounds newly generated values in their declared units; allowed range is 0 through 15. | `--decimal-places 4`  | `workflows.points.commands.{generate,suggest-additional}.decimal_places` |
+| `--existing-points PATH` | Generate | Original CSV retained and appended when `--extend-range` is used. | `--existing-points geometries.csv`  | `workflows.points.commands.generate.existing_points` |
+| `--extend-range NAME=LOW:HIGH` | Generate | Extends exactly one existing parameter on one side and samples only the added slab. Requires `--existing-points`. | `--extend-range W=0.4mm:1.0mm`  | `workflows.points.commands.generate.extend_range` |
+| `--include-normalized` | Generate, suggest | Adds `u_NAME` unit-cube coordinate columns. | `--include-normalized`  | `workflows.points.commands.{generate,suggest-additional}.include_normalized` |
+| `--lhs-candidates INT` | Generate, suggest | Candidate Latin-hypercube designs tested by maximin LHS. Default: `64`. | `--lhs-candidates 128`  | `workflows.points.commands.{generate,suggest-additional}.lhs_candidates` |
+| `--method NAME` | Generate | Repeatable or comma-separated initial-design method: `maximin-lhs`, `minimax-lhs` alias, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--method maximin-lhs --method sobol`  | `workflows.points.commands.generate.method` |
+| `--no-scramble` | Generate, suggest | Disables Sobol scrambling; scrambling is enabled by default. | `--no-scramble`  | `workflows.points.commands.{generate,suggest-additional}.no_scramble` |
+| `--out PATH` | Generate | Combined output CSV. Use `{method}` when generating multiple methods. The default is `generated_points.csv`, or an inferred `_extended.csv` name. | `--out geometries.csv`  | `workflows.points.commands.generate.out` |
+| `--parameter NAME=LOW:HIGH[:SCALE]` | Generate; optional suggest override | Repeat once per parameter. `SCALE` is `linear` or `log`; linear is the default. Suggestions normally recover this domain from the companion JSON. | `--parameter R=1:100:log`  | `workflows.points.commands.{generate,suggest-additional}.parameter` |
+| `--range-factor NAME=FACTOR` | Generate, suggest | Expands a declared parameter span about its center before sampling. Repeat for multiple parameters. | `--range-factor W=1.5`  | `workflows.points.commands.{generate,suggest-additional}.range_factor` |
+| `--seed INT` | Generate, suggest | Random seed. Default: `1234`. | `--seed 42`  | `workflows.points.commands.{generate,suggest-additional}.seed` |
+| `--skip INT` | Generate, suggest | Skips leading Sobol or Halton sequence points. Default: `0`. | `--skip 32`  | `workflows.points.commands.{generate,suggest-additional}.skip` |
+| `--split-var NAME` | Generate, suggest | CSV column used for dataset labels. Default: `dataset`. | `--split-var dataset`  | `workflows.points.commands.{generate,suggest-additional}.split_var` |
+| `--verification-count INT` | Generate | Number of new tail points labeled verification. Default: `0`; range extension preserves the original split ratio when omitted. | `--verification-count 8`  | `workflows.points.commands.generate.verification_count` |
+| `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files; JSON and coverage PNG remain combined. | `--write-split-files`  | `workflows.points.commands.generate.write_split_files` |
 
 ### D.6 Adaptive additional-point options
 
 These options apply only to `points suggest-additional`; the shared sampling
 options in D.5 also apply where marked.
 
-| Option | Explanation | Example |
-| --- | --- | --- |
-| `--acquisition {gp-ucb,error-distance}` | Selection method. Default: `gp-ucb`; `error-distance` is the legacy non-GP selector. | `--acquisition gp-ucb` |
-| `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive` |
-| `--analysis-out PATH` | Ranked current-fit error-region CSV. Default: `<out>_fit_error_regions.csv`. | `--analysis-out additions_regions.csv` |
-| `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, count * candidate-factor)`. | `--candidate-count 4000` |
-| `--candidate-factor INT` | Candidate multiplier when `--candidate-count` is omitted. Default: `200`. | `--candidate-factor 300` |
-| `--candidate-method NAME` | Candidate generator: `maximin-lhs`, `minimax-lhs`, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--candidate-method sobol` |
-| `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. | `--existing-mdif train_verify.mdif` |
-| `--existing-points PATH` | Repeatable CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. | `--existing-points geometries.csv` |
-| `--exploration-weight FLOAT` | GP-UCB uncertainty multiplier; larger values explore more. Default: `2.0`. | `--exploration-weight 2.5` |
-| `--fit-dir PATH` | Fit/model directory or optimize/sweep root. A sweep root resolves `best_model/verification_metrics.csv`, or `point_generation_fallback/verification_metrics.csv` with `--allow-nonpassive`. | `--fit-dir dnn_opt` |
-| `--focus-power FLOAT` | Exponent on measured verification-error scores for legacy error-distance selection. Default: `1.0`. | `--focus-power 1.5` |
-| `--focus-radius FLOAT` | Normalized radius around high-error verification points for legacy selection. Default: `0.25`. | `--focus-radius 0.2` |
-| `--gp-error-floor FLOAT` | Positive floor before the GP log-error transform. Default: `1e-12`. | `--gp-error-floor 1e-10` |
-| `--gp-length-scale FLOAT` | Fixed normalized Matérn-5/2 length scale. If omitted, log marginal likelihood selects it. | `--gp-length-scale 0.3` |
-| `--gp-noise-variance FLOAT` | Non-negative normalized covariance nugget. Default: `1e-6`. | `--gp-noise-variance 1e-5` |
-| `--metric NAME` | Column from `verification_metrics.csv`; use `auto` for a known available metric. Default: `evm_pct`. | `--metric weighted_evm_pct` |
-| `--min-distance FLOAT` | Rejects candidates closer than this normalized distance to occupied or newly selected points. Default: `0`. | `--min-distance 0.08` |
-| `--novelty-power FLOAT` | Exponent on candidate distance/diversity. Default: `1.0`. | `--novelty-power 2` |
-| `--out PATH` | Suggested-point CSV; a same-stem JSON and PNG are also written. Default: `targeted_additional_points.csv`. | `--out additions.csv` |
-| `--parameter-json PATH` | Explicit geometry metadata JSON. Normally inferred beside `--existing-points`. | `--parameter-json geometries.json` |
-| `--target-dataset NAME` | Dataset label written on suggested points. Default: `targeted`. | `--target-dataset train` |
-| `--verification-metrics PATH` | Direct metrics CSV path; overrides `--fit-dir`. | `--verification-metrics dnn_model/verification_metrics.csv` |
+| Option | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- |
+| `--acquisition {gp-ucb,error-distance}` | Selection method. Default: `gp-ucb`; `error-distance` is the legacy non-GP selector. | `--acquisition gp-ucb`  | `workflows.points.commands.suggest-additional.acquisition` |
+| `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive`  | `workflows.points.commands.suggest-additional.allow_nonpassive` |
+| `--analysis-out PATH` | Ranked current-fit error-region CSV. Default: `<out>_fit_error_regions.csv`. | `--analysis-out additions_regions.csv`  | `workflows.points.commands.suggest-additional.analysis_out` |
+| `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, count * candidate-factor)`. | `--candidate-count 4000`  | `workflows.points.commands.suggest-additional.candidate_count` |
+| `--candidate-factor INT` | Candidate multiplier when `--candidate-count` is omitted. Default: `200`. | `--candidate-factor 300`  | `workflows.points.commands.suggest-additional.candidate_factor` |
+| `--candidate-method NAME` | Candidate generator: `maximin-lhs`, `minimax-lhs`, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--candidate-method sobol`  | `workflows.points.commands.suggest-additional.candidate_method` |
+| `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. | `--existing-mdif train_verify.mdif`  | `workflows.points.commands.suggest-additional.existing_mdif` |
+| `--existing-points PATH` | Repeatable CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. | `--existing-points geometries.csv`  | `workflows.points.commands.suggest-additional.existing_points` |
+| `--exploration-weight FLOAT` | GP-UCB uncertainty multiplier; larger values explore more. Default: `2.0`. | `--exploration-weight 2.5`  | `workflows.points.commands.suggest-additional.exploration_weight` |
+| `--fit-dir PATH` | Fit/model directory or optimize/sweep root. A sweep root resolves `best_model/verification_metrics.csv`, or `point_generation_fallback/verification_metrics.csv` with `--allow-nonpassive`. | `--fit-dir dnn_opt`  | `workflows.points.commands.suggest-additional.fit_dir` |
+| `--focus-power FLOAT` | Exponent on measured verification-error scores for legacy error-distance selection. Default: `1.0`. | `--focus-power 1.5`  | `workflows.points.commands.suggest-additional.focus_power` |
+| `--focus-radius FLOAT` | Normalized radius around high-error verification points for legacy selection. Default: `0.25`. | `--focus-radius 0.2`  | `workflows.points.commands.suggest-additional.focus_radius` |
+| `--gp-error-floor FLOAT` | Positive floor before the GP log-error transform. Default: `1e-12`. | `--gp-error-floor 1e-10`  | `workflows.points.commands.suggest-additional.gp_error_floor` |
+| `--gp-length-scale FLOAT` | Fixed normalized Matérn-5/2 length scale. If omitted, log marginal likelihood selects it. | `--gp-length-scale 0.3`  | `workflows.points.commands.suggest-additional.gp_length_scale` |
+| `--gp-noise-variance FLOAT` | Non-negative normalized covariance nugget. Default: `1e-6`. | `--gp-noise-variance 1e-5`  | `workflows.points.commands.suggest-additional.gp_noise_variance` |
+| `--metric NAME` | Per-geometry row column from `verification_metrics.csv`; use `auto` for a known available metric. Default: `evm_pct`. Summary-only fields such as `weighted_evm_pct` are not valid here. | `--metric evm_pct`  | `workflows.points.commands.suggest-additional.metric` |
+| `--min-distance FLOAT` | Rejects candidates closer than this normalized distance to occupied or newly selected points. Default: `0`. | `--min-distance 0.08`  | `workflows.points.commands.suggest-additional.min_distance` |
+| `--novelty-power FLOAT` | Exponent on candidate distance/diversity. Default: `1.0`. | `--novelty-power 2`  | `workflows.points.commands.suggest-additional.novelty_power` |
+| `--out PATH` | Suggested-point CSV; a same-stem JSON and PNG are also written. Default: `targeted_additional_points.csv`. | `--out additions.csv`  | `workflows.points.commands.suggest-additional.out` |
+| `--parameter-json PATH` | Explicit geometry metadata JSON. Normally inferred beside `--existing-points`. | `--parameter-json geometries.json`  | `workflows.points.commands.suggest-additional.parameter_json` |
+| `--target-dataset NAME` | Dataset label written on suggested points. Default: `targeted`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
+| `--verification-metrics PATH` | Direct metrics CSV path; overrides `--fit-dir`. | `--verification-metrics dnn_model/verification_metrics.csv`  | `workflows.points.commands.suggest-additional.verification_metrics` |
 
 Complete GP-UCB example without re-entering parameter ranges:
 
@@ -6027,111 +6074,111 @@ python3 surrogate.py points suggest-additional \
 
 All options apply to `audit` and are alphabetized.
 
-| Option | Explanation | Example |
-| --- | --- | --- |
-| `--coarse-mdif PATH` | Optional KBNN coarse training/combined MDIF. | `--coarse-mdif coarse.mdif` |
-| `--coarse-verification-mdif PATH` | Optional separate coarse verification MDIF; requires `--coarse-mdif`. | `--coarse-verification-mdif coarse_verify.mdif` |
-| `--expect-reciprocal` | Makes reciprocity mismatch an audit error. Leave unset for intentionally nonreciprocal networks. | `--expect-reciprocal` |
-| `--fail-on-warnings` | Returns nonzero status for warnings as well as errors. | `--fail-on-warnings` |
-| `--frequency-abs-tolerance-hz FLOAT` | Absolute grid-comparison tolerance in hertz. Default: `1e-3`. | `--frequency-abs-tolerance-hz 1` |
-| `--frequency-rel-tolerance FLOAT` | Relative frequency-grid tolerance. Default: `1e-10`. | `--frequency-rel-tolerance 1e-9` |
-| `--geometry-json PATH` | Repeatable generation metadata whose declared bounds define coverage; same-stem files are inferred when possible. | `--geometry-json geometries.json` |
-| `--holdout-fraction FLOAT` | Random holdout used only when no recognized train labels exist. Default: `0.2`. | `--holdout-fraction 0.25` |
-| `--mdif PATH` | Required fine/direct training or combined MDIF. | `--mdif train_verify.mdif` |
-| `--neighbor-min-relative-jump FLOAT` | Minimum relative response RMSE eligible for a neighbor warning. Default: `0.05`. | `--neighbor-min-relative-jump 0.1` |
-| `--neighbor-outlier-factor FLOAT` | Warning multiplier above the median nearest-neighbor jump. Default: `5`. | `--neighbor-outlier-factor 8` |
-| `--out-dir PATH` | Report directory. Default: `dataset_audit`. | `--out-dir outputs/audit` |
-| `--parameter-abs-tolerance FLOAT` | Base-unit absolute tolerance for duplicate geometry. Default: `1e-15`. | `--parameter-abs-tolerance 1e-12` |
-| `--parameter-names LIST` | Comma-separated geometry/process variables; normally inferred. | `--parameter-names W,L,H` |
-| `--parameter-rel-tolerance FLOAT` | Relative tolerance for duplicate geometry. Default: `1e-10`. | `--parameter-rel-tolerance 1e-9` |
-| `--passivity-tolerance FLOAT` | Allows `sigma_max <= 1 + tolerance`. Default: `1e-6`. | `--passivity-tolerance 1e-5` |
-| `--reciprocity-tolerance FLOAT` | Maximum absolute `abs(Sij-Sji)` when reciprocity is required. Default: `1e-3`. | `--reciprocity-tolerance 1e-4` |
-| `--response-abs-tolerance FLOAT` | Absolute duplicate-response conflict tolerance. Default: `1e-6`. | `--response-abs-tolerance 1e-5` |
-| `--response-rel-tolerance FLOAT` | Relative duplicate-response conflict tolerance. Default: `1e-4`. | `--response-rel-tolerance 1e-3` |
-| `--seed INT` | Random-holdout seed. Default: `1234`. | `--seed 42` |
-| `--split-var NAME` | Split `VAR` name. Default: `dataset`. | `--split-var dataset` |
-| `--train-values LIST` | Comma-separated training labels. Default: `train,training`. | `--train-values train` |
-| `--verification-mdif PATH` | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif` |
-| `--verify-values LIST` | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification` |
+| Option | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- |
+| `--coarse-mdif PATH` | Optional KBNN coarse training/combined MDIF. | `--coarse-mdif coarse.mdif`  | `workflows.audit.common.coarse_mdif` |
+| `--coarse-verification-mdif PATH` | Optional separate coarse verification MDIF; requires `--coarse-mdif`. | `--coarse-verification-mdif coarse_verify.mdif`  | `workflows.audit.common.coarse_verification_mdif` |
+| `--expect-reciprocal` | Makes reciprocity mismatch an audit error. Leave unset for intentionally nonreciprocal networks. | `--expect-reciprocal`  | `workflows.audit.common.expect_reciprocal` |
+| `--fail-on-warnings` | Returns nonzero status for warnings as well as errors. | `--fail-on-warnings`  | `workflows.audit.common.fail_on_warnings` |
+| `--frequency-abs-tolerance-hz FLOAT` | Absolute grid-comparison tolerance in hertz. Default: `1e-3`. | `--frequency-abs-tolerance-hz 1`  | `workflows.audit.common.frequency_abs_tolerance_hz` |
+| `--frequency-rel-tolerance FLOAT` | Relative frequency-grid tolerance. Default: `1e-10`. | `--frequency-rel-tolerance 1e-9`  | `workflows.audit.common.frequency_rel_tolerance` |
+| `--geometry-json PATH` | Repeatable generation metadata whose declared bounds define coverage; same-stem files are inferred when possible. | `--geometry-json geometries.json`  | `workflows.audit.common.geometry_json` |
+| `--holdout-fraction FLOAT` | Random holdout used only when no recognized train labels exist. Default: `0.2`. | `--holdout-fraction 0.25`  | `workflows.audit.common.holdout_fraction` |
+| `--mdif PATH` | Required fine/direct training or combined MDIF. | `--mdif train_verify.mdif`  | `workflows.audit.common.mdif` |
+| `--neighbor-min-relative-jump FLOAT` | Minimum relative response RMSE eligible for a neighbor warning. Default: `0.05`. | `--neighbor-min-relative-jump 0.1`  | `workflows.audit.common.neighbor_min_relative_jump` |
+| `--neighbor-outlier-factor FLOAT` | Warning multiplier above the median nearest-neighbor jump. Default: `5`. | `--neighbor-outlier-factor 8`  | `workflows.audit.common.neighbor_outlier_factor` |
+| `--out-dir PATH` | Report directory. Default: `dataset_audit`. | `--out-dir outputs/audit`  | `workflows.audit.common.out_dir` |
+| `--parameter-abs-tolerance FLOAT` | Base-unit absolute tolerance for duplicate geometry. Default: `1e-15`. | `--parameter-abs-tolerance 1e-12`  | `workflows.audit.common.parameter_abs_tolerance` |
+| `--parameter-names LIST` | Comma-separated geometry/process variables; normally inferred. | `--parameter-names W,L,H`  | `workflows.audit.common.parameter_names` |
+| `--parameter-rel-tolerance FLOAT` | Relative tolerance for duplicate geometry. Default: `1e-10`. | `--parameter-rel-tolerance 1e-9`  | `workflows.audit.common.parameter_rel_tolerance` |
+| `--passivity-tolerance FLOAT` | Allows `sigma_max <= 1 + tolerance`. Default: `1e-6`. | `--passivity-tolerance 1e-5`  | `workflows.audit.common.passivity_tolerance` |
+| `--reciprocity-tolerance FLOAT` | Maximum absolute `abs(Sij-Sji)` when reciprocity is required. Default: `1e-3`. | `--reciprocity-tolerance 1e-4`  | `workflows.audit.common.reciprocity_tolerance` |
+| `--response-abs-tolerance FLOAT` | Absolute duplicate-response conflict tolerance. Default: `1e-6`. | `--response-abs-tolerance 1e-5`  | `workflows.audit.common.response_abs_tolerance` |
+| `--response-rel-tolerance FLOAT` | Relative duplicate-response conflict tolerance. Default: `1e-4`. | `--response-rel-tolerance 1e-3`  | `workflows.audit.common.response_rel_tolerance` |
+| `--seed INT` | Random-holdout seed. Default: `1234`. | `--seed 42`  | `workflows.audit.common.seed` |
+| `--split-var NAME` | Split `VAR` name. Default: `dataset`. | `--split-var dataset`  | `workflows.audit.common.split_var` |
+| `--train-values LIST` | Comma-separated training labels. Default: `train,training`. | `--train-values train`  | `workflows.audit.common.train_values` |
+| `--verification-mdif PATH` | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif`  | `workflows.audit.common.verification_mdif` |
+| `--verify-values LIST` | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification`  | `workflows.audit.common.verify_values` |
 
 ### D.8 Shared model fitting options
 
 Unless stated otherwise, these options apply to all models for both `train` and
 `optimize`. Defaults are the same across models except where noted.
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--activation {tanh,relu}` | All-model `train`; single-value form in `optimize` | Hidden activation. Default: `tanh`. In optimize, `--activations` supplies a list. | `--activation tanh` |
-| `--batch-size INT` | All-model fit | Adam batch size. DNN/KBNN default: `256`; Neuro-TF default: `64`. | `--batch-size 128` |
-| `--dc-open-resistance FLOAT` | All-model fit | Finite resistance used for an open selected DC path. Default: `1e19` ohm. | `--dc-open-resistance 1e19` |
-| `--dc-open-threshold FLOAT` | All-model fit | Selected path below the reciprocal-conductance threshold is treated as open. Default: `1e12` ohm. | `--dc-open-threshold 1e12` |
-| `--dc-port-paths SPEC` | All-model fit | Comma-separated viable paths such as `1-2,3-4` or `1-ground`. Undeclared paths stay open; omission fits every ordered exact-DC complex S entry. | `--dc-port-paths 1-2,3-ground` |
-| `--debug` | All-model fit | Prints diagnostic details and tracebacks; model-specific debug JSON may also be written. | `--debug` |
-| `--epochs INT` | All-model fit | Maximum Adam epochs. Train default: `2000`; Neuro-TF optimize default: `1200`. | `--epochs 2500` |
-| `--frequency-weights SPEC` | All-model fit | Semicolon-separated exact-frequency/band weights. DNN/KBNN weight neural samples; Neuro-TF weights rational fitting. | `--frequency-weights 'default=1;2GHz:4GHz=3'` |
-| `--hidden-layers LAYOUT` | All-model fit | Comma-separated widths for one model. In optimize it may contain semicolon-separated layouts; `--hidden-layer-layouts` and `--hidden-layer-options` are aliases. DNN train default: `128,128,64`; KBNN/Neuro-TF: `64,64`. | `--hidden-layers 128,128,64` |
-| `--holdout-fraction FLOAT` | All-model fit | Random verification fraction only when split labels are absent. Default: `0.2`. | `--holdout-fraction 0.2` |
-| `--learning-rate FLOAT` | All-model `train`; single-value form in `optimize` | Adam step size. Default: `0.002`. Use `--learning-rates` for a candidate list. | `--learning-rate 0.001` |
-| `--loss-interval INT` | All-model fit | Epoch interval for full train/verification scoring. Default: `1`. | `--loss-interval 5` |
-| `--mdif PATH` | All-model fit | Required fine/direct training or combined MDIF. | `--mdif train_verify.mdif` |
-| `--out-dir PATH` | All-model fit | Required model or optimize-report directory. | `--out-dir outputs/model` |
-| `--parameter-names LIST` | All-model fit | Comma-separated numeric geometry/process `VAR` names; inferred when omitted. | `--parameter-names W,L,H` |
-| `--passivity-margin FLOAT` | All-model fit | Target margin below unit maximum singular value. Default: `0.001`. | `--passivity-margin 0.001` |
-| `--passivity-mode {auto,enforce,off}` | All-model fit | `auto` protects passive training data, `enforce` always protects a complete S response, and `off` disables protection. Default: `auto`. | `--passivity-mode auto` |
-| `--patience INT` | All-model fit | Early-stopping patience in epochs; `0` disables. Train default: `200`; Neuro-TF optimize default: `150`. | `--patience 250` |
-| `--progress-interval INT` | All-model fit | In-place terminal progress refresh interval; `0` disables. Default: `25`. | `--progress-interval 10` |
-| `--reciprocity-mode {auto,enforce,off}` | All-model fit | Reciprocity projection policy. Default: `enforce` for DNN/KBNN and `auto` for Neuro-TF. | `--reciprocity-mode enforce` |
-| `--reciprocity-tolerance FLOAT` | All-model fit | Maximum relative source mismatch accepted by `auto`. Default: `1e-6`. | `--reciprocity-tolerance 1e-5` |
-| `--seed INT` | All-model fit | Split, initialization, minibatch, and candidate seed. Default: `1234`. | `--seed 1234` |
-| `--split-var NAME` | All-model fit; `inspect-mdif` | Split `VAR` name. Default: `dataset`. | `--split-var dataset` |
-| `--train-values LIST` | All-model fit | Comma-separated training labels. Default: `train,training`. | `--train-values train` |
-| `--verification-mdif PATH` | All-model fit | Optional separate verification MDIF; then all `--mdif` blocks train. | `--verification-mdif verify.mdif` |
-| `--verify-values LIST` | All-model fit | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification` |
-| `--worst-plots INT` | All-model fit | Number of worst verification S/Y plot pairs. Default: `6`; `0` disables. | `--worst-plots 4` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--activation {tanh,relu}` | All-model `train`; single-value form in `optimize` | Hidden activation. Default: `tanh`. In optimize, `--activations` supplies a list. | `--activation tanh`  | `models.commands.fit.activation` |
+| `--batch-size INT` | All-model fit | Adam batch size. DNN/KBNN default: `256`; Neuro-TF default: `64`. | `--batch-size 128`  | `models.commands.fit.batch_size` |
+| `--dc-open-resistance FLOAT` | All-model fit | Finite resistance used for an open selected DC path. Default: `1e19` ohm. | `--dc-open-resistance 1e19`  | `models.commands.fit.dc_open_resistance` |
+| `--dc-open-threshold FLOAT` | All-model fit | Selected path below the reciprocal-conductance threshold is treated as open. Default: `1e12` ohm. | `--dc-open-threshold 1e12`  | `models.commands.fit.dc_open_threshold` |
+| `--dc-port-paths SPEC` | All-model fit | Comma-separated viable paths such as `1-2,3-4` or `1-ground`. Undeclared paths stay open; omission fits every ordered exact-DC complex S entry. | `--dc-port-paths 1-2,3-ground`  | `models.commands.fit.dc_port_paths` |
+| `--debug` | All-model fit | Prints diagnostic details and tracebacks; model-specific debug JSON may also be written. | `--debug`  | `models.commands.fit.debug` |
+| `--epochs INT` | All-model fit | Maximum Adam epochs. Train default: `2000`; Neuro-TF optimize default: `1200`. | `--epochs 2500`  | `models.commands.fit.epochs` |
+| `--frequency-weights SPEC` | All-model fit | Semicolon-separated exact-frequency/band weights. DNN/KBNN weight neural samples; Neuro-TF weights rational fitting. | `--frequency-weights 'default=1;2GHz:4GHz=3'`  | `models.commands.fit.frequency_weights` |
+| `--hidden-layers LAYOUT` | All-model fit | Comma-separated widths for one model. In optimize it may contain semicolon-separated layouts; `--hidden-layer-layouts` and `--hidden-layer-options` are aliases. DNN train default: `128,128,64`; KBNN/Neuro-TF: `64,64`. | `--hidden-layers 128,128,64`  | `models.commands.fit.hidden_layers` |
+| `--holdout-fraction FLOAT` | All-model fit | Random verification fraction only when split labels are absent. Default: `0.2`. | `--holdout-fraction 0.2`  | `models.commands.fit.holdout_fraction` |
+| `--learning-rate FLOAT` | All-model `train`; single-value form in `optimize` | Adam step size. Default: `0.002`. Use `--learning-rates` for a candidate list. | `--learning-rate 0.001`  | `models.commands.fit.learning_rate` |
+| `--loss-interval INT` | All-model fit | Epoch interval for full train/verification scoring. Default: `1`. | `--loss-interval 5`  | `models.commands.fit.loss_interval` |
+| `--mdif PATH` | All-model fit | Required fine/direct training or combined MDIF. | `--mdif train_verify.mdif`  | `models.commands.fit.mdif` |
+| `--out-dir PATH` | All-model fit | Required model or optimize-report directory. | `--out-dir outputs/model`  | `models.commands.fit.out_dir` |
+| `--parameter-names LIST` | All-model fit | Comma-separated numeric geometry/process `VAR` names; inferred when omitted. | `--parameter-names W,L,H`  | `models.commands.fit.parameter_names` |
+| `--passivity-margin FLOAT` | All-model fit | Target margin below unit maximum singular value. Default: `0.001`. | `--passivity-margin 0.001`  | `models.commands.fit.passivity_margin` |
+| `--passivity-mode {auto,enforce,off}` | All-model fit | `auto` protects passive training data, `enforce` always protects a complete S response, and `off` disables protection. Default: `auto`. | `--passivity-mode auto`  | `models.commands.fit.passivity_mode` |
+| `--patience INT` | All-model fit | Early-stopping patience in epochs; `0` disables. Train default: `200`; Neuro-TF optimize default: `150`. | `--patience 250`  | `models.commands.fit.patience` |
+| `--progress-interval INT` | All-model fit | In-place terminal progress refresh interval; `0` disables. Default: `25`. | `--progress-interval 10`  | `models.commands.fit.progress_interval` |
+| `--reciprocity-mode {auto,enforce,off}` | All-model fit | Reciprocity projection policy. Default: `enforce` for DNN/KBNN and `auto` for Neuro-TF. | `--reciprocity-mode enforce`  | `models.commands.fit.reciprocity_mode` |
+| `--reciprocity-tolerance FLOAT` | All-model fit | Maximum relative source mismatch accepted by `auto`. Default: `1e-6`. | `--reciprocity-tolerance 1e-5`  | `models.commands.fit.reciprocity_tolerance` |
+| `--seed INT` | All-model fit | Split, initialization, minibatch, and candidate seed. Default: `1234`. | `--seed 1234`  | `models.commands.fit.seed` |
+| `--split-var NAME` | All-model fit; `inspect-mdif` | Split `VAR` name. Default: `dataset`. | `--split-var dataset`  | `models.commands.fit.split_var`<br>`models.MODEL.commands.inspect-mdif.split_var` |
+| `--train-values LIST` | All-model fit | Comma-separated training labels. Default: `train,training`. | `--train-values train`  | `models.commands.fit.train_values` |
+| `--verification-mdif PATH` | All-model fit | Optional separate verification MDIF; then all `--mdif` blocks train. | `--verification-mdif verify.mdif`  | `models.commands.fit.verification_mdif` |
+| `--verify-values LIST` | All-model fit | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification`  | `models.commands.fit.verify_values` |
+| `--worst-plots INT` | All-model fit | Number of worst verification S/Y plot pairs. Default: `6`; `0` disables. | `--worst-plots 4`  | `models.commands.fit.worst_plots` |
 
 ### D.9 Optimization and reranking options
 
 `optimize` and `sweep` are identical commands. These options apply to all-model
 optimize unless the applicability column says otherwise.
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--activations LIST` | All-model optimize | Comma-separated activation candidates; aliases are `--activation-options` and single-value `--activation`. Default: `tanh,relu`. | `--activations tanh,relu` |
-| `--adaptive-candidate-pool INT` | All-model optimize | Candidate configurations considered by adaptive search. Default: `512`. | `--adaptive-candidate-pool 768` |
-| `--adaptive-category-balance FLOAT` | All-model optimize | GP-stage categorical coverage floor from `0` (unrestricted after balanced initialization) to `1` (nearly equal marginal counts). Default: `0.5`. | `--adaptive-category-balance 0.75` |
-| `--adaptive-exploration FLOAT` | All-model optimize | GP lower-confidence-bound uncertainty multiplier. Default: `1.5`. | `--adaptive-exploration 2` |
-| `--adaptive-hidden-width-step INT` | All-model optimize | Width quantization for structured hidden-layer ranges. Default: `8`. | `--adaptive-hidden-width-step 16` |
-| `--adaptive-initial-trials INT` | All-model optimize | Category-balanced, maximin-separated trials before GP guidance. Marginal category counts differ by at most one when possible, and the count is raised to cover all levels once when needed. Default: `6`. | `--adaptive-initial-trials 8` |
-| `--best-model-dir PATH` | DNN/KBNN `rerank-sweep` | Destination used by `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | `--best-model-dir dnn_opt/best_passive` |
-| `--jobs INT` | All-model optimize | Parallel workers for grid/random search; adaptive search is sequential. Default: `1`. | `--jobs 4` |
-| `--keep-trial-models` | All-model optimize | Retains every full trial model so a later rerank can promote it. | `--keep-trial-models` |
-| `--learning-rates LIST` | All-model optimize | Comma-separated Adam learning-rate candidates. Default: `0.001,0.002,0.005`; single-value alias: `--learning-rate`. | `--learning-rates 0.0005,0.001,0.002` |
-| `--max-passivity-sigma FLOAT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for worst predicted S-matrix singular value. | `--max-passivity-sigma 1.000001` |
-| `--max-passivity-violations INT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for violating sampled points. | `--max-passivity-violations 0` |
-| `--max-trials INT` | All-model optimize | Trial budget or product truncation. Default: `24`. | `--max-trials 40` |
-| `--optimize-parameter SPEC` | All-model optimize | Repeatable adaptive domain, such as numeric `name=low:high:log`, categories, explicit layouts, or structured hidden-layer ranges. | `--optimize-parameter learning_rate=1e-4:1e-2:log` |
-| `--overwrite` | DNN/KBNN `rerank-sweep` | Allows replacement of an existing reranked destination. | `--overwrite` |
-| `--promote-best` | DNN/KBNN `rerank-sweep` | Copies the selected retained trial model to `--best-model-dir`. | `--promote-best` |
-| `--replace-current-best` | DNN/KBNN `rerank-sweep` | Replaces `<sweep-dir>/best_model` with the selected retained trial. | `--replace-current-best` |
-| `--require-passive` | All-model optimize; DNN/KBNN rerank | Restricts best-model selection to zero passivity violations; failed trials remain in reports. | `--require-passive` |
-| `--retrain-best` | All-model optimize | Refits the winner after search instead of promoting its completed trial model. | `--retrain-best` |
-| `--search-mode {adaptive,grid,random}` | All-model optimize | Search strategy. Default: `random`. `--mode` remains a DNN/Neuro-TF legacy alias; KBNN reserves `--mode` primarily for its model formulation. | `--search-mode adaptive` |
-| `--selection-metric NAME` | All-model optimize; DNN/KBNN rerank | Metric minimized for promotion: absolute, dB, EVM, weighted, or passivity metrics. Default: `rmse_abs`. | `--selection-metric weighted_evm_pct` |
-| `--sweep-dir PATH` | DNN/KBNN `rerank-sweep` | Required existing optimize output directory. | `--sweep-dir dnn_opt` |
-| `--trial-seed-mode {fixed,indexed}` | All-model optimize | `fixed` reuses `--seed`; `indexed` uses seed plus trial number. Default: `fixed`. | `--trial-seed-mode fixed` |
-| `--trial-worst-plots INT` | All-model optimize | Worst-case plot pairs written per trial. Default: `1`; `0` speeds large searches. | `--trial-worst-plots 0` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--activations LIST` | All-model optimize | Comma-separated activation candidates; aliases are `--activation-options` and single-value `--activation`. Default: `tanh,relu`. | `--activations tanh,relu`  | `models.commands.optimize.activations` |
+| `--adaptive-candidate-pool INT` | All-model optimize | Candidate configurations considered by adaptive search. Default: `512`. | `--adaptive-candidate-pool 768`  | `models.commands.optimize.adaptive_candidate_pool` |
+| `--adaptive-category-balance FLOAT` | All-model optimize | GP-stage categorical coverage floor from `0` (unrestricted after balanced initialization) to `1` (nearly equal marginal counts). Default: `0.5`. | `--adaptive-category-balance 0.75`  | `models.commands.optimize.adaptive_category_balance` |
+| `--adaptive-exploration FLOAT` | All-model optimize | GP lower-confidence-bound uncertainty multiplier. Default: `1.5`. | `--adaptive-exploration 2`  | `models.commands.optimize.adaptive_exploration` |
+| `--adaptive-hidden-width-step INT` | All-model optimize | Width quantization for structured hidden-layer ranges. Default: `8`. | `--adaptive-hidden-width-step 16`  | `models.commands.optimize.adaptive_hidden_width_step` |
+| `--adaptive-initial-trials INT` | All-model optimize | Category-balanced, maximin-separated trials before GP guidance. Marginal category counts differ by at most one when possible, and the count is raised to cover all levels once when needed. Default: `6`. | `--adaptive-initial-trials 8`  | `models.commands.optimize.adaptive_initial_trials` |
+| `--best-model-dir PATH` | DNN/KBNN `rerank-sweep` | Destination used by `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | `--best-model-dir dnn_opt/best_passive`  | `models.MODEL.commands.rerank-sweep.best_model_dir` |
+| `--jobs INT` | All-model optimize | Parallel workers for grid/random search; adaptive search is sequential. Default: `1`. | `--jobs 4`  | `models.commands.optimize.jobs` |
+| `--keep-trial-models` | All-model optimize | Retains every full trial model so a later rerank can promote it. | `--keep-trial-models`  | `models.commands.optimize.keep_trial_models` |
+| `--learning-rates LIST` | All-model optimize | Comma-separated Adam learning-rate candidates. Default: `0.001,0.002,0.005`; single-value alias: `--learning-rate`. | `--learning-rates 0.0005,0.001,0.002`  | `models.commands.optimize.learning_rates` |
+| `--max-passivity-sigma FLOAT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for worst predicted S-matrix singular value. | `--max-passivity-sigma 1.000001`  | `models.commands.optimize.max_passivity_sigma`<br>`models.MODEL.commands.rerank-sweep.max_passivity_sigma` |
+| `--max-passivity-violations INT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for violating sampled points. | `--max-passivity-violations 0`  | `models.commands.optimize.max_passivity_violations`<br>`models.MODEL.commands.rerank-sweep.max_passivity_violations` |
+| `--max-trials INT` | All-model optimize | Trial budget or product truncation. Default: `24`. | `--max-trials 40`  | `models.commands.optimize.max_trials` |
+| `--optimize-parameter SPEC` | All-model optimize | Repeatable adaptive domain, such as numeric `name=low:high:log`, categories, explicit layouts, or structured hidden-layer ranges. | `--optimize-parameter learning_rate=1e-4:1e-2:log`  | `models.commands.optimize.optimize_parameter` |
+| `--overwrite` | DNN/KBNN `rerank-sweep` | Allows replacement of an existing reranked destination. | `--overwrite`  | `models.MODEL.commands.rerank-sweep.overwrite` |
+| `--promote-best` | DNN/KBNN `rerank-sweep` | Copies the selected retained trial model to `--best-model-dir`. | `--promote-best`  | `models.MODEL.commands.rerank-sweep.promote_best` |
+| `--replace-current-best` | DNN/KBNN `rerank-sweep` | Replaces `<sweep-dir>/best_model` with the selected retained trial. | `--replace-current-best`  | `models.MODEL.commands.rerank-sweep.replace_current_best` |
+| `--require-passive` | All-model optimize; DNN/KBNN rerank | Restricts best-model selection to zero passivity violations; failed trials remain in reports. | `--require-passive`  | `models.commands.optimize.require_passive`<br>`models.MODEL.commands.rerank-sweep.require_passive` |
+| `--retrain-best` | All-model optimize | Refits the winner after search instead of promoting its completed trial model. | `--retrain-best`  | `models.commands.optimize.retrain_best` |
+| `--search-mode {adaptive,grid,random}` | All-model optimize | Search strategy. Default: `random`. `--mode` remains a DNN/Neuro-TF legacy alias; KBNN reserves `--mode` primarily for its model formulation. | `--search-mode adaptive`  | `models.commands.optimize.search_mode` |
+| `--selection-metric NAME` | All-model optimize; DNN/KBNN rerank | Metric minimized for promotion: absolute, dB, EVM, weighted, or passivity metrics. Default: `rmse_abs`. | `--selection-metric weighted_evm_pct`  | `models.commands.optimize.selection_metric`<br>`models.MODEL.commands.rerank-sweep.selection_metric` |
+| `--sweep-dir PATH` | DNN/KBNN `rerank-sweep` | Required existing optimize output directory. | `--sweep-dir dnn_opt`  | `models.MODEL.commands.rerank-sweep.sweep_dir` |
+| `--trial-seed-mode {fixed,indexed}` | All-model optimize | `fixed` reuses `--seed`; `indexed` uses seed plus trial number. Default: `fixed`. | `--trial-seed-mode fixed`  | `models.commands.optimize.trial_seed_mode` |
+| `--trial-worst-plots INT` | All-model optimize | Worst-case plot pairs written per trial. Default: `1`; `0` speeds large searches. | `--trial-worst-plots 0`  | `models.commands.optimize.trial_worst_plots` |
 
 ### D.10 DNN-only fitting options
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--freq-transform {log,linear,log-linear}` | DNN `train`; single-value optimize form | Frequency feature transform. Default: `log`. | `--freq-transform log-linear` |
-| `--freq-transforms LIST` | DNN optimize | Transform candidates; aliases: `--freq-transform-options`, single-value `--freq-transform`. Default: `log,linear,log-linear`. | `--freq-transforms log,log-linear` |
-| `--max-y-condition FLOAT` | DNN fit | Rejects direct-Y targets when `cond(I+S)` exceeds the limit. Default: `1e10`. | `--max-y-condition 1e8` |
-| `--output-domain {s,y}` | DNN fit | Fits S directly or converts source S to direct admittance targets. Default: `s`. | `--output-domain y` |
-| `--passivity-penalty FLOAT` | DNN fit | Weight of the differentiable S-matrix passivity loss. Default: `10`. | `--passivity-penalty 20` |
-| `--sparam-weights SPEC` | DNN fit | S-parameter loss and weighted-selection priorities; rules are applied left to right. | `--sparam-weights 'diag=1;offdiag=0.2'` |
-| `--target-z0 FLOAT` | DNN fit | Reference impedance used to build direct-Y targets. Default: `50`. | `--target-z0 50` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--freq-transform {log,linear,log-linear}` | DNN `train`; single-value optimize form | Frequency feature transform. Default: `log`. | `--freq-transform log-linear`  | `models.dnn.commands.fit.freq_transform` |
+| `--freq-transforms LIST` | DNN optimize | Transform candidates; aliases: `--freq-transform-options`, single-value `--freq-transform`. Default: `log,linear,log-linear`. | `--freq-transforms log,log-linear`  | `models.dnn.commands.optimize.freq_transforms` |
+| `--max-y-condition FLOAT` | DNN fit | Rejects direct-Y targets when `cond(I+S)` exceeds the limit. Default: `1e10`. | `--max-y-condition 1e8`  | `models.dnn.commands.fit.max_y_condition` |
+| `--output-domain {s,y}` | DNN fit | Fits S directly or converts source S to direct admittance targets. Default: `s`. | `--output-domain y`  | `models.dnn.commands.fit.output_domain` |
+| `--passivity-penalty FLOAT` | DNN fit | Weight of the differentiable S-matrix passivity loss. Default: `10`. | `--passivity-penalty 20`  | `models.dnn.commands.fit.passivity_penalty` |
+| `--sparam-weights SPEC` | DNN fit | S-parameter loss and weighted-selection priorities; rules are applied left to right. | `--sparam-weights 'diag=1;offdiag=0.2'`  | `models.dnn.commands.fit.sparam_weights` |
+| `--target-z0 FLOAT` | DNN fit | Reference impedance used to build direct-Y targets. Default: `50`. | `--target-z0 50`  | `models.dnn.commands.fit.target_z0` |
 
 ### D.11 KBNN-only fitting options
 
@@ -6139,32 +6186,32 @@ The fine fit must receive exactly one reusable coarse source for `residual` or
 `prior-input`: either `--coarse-mdif` to fit it jointly or
 `--coarse-model-dir` to reuse a frozen compatible DNN.
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--coarse-activation {tanh,relu}` | KBNN fit with `--coarse-mdif` | Integrated coarse-DNN activation. Default: `tanh`. | `--coarse-activation tanh` |
-| `--coarse-batch-size INT` | KBNN fit with `--coarse-mdif` | Coarse batch size; defaults to fine `--batch-size`. | `--coarse-batch-size 256` |
-| `--coarse-epochs INT` | KBNN fit with `--coarse-mdif` | Coarse epoch limit; defaults to fine `--epochs`. | `--coarse-epochs 2500` |
-| `--coarse-freq-transform NAME` | KBNN fit with `--coarse-mdif` | Coarse transform: `log`, `linear`, or `log-linear`; defaults to the fine transform. | `--coarse-freq-transform log` |
-| `--coarse-frequency-weights SPEC` | KBNN fit with `--coarse-mdif` | Coarse frequency priorities; defaults to fine `--frequency-weights`. | `--coarse-frequency-weights 'default=1;1GHz=3'` |
-| `--coarse-hidden-layers LAYOUT` | KBNN fit with `--coarse-mdif` | Integrated coarse-DNN widths. Default: `64,64`. | `--coarse-hidden-layers 128,64` |
-| `--coarse-learning-rate FLOAT` | KBNN fit with `--coarse-mdif` | Integrated coarse-DNN Adam rate. Default: `0.002`. | `--coarse-learning-rate 0.001` |
-| `--coarse-loss-interval INT` | KBNN fit with `--coarse-mdif` | Coarse full-loss interval; defaults to fine `--loss-interval`. | `--coarse-loss-interval 5` |
-| `--coarse-mdif PATH` | KBNN fit | Coarse/prior data used to fit and save `<out-dir>/coarse_model`; mutually exclusive with `--coarse-model-dir`. | `--coarse-mdif coarse.mdif` |
-| `--coarse-model-dir PATH` | KBNN fit, predict, MDIF/HB/VA export | Reuses the matching frozen S-domain coarse DNN; packaged/recorded path is used when available during prediction/export. | `--coarse-model-dir coarse_model` |
-| `--coarse-patience INT` | KBNN fit with `--coarse-mdif` | Coarse early-stopping patience; defaults to fine `--patience`. | `--coarse-patience 250` |
-| `--coarse-progress-interval INT` | KBNN fit with `--coarse-mdif` | Coarse in-place progress interval; defaults to fine `--progress-interval`. | `--coarse-progress-interval 10` |
-| `--coarse-seed INT` | KBNN fit with `--coarse-mdif` | Coarse random seed; defaults to fine `--seed`. | `--coarse-seed 1234` |
-| `--coarse-sparam-weights SPEC` | KBNN fit with `--coarse-mdif` | Coarse S-parameter priorities; defaults to fine `--sparam-weights`. | `--coarse-sparam-weights 'diag=1;offdiag=0.5'` |
-| `--coarse-verification-mdif PATH` | KBNN fit with `--coarse-mdif` | Optional separate coarse verification data. | `--coarse-verification-mdif coarse_verify.mdif` |
-| `--coarse-worst-plots INT` | KBNN fit with `--coarse-mdif` | Coarse verification plot count; defaults to fine `--worst-plots`. | `--coarse-worst-plots 3` |
-| `--freq-transform NAME` | KBNN `train`; single-value optimize form | Fine-network transform: `log`, `linear`, or `log-linear`. Default: `log`. | `--freq-transform log` |
-| `--freq-transforms LIST` | KBNN optimize | Fine transform candidates; aliases include `--freq-transform-options` and single-value `--freq-transform`. Default: `log,linear,log-linear`. | `--freq-transforms log,log-linear` |
-| `--include-coarse-input` | KBNN `train`, optimize, ADS ANN export | Adds coarse S as fine-network inputs; for optimize this is the single true candidate. | `--include-coarse-input` |
-| `--include-coarse-inputs LIST` | KBNN optimize | Boolean candidate list; alias: `--include-coarse-input-options`. Default: `false,true`. | `--include-coarse-inputs false,true` |
-| `--mode {plain,residual,prior-input,adaptive,grid,random}` | KBNN `train`/optimize | Fine formulation for the first three values; train accepts only those and defaults to `residual`. In optimize, `adaptive`, `grid`, and `random` are legacy search-mode values; prefer `--search-mode` for clarity. | `--mode residual` |
-| `--modes LIST` | KBNN optimize | Comma-separated formulation candidates; alias: `--mode-options`. Default: `residual,prior-input`. | `--modes residual,prior-input` |
-| `--passivity-penalty FLOAT` | KBNN fit | Reconstructed fine-response passivity-loss weight. Default: `10`. | `--passivity-penalty 20` |
-| `--sparam-weights SPEC` | KBNN fit | Fine loss and weighted-selection priorities. | `--sparam-weights 'diag=1;offdiag=0.2'` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--coarse-activation {tanh,relu}` | KBNN fit with `--coarse-mdif` | Integrated coarse-DNN activation. Default: `tanh`. | `--coarse-activation tanh`  | `models.kbnn.commands.fit.coarse_activation` |
+| `--coarse-batch-size INT` | KBNN fit with `--coarse-mdif` | Coarse batch size; defaults to fine `--batch-size`. | `--coarse-batch-size 256`  | `models.kbnn.commands.fit.coarse_batch_size` |
+| `--coarse-epochs INT` | KBNN fit with `--coarse-mdif` | Coarse epoch limit; defaults to fine `--epochs`. | `--coarse-epochs 2500`  | `models.kbnn.commands.fit.coarse_epochs` |
+| `--coarse-freq-transform NAME` | KBNN fit with `--coarse-mdif` | Coarse transform: `log`, `linear`, or `log-linear`; defaults to the fine transform. | `--coarse-freq-transform log`  | `models.kbnn.commands.fit.coarse_freq_transform` |
+| `--coarse-frequency-weights SPEC` | KBNN fit with `--coarse-mdif` | Coarse frequency priorities; defaults to fine `--frequency-weights`. | `--coarse-frequency-weights 'default=1;1GHz=3'`  | `models.kbnn.commands.fit.coarse_frequency_weights` |
+| `--coarse-hidden-layers LAYOUT` | KBNN fit with `--coarse-mdif` | Integrated coarse-DNN widths. Default: `64,64`. | `--coarse-hidden-layers 128,64`  | `models.kbnn.commands.fit.coarse_hidden_layers` |
+| `--coarse-learning-rate FLOAT` | KBNN fit with `--coarse-mdif` | Integrated coarse-DNN Adam rate. Default: `0.002`. | `--coarse-learning-rate 0.001`  | `models.kbnn.commands.fit.coarse_learning_rate` |
+| `--coarse-loss-interval INT` | KBNN fit with `--coarse-mdif` | Coarse full-loss interval; defaults to fine `--loss-interval`. | `--coarse-loss-interval 5`  | `models.kbnn.commands.fit.coarse_loss_interval` |
+| `--coarse-mdif PATH` | KBNN fit | Coarse/prior data used to fit and save `<out-dir>/coarse_model`; mutually exclusive with `--coarse-model-dir`. | `--coarse-mdif coarse.mdif`  | `models.kbnn.commands.fit.coarse_mdif` |
+| `--coarse-model-dir PATH` | KBNN fit, predict, MDIF/HB/VA export | Reuses the matching frozen S-domain coarse DNN; packaged/recorded path is used when available during prediction/export. | `--coarse-model-dir coarse_model`  | `models.kbnn.commands.fit.coarse_model_dir`<br>`models.kbnn.commands.{predict,export-ads-mdif,export-ads-hb,export-veriloga}.coarse_model_dir` |
+| `--coarse-patience INT` | KBNN fit with `--coarse-mdif` | Coarse early-stopping patience; defaults to fine `--patience`. | `--coarse-patience 250`  | `models.kbnn.commands.fit.coarse_patience` |
+| `--coarse-progress-interval INT` | KBNN fit with `--coarse-mdif` | Coarse in-place progress interval; defaults to fine `--progress-interval`. | `--coarse-progress-interval 10`  | `models.kbnn.commands.fit.coarse_progress_interval` |
+| `--coarse-seed INT` | KBNN fit with `--coarse-mdif` | Coarse random seed; defaults to fine `--seed`. | `--coarse-seed 1234`  | `models.kbnn.commands.fit.coarse_seed` |
+| `--coarse-sparam-weights SPEC` | KBNN fit with `--coarse-mdif` | Coarse S-parameter priorities; defaults to fine `--sparam-weights`. | `--coarse-sparam-weights 'diag=1;offdiag=0.5'`  | `models.kbnn.commands.fit.coarse_sparam_weights` |
+| `--coarse-verification-mdif PATH` | KBNN fit with `--coarse-mdif` | Optional separate coarse verification data. | `--coarse-verification-mdif coarse_verify.mdif`  | `models.kbnn.commands.fit.coarse_verification_mdif` |
+| `--coarse-worst-plots INT` | KBNN fit with `--coarse-mdif` | Coarse verification plot count; defaults to fine `--worst-plots`. | `--coarse-worst-plots 3`  | `models.kbnn.commands.fit.coarse_worst_plots` |
+| `--freq-transform NAME` | KBNN `train`; single-value optimize form | Fine-network transform: `log`, `linear`, or `log-linear`. Default: `log`. | `--freq-transform log`  | `models.kbnn.commands.fit.freq_transform` |
+| `--freq-transforms LIST` | KBNN optimize | Fine transform candidates; aliases include `--freq-transform-options` and single-value `--freq-transform`. Default: `log,linear,log-linear`. | `--freq-transforms log,log-linear`  | `models.kbnn.commands.optimize.freq_transforms` |
+| `--include-coarse-input` | KBNN `train`, optimize, ADS ANN export | Adds coarse S as fine-network inputs; for optimize this is the single true candidate. | `--include-coarse-input`  | `models.kbnn.commands.fit.include_coarse_input`<br>`models.kbnn.commands.export-ads-ann.include_coarse_input` |
+| `--include-coarse-inputs LIST` | KBNN optimize | Boolean candidate list; alias: `--include-coarse-input-options`. Default: `false,true`. | `--include-coarse-inputs false,true`  | `models.kbnn.commands.optimize.include_coarse_inputs` |
+| `--mode {plain,residual,prior-input,adaptive,grid,random}` | KBNN `train`/optimize | Fine formulation for the first three values; train accepts only those and defaults to `residual`. In optimize, `adaptive`, `grid`, and `random` are legacy search-mode values; prefer `--search-mode` for clarity. | `--mode residual`  | `models.kbnn.commands.fit.mode` |
+| `--modes LIST` | KBNN optimize | Comma-separated formulation candidates; alias: `--mode-options`. Default: `residual,prior-input`. | `--modes residual,prior-input`  | `models.kbnn.commands.optimize.modes` |
+| `--passivity-penalty FLOAT` | KBNN fit | Reconstructed fine-response passivity-loss weight. Default: `10`. | `--passivity-penalty 20`  | `models.kbnn.commands.fit.passivity_penalty` |
+| `--sparam-weights SPEC` | KBNN fit | Fine loss and weighted-selection priorities. | `--sparam-weights 'diag=1;offdiag=0.2'`  | `models.kbnn.commands.fit.sparam_weights` |
 
 ### D.12 Neuro-TF-only fitting options
 
@@ -6172,50 +6219,50 @@ Neuro-TF does not expose `--sparam-weights`; use `--frequency-weights` and the
 response/passivity selection metrics. The rational coefficient fit is shared by
 all S-parameters.
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--order INT` | Neuro-TF `train`; single-value optimize form | Number of fixed stable rational poles. Default: `10`. | `--order 12` |
-| `--orders LIST` | Neuro-TF optimize | Pole-count candidates. Default: `6,10,14`; single-value alias: `--order`. | `--orders 8,12,16` |
-| `--pole-damping FLOAT` | Neuro-TF `train`; single-value optimize form | Fixed-pole real-part damping factor. Default: `0.18`. | `--pole-damping 0.18` |
-| `--pole-dampings LIST` | Neuro-TF optimize | Damping candidates. Default: `0.12,0.18,0.28`; single-value alias: `--pole-damping`. | `--pole-dampings 0.12,0.18,0.24` |
-| `--ridge FLOAT` | Neuro-TF `train`; single-value optimize form | Ridge regularization for rational least squares. Default: `1e-8`. | `--ridge 1e-8` |
-| `--ridges LIST` | Neuro-TF optimize | Ridge candidates. Default: `1e-10,1e-8,1e-6`; aliases: `--ridge-values`, single-value `--ridge`. | `--ridges 1e-10,1e-8,1e-6` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--order INT` | Neuro-TF `train`; single-value optimize form | Number of fixed stable rational poles. Default: `10`. | `--order 12`  | `models.neuro-tf.commands.fit.order` |
+| `--orders LIST` | Neuro-TF optimize | Pole-count candidates. Default: `6,10,14`; single-value alias: `--order`. | `--orders 8,12,16`  | `models.neuro-tf.commands.optimize.orders` |
+| `--pole-damping FLOAT` | Neuro-TF `train`; single-value optimize form | Fixed-pole real-part damping factor. Default: `0.18`. | `--pole-damping 0.18`  | `models.neuro-tf.commands.fit.pole_damping` |
+| `--pole-dampings LIST` | Neuro-TF optimize | Damping candidates. Default: `0.12,0.18,0.28`; single-value alias: `--pole-damping`. | `--pole-dampings 0.12,0.18,0.24`  | `models.neuro-tf.commands.optimize.pole_dampings` |
+| `--ridge FLOAT` | Neuro-TF `train`; single-value optimize form | Ridge regularization for rational least squares. Default: `1e-8`. | `--ridge 1e-8`  | `models.neuro-tf.commands.fit.ridge` |
+| `--ridges LIST` | Neuro-TF optimize | Ridge candidates. Default: `1e-10,1e-8,1e-6`; aliases: `--ridge-values`, single-value `--ridge`. | `--ridges 1e-10,1e-8,1e-6`  | `models.neuro-tf.commands.optimize.ridges` |
 
 ### D.13 Prediction, inspection, and common export options
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--dc-mdif PATH` | All-model MDIF/HB/VA export | Exact-zero-Hz validation or override source. It can rebuild only the DC network; it never refits RF. | `--dc-mdif train_with_dc.mdif` |
-| `--dc-open-resistance FLOAT` | All-model MDIF/HB/VA export | Open-path resistance. Default: `1e19` ohm. | `--dc-open-resistance 1e19` |
-| `--dc-open-threshold FLOAT` | All-model MDIF/HB/VA export | Selected-path open threshold. Default: `1e12` ohm. | `--dc-open-threshold 1e12` |
-| `--dc-port-paths SPEC` | All-model MDIF/HB/VA export | Export-time DC topology. Changing saved topology requires `--dc-mdif`. | `--dc-port-paths 1-2,3-4` |
-| `--freqs SPEC` | All-model `export-ads-mdif` | Frequency list or `start:stop:count`; required with explicit parameter grids. | `--freqs 1GHz:20GHz:401` |
-| `--frequency-expression EXPR` | All-model `export-veriloga` | Simulator frequency expression in hertz. Default: `$freq`. | `--frequency-expression '$freq'` |
-| `--mdif PATH` | All-model `inspect-mdif`, `predict` | Input MDIF to inspect or whose parameter/frequency blocks should be predicted. | `--mdif request.mdif` |
-| `--model-dir PATH` | All-model predict/export | Directory containing `model.npz` and `metadata.json`. | `--model-dir dnn_model` |
-| `--module-name NAME` | All-model HB/VA export | ADS subnetwork or Verilog-A module name; otherwise derived from the model directory. | `--module-name filter_model` |
-| `--out-dir PATH` | All-model export | Required package destination. | `--out-dir exports/filter` |
-| `--out-mdif PATH` | All-model `predict` | Required predicted MDIF path. | `--out-mdif predicted.mdif` |
-| `--output-name NAME` | All-model `export-ads-mdif` | Exported MDIF filename. Default: `surrogate_ads.mdif`. | `--output-name filter.mdif` |
-| `--parameter-grid NAME=SPEC` | All-model `export-ads-mdif` | Repeat once per model parameter; values are a comma list or `start:stop:count`. | `--parameter-grid W=0.4mm:0.8mm:9` |
-| `--parameter-input-scales SCALE` | All-model HB/VA export | One positive ADS-side denominator applied to every parameter: `model_value=instance_value/scale`. Default: `1.0`. | `--parameter-input-scales 1um` |
-| `--split-var NAME` | All-model `inspect-mdif` | Split variable summarized by inspection. Default: `dataset`. | `--split-var dataset` |
-| `--template-mdif PATH` | All-model `export-ads-mdif` | Supplies exact parameter/frequency blocks; its S values are ignored. Alternative to an explicit grid. | `--template-mdif template.mdif` |
-| `--z0 FLOAT` | All-model HB/VA export | S reference impedance for conversion/stamping. Default: `50`. | `--z0 50` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--dc-mdif PATH` | All-model MDIF/HB/VA export | Exact-zero-Hz validation or override source. It can rebuild only the DC network; it never refits RF. | `--dc-mdif train_with_dc.mdif`  | `models.MODEL.commands.{export-ads-mdif,export-ads-hb,export-veriloga}.dc_mdif` |
+| `--dc-open-resistance FLOAT` | All-model MDIF/HB/VA export | Open-path resistance. Default: `1e19` ohm. | `--dc-open-resistance 1e19`  | `models.MODEL.commands.{export-ads-mdif,export-ads-hb,export-veriloga}.dc_open_resistance` |
+| `--dc-open-threshold FLOAT` | All-model MDIF/HB/VA export | Selected-path open threshold. Default: `1e12` ohm. | `--dc-open-threshold 1e12`  | `models.MODEL.commands.{export-ads-mdif,export-ads-hb,export-veriloga}.dc_open_threshold` |
+| `--dc-port-paths SPEC` | All-model MDIF/HB/VA export | Export-time DC topology. Changing saved topology requires `--dc-mdif`. | `--dc-port-paths 1-2,3-4`  | `models.MODEL.commands.{export-ads-mdif,export-ads-hb,export-veriloga}.dc_port_paths` |
+| `--freqs SPEC` | All-model `export-ads-mdif` | Frequency list or `start:stop:count`; required with explicit parameter grids. | `--freqs 1GHz:20GHz:401`  | `models.MODEL.commands.export-ads-mdif.freqs` |
+| `--frequency-expression EXPR` | All-model `export-veriloga` | Simulator frequency expression in hertz. Default: `$freq`. | `--frequency-expression '$freq'`  | `models.MODEL.commands.export-veriloga.frequency_expression` |
+| `--mdif PATH` | All-model `inspect-mdif`, `predict` | Input MDIF to inspect or whose parameter/frequency blocks should be predicted. | `--mdif request.mdif`  | `models.MODEL.commands.{inspect-mdif,predict}.mdif` |
+| `--model-dir PATH` | All-model predict/export | Directory containing `model.npz` and `metadata.json`. | `--model-dir dnn_model`  | `models.MODEL.commands.{predict,export-ads-mdif,export-ads-ann,export-ads-hb,export-veriloga}.model_dir` |
+| `--module-name NAME` | All-model HB/VA export | ADS subnetwork or Verilog-A module name; otherwise derived from the model directory. | `--module-name filter_model`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.module_name` |
+| `--out-dir PATH` | All-model export | Required package destination. | `--out-dir exports/filter`  | `models.MODEL.commands.export.out_dir` |
+| `--out-mdif PATH` | All-model `predict` | Required predicted MDIF path. | `--out-mdif predicted.mdif`  | `models.MODEL.commands.predict.out_mdif` |
+| `--output-name NAME` | All-model `export-ads-mdif` | Exported MDIF filename. Default: `surrogate_ads.mdif`. | `--output-name filter.mdif`  | `models.MODEL.commands.export-ads-mdif.output_name` |
+| `--parameter-grid NAME=SPEC` | All-model `export-ads-mdif` | Repeat once per model parameter; values are a comma list or `start:stop:count`. | `--parameter-grid W=0.4mm:0.8mm:9`  | `models.MODEL.commands.export-ads-mdif.parameter_grid` |
+| `--parameter-input-scales SCALE` | All-model HB/VA export | One positive ADS-side denominator applied to every parameter: `model_value=instance_value/scale`. Default: `1.0`. | `--parameter-input-scales 1um`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.parameter_input_scales` |
+| `--split-var NAME` | All-model `inspect-mdif` | Split variable summarized by inspection. Default: `dataset`. | `--split-var dataset`  | `models.MODEL.commands.inspect-mdif.split_var` |
+| `--template-mdif PATH` | All-model `export-ads-mdif` | Supplies exact parameter/frequency blocks; its S values are ignored. Alternative to an explicit grid. | `--template-mdif template.mdif`  | `models.MODEL.commands.export-ads-mdif.template_mdif` |
+| `--z0 FLOAT` | All-model HB/VA export | S reference impedance for conversion/stamping. Default: `50`. | `--z0 50`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.z0` |
 
 #### DNN export-only options
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--direct-y-trial-model-dir PATH` | DNN `export-ads-hb` | Exports a compatible separately trained direct-Y timing trial beside the unchanged S-domain baseline. | `--direct-y-trial-model-dir dnn_y_model` |
-| `--no-fold-scalers` | DNN `export-veriloga` | Debug form that leaves standardization arithmetic explicit instead of folding it into network layers. | `--no-fold-scalers` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--direct-y-trial-model-dir PATH` | DNN `export-ads-hb` | Exports a compatible separately trained direct-Y timing trial beside the unchanged S-domain baseline. | `--direct-y-trial-model-dir dnn_y_model`  | `models.dnn.commands.export-ads-hb.direct_y_trial_model_dir` |
+| `--no-fold-scalers` | DNN `export-veriloga` | Debug form that leaves standardization arithmetic explicit instead of folding it into network layers. | `--no-fold-scalers`  | `models.dnn.commands.export-veriloga.no_fold_scalers` |
 
 #### KBNN export-only options
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--allow-coarse-hooks` | KBNN `export-veriloga` | Allows the legacy non-self-contained residual/prior-input export with zero-default coarse hooks when no coarse model is available. | `--allow-coarse-hooks` |
-| `--coarse-model-dir PATH` | KBNN predict, MDIF/HB/VA export | Explicit matching frozen coarse DNN; recorded or packaged coarse data is otherwise used when available. | `--coarse-model-dir kbnn_model/coarse_model` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--allow-coarse-hooks` | KBNN `export-veriloga` | Allows the legacy non-self-contained residual/prior-input export with zero-default coarse hooks when no coarse model is available. | `--allow-coarse-hooks`  | `models.kbnn.commands.export-veriloga.allow_coarse_hooks` |
+| `--coarse-model-dir PATH` | KBNN predict, MDIF/HB/VA export | Explicit matching frozen coarse DNN; recorded or packaged coarse data is otherwise used when available. | `--coarse-model-dir kbnn_model/coarse_model`  | `models.kbnn.commands.{predict,export-ads-mdif,export-ads-hb,export-veriloga}.coarse_model_dir` |
 
 ### D.14 ADS ANN export options
 
@@ -6223,50 +6270,50 @@ These apply to DNN and KBNN `export-ads-ann`; Neuro-TF has no ADS ANN export
 subcommand. Input/split options also appear in D.7 because ADS ANN rebuilds its
 training tables from MDIF rather than importing local weights.
 
-| Option | Applies to | Explanation | Example |
-| --- | --- | --- | --- |
-| `--activation {tanh,relu}` | DNN/KBNN ADS ANN | Architecture override; otherwise model metadata is used when supplied. | `--activation tanh` |
-| `--ads-ann-target {native,fine}` | KBNN ADS ANN only | `native` preserves the KBNN target; `fine` asks ADS ANN to predict final fine S directly. Default: `native`. | `--ads-ann-target fine` |
-| `--ads-hidden-layers INT` | DNN/KBNN ADS ANN | Overrides ADS `AnnSetup.num_hidden_layers`. | `--ads-hidden-layers 3` |
-| `--ads-iterations INT` | DNN/KBNN ADS ANN | ADS maximum training iterations. Default: `500`. | `--ads-iterations 1000` |
-| `--ads-network-training-type {standard,adjoint,classification}` | DNN/KBNN ADS ANN | ADS network training type. Default: `standard`. | `--ads-network-training-type standard` |
-| `--ads-neurons-per-layer INT` | DNN/KBNN ADS ANN | Overrides ADS neurons per hidden layer. | `--ads-neurons-per-layer 128` |
-| `--ads-optimizer {quasi-newton,bayesian-regularization}` | DNN/KBNN ADS ANN | ADS modeler optimizer. Default: `quasi-newton`. | `--ads-optimizer quasi-newton` |
-| `--ads-output-format {all,verilog-a,c-code,equation,struct-scale}` | DNN/KBNN ADS ANN | Native artifact type requested from ADS. Default: `all`. | `--ads-output-format all` |
-| `--ads-training-stop-tolerance FLOAT` | DNN/KBNN ADS ANN | ADS RMSE stop tolerance. Default: `0`. | `--ads-training-stop-tolerance 0` |
-| `--coarse-mdif PATH` | KBNN ADS ANN only | Optional coarse/prior MDIF used to prepare native KBNN targets. | `--coarse-mdif coarse.mdif` |
-| `--coarse-verification-mdif PATH` | KBNN ADS ANN only | Optional separate coarse verification MDIF. | `--coarse-verification-mdif coarse_verify.mdif` |
-| `--freq-transform NAME` | DNN/KBNN ADS ANN | Frequency-transform override; otherwise model metadata is used. | `--freq-transform log` |
-| `--hidden-layers LAYOUT` | DNN/KBNN ADS ANN | Architecture metadata override. | `--hidden-layers 128,128,64` |
-| `--holdout-fraction FLOAT` | DNN/KBNN ADS ANN | Random verification fraction if labels are absent. Default: `0.2`. | `--holdout-fraction 0.2` |
-| `--include-coarse-input` | KBNN ADS ANN only | Includes coarse S among network inputs. | `--include-coarse-input` |
-| `--mdif PATH` | DNN/KBNN ADS ANN | Required direct/fine MDIF. | `--mdif train_verify.mdif` |
-| `--mode {plain,residual,prior-input}` | KBNN ADS ANN only | KBNN target formulation override. | `--mode residual` |
-| `--model-dir PATH` | DNN/KBNN ADS ANN | Optional local model or `best_model` directory used for architecture metadata. | `--model-dir dnn_opt/best_model` |
-| `--out-dir PATH` | DNN/KBNN ADS ANN | Required package directory. | `--out-dir ads_ann` |
-| `--output-prefix NAME` | DNN/KBNN ADS ANN | Generated ADS artifact prefix. Defaults: `dnn_ads_ann` or `kbnn_ads_ann`. | `--output-prefix filter_ann` |
-| `--parameter-names LIST` | DNN/KBNN ADS ANN | Geometry/process inputs; inferred when omitted. | `--parameter-names W,L,H` |
-| `--seed INT` | DNN/KBNN ADS ANN | Optional data-preparation seed. | `--seed 1234` |
-| `--sparam-weights SPEC` | DNN/KBNN ADS ANN | Records intended output priorities in the manifest; defaults to model metadata. | `--sparam-weights 'diag=1;offdiag=0.2'` |
-| `--split-var NAME` | DNN/KBNN ADS ANN | Split-variable override. | `--split-var dataset` |
-| `--train-values LIST` | DNN/KBNN ADS ANN | Training-label override. | `--train-values train` |
-| `--verification-mdif PATH` | DNN/KBNN ADS ANN | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif` |
-| `--verify-values LIST` | DNN/KBNN ADS ANN | Verification-label override. | `--verify-values verification` |
+| Option | Applies to | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- | --- |
+| `--activation {tanh,relu}` | DNN/KBNN ADS ANN | Architecture override; otherwise model metadata is used when supplied. | `--activation tanh`  | `models.MODEL.commands.export-ads-ann.activation` |
+| `--ads-ann-target {native,fine}` | KBNN ADS ANN only | `native` preserves the KBNN target; `fine` asks ADS ANN to predict final fine S directly. Default: `native`. | `--ads-ann-target fine`  | `models.MODEL.commands.export-ads-ann.ads_ann_target` |
+| `--ads-hidden-layers INT` | DNN/KBNN ADS ANN | Overrides ADS `AnnSetup.num_hidden_layers`. | `--ads-hidden-layers 3`  | `models.MODEL.commands.export-ads-ann.ads_hidden_layers` |
+| `--ads-iterations INT` | DNN/KBNN ADS ANN | ADS maximum training iterations. Default: `500`. | `--ads-iterations 1000`  | `models.MODEL.commands.export-ads-ann.ads_iterations` |
+| `--ads-network-training-type {standard,adjoint,classification}` | DNN/KBNN ADS ANN | ADS network training type. Default: `standard`. | `--ads-network-training-type standard`  | `models.MODEL.commands.export-ads-ann.ads_network_training_type` |
+| `--ads-neurons-per-layer INT` | DNN/KBNN ADS ANN | Overrides ADS neurons per hidden layer. | `--ads-neurons-per-layer 128`  | `models.MODEL.commands.export-ads-ann.ads_neurons_per_layer` |
+| `--ads-optimizer {quasi-newton,bayesian-regularization}` | DNN/KBNN ADS ANN | ADS modeler optimizer. Default: `quasi-newton`. | `--ads-optimizer quasi-newton`  | `models.MODEL.commands.export-ads-ann.ads_optimizer` |
+| `--ads-output-format {all,verilog-a,c-code,equation,struct-scale}` | DNN/KBNN ADS ANN | Native artifact type requested from ADS. Default: `all`. | `--ads-output-format all`  | `models.MODEL.commands.export-ads-ann.ads_output_format` |
+| `--ads-training-stop-tolerance FLOAT` | DNN/KBNN ADS ANN | ADS RMSE stop tolerance. Default: `0`. | `--ads-training-stop-tolerance 0`  | `models.MODEL.commands.export-ads-ann.ads_training_stop_tolerance` |
+| `--coarse-mdif PATH` | KBNN ADS ANN only | Optional coarse/prior MDIF used to prepare native KBNN targets. | `--coarse-mdif coarse.mdif`  | `models.MODEL.commands.export-ads-ann.coarse_mdif` |
+| `--coarse-verification-mdif PATH` | KBNN ADS ANN only | Optional separate coarse verification MDIF. | `--coarse-verification-mdif coarse_verify.mdif`  | `models.MODEL.commands.export-ads-ann.coarse_verification_mdif` |
+| `--freq-transform NAME` | DNN/KBNN ADS ANN | Frequency-transform override; otherwise model metadata is used. | `--freq-transform log`  | `models.MODEL.commands.export-ads-ann.freq_transform` |
+| `--hidden-layers LAYOUT` | DNN/KBNN ADS ANN | Architecture metadata override. | `--hidden-layers 128,128,64`  | `models.MODEL.commands.export-ads-ann.hidden_layers` |
+| `--holdout-fraction FLOAT` | DNN/KBNN ADS ANN | Random verification fraction if labels are absent. Default: `0.2`. | `--holdout-fraction 0.2`  | `models.MODEL.commands.export-ads-ann.holdout_fraction` |
+| `--include-coarse-input` | KBNN ADS ANN only | Includes coarse S among network inputs. | `--include-coarse-input`  | `models.MODEL.commands.export-ads-ann.include_coarse_input` |
+| `--mdif PATH` | DNN/KBNN ADS ANN | Required direct/fine MDIF. | `--mdif train_verify.mdif`  | `models.MODEL.commands.export-ads-ann.mdif` |
+| `--mode {plain,residual,prior-input}` | KBNN ADS ANN only | KBNN target formulation override. | `--mode residual`  | `models.MODEL.commands.export-ads-ann.mode` |
+| `--model-dir PATH` | DNN/KBNN ADS ANN | Optional local model or `best_model` directory used for architecture metadata. | `--model-dir dnn_opt/best_model`  | `models.MODEL.commands.export-ads-ann.model_dir` |
+| `--out-dir PATH` | DNN/KBNN ADS ANN | Required package directory. | `--out-dir ads_ann`  | `models.MODEL.commands.export-ads-ann.out_dir` |
+| `--output-prefix NAME` | DNN/KBNN ADS ANN | Generated ADS artifact prefix. Defaults: `dnn_ads_ann` or `kbnn_ads_ann`. | `--output-prefix filter_ann`  | `models.MODEL.commands.export-ads-ann.output_prefix` |
+| `--parameter-names LIST` | DNN/KBNN ADS ANN | Geometry/process inputs; inferred when omitted. | `--parameter-names W,L,H`  | `models.MODEL.commands.export-ads-ann.parameter_names` |
+| `--seed INT` | DNN/KBNN ADS ANN | Optional data-preparation seed. | `--seed 1234`  | `models.MODEL.commands.export-ads-ann.seed` |
+| `--sparam-weights SPEC` | DNN/KBNN ADS ANN | Records intended output priorities in the manifest; defaults to model metadata. | `--sparam-weights 'diag=1;offdiag=0.2'`  | `models.MODEL.commands.export-ads-ann.sparam_weights` |
+| `--split-var NAME` | DNN/KBNN ADS ANN | Split-variable override. | `--split-var dataset`  | `models.MODEL.commands.export-ads-ann.split_var` |
+| `--train-values LIST` | DNN/KBNN ADS ANN | Training-label override. | `--train-values train`  | `models.MODEL.commands.export-ads-ann.train_values` |
+| `--verification-mdif PATH` | DNN/KBNN ADS ANN | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif`  | `models.MODEL.commands.export-ads-ann.verification_mdif` |
+| `--verify-values LIST` | DNN/KBNN ADS ANN | Verification-label override. | `--verify-values verification`  | `models.MODEL.commands.export-ads-ann.verify_values` |
 
 ### D.15 ADS HB solver-report options
 
 The `hb-report` route accepts one or more positional `LOG` files. Use `-` once
 to read a log from standard input.
 
-| Option or argument | Explanation | Example |
-| --- | --- | --- |
-| `LOG [LOG ...]` | Required ADS StatusLevel 4/5 text logs. | `baseline.log trial.log` |
-| `--cpu-time-seconds SECONDS [...]` | Optional CPU-time overrides, exactly one per log. | `--cpu-time-seconds 120.5 110.2` |
-| `--frequency-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--frequency-regex 'Freq=(?P<value>[0-9.]+)(?P<unit>GHz)'` |
-| `--labels NAME [...]` | Unique report labels, exactly one per log; defaults to file stems. | `--labels Baseline Trial` |
-| `--out-dir PATH` | Report directory. Default: `ads_hb_solver_report`. | `--out-dir hb_report` |
-| `--power-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--power-regex 'Pin=(?P<value>[-+0-9.]+)(?P<unit>dBm)'` |
-| `--wall-clock-seconds SECONDS [...]` | Optional elapsed-time overrides, exactly one per log. Alias: `--elapsed-seconds`. | `--wall-clock-seconds 75.2 63.8` |
+| Option or argument | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- |
+| `LOG [LOG ...]` | Required ADS StatusLevel 4/5 text logs. | `baseline.log trial.log`  | Not supported (positional CLI argument) |
+| `--cpu-time-seconds SECONDS [...]` | Optional CPU-time overrides, exactly one per log. | `--cpu-time-seconds 120.5 110.2`  | `workflows.hb-report.commands.hb-report.cpu_time_seconds` |
+| `--frequency-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--frequency-regex 'Freq=(?P<value>[0-9.]+)(?P<unit>GHz)'`  | `workflows.hb-report.commands.hb-report.frequency_regex` |
+| `--labels NAME [...]` | Unique report labels, exactly one per log; defaults to file stems. | `--labels Baseline Trial`  | `workflows.hb-report.commands.hb-report.labels` |
+| `--out-dir PATH` | Report directory. Default: `ads_hb_solver_report`. | `--out-dir hb_report`  | `workflows.hb-report.commands.hb-report.out_dir` |
+| `--power-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--power-regex 'Pin=(?P<value>[-+0-9.]+)(?P<unit>dBm)'`  | `workflows.hb-report.commands.hb-report.power_regex` |
+| `--wall-clock-seconds SECONDS [...]` | Optional elapsed-time overrides, exactly one per log. Alias: `--elapsed-seconds`. | `--wall-clock-seconds 75.2 63.8`  | `workflows.hb-report.commands.hb-report.wall_clock_seconds` |
 
 ### D.16 Copyable end-to-end command set
 
@@ -6275,6 +6322,7 @@ on the primary entry point:
 
 | Stage | Copyable command |
 | --- | --- |
+| Inspect resolved configuration | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options` |
 | Generate | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 32 --verification-count 8 --out geometries.csv` |
 | Audit | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |

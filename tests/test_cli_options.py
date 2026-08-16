@@ -282,6 +282,82 @@ class OptionsJSONTests(unittest.TestCase):
                 )
         self.assertIn("cannot enable --update-options-json", stderr.getvalue())
 
+    def test_explain_options_reports_effective_values_and_exact_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "commands": {"fit": {"frequency_weights": "default=2"}},
+                        "dnn": {
+                            "commands": {
+                                "train": {"mdif": "data/from_json.mdif"}
+                            }
+                        },
+                    }
+                },
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), self.assertRaises(
+                SystemExit
+            ) as stopped:
+                parse_args_with_options_json(
+                    example_parser(),
+                    [
+                        "train",
+                        "--options-json",
+                        str(config),
+                        "--epochs",
+                        "600",
+                        "--explain-options",
+                    ],
+                    model="dnn",
+                )
+
+        report = stdout.getvalue()
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertIn("command was not executed", report)
+        self.assertIn("JSON: models.dnn.commands.train.mdif", report)
+        self.assertIn("JSON: models.commands.fit.frequency_weights", report)
+        self.assertIn("CLI (--epochs)", report)
+        self.assertIn("Required argparse options: complete", report)
+
+    def test_explain_additional_points_preflights_domain_and_metric(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metrics = root / "verification_metrics.csv"
+            metrics.write_text("W,evm_pct\n1.0,2.0\n", encoding="utf-8")
+            config = self.write_config(
+                root,
+                {
+                    "workflows": {
+                        "points": {
+                            "commands": {
+                                "suggest-additional": {
+                                    "parameter": ["W=0:2"],
+                                    "count": 4,
+                                    "verification_metrics": str(metrics),
+                                    "metric": "weighted_evm_pct",
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit):
+                parse_args_with_options_json(
+                    generate_points.build_suggest_parser(),
+                    ["--options-json", str(config), "--show-options"],
+                    workflow="points",
+                    command="suggest-additional",
+                )
+
+        report = stdout.getvalue()
+        self.assertIn("parameter domain: OK, 1 --parameter value", report)
+        self.assertIn("COLUMN NOT FOUND: weighted_evm_pct", report)
+        self.assertIn("weighted_* values are fit-summary metrics", report)
+
     def test_points_main_commits_update_after_command_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.write_config(Path(temp_dir), {"schema_version": 1})

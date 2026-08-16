@@ -84,6 +84,7 @@ class SurrogateDispatcherTests(unittest.TestCase):
         self.assertIn("options", output.getvalue())
         self.assertIn("--options-json", output.getvalue())
         self.assertIn("--update-options-json", output.getvalue())
+        self.assertIn("--explain-options", output.getvalue())
 
     def test_options_init_generates_template_and_requires_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -147,6 +148,21 @@ class SurrogateDispatcherTests(unittest.TestCase):
                     "--options-json",
                     "defaults.json",
                     "--update-options-json",
+                ],
+            ),
+            (
+                [
+                    "--options-json",
+                    "defaults.json",
+                    "points",
+                    "suggest-additional",
+                    "--explain-options",
+                ],
+                [
+                    "suggest-additional",
+                    "--options-json",
+                    "defaults.json",
+                    "--explain-options",
                 ],
             ),
         )

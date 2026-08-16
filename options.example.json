@@ -92,12 +92,16 @@
         },
         "suggest-additional": {
           "acquisition": "gp-ucb",
+          "allow_nonpassive": false,
           "count": null,
           "existing_points": null,
           "exploration_weight": 2.0,
           "fit_dir": null,
+          "metric": "auto",
           "min_distance": 0.05,
-          "out": null
+          "out": null,
+          "parameter_json": null,
+          "verification_metrics": null
         }
       }
     }
