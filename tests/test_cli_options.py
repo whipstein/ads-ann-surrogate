@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import audit_dataset
 import dnn
@@ -14,6 +15,7 @@ import neuro_tf
 
 from cli_options import (
     add_options_json_argument,
+    finalize_options_json_update,
     parse_args_with_options_json,
     starter_options_payload,
 )
@@ -179,6 +181,140 @@ class OptionsJSONTests(unittest.TestCase):
         self.assertEqual(kbnn_args.frequency_weights, "models-common")
         self.assertEqual(kbnn_args.passivity_mode, "enforce")
         self.assertEqual(cli_args.epochs, 600)
+
+    def test_update_options_json_saves_explicit_values_at_exact_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "schema_version": 1,
+                    "models": {
+                        "commands": {"fit": {"epochs": 200}},
+                        "dnn": {"commands": {}},
+                    },
+                },
+            )
+            args = parse_args_with_options_json(
+                example_parser(),
+                [
+                    "train",
+                    "--options-json",
+                    str(config),
+                    "--update-options-json",
+                    "--mdif",
+                    "data/new.mdif",
+                    "--epochs",
+                    "500",
+                    "--parameter",
+                    "W=1:2",
+                    "--parameter",
+                    "L=3:4",
+                    "--require-passive",
+                ],
+                model="dnn",
+            )
+            status = finalize_options_json_update(args, 0)
+            payload = json.loads(config.read_text())
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            payload["models"]["dnn"]["commands"]["train"],
+            {
+                "mdif": "data/new.mdif",
+                "epochs": 500,
+                "parameter": ["W=1:2", "L=3:4"],
+                "require_passive": True,
+            },
+        )
+        self.assertEqual(payload["models"]["commands"]["fit"]["epochs"], 200)
+
+    def test_update_options_json_requires_path_and_skips_runtime_failure(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            parse_args_with_options_json(
+                example_parser(),
+                ["train", "--update-options-json", "--mdif", "x"],
+                model="dnn",
+            )
+        self.assertIn("requires --options-json", stderr.getvalue())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(Path(temp_dir), {"schema_version": 1})
+            original = config.read_text()
+            args = parse_args_with_options_json(
+                example_parser(),
+                [
+                    "train",
+                    "--options-json",
+                    str(config),
+                    "--update-options-json",
+                    "--mdif",
+                    "x",
+                ],
+                model="dnn",
+            )
+            status = finalize_options_json_update(args, 2)
+            unchanged = config.read_text()
+
+        self.assertEqual(status, 2)
+        self.assertEqual(unchanged, original)
+
+    def test_options_json_cannot_enable_its_own_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "dnn": {
+                            "commands": {
+                                "train": {"update_options_json": True}
+                            }
+                        }
+                    }
+                },
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                parse_args_with_options_json(
+                    example_parser(),
+                    ["train", "--options-json", str(config), "--mdif", "x"],
+                    model="dnn",
+                )
+        self.assertIn("cannot enable --update-options-json", stderr.getvalue())
+
+    def test_points_main_commits_update_after_command_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(Path(temp_dir), {"schema_version": 1})
+            with mock.patch(
+                "generate_points.command_generate",
+                return_value=0,
+            ) as command:
+                status = generate_points.main(
+                    [
+                        "generate",
+                        "--options-json",
+                        str(config),
+                        "--update-options-json",
+                        "--parameter",
+                        "W=1:2",
+                        "--count",
+                        "12",
+                        "--out",
+                        "geometries.csv",
+                    ]
+                )
+            payload = json.loads(config.read_text())
+
+        self.assertEqual(status, 0)
+        command.assert_called_once()
+        self.assertEqual(
+            payload["workflows"]["points"]["commands"]["generate"],
+            {
+                "parameter": ["W=1:2"],
+                "count": 12,
+                "out": "geometries.csv",
+            },
+        )
 
     def test_invalid_option_is_rejected_for_the_selected_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

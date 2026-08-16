@@ -16,7 +16,11 @@ from typing import Sequence
 
 import numpy as np
 
-from cli_options import add_options_json_argument, parse_args_with_options_json
+from cli_options import (
+    add_options_json_argument,
+    finalize_options_json_update,
+    parse_args_with_options_json,
+)
 from surrogate_common import *  # noqa: F401,F403,E402
 
 VERSION = "0.2.0-rc3"
@@ -2008,10 +2012,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parse_args_with_options_json(parser, argv, model="neuro-tf")
     try:
-        return int(args.func(args))
+        status = int(args.func(args))
     except Exception as exc:
         print_cli_error(args, exc)
         return 2
+    return finalize_options_json_update(args, status)
 
 
 if __name__ == "__main__":

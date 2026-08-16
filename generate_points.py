@@ -23,7 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from cli_options import add_options_json_argument, parse_args_with_options_json
+from cli_options import (
+    add_options_json_argument,
+    finalize_options_json_update,
+    parse_args_with_options_json,
+)
 
 
 UNIT_SCALES = {
@@ -2892,7 +2896,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             workflow="points",
             command="suggest-additional",
         )
-        return command_suggest_additional(args, parser)
+        status = command_suggest_additional(args, parser)
+        return finalize_options_json_update(args, status)
 
     parser = build_generate_parser()
     args = parse_args_with_options_json(
@@ -2901,7 +2906,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         workflow="points",
         command="generate",
     )
-    return command_generate(args, parser)
+    status = command_generate(args, parser)
+    return finalize_options_json_update(args, status)
 
 
 if __name__ == "__main__":

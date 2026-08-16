@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from difflib import get_close_matches
 from pathlib import Path
@@ -20,6 +21,10 @@ OPTIONS_JSON_HELP = (
     "JSON file containing reusable option defaults. Supports common, commands, "
     "model/workflow-wide defaults, and narrower overrides; explicit command-line "
     "options take precedence."
+)
+UPDATE_OPTIONS_JSON_HELP = (
+    "After a successful command, save explicitly supplied CLI options into "
+    "the exact model/workflow command section of --options-json."
 )
 
 MODEL_NAMES = {"dnn", "kbnn", "neuro-tf"}
@@ -178,6 +183,15 @@ def add_options_json_argument(
             metavar="PATH",
             help=OPTIONS_JSON_HELP,
         )
+    if not any(
+        "--update-options-json" in action.option_strings
+        for action in parser._actions
+    ):
+        parser.add_argument(
+            "--update-options-json",
+            action="store_true",
+            help=UPDATE_OPTIONS_JSON_HELP,
+        )
     if not recursive:
         return
     for action in parser._actions:
@@ -219,6 +233,23 @@ def extract_options_json_argument(
     if paths and not paths[0].strip():
         raise OptionsJSONError("--options-json requires a non-empty PATH")
     return (paths[0] if paths else None), clean
+
+
+def extract_update_options_json_argument(
+    argv: Sequence[str],
+) -> tuple[bool, list[str]]:
+    """Remove the opt-in JSON-update flag from an argument sequence."""
+
+    clean: list[str] = []
+    requested = False
+    for token in argv:
+        if token == "--update-options-json":
+            requested = True
+            continue
+        if token.startswith("--update-options-json="):
+            raise OptionsJSONError("--update-options-json does not take a value")
+        clean.append(token)
+    return requested, clean
 
 
 def _mapping(value: object, context: str) -> dict[str, object]:
@@ -575,6 +606,11 @@ def apply_options_json_defaults(
             raise OptionsJSONError(
                 "The options JSON cannot set its own --options-json path"
             )
+        if option == "--update-options-json":
+            raise OptionsJSONError(
+                "The options JSON cannot enable --update-options-json; "
+                "request updates explicitly on the command line"
+            )
         action = option_actions.get(option)
         if action is None:
             available = sorted(option_actions)
@@ -598,6 +634,218 @@ def apply_options_json_defaults(
             action.required = False
 
 
+def _json_compatible(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, list):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise OptionsJSONError(
+        f"Cannot save command option value of type {type(value).__name__} to JSON"
+    )
+
+
+def _explicit_option_updates(
+    parser: argparse.ArgumentParser,
+    argv: Sequence[str],
+    args: argparse.Namespace,
+    *,
+    command: str,
+) -> tuple[dict[str, object], dict[str, argparse.Action]]:
+    selected = _selected_parser(parser, command)
+    actions = [
+        action
+        for owner in (parser, selected)
+        for action in owner._actions
+        if action.option_strings
+    ]
+    option_actions = {
+        option: action
+        for action in actions
+        for option in action.option_strings
+        if option.startswith("-")
+    }
+    selected_options: dict[str, tuple[str, argparse.Action]] = {}
+    for token in argv:
+        if not token.startswith("-"):
+            continue
+        raw_option = token.split("=", 1)[0]
+        action = option_actions.get(raw_option)
+        if action is None or raw_option in {
+            "--options-json",
+            "--update-options-json",
+        }:
+            continue
+        saved_option = raw_option
+        if not saved_option.startswith("--"):
+            saved_option = next(
+                (
+                    option
+                    for option in action.option_strings
+                    if option.startswith("--")
+                ),
+                saved_option,
+            )
+        selected_options[action.dest] = (
+            saved_option.lstrip("-").replace("-", "_"),
+            action,
+        )
+
+    updates: dict[str, object] = {}
+    updated_actions: dict[str, argparse.Action] = {}
+    for destination, (key, action) in selected_options.items():
+        if isinstance(
+            action,
+            (
+                argparse._StoreTrueAction,
+                argparse._StoreFalseAction,
+                argparse._StoreConstAction,
+            ),
+        ):
+            value: object = True
+        else:
+            value = getattr(args, destination)
+        updates[key] = _json_compatible(value)
+        updated_actions[key] = action
+    return updates, updated_actions
+
+
+def _exact_command_node(
+    payload: dict[str, object],
+    *,
+    model: str | None,
+    workflow: str | None,
+    command: str,
+) -> tuple[dict[str, object], str]:
+    if model is not None:
+        scope_name = normalize_model_name(model)
+        container_name = "models"
+    elif workflow is not None:
+        scope_name = normalize_workflow_name(workflow)
+        container_name = "workflows"
+    else:
+        raise OptionsJSONError(
+            "Cannot update options JSON without a selected model or workflow"
+        )
+
+    container = payload.setdefault(container_name, {})
+    if not isinstance(container, dict):
+        raise OptionsJSONError(f"options JSON {container_name} must be an object")
+
+    scope_key = scope_name
+    for existing_key in container:
+        normalized = (
+            normalize_model_name(existing_key)
+            if model is not None
+            else normalize_workflow_name(existing_key)
+        )
+        if normalized == scope_name:
+            scope_key = existing_key
+            break
+    scope = container.setdefault(scope_key, {})
+    if not isinstance(scope, dict):
+        raise OptionsJSONError(
+            f"options JSON {container_name}.{scope_key} must be an object"
+        )
+    commands = scope.setdefault("commands", {})
+    if not isinstance(commands, dict):
+        raise OptionsJSONError(
+            f"options JSON {container_name}.{scope_key}.commands must be an object"
+        )
+
+    canonical_command = normalize_command_name(command)
+    command_key = canonical_command
+    for existing_key in commands:
+        if normalize_command_name(existing_key) == canonical_command:
+            command_key = existing_key
+            break
+    command_node = commands.setdefault(command_key, {})
+    if not isinstance(command_node, dict):
+        raise OptionsJSONError(
+            f"options JSON {container_name}.{scope_key}.commands.{command_key} "
+            "must be an object"
+        )
+    location = f"{container_name}.{scope_key}.commands.{command_key}"
+    return command_node, location
+
+
+def _write_options_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
+    resolved = path.resolve(strict=True)
+    temporary = resolved.with_name(f".{resolved.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, resolved.stat().st_mode & 0o777)
+        temporary.replace(resolved)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def finalize_options_json_update(args: argparse.Namespace, status: int) -> int:
+    """Persist an opted-in invocation after, and only after, successful work."""
+
+    requested = bool(getattr(args, "_options_json_update_requested", False))
+    # Status 1 is a completed command with an unfavorable domain result for
+    # workflows such as dataset audit.  Its invocation is still useful project
+    # state.  Status 2+ represents a CLI/runtime failure and is not persisted.
+    if status >= 2 or not requested:
+        return int(status)
+    try:
+        parser = getattr(args, "_options_json_update_parser")
+        argv = getattr(args, "_options_json_update_argv")
+        model = getattr(args, "_options_json_update_model")
+        workflow = getattr(args, "_options_json_update_workflow")
+        command = getattr(args, "_options_json_update_command")
+        source = Path(args.options_json).expanduser()
+        updates, updated_actions = _explicit_option_updates(
+            parser,
+            argv,
+            args,
+            command=command,
+        )
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        root = _mapping(payload, "options JSON root")
+        command_node, location = _exact_command_node(
+            root,
+            model=model,
+            workflow=workflow,
+            command=command,
+        )
+
+        for key, action in updated_actions.items():
+            aliases = {
+                option
+                for option in action.option_strings
+                if option.startswith("--")
+            }
+            for existing_key in list(command_node):
+                if _option_name(existing_key) in aliases:
+                    del command_node[existing_key]
+            command_node[key] = updates[key]
+
+        if not updates:
+            print(
+                f"options JSON unchanged: no explicit command options to save "
+                f"in {location}"
+            )
+            return int(status)
+        _write_options_json_atomic(source, root)
+        saved = ", ".join(f"--{key.replace('_', '-')}" for key in updates)
+        print(f"updated {source}: {location} ({saved})")
+        return int(status)
+    except (OSError, TypeError, ValueError, OptionsJSONError) as exc:
+        print(f"error: could not update options JSON: {exc}", file=sys.stderr)
+        return 2
+
+
 def parse_args_with_options_json(
     parser: argparse.ArgumentParser,
     argv: Sequence[str] | None = None,
@@ -610,7 +858,14 @@ def parse_args_with_options_json(
 
     raw_args = list(sys.argv[1:] if argv is None else argv)
     try:
-        options_path, clean_args = extract_options_json_argument(raw_args)
+        options_path, without_options_path = extract_options_json_argument(raw_args)
+        update_requested, clean_args = extract_update_options_json_argument(
+            without_options_path
+        )
+        if update_requested and options_path is None:
+            raise OptionsJSONError(
+                "--update-options-json requires --options-json PATH"
+            )
         selected_command = command
         if selected_command is None:
             registered: set[str] = set()
@@ -639,7 +894,17 @@ def parse_args_with_options_json(
                 command=selected_command,
                 source_path=options_path,
             )
-        return parser.parse_args(clean_args)
+        args = parser.parse_args(clean_args)
+        args.update_options_json = update_requested
+        args._options_json_update_requested = update_requested
+        args._options_json_update_parser = parser
+        args._options_json_update_argv = clean_args
+        args._options_json_update_model = model
+        args._options_json_update_workflow = workflow
+        args._options_json_update_command = normalize_command_name(
+            selected_command or command or ""
+        )
+        return args
     except OptionsJSONError as exc:
         parser.error(str(exc))
     raise AssertionError("argparse.parser.error should not return")

@@ -22,7 +22,11 @@ from typing import Sequence
 
 import numpy as np
 
-from cli_options import add_options_json_argument, parse_args_with_options_json
+from cli_options import (
+    add_options_json_argument,
+    finalize_options_json_update,
+    parse_args_with_options_json,
+)
 from generate_points import parameter_specs_from_geometry_metadata
 from surrogate_common import (
     MDIFBlock,
@@ -1957,10 +1961,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     validate_args(parser, args)
     try:
-        return run_audit(args)[0]
+        status = run_audit(args)[0]
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    return finalize_options_json_update(args, status)
 
 
 if __name__ == "__main__":

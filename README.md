@@ -281,6 +281,73 @@ python3 surrogate.py --options-json options.json --model dnn optimize \
   --out-dir outputs/dnn_optimize_80_trials
 ```
 
+### Update the JSON from a Completed Command
+
+Add `--update-options-json` when the explicit options from a command should be
+saved back into the file supplied by `--options-json`:
+
+```bash
+python3 surrogate.py --options-json options.json points generate \
+  --parameter W=0.40mm:0.80mm \
+  --parameter L=1.00mm:1.60mm \
+  --count 32 \
+  --verification-count 8 \
+  --out geometries.csv \
+  --update-options-json
+```
+
+After point generation completes, those values are written to
+`workflows.points.commands.generate`. Repeated options such as `--parameter`
+are saved as JSON arrays. The next generation can therefore reuse them with:
+
+```bash
+python3 surrogate.py --options-json options.json points generate
+```
+
+The same pattern applies to audit and additional-point selection:
+
+```bash
+python3 surrogate.py --options-json options.json audit \
+  --mdif data/train_verify.mdif \
+  --geometry-json geometries.json \
+  --out-dir outputs/data_audit \
+  --update-options-json
+
+python3 surrogate.py --options-json options.json points suggest-additional \
+  --fit-dir outputs/dnn_optimize/best_model \
+  --existing-points geometries.csv \
+  --count 8 \
+  --out additional_points.csv \
+  --update-options-json
+```
+
+For model commands, updates are stored below the selected model and exact
+command. This intentionally gives the recorded value precedence over broader
+model defaults:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn optimize \
+  --mdif data/train_verify.mdif \
+  --out-dir outputs/dnn_optimize \
+  --max-trials 40 \
+  --update-options-json
+```
+
+The update behavior is deliberately bounded:
+
+- `--update-options-json` requires `--options-json PATH`; a JSON file cannot
+  enable its own future mutation;
+- only options explicitly written on that command line are saved, while values
+  already inherited from the JSON remain at their existing broader scopes;
+- options are written to the narrowest exact command section and are never
+  automatically promoted to `models.commands` or another common scope;
+- the file is replaced atomically after the command completes, including a
+  completed audit whose data verdict is `FAIL`; parse errors and runtime
+  failures do not modify it; and
+- generated geometry metadata, audit results, plots, and model metadata remain
+  in their normal artifact files. The options JSON records how to invoke the
+  command, not copies of result data.
+
 ### Where Each Project Setting Goes
 
 | Project setting | JSON location | Notes |
@@ -5838,6 +5905,7 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 | --- | --- | --- | --- |
 | `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help` |
 | `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init`, which creates the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model` |
+| `--update-options-json` | Every executable model/data workflow | After a completed command, atomically saves explicitly supplied CLI options into the selected exact command section of `--options-json`. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --update-options-json` |
 | `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help` |
 
 ### D.3 Starter options JSON generation

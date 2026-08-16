@@ -15,6 +15,7 @@ from cli_options import (
     OptionsJSONError,
     add_options_json_argument,
     extract_options_json_argument,
+    extract_update_options_json_argument,
     starter_options_payload,
 )
 
@@ -234,28 +235,40 @@ def command_options(argv: Sequence[str]) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     try:
-        options_json, routing_args = extract_options_json_argument(raw_args)
+        options_json, without_options_path = extract_options_json_argument(raw_args)
+        update_options_json, routing_args = extract_update_options_json_argument(
+            without_options_path
+        )
     except OptionsJSONError as exc:
         build_arg_parser().error(str(exc))
+    if update_options_json and options_json is None:
+        build_arg_parser().error(
+            "--update-options-json requires --options-json PATH"
+        )
     options_args = (
         ["--options-json", options_json] if options_json is not None else []
     )
+    update_args = ["--update-options-json"] if update_options_json else []
     if not routing_args or routing_args in (["-h"], ["--help"]):
         build_arg_parser().print_help()
         return 0
     if routing_args[0] in LOCAL_WORKFLOWS:
-        if options_json is not None:
+        if options_json is not None or update_options_json:
             build_options_parser().error(
-                "--options-json cannot be used while generating an options JSON"
+                "--options-json and --update-options-json cannot be used while "
+                "generating an options JSON"
             )
         return command_options(routing_args[1:])
     if routing_args[0] in WORKFLOW_SCRIPTS:
         return dispatch_workflow(
             routing_args[0],
-            [*routing_args[1:], *options_args],
+            [*routing_args[1:], *options_args, *update_args],
         )
     args, backend_args = parse_dispatch_args(routing_args)
-    return dispatch(args.model_type, [*backend_args, *options_args])
+    return dispatch(
+        args.model_type,
+        [*backend_args, *options_args, *update_args],
+    )
 
 
 if __name__ == "__main__":

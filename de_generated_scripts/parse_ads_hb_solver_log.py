@@ -29,7 +29,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from cli_options import add_options_json_argument, parse_args_with_options_json
+from cli_options import (
+    add_options_json_argument,
+    finalize_options_json_update,
+    parse_args_with_options_json,
+)
 
 
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
@@ -1838,7 +1842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Plots:        "
         + ", ".join(str(out_dir / name) for name in report_artifacts[1:])
     )
-    return 0
+    return finalize_options_json_update(args, 0)
 
 
 if __name__ == "__main__":

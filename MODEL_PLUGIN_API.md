@@ -37,7 +37,11 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from cli_options import add_options_json_argument, parse_args_with_options_json
+from cli_options import (
+    add_options_json_argument,
+    finalize_options_json_update,
+    parse_args_with_options_json,
+)
 from surrogate_common import (
     MDIFBlock,
     MLP,
@@ -69,7 +73,8 @@ from surrogate_common import (
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parse_args_with_options_json(parser, argv, model="my-model")
-    return int(args.func(args))
+    status = int(args.func(args))
+    return finalize_options_json_update(args, status)
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -500,7 +505,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parse_args_with_options_json(parser, argv, model="my-model")
-    return args.func(args)
+    status = int(args.func(args))
+    return finalize_options_json_update(args, status)
 ```
 
 Optional commands normally include:
@@ -663,8 +669,9 @@ configuration is trained again after all trials finish.
    `save`, and `load`.
 4. Add `sweep_candidate_grid`, `namespace_for_trial`, a sweep worker, and
    `command_sweep` using `run_sweep_command`.
-5. Add `build_arg_parser` and `main`, including `add_options_json_argument`
-   and `parse_args_with_options_json` so the backend follows the primary CLI.
+5. Add `build_arg_parser` and `main`, including `add_options_json_argument`,
+   `parse_args_with_options_json`, and `finalize_options_json_update` so the
+   backend follows the primary CLI and supports opt-in configuration updates.
 6. Add `--loss-interval` and `--progress-interval` to neural training/sweep
    parsers, and add `--retrain-best` to sweep parsers.
 7. Reuse `write_training_verification_artifacts` for verification outputs.
