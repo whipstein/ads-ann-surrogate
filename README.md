@@ -608,7 +608,7 @@ Existing `*-options` spellings remain supported as compatibility aliases.
 | --- | --- |
 | `--activation relu` | `--activations tanh,relu` |
 | `--learning-rate 0.002` | `--learning-rates 0.001,0.002,0.005` |
-| `--freq-transform log` | `--freq-transforms log,linear` |
+| `--freq-transform log` | `--freq-transforms log,linear,log-linear` |
 | `--hidden-layers 64,64` | `--hidden-layers '32;64;64,64'` |
 | `--order 10` | `--orders 6,10,14` |
 | `--pole-damping 0.18` | `--pole-dampings 0.12,0.18,0.28` |
@@ -665,8 +665,8 @@ Supported adaptive domains by model are:
 
 | Model | `--optimize-parameter` names |
 | --- | --- |
-| DNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `learning_rate`, `output_domain`, `patience`, `target_z0` |
-| KBNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `include_coarse_input`, `learning_rate`, `mode`, `patience` |
+| DNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `learning_rate`, `output_domain`, `passivity_penalty`, `patience`, `target_z0` |
+| KBNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `include_coarse_input`, `learning_rate`, `mode`, `passivity_penalty`, `patience` |
 | Neuro-TF | `activation`, `batch_size`, `epochs`, `hidden_layers`, `learning_rate`, `order`, `patience`, `pole_damping`, `ridge` |
 
 This example searches learning rate, activation, and neural architecture while
@@ -2931,6 +2931,22 @@ The trainer automatically floors zero-variance output scaler columns to a
 representative response scale, which prevents constant residual or isolation
 terms from becoming oversized learned delta-S errors in exported models.
 
+KBNN uses the same physical-response weighting and structural RF controls as
+the direct DNN, but applies them to the **reconstructed fine response**. The
+default `--reciprocity-mode enforce` ties reciprocal pairs exactly. The default
+`--passivity-mode auto` activates a differentiable singular-value penalty and a
+final sampled-training safeguard whenever the positive-frequency fine training
+data are passive. In residual mode these operations see
+$\widehat{\mathbf S}_{\mathrm{coarse}}+\widehat{\boldsymbol\Delta}$, not the
+correction by itself.
+
+An integrated coarse DNN is reciprocal by construction under its own default.
+If `--coarse-model-dir` points to an older nonreciprocal coarse fit, residual
+training with `--reciprocity-mode enforce` stops with an actionable error:
+projecting only the correction cannot make a nonreciprocal baseline exactly
+reciprocal. Retrain that coarse DNN with reciprocity enforcement, or explicitly
+choose `auto` or `off` for the fine fit.
+
 #### Expected MDIF Shape
 
 Fine and coarse MDIF files use the same generic block structure as the Neuro-TF
@@ -2945,8 +2961,8 @@ VAR L=1.20mm
 BEGIN ACDATA
 % Freq S11 S12 S21 S22
 # Hz S RI R 50
-1.0e9  0.08 -0.12  0 0  0.92 -0.10  0.08 -0.12
-2.0e9  0.03 -0.18  0 0  0.73 -0.24  0.03 -0.18
+1.0e9  0.08 -0.12  0.92 -0.10  0.92 -0.10  0.08 -0.12
+2.0e9  0.03 -0.18  0.73 -0.24  0.73 -0.24  0.03 -0.18
 END
 ```
 
@@ -2974,7 +2990,10 @@ python3 surrogate.py --model kbnn train \
   --coarse-mdif coarse_train_verify.mdif \
   --out-dir kbnn_model \
   --parameter-names W,L \
-  --mode residual
+  --mode residual \
+  --freq-transform log-linear \
+  --passivity-mode auto \
+  --reciprocity-mode enforce
 ```
 
 Outputs:
@@ -3049,7 +3068,8 @@ python3 surrogate.py --model kbnn optimize \
   --search-mode adaptive \
   --optimize-parameter mode=residual,prior-input \
   --optimize-parameter include_coarse_input=false,true \
-  --optimize-parameter freq_transform=log,linear \
+  --optimize-parameter freq_transform=log,linear,log-linear \
+  --optimize-parameter passivity_penalty=1:30:log \
   --optimize-parameter learning_rate=1e-4:8e-3:log \
   --optimize-parameter batch_size=64:512:log \
   --optimize-parameter activation=tanh,relu \
@@ -3084,7 +3104,7 @@ python3 surrogate.py --model kbnn optimize \
   --parameter-names W,L \
   --modes residual,prior-input \
   --include-coarse-inputs false,true \
-  --freq-transforms log,linear \
+  --freq-transforms log,linear,log-linear \
   --hidden-layers '32;64;64,64' \
   --activations tanh,relu \
   --learning-rates 0.001,0.002,0.005 \
@@ -3126,11 +3146,13 @@ columns, and initial-to-final scaled losses, and each trial writes
 `kbnn_training_debug.json` in its trial directory.
 
 Use `--sparam-weights` to make some S-parameters matter less during training
-and sweep selection. In residual KBNN mode, the weights apply to the residual
-target for each S-parameter. Rules are applied left to right, so later rules
-override earlier broad rules. Weights are normalized internally so their average
-across S-parameter labels is 1.0 before they are applied to the training loss
-and scale-sensitive weighted metrics.
+and sweep selection. In residual KBNN mode, the fine-response error equals the
+residual-prediction error because the same frozen coarse value appears in the
+target and reconstruction. Requested weights are multiplied by the squared
+target-column standard deviations before scaled-coordinate training, so output
+standardization does not silently change their physical final-S priorities.
+Rules are applied left to right, so later rules override earlier broad rules.
+Frequency weights are normalized over positive-frequency training rows.
 
 Examples:
 
@@ -3445,9 +3467,10 @@ Plain KBNN exports contain one network. Residual and prior-input exports contain
 two networks. The embedded coarse DNN evaluates
 `Scoarse(geometry, frequency)` internally. A residual export adds the KBNN
 correction to that response; a prior-input export feeds that response into the
-KBNN. The final S-matrix is then converted to Y and stamped at the electrical
-ports. No coarse MDIF, coarse circuit, coarse S-parameter instance settings, or
-extra pins are needed in ADS.
+KBNN. The exporter then applies the saved `rf_response_scale` to the complete
+reconstructed RF S-matrix, converts it to Y, and stamps the electrical ports.
+The exact-DC branch bypasses that RF scale. No coarse MDIF, coarse circuit,
+coarse S-parameter instance settings, or extra pins are needed in ADS.
 
 For safety, residual and prior-input exports verify the coarse DNN's saved-model
 and metadata hashes against the identity recorded during KBNN training. If the
@@ -3538,7 +3561,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--coarse-activation {tanh,relu}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN hidden activation. Default: `tanh`. | <nobr><code>--coarse-activation tanh</code></nobr> |
 | <nobr><code>--coarse-batch-size INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN batch size. Defaults to `--batch-size`. | <nobr><code>--coarse-batch-size 256</code></nobr> |
 | <nobr><code>--coarse-epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN maximum epochs. Defaults to `--epochs`. | <nobr><code>--coarse-epochs 2000</code></nobr> |
-| <nobr><code>--coarse-freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN frequency transform. Defaults to the fine KBNN `--freq-transform`. | <nobr><code>--coarse-freq-transform log-linear</code></nobr> |
+| <nobr><code>--coarse-freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN frequency transform. For `train`, it defaults to the fine `--freq-transform`; for an optimize list, it defaults to the first fine transform because the shared coarse DNN is fitted once. | <nobr><code>--coarse-freq-transform log-linear</code></nobr> |
 | <nobr><code>--coarse-hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN hidden layout. Default: `64,64`. | <nobr><code>--coarse-hidden-layers 64,64</code></nobr> |
 | <nobr><code>--coarse-learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN Adam step size. Default: `0.002`. | <nobr><code>--coarse-learning-rate 0.002</code></nobr> |
 | <nobr><code>--coarse-loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN full-loss check interval. Defaults to `--loss-interval`. | <nobr><code>--coarse-loss-interval 5</code></nobr> |
@@ -3548,8 +3571,8 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--coarse-worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Coarse-DNN worst verification plots. Defaults to `--worst-plots`. | <nobr><code>--coarse-worst-plots 6</code></nobr> |
 | <nobr><code>--debug</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Enable KBNN data/loss diagnostics and tracebacks. Sweeps also print the candidate list and retain per-trial debug output; use `--jobs 1` for the cleanest trace. | <nobr><code>--debug</code></nobr> |
 | <nobr><code>--epochs INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum Adam training epochs for one fit or each sweep candidate. Early stopping may finish sooner. Default: `2000`. | <nobr><code>--epochs 2000</code></nobr> |
-| <nobr><code>--freq-transform {log,linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses $\log_{10}(f_{\mathrm{Hz}})$ and is usually better for wideband data. Default: `log`. | <nobr><code>--freq-transform log</code></nobr> |
-| <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. | <nobr><code>--freq-transforms log,linear</code></nobr> |
+| <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses $\log_{10}(f_{\mathrm{Hz}})$, `linear` uses raw Hz, and `log-linear` supplies both columns. Train default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
+| <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. Default: `log,linear,log-linear`. | <nobr><code>--freq-transforms log,linear,log-linear</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `64,64`; sweep default: `32;64;64,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 64,64</code></nobr> |
 | <nobr><code>--include-coarse-input</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | In `residual` mode, append coarse real/imaginary S-parameters to the NN input vector. This can improve accuracy if the correction depends strongly on the coarse response. Forced on for `prior-input` and off for `plain`. | <nobr><code>--include-coarse-input</code></nobr> |
 | <nobr><code>--include-coarse-inputs LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated boolean candidates for `--include-coarse-input`. Supplying the singular flag selects only `true`; `--include-coarse-input-options` remains an alias. Default: `false,true`. | <nobr><code>--include-coarse-inputs false,true</code></nobr> |
@@ -3557,9 +3580,14 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
 | <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | KBNN formulation. `residual` learns $\mathbf S_{\mathrm{fine}}-\widehat{\mathbf S}_{\mathrm{coarse}}$; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
-| <nobr><code>--modes LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated KBNN model modes. The singular `--mode` accepts one train-compatible value; `--mode-options` remains an alias. Default: `plain,residual,prior-input`. | <nobr><code>--modes residual,prior-input</code></nobr> |
+| <nobr><code>--modes LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated KBNN model modes. The singular `--mode` accepts one train-compatible value; `--mode-options` remains an alias. Default: `residual,prior-input`. | <nobr><code>--modes residual,prior-input</code></nobr> |
+| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Target margin below $\sigma_{\max}=1$ for the reconstructed fine S-matrix. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.001</code></nobr> |
+| <nobr><code>--passivity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` protects complete passive positive-frequency fine training data; `enforce` always protects a complete fine S-matrix; `off` disables the penalty and final safeguard. Residual mode evaluates coarse plus correction. Default: `auto`. | <nobr><code>--passivity-mode auto</code></nobr> |
+| <nobr><code>--passivity-penalty FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Non-negative weight of the differentiable largest-singular-value penalty on reconstructed fine S. It is also an adaptive `--optimize-parameter`. Default: `10`. | <nobr><code>--passivity-penalty 10</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience in epochs for each candidate. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
 | <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
+| <nobr><code>--reciprocity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `enforce` ties fine $S_{ij}$/$S_{ji}$ pairs exactly. In residual mode the frozen coarse DNN must also be exactly reciprocal. `auto` ties only reciprocal source data with a compatible reciprocal coarse model; `off` leaves ordered outputs independent. Default: `enforce`. | <nobr><code>--reciprocity-mode enforce</code></nobr> |
+| <nobr><code>--reciprocity-tolerance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum relative fine-source $S_{ij}$/$S_{ji}$ disagreement accepted by auto mode. Must be finite and non-negative. Default: `1e-6`. | <nobr><code>--reciprocity-tolerance 1e-6</code></nobr> |
 | <nobr><code>--seed INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Random seed for data splitting, model initialization, minibatch order, ADS ANN data preparation, and sweep candidate selection where applicable. Default: `1234`. | <nobr><code>--seed 1234</code></nobr> |
 | <nobr><code>--worst-plots INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of worst verification S/Y plot pairs to generate. In a sweep it applies to a final `--retrain-best`; otherwise the promoted trial retains its `--trial-worst-plots` output. Default: `6`. | <nobr><code>--worst-plots 6</code></nobr> |
 
@@ -3577,7 +3605,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
 | <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget. Default: `24`. | <nobr><code>--max-trials 24</code></nobr> |
-| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. KBNN supports `mode`, `include_coarse_input`, `freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter mode=residual,prior-input</code></nobr> |
+| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. KBNN supports `mode`, `include_coarse_input`, `freq_transform`, `hidden_layers`, `activation`, `learning_rate`, `passivity_penalty`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter passivity_penalty=1:30:log</code></nobr> |
 | <nobr><code>--overwrite</code></nobr> | <code>rerank-sweep</code> | Allow `--promote-best` to replace an existing `--best-model-dir`. | <nobr><code>--overwrite</code></nobr> |
 | <nobr><code>--promote-best</code></nobr> | <code>rerank-sweep</code> | Copy the selected trial model to `--best-model-dir` if that trial still contains `model.npz` and `metadata.json`. Requires the original sweep to have used `--keep-trial-models`. | <nobr><code>--promote-best</code></nobr> |
 | <nobr><code>--replace-current-best</code></nobr> | <code>rerank-sweep</code> | Overwrite `<sweep-dir>/best_model` with the selected trial model if the trial model files are available. | <nobr><code>--replace-current-best</code></nobr> |
@@ -4438,25 +4466,18 @@ verification data exists, checked training loss is used. `--loss-interval`
 controls how often the complete datasets are evaluated, and `--patience` is
 the number of epochs since the best checked epoch before early stopping.
 
-KBNN uses a scaled-coordinate weighted mean-squared error. If sample $k$ is at
-frequency $f_k$, output column $q$ belongs to S-parameter $\ell(q)$, and
-$e_{kq}$ is the scaled prediction error, its response objective is
+For DNN and KBNN, let $\epsilon_{kq}$ be the physical response-component error
+for positive-frequency sample $k$ and real/imaginary output column $q$. In a
+residual KBNN this is simultaneously the correction error and the reconstructed
+fine-response error because the identical frozen coarse prediction is added to
+both target and prediction. Let $\sigma_q$ be that target column's training
+standard deviation. Both trainers multiply the requested response weight by
+$\sigma_q^2$ before applying it to the scaled error
+$e_{kq}=\epsilon_{kq}/\sigma_q$. Apart from a single positive renormalization
+constant, the optimized response loss is therefore
 
 $$
-\mathcal L
-=\frac{1}{KQ}
-\sum_{k=1}^{K}\sum_{q=1}^{Q}
-w_f(f_k)\,w_s(\ell(q))\,e_{kq}^2.
-$$
-
-For DNN, let $\epsilon_{kq}$ instead be the physical S- or Y-response component
-error and let $\sigma_q$ be that output column's training standard deviation.
-The DNN multiplies the requested response weight by $\sigma_q^2$ before applying
-it to $e_{kq}=\epsilon_{kq}/\sigma_q$. Apart from a single positive
-renormalization constant, its optimized response loss is therefore
-
-$$
-\mathcal L_{\mathrm{DNN,response}}
+\mathcal L_{\mathrm{response}}
 \propto
 \sum_{k=1}^{K}\sum_{q=1}^{Q}
 w_f(f_k)\,w_s(\ell(q))\,\epsilon_{kq}^2.
@@ -4685,6 +4706,77 @@ S-parameter weights are applied to the KBNN objective. When a coarse DNN is
 trained by the same command, it inherits those weights unless corresponding
 `--coarse-*` options override them.
 
+#### Physical loss, reciprocity, and composite passivity
+
+The response part of the KBNN loss is evaluated in physical final-S component
+coordinates as described in B.2. If $e_{kq}$ is a standardized target error and
+$\sigma_q$ is that target column's scale, the trainer uses an output weight
+proportional to $w_s(\ell(q))\sigma_q^2$. Thus
+
+$$
+w_s(\ell(q))\sigma_q^2 e_{kq}^2
+=w_s(\ell(q))\epsilon_{kq}^2,
+$$
+
+up to the common normalization of all output weights. This matters especially
+for small residual targets: a nearly constant correction column no longer gets
+an accidentally dominant physical penalty merely because it has a small
+standard deviation.
+
+Passivity is never tested on an isolated residual. For every minibatch sample,
+the callback first inverse-scales the fine-network output and constructs
+
+$$
+\widehat{\mathbf S}_{k,\mathrm{composite}}
+=
+\begin{cases}
+\widehat{\mathbf S}_{k,\mathrm{coarse}}
++\widehat{\boldsymbol\Delta}_k,
+&\text{residual},\\
+\widehat{\mathbf S}_{k,\mathrm{fine}},
+&\text{plain or prior-input}.
+\end{cases}
+$$
+
+It then applies the largest-singular-value loss from B.3 to this composite
+matrix. Minibatch indices select the matching frozen coarse rows, so shuffling
+does not misalign coarse responses. The SVD is used only while training; it is
+not emitted into `model.npz`, Verilog-A, sampled MDIF, or ADS HB equations.
+
+After early stopping and reciprocity projection, the trainer evaluates all
+positive-frequency training predictions. If their worst singular value is
+$\sigma_\star>1-m$, the saved KBNN records
+
+$$
+\alpha=\frac{1-m}{\sigma_\star},
+\qquad
+\widehat{\mathbf S}_{\mathrm{RF,saved}}
+=\alpha\widehat{\mathbf S}_{\mathrm{composite}}.
+$$
+
+Unlike the direct DNN, residual KBNN cannot fold this final operation solely
+into the correction layer: scaling only $\widehat{\boldsymbol\Delta}$ would not
+scale the frozen coarse term. The scalar `rf_response_scale` is therefore
+stored explicitly and applied after final response reconstruction. Prediction,
+sampled-MDIF export, Verilog-A, and ADS HB all apply the same scalar. Exact DC
+does not: the zero-Hz branch bypasses both RF networks and this scale.
+
+The reciprocity projection itself is folded into the fine MLP's last affine
+layer. For `plain` and `prior-input`, it ties final fine-output pairs directly.
+For `residual`, it ties correction pairs and requires the frozen coarse DNN to
+be exactly reciprocal, making their sum exactly reciprocal as well. Integrated
+coarse fitting meets that contract by default. `--reciprocity-mode enforce`
+rejects an incompatible reused coarse model instead of claiming a property the
+composite response cannot have.
+
+These controls guarantee reciprocity structurally and passivity on the sampled
+positive-frequency training rows after the final safeguard. Verification rows
+and unsampled parameter/frequency points remain independent tests; use sweep
+passivity filters and a sufficiently dense export-validation grid. The metadata
+records source fine passivity/reciprocity, coarse reciprocity, passivity before
+and after scaling, `rf_response_scale`, and the final training reciprocity
+error.
+
 #### Coarse versus fine DC
 
 The frozen coarse DNN is evaluated only on positive-frequency fine grids during
@@ -4703,7 +4795,8 @@ HB export embed both evaluators when the mode requires coarse knowledge:
 2. feed its complex response into the KBNN when configured;
 3. evaluate the fine or residual KBNN;
 4. add the coarse response for residual mode;
-5. convert the final complete S-matrix to Y and stamp the ports.
+5. apply the saved RF response scale when it is below one;
+6. convert the final complete S-matrix to Y and stamp the ports.
 
 Legacy editable coarse hooks are available only when explicitly requested and
 are not equivalent to the normal self-contained path.

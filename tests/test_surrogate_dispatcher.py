@@ -53,6 +53,13 @@ class SurrogateDispatcherTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(run.call_args.args[0][2:], ["inspect-mdif", "--mdif", "input.mdif"])
 
+    def test_kbnn_mode_is_not_consumed_as_a_model_abbreviation(self) -> None:
+        args, backend_args = surrogate.parse_dispatch_args(
+            ["--model", "kbnn", "train", "--mode", "residual"]
+        )
+        self.assertEqual(args.model_type, "kbnn")
+        self.assertEqual(backend_args, ["train", "--mode", "residual"])
+
     def test_neuro_tf_alias_is_canonicalized(self) -> None:
         completed = mock.Mock(returncode=0)
         with mock.patch("surrogate.subprocess.run", return_value=completed) as run:

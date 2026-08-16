@@ -75,11 +75,11 @@ from surrogate_common import (  # noqa: E402
     normalize_frequency_weights,
     normalize_name,
     normalize_sparam_weights,
-    output_weights_from_sparam_weights,
     parse_csv_set,
     parse_number,
     parse_parameter_scale_spec,
     parse_sparam_weights,
+    passivity_summary,
     progress_interval_from_args,
     plot_sweep_diagnostics,
     plot_worst_case_fits,
@@ -116,7 +116,17 @@ from surrogate_common import (  # noqa: E402
     write_ads_hb_mlp_package,
     write_veriloga_package,
 )
-from dnn import DNN, command_train as command_train_dnn, dnn_export_commands  # noqa: E402
+from dnn import (  # noqa: E402
+    DNN,
+    command_train as command_train_dnn,
+    dnn_export_commands,
+    dnn_reciprocity_projection,
+    dnn_reciprocity_summary,
+    fold_raw_output_projection,
+    make_s_passivity_loss_gradient,
+    output_column_names,
+    physical_response_output_weights,
+)
 
 
 VERSION = "0.2.0-rc3"
@@ -288,6 +298,7 @@ def file_sha256(path: Path) -> str:
 
 def coarse_dnn_identity(model_dir: Path, model: DNN) -> dict[str, object]:
     resolved = model_dir.expanduser().resolve()
+    coarse_metadata = read_model_metadata(str(resolved))
     identity: dict[str, object] = {
         "source_model_dir": str(resolved),
         "model_npz_sha256": file_sha256(resolved / "model.npz"),
@@ -295,6 +306,15 @@ def coarse_dnn_identity(model_dir: Path, model: DNN) -> dict[str, object]:
         "output_domain": model.output_domain,
         "parameter_names": list(model.parameter_names),
         "sparam_labels": list(model.sparam_labels),
+        "passivity_enforced": bool(
+            coarse_metadata.get("passivity_enforced", False)
+        ),
+        "reciprocity_enforced": bool(
+            coarse_metadata.get("reciprocity_enforced", False)
+        ),
+        "rf_response_scale": float(
+            coarse_metadata.get("rf_response_scale", 1.0) or 1.0
+        ),
     }
     if (resolved / "dc_model.npz").is_file() and (resolved / "dc_model.json").is_file():
         identity["dc_model_npz_sha256"] = file_sha256(resolved / "dc_model.npz")
@@ -397,7 +417,9 @@ def write_composite_model_manifest(
     )
     export_argv = [
         Path(sys.executable).name or "python3",
-        repository_relative_path(Path(__file__), repository_root),
+        repository_relative_path(repository_root / "surrogate.py", repository_root),
+        "--model",
+        "kbnn",
         "export-veriloga",
         "--model-dir",
         repository_relative_path(resolved_model_dir, repository_root),
@@ -410,7 +432,9 @@ def write_composite_model_manifest(
     ]
     ads_hb_export_argv = [
         Path(sys.executable).name or "python3",
-        repository_relative_path(Path(__file__), repository_root),
+        repository_relative_path(repository_root / "surrogate.py", repository_root),
+        "--model",
+        "kbnn",
         "export-ads-hb",
         "--model-dir",
         repository_relative_path(resolved_model_dir, repository_root),
@@ -510,6 +534,11 @@ def write_composite_model_manifest(
             "dc_port_paths": metadata.get("dc_port_paths"),
             "dc_port_resistances_ohm": model.dc_port_resistances_ohm,
             "dc_is_separate_from_fitted_response": True,
+            "rf_response_scale": model.rf_response_scale,
+            "passivity_enforced": bool(metadata.get("passivity_enforced", False)),
+            "reciprocity_enforced": bool(
+                metadata.get("reciprocity_enforced", False)
+            ),
         },
         "coarse_model": coarse_payload,
         "veriloga_ready": bool(model.mode == "plain" or coarse_payload is not None),
@@ -1067,7 +1096,83 @@ def frequency_feature(freq_hz: np.ndarray, transform: str) -> np.ndarray:
         return np.log10(np.maximum(freq_hz, 1.0))[:, None]
     if transform == "linear":
         return freq_hz[:, None]
+    if transform == "log-linear":
+        return np.column_stack(
+            [
+                np.log10(np.maximum(freq_hz, 1.0)),
+                freq_hz,
+            ]
+        )
     raise ValueError(f"Unsupported frequency transform {transform!r}")
+
+
+def response_columns(
+    blocks: Sequence[MDIFBlock],
+    labels: Sequence[str],
+) -> np.ndarray:
+    """Return block-ordered real/imag response columns."""
+
+    if not blocks:
+        return np.empty((0, 2 * len(labels)), dtype=float)
+    return np.concatenate(
+        [complex_to_columns(block_values(block, labels)) for block in blocks],
+        axis=0,
+    )
+
+
+def make_kbnn_composite_passivity_loss_gradient(
+    output_scaler: Standardizer,
+    labels: Sequence[str],
+    mode: str,
+    coarse_response_columns: np.ndarray | None,
+    target_sigma: float,
+    penalty: float,
+):
+    """Penalize the reconstructed fine S matrix, not an isolated residual."""
+
+    if output_scaler.mean is None or output_scaler.std is None:
+        raise ValueError("Output standardizer must be fitted before passivity loss")
+    normalized_mode = normalize_mode(mode)
+    coarse_columns = (
+        None
+        if coarse_response_columns is None
+        else np.asarray(coarse_response_columns, dtype=float)
+    )
+    if normalized_mode == "residual" and coarse_columns is None:
+        raise ValueError("Residual KBNN passivity loss requires aligned coarse responses")
+    identity_scaler = Standardizer()
+    identity_scaler.mean = np.zeros(2 * len(labels), dtype=float)
+    identity_scaler.std = np.ones(2 * len(labels), dtype=float)
+    raw_callback = make_s_passivity_loss_gradient(
+        identity_scaler,
+        labels,
+        target_sigma,
+        penalty,
+    )
+    mean = np.asarray(output_scaler.mean, dtype=float)
+    std = np.asarray(output_scaler.std, dtype=float)
+
+    def callback(
+        predicted_scaled: np.ndarray,
+        truth_scaled: np.ndarray,
+        sample_weights: np.ndarray,
+        sample_indices: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
+        predicted = np.asarray(predicted_scaled, dtype=float)
+        reconstructed = predicted * std[None, :] + mean[None, :]
+        if normalized_mode == "residual":
+            assert coarse_columns is not None
+            reconstructed = reconstructed + coarse_columns[
+                np.asarray(sample_indices, dtype=int)
+            ]
+        loss, raw_gradient = raw_callback(
+            reconstructed,
+            truth_scaled,
+            sample_weights,
+        )
+        return loss, np.asarray(raw_gradient, dtype=float) * std[None, :]
+
+    return callback
 
 
 def make_feature_target_samples(
@@ -1230,6 +1335,7 @@ class KBNN:
         dc_resistance_source_kind: str | None = None,
         dc_port_resistances_ohm: dict[str, float] | None = None,
         dc_model: DCConductanceModel | None = None,
+        rf_response_scale: float = 1.0,
     ) -> None:
         self.mlp = mlp
         self.x_scaler = x_scaler
@@ -1254,6 +1360,9 @@ class KBNN:
             }
         )
         self.dc_model = dc_model
+        self.rf_response_scale = float(rf_response_scale)
+        if not math.isfinite(self.rf_response_scale) or self.rf_response_scale <= 0.0:
+            raise ValueError("KBNN RF response scale must be positive and finite")
 
     def predict_blocks(
         self,
@@ -1286,6 +1395,10 @@ class KBNN:
                 pred_values = coarse_values + block_y_complex
             else:
                 pred_values = block_y_complex
+            pred_values = np.array(pred_values, dtype=complex, copy=True)
+            rf_mask = np.asarray(fine.freq_hz, dtype=float) > 0.0
+            if self.rf_response_scale != 1.0 and np.any(rf_mask):
+                pred_values[rf_mask, :] *= self.rf_response_scale
             dc_mask = np.asarray(fine.freq_hz, dtype=float) == 0.0
             if self.dc_model is not None and np.any(dc_mask):
                 pred_values[dc_mask, :] = self.dc_model.predict_block_s_values(fine)[None, :]
@@ -1341,6 +1454,7 @@ class KBNN:
             "dc_resistance_source_kind": self.dc_resistance_source_kind,
             "dc_port_resistances_ohm": self.dc_port_resistances_ohm,
             **metadata,
+            "rf_response_scale": self.rf_response_scale,
         }
         (out_dir / "metadata.json").write_text(json.dumps(combined_metadata, indent=2))
 
@@ -1371,6 +1485,7 @@ class KBNN:
             dc_resistance_source_kind=metadata.get("dc_resistance_source_kind"),
             dc_port_resistances_ohm=metadata.get("dc_port_resistances_ohm"),
             dc_model=DCConductanceModel.load_optional(model_dir),
+            rf_response_scale=float(metadata.get("rf_response_scale", 1.0) or 1.0),
         )
 
 
@@ -1432,6 +1547,55 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
     )
     fit_train_fine = positive_frequency_blocks(train_fine)
     fit_verify_fine = positive_frequency_blocks(verify_fine) if verify_fine else []
+    source_rf_passivity = passivity_summary(fit_train_fine, labels)
+    source_rf_reciprocity = dnn_reciprocity_summary(fit_train_fine, labels)
+    passivity_mode = str(getattr(args, "passivity_mode", "auto"))
+    passivity_margin = float(getattr(args, "passivity_margin", 1e-3))
+    passivity_penalty = float(getattr(args, "passivity_penalty", 10.0))
+    if passivity_mode not in {"auto", "enforce", "off"}:
+        raise ValueError(f"Unsupported passivity mode {passivity_mode!r}")
+    if (
+        not math.isfinite(passivity_margin)
+        or passivity_margin < 0.0
+        or passivity_margin >= 1.0
+    ):
+        raise ValueError("--passivity-margin must be finite and in [0, 1)")
+    if not math.isfinite(passivity_penalty) or passivity_penalty < 0.0:
+        raise ValueError("--passivity-penalty must be finite and non-negative")
+    source_passivity_available = source_rf_passivity["nports"] is not None
+    source_is_passive = (
+        source_passivity_available
+        and source_rf_passivity["violating_points"] == 0
+    )
+    passivity_requested = passivity_mode == "enforce" or (
+        passivity_mode == "auto" and source_is_passive
+    )
+    if passivity_mode == "enforce" and not source_passivity_available:
+        raise ValueError(
+            "--passivity-mode enforce requires a complete S-parameter matrix"
+        )
+    passivity_enforced = bool(passivity_requested and source_passivity_available)
+    passivity_target_sigma = 1.0 - passivity_margin
+
+    reciprocity_mode = str(getattr(args, "reciprocity_mode", "enforce"))
+    reciprocity_tolerance = float(getattr(args, "reciprocity_tolerance", 1e-6))
+    if reciprocity_mode not in {"auto", "enforce", "off"}:
+        raise ValueError(f"Unsupported reciprocity mode {reciprocity_mode!r}")
+    if not math.isfinite(reciprocity_tolerance) or reciprocity_tolerance < 0.0:
+        raise ValueError("--reciprocity-tolerance must be finite and non-negative")
+    reciprocity_comparable = bool(source_rf_reciprocity["comparable"])
+    source_reciprocity_error = source_rf_reciprocity["relative_error"]
+    reciprocity_requested = reciprocity_mode == "enforce" or (
+        reciprocity_mode == "auto"
+        and reciprocity_comparable
+        and source_reciprocity_error is not None
+        and float(source_reciprocity_error) <= reciprocity_tolerance
+    )
+    if reciprocity_mode == "enforce" and not reciprocity_comparable:
+        raise ValueError(
+            "--reciprocity-mode enforce requires a complete S-parameter matrix"
+        )
+
     coarse_identity: dict[str, object] | None = None
     if mode == "plain":
         train_coarse: list[MDIFBlock] = []
@@ -1453,6 +1617,29 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
             coarse_model.predict_blocks(fit_verify_fine) if fit_verify_fine else []
         )
         verify_coarse = coarse_model.predict_blocks(verify_fine) if verify_fine else []
+
+    coarse_rf_reciprocity = (
+        dnn_reciprocity_summary(train_coarse, labels)
+        if train_coarse
+        else None
+    )
+    coarse_is_exactly_reciprocal = bool(
+        coarse_rf_reciprocity is not None
+        and coarse_rf_reciprocity["comparable"]
+        and coarse_rf_reciprocity["max_abs_error"] is not None
+        and float(coarse_rf_reciprocity["max_abs_error"]) <= 1e-12
+    )
+    if mode == "residual" and reciprocity_requested and not coarse_is_exactly_reciprocal:
+        if reciprocity_mode == "enforce":
+            raise ValueError(
+                "--reciprocity-mode enforce cannot make the reconstructed residual "
+                "KBNN exactly reciprocal because its frozen coarse DNN is not "
+                "exactly reciprocal. Retrain the coarse DNN with "
+                "--reciprocity-mode enforce, or explicitly select auto/off."
+            )
+        reciprocity_enforced = False
+    else:
+        reciprocity_enforced = bool(reciprocity_requested)
 
     x_train, y_train = make_feature_target_samples(
         fit_train_fine,
@@ -1488,7 +1675,11 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
     mlp = MLP(layer_sizes, activation=args.activation, seed=args.seed)
     sparam_weights = parse_sparam_weights(labels, getattr(args, "sparam_weights", None))
     normalized_sparam_weights = normalize_sparam_weights(labels, sparam_weights)
-    output_weights = output_weights_from_sparam_weights(labels, sparam_weights)
+    output_weights = physical_response_output_weights(
+        labels,
+        sparam_weights,
+        y_scaler,
+    )
     frequency_weight_spec = getattr(args, "frequency_weights", None)
     raw_frequency_weights = frequency_weights_from_blocks(
         fit_train_fine,
@@ -1509,6 +1700,21 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         )
     else:
         normalized_verify_frequency_weights = None
+    coarse_train_columns = (
+        response_columns(train_coarse, labels) if mode == "residual" else None
+    )
+    passivity_loss_gradient = (
+        make_kbnn_composite_passivity_loss_gradient(
+            y_scaler,
+            labels,
+            mode,
+            coarse_train_columns,
+            passivity_target_sigma,
+            passivity_penalty,
+        )
+        if passivity_enforced and passivity_penalty > 0.0
+        else None
+    )
     initial_train_loss = mse(
         mlp.predict(x_train_scaled),
         y_train_scaled,
@@ -1545,6 +1751,7 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
             progress_interval,
         ),
         progress_interval=progress_interval,
+        indexed_extra_loss_gradient=passivity_loss_gradient,
     )
     final_train_loss = mse(
         mlp.predict(x_train_scaled),
@@ -1562,6 +1769,12 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         if x_verify_scaled is not None and y_verify_scaled is not None
         else None
     )
+    if reciprocity_enforced:
+        fold_raw_output_projection(
+            mlp,
+            y_scaler,
+            dnn_reciprocity_projection(labels),
+        )
     model = KBNN(
         mlp=mlp,
         x_scaler=x_scaler,
@@ -1578,6 +1791,33 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         dc_port_resistances_ohm=dict(dc_metadata["dc_port_resistances_ohm"]),
         dc_model=dc_model,
     )
+    predicted_train_before_scale = model.predict_blocks(
+        fit_train_fine,
+        train_coarse,
+    )
+    predicted_train_passivity_before_scale = passivity_summary(
+        predicted_train_before_scale,
+        labels,
+    )
+    rf_response_scale = 1.0
+    if passivity_enforced:
+        predicted_sigma = predicted_train_passivity_before_scale[
+            "max_singular_value"
+        ]
+        if predicted_sigma is None or not math.isfinite(float(predicted_sigma)):
+            raise ValueError("Could not assess the fitted KBNN response for passivity")
+        if float(predicted_sigma) > passivity_target_sigma:
+            rf_response_scale = passivity_target_sigma / float(predicted_sigma)
+            model.rf_response_scale = rf_response_scale
+    predicted_train_after_scale = model.predict_blocks(fit_train_fine, train_coarse)
+    predicted_train_passivity_after_scale = passivity_summary(
+        predicted_train_after_scale,
+        labels,
+    )
+    predicted_train_reciprocity = dnn_reciprocity_summary(
+        predicted_train_after_scale,
+        labels,
+    )
     metadata = {
         "training_blocks": len(train_fine),
         "verification_blocks": len(verify_fine),
@@ -1592,8 +1832,13 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         "verify_values": sorted(parse_csv_set(args.verify_values)),
         "sparam_weights": sparam_weights,
         "normalized_sparam_weights": normalized_sparam_weights,
+        "scaled_output_loss_weights": {
+            name: float(weight)
+            for name, weight in zip(output_column_names(labels), output_weights)
+        },
         "sparam_weight_mean": sparam_weight_mean(labels, sparam_weights),
-        "sparam_weight_normalization": "Raw S-parameter weights are divided by their mean before training, so the average normalized weight is 1.0.",
+        "sparam_weight_normalization": "Requested response weights are combined with squared output standard deviations and renormalized before training, so standardized-coordinate MSE is proportional to the requested physical final-response component MSE.",
+        "response_loss_domain": "physical_final_s_components",
         "frequency_weights": frequency_weight_spec,
         "frequency_weight_mean": frequency_weight_mean,
         "frequency_weight_min": float(np.min(raw_frequency_weights)),
@@ -1601,6 +1846,25 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
         "frequency_weight_normalization": "Raw frequency weights are divided by their mean over fitted training samples, so the average normalized weight is 1.0.",
         "output_scaler_floor": output_std_floor,
         "floored_output_columns": floored_output_columns,
+        "reciprocity_mode": reciprocity_mode,
+        "reciprocity_tolerance": reciprocity_tolerance,
+        "reciprocity_requested": reciprocity_requested,
+        "reciprocity_enforced": reciprocity_enforced,
+        "source_rf_reciprocity": source_rf_reciprocity,
+        "coarse_rf_reciprocity": coarse_rf_reciprocity,
+        "coarse_is_exactly_reciprocal": coarse_is_exactly_reciprocal,
+        "predicted_train_reciprocity": predicted_train_reciprocity,
+        "passivity_mode": passivity_mode,
+        "passivity_margin": passivity_margin,
+        "passivity_penalty": passivity_penalty,
+        "passivity_target_sigma": passivity_target_sigma,
+        "passivity_requested": passivity_requested,
+        "passivity_enforced": passivity_enforced,
+        "source_rf_passivity": source_rf_passivity,
+        "predicted_train_passivity_before_scale": predicted_train_passivity_before_scale,
+        "rf_response_scale": rf_response_scale,
+        "predicted_train_passivity_after_scale": predicted_train_passivity_after_scale,
+        "passivity_assessment_scope": "positive-frequency training blocks only; penalty and final safeguard operate on the reconstructed fine S response",
         **dc_metadata,
         "dc_model_history_rows": len(dc_history),
     }
@@ -1762,6 +2026,27 @@ def command_train(args: argparse.Namespace) -> int:
         "normalized_sparam_weights": metadata["normalized_sparam_weights"],
         "frequency_weights": metadata["frequency_weights"],
         "frequency_weight_mean": metadata["frequency_weight_mean"],
+        "response_loss_domain": metadata["response_loss_domain"],
+        "scaled_output_loss_weights": metadata["scaled_output_loss_weights"],
+        "passivity_mode": metadata["passivity_mode"],
+        "passivity_margin": metadata["passivity_margin"],
+        "passivity_penalty": metadata["passivity_penalty"],
+        "passivity_enforced": metadata["passivity_enforced"],
+        "passivity_target_sigma": metadata["passivity_target_sigma"],
+        "source_rf_passivity": metadata["source_rf_passivity"],
+        "predicted_train_passivity_before_scale": metadata[
+            "predicted_train_passivity_before_scale"
+        ],
+        "rf_response_scale": metadata["rf_response_scale"],
+        "predicted_train_passivity_after_scale": metadata[
+            "predicted_train_passivity_after_scale"
+        ],
+        "reciprocity_mode": metadata["reciprocity_mode"],
+        "reciprocity_tolerance": metadata["reciprocity_tolerance"],
+        "reciprocity_enforced": metadata["reciprocity_enforced"],
+        "source_rf_reciprocity": metadata["source_rf_reciprocity"],
+        "coarse_rf_reciprocity": metadata["coarse_rf_reciprocity"],
+        "predicted_train_reciprocity": metadata["predicted_train_reciprocity"],
         "output_scaler_floor": metadata["output_scaler_floor"],
         "floored_output_columns": metadata["floored_output_columns"],
     }
@@ -1847,6 +2132,9 @@ def command_train(args: argparse.Namespace) -> int:
             "sparam_weight_mean": metadata["sparam_weight_mean"],
             "frequency_weights": metadata["frequency_weights"],
             "frequency_weight_mean": metadata["frequency_weight_mean"],
+            "passivity_enforced": metadata["passivity_enforced"],
+            "rf_response_scale": metadata["rf_response_scale"],
+            "reciprocity_enforced": metadata["reciprocity_enforced"],
             "output_scaler_floor": metadata["output_scaler_floor"],
             "floored_output_columns": metadata["floored_output_columns"],
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
@@ -1945,6 +2233,11 @@ def command_export_ads(args: argparse.Namespace) -> int:
         notes.append(
             "The same frozen coarse DNN used during KBNN training was evaluated during export; ADS only needs the final exported MDIF."
         )
+    if model.rf_response_scale != 1.0:
+        notes.append(
+            "The saved RF response scale was applied after reconstructing the "
+            "complete fine response; exact-DC rows were not scaled."
+        )
     manifest = write_ads_export_package(
         out_dir=out_dir,
         model_kind="KBNN",
@@ -1960,6 +2253,13 @@ def command_export_ads(args: argparse.Namespace) -> int:
             "layer_sizes": model.mlp.layer_sizes,
             "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
             "coarse_model": coarse_identity,
+            "rf_response_scale": model.rf_response_scale,
+            "passivity_enforced": bool(
+                source_metadata.get("passivity_enforced", False)
+            ),
+            "reciprocity_enforced": bool(
+                source_metadata.get("reciprocity_enforced", False)
+            ),
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_metadata": dc_metadata,
             "dc_is_separate_from_fitted_response": True,
@@ -1972,6 +2272,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         "manifest": str(out_dir / "ads_model_manifest.json"),
         "blocks": manifest["blocks"],
         "frequency_points_per_block": manifest["frequency_points_per_block"],
+        "rf_response_scale": model.rf_response_scale,
         "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
         "dc_port_paths": dc_metadata.get("dc_port_paths"),
         "dc_matrix_entries": dc_metadata.get("dc_matrix_entries"),
@@ -2342,6 +2643,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         frequency_expression=args.frequency_expression,
         uses_coarse_inputs=uses_coarse_inputs,
         adds_coarse_to_output=adds_coarse_to_output,
+        rf_response_scale=model.rf_response_scale,
         parameter_input_scales=parameter_input_scales,
         embedded_coarse_model=embedded_coarse_model,
         dc_equivalent_resistance_ohm=float(
@@ -2363,6 +2665,13 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
                 else None
             ),
             "coarse_model_match_verified": coarse_identity is not None,
+            "rf_response_scale": model.rf_response_scale,
+            "passivity_enforced": bool(
+                source_metadata.get("passivity_enforced", False)
+            ),
+            "reciprocity_enforced": bool(
+                source_metadata.get("reciprocity_enforced", False)
+            ),
             "fully_self_contained": bool(not needs_coarse_response or coarse_model is not None),
             "requires_coarse_hooks": bool(needs_coarse_response and coarse_model is None),
             "dc_resistance_source_kind": dc_metadata.get(
@@ -2384,6 +2693,7 @@ def command_export_veriloga(args: argparse.Namespace) -> int:
         "nports": manifest["nports"],
         "parameters": manifest["parameter_identifiers"],
         "parameter_input_scales": manifest["parameter_input_scales"],
+        "rf_response_scale": manifest["rf_response_scale"],
         "coarse_model_dir": manifest["coarse_model_dir"],
         "coarse_model_match_verified": manifest["coarse_model_match_verified"],
         "fully_self_contained": manifest["fully_self_contained"],
@@ -2488,6 +2798,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
         parameter_input_scales=parameter_input_scales,
         uses_coarse_inputs=uses_coarse_inputs,
         adds_coarse_to_output=adds_coarse_to_output,
+        rf_response_scale=model.rf_response_scale,
         embedded_coarse_model=embedded_coarse_model,
         dc_equivalent_resistance_ohm=float(
             dc_metadata["dc_equivalent_resistance_ohm"]
@@ -2503,6 +2814,13 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
             "coarse_source": "fitted_dnn" if coarse_identity is not None else None,
             "coarse_model": coarse_identity,
             "coarse_model_match_verified": coarse_identity is not None,
+            "rf_response_scale": model.rf_response_scale,
+            "passivity_enforced": bool(
+                source_metadata.get("passivity_enforced", False)
+            ),
+            "reciprocity_enforced": bool(
+                source_metadata.get("reciprocity_enforced", False)
+            ),
             "dc_metadata": dc_metadata,
         },
         extra_notes=[
@@ -2519,6 +2837,7 @@ def command_export_ads_hb(args: argparse.Namespace) -> int:
                 "manifest": str(out_dir / "ads_hb_manifest.json"),
                 "module_name": manifest["module_name"],
                 "mode": model.mode,
+                "rf_response_scale": manifest["rf_response_scale"],
                 "embedded_coarse_model": manifest["embedded_coarse_model"],
                 "coarse_model_match_verified": manifest[
                     "coarse_model_match_verified"
@@ -2577,7 +2896,7 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
         else [args.freq_transform]
     )
     for freq_transform in freq_transform_options:
-        if freq_transform not in {"log", "linear"}:
+        if freq_transform not in {"log", "linear", "log-linear"}:
             raise ValueError(f"Unsupported frequency transform {freq_transform!r}")
     if args.mode == "adaptive":
         base_config = {
@@ -2593,6 +2912,7 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
             "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options)[0],
             "activation": parse_text_options(args.activation_options)[0],
             "learning_rate": parse_float_options(args.learning_rates)[0],
+            "passivity_penalty": float(args.passivity_penalty),
         }
         candidates, columns, log_parameters = build_adaptive_candidate_pool(
             base_config,
@@ -2606,6 +2926,7 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
                 "include_coarse_input": "bool",
                 "learning_rate": "float",
                 "mode": "str",
+                "passivity_penalty": "float",
                 "patience": "int",
             },
             max_trials=args.max_trials,
@@ -2728,6 +3049,11 @@ def namespace_for_trial(
         worst_plots=plots,
         sparam_weights=args.sparam_weights,
         frequency_weights=args.frequency_weights,
+        passivity_mode=args.passivity_mode,
+        passivity_margin=args.passivity_margin,
+        passivity_penalty=args.passivity_penalty,
+        reciprocity_mode=args.reciprocity_mode,
+        reciprocity_tolerance=args.reciprocity_tolerance,
         debug=bool(getattr(args, "debug", False)),
         quiet=True,
     ), candidate)
@@ -2779,6 +3105,11 @@ def command_sweep(args: argparse.Namespace) -> int:
     args = argparse.Namespace(**vars(args))
     args.mode = search_mode
     args.mode_options = model_modes or "residual,prior-input"
+    # The integrated coarse DNN is fitted once before candidate trials.  Use
+    # the first fine candidate as its implicit transform, which also preserves
+    # train-compatible behavior for a singular --freq-transform value.
+    fine_frequency_candidates = parse_text_options(args.freq_transform_options)
+    args.freq_transform = fine_frequency_candidates[0]
     integrated_coarse_fit = bool(getattr(args, "coarse_mdif", None))
     prepared_args = prepare_fitted_coarse_model(args, Path(args.out_dir))
     # Trial directories are transient, so package the shared coarse model only
@@ -2997,7 +3328,11 @@ def command_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
-def add_common_train_args(parser: argparse.ArgumentParser) -> None:
+def add_common_train_args(
+    parser: argparse.ArgumentParser,
+    *,
+    optimize: bool = False,
+) -> None:
     parser.add_argument("--mdif", required=True, help="Fine/target S-parameter MDIF")
     parser.add_argument("--verification-mdif", help="Optional separate fine/target verification MDIF")
     coarse_source = parser.add_mutually_exclusive_group()
@@ -3026,7 +3361,25 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--parameter-names", help="Comma-separated geometry/process VAR names")
     parser.add_argument("--holdout-fraction", type=float, default=0.2)
     add_dc_fitting_arguments(parser)
-    parser.add_argument("--freq-transform", choices=["log", "linear"], default="log")
+    if optimize:
+        parser.add_argument(
+            "--freq-transforms",
+            "--freq-transform-options",
+            "--freq-transform",
+            dest="freq_transform_options",
+            default="log,linear,log-linear",
+            help=(
+                "Comma-separated frequency transforms; --freq-transform is the "
+                "single-value train-compatible form"
+            ),
+        )
+        parser.set_defaults(freq_transform="log")
+    else:
+        parser.add_argument(
+            "--freq-transform",
+            choices=["log", "linear", "log-linear"],
+            default="log",
+        )
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--loss-interval", type=int, default=1, help="Full train/validation loss check interval in epochs")
@@ -3045,6 +3398,47 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         "--coarse-freq-transform",
         choices=["log", "linear", "log-linear"],
         help="Coarse-DNN frequency transform. Defaults to --freq-transform.",
+    )
+    parser.add_argument(
+        "--passivity-mode",
+        choices=["auto", "enforce", "off"],
+        default="auto",
+        help=(
+            "Passivity handling for the reconstructed fine S response. auto "
+            "protects passive training data, enforce always protects it, and "
+            "off disables the protection"
+        ),
+    )
+    parser.add_argument(
+        "--passivity-margin",
+        type=float,
+        default=1e-3,
+        help="Target margin below unit maximum singular value (default: 0.001)",
+    )
+    parser.add_argument(
+        "--passivity-penalty",
+        type=float,
+        default=10.0,
+        help=(
+            "Weight of the reconstructed-response passivity loss; may also be "
+            "an adaptive --optimize-parameter (default: 10)"
+        ),
+    )
+    parser.add_argument(
+        "--reciprocity-mode",
+        choices=["auto", "enforce", "off"],
+        default="enforce",
+        help=(
+            "Reciprocity handling for final fine S. enforce ties reciprocal "
+            "outputs by default; residual mode also requires an exactly "
+            "reciprocal frozen coarse DNN"
+        ),
+    )
+    parser.add_argument(
+        "--reciprocity-tolerance",
+        type=float,
+        default=1e-6,
+        help="Maximum relative source mismatch accepted by reciprocity auto mode",
     )
     coarse_fit.add_argument("--coarse-learning-rate", type=float, default=2e-3)
     coarse_fit.add_argument("--coarse-epochs", type=int, help="Defaults to --epochs")
@@ -3111,7 +3505,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         aliases=["optimize"],
         help="Try multiple KBNN configurations and retrain the best one",
     )
-    add_common_train_args(sweep)
+    add_common_train_args(sweep, optimize=True)
     sweep.add_argument(
         "--modes",
         "--mode-options",
@@ -3137,15 +3531,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         const="true",
         default=argparse.SUPPRESS,
         help="Train-compatible single true value for the optimize candidate set.",
-    )
-    sweep.add_argument(
-        "--freq-transforms",
-        "--freq-transform-options",
-        dest="freq_transform_options",
-        help=(
-            "Comma-separated frequency transforms to try. Available values are log and linear. "
-            "If omitted, the sweep uses --freq-transform."
-        ),
     )
     sweep.add_argument(
         "--hidden-layers",
@@ -3356,7 +3741,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_ann.add_argument("--verify-values")
     export_ann.add_argument("--parameter-names", help="Comma-separated geometry/process VAR names")
     export_ann.add_argument("--holdout-fraction", type=float, default=0.2)
-    export_ann.add_argument("--freq-transform", choices=["log", "linear"])
+    export_ann.add_argument(
+        "--freq-transform",
+        choices=["log", "linear", "log-linear"],
+    )
     export_ann.add_argument("--mode", choices=["plain", "residual", "prior-input"])
     export_ann.add_argument("--include-coarse-input", action="store_true", default=None)
     export_ann.add_argument(

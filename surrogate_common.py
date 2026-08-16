@@ -2608,6 +2608,7 @@ def veriloga_module_text(
     frequency_expression: str,
     uses_coarse_inputs: bool = False,
     adds_coarse_to_output: bool = False,
+    rf_response_scale: float = 1.0,
     parameter_input_scales: dict[str, float] | None = None,
     output_domain: str = "s",
     fold_input_scaler: bool = False,
@@ -2623,6 +2624,9 @@ def veriloga_module_text(
         raise ValueError("Verilog-A output_domain must be 's' or 'y'")
     if output_domain == "y" and (uses_coarse_inputs or adds_coarse_to_output):
         raise ValueError("Direct-Y Verilog-A export is currently supported only without coarse hooks")
+    response_scale = float(rf_response_scale)
+    if not math.isfinite(response_scale) or response_scale <= 0.0:
+        raise ValueError("Verilog-A RF response scale must be positive and finite")
     dc_source_kind = validate_exact_dc_source_kind(
         dc_resistance_source_kind,
         context=f"{model_kind} Verilog-A export",
@@ -3171,16 +3175,28 @@ def veriloga_module_text(
         for idx, label in enumerate(sparam_labels):
             row, col = sparam_indices(label) or (0, 0)
             flat = (row - 1) * nports + (col - 1)
-            direct_y_real_by_flat[flat] = network_output(idx)
-            direct_y_imag_by_flat[flat] = network_output(idx + n_sparams)
+            real_expression = network_output(idx)
+            imag_expression = network_output(idx + n_sparams)
+            if response_scale != 1.0:
+                scale_literal = veriloga_float(response_scale)
+                real_expression = f"({scale_literal})*({real_expression})"
+                imag_expression = f"({scale_literal})*({imag_expression})"
+            direct_y_real_by_flat[flat] = real_expression
+            direct_y_imag_by_flat[flat] = imag_expression
     else:
         for idx, label in enumerate(sparam_labels):
             row, col = sparam_indices(label) or (0, 0)
             flat = (row - 1) * nports + (col - 1)
             add_re = f" + cr[{idx}]" if adds_coarse_to_output else ""
             add_im = f" + ci[{idx}]" if adds_coarse_to_output else ""
-            lines.append(f"    sr[{flat}] = {network_output(idx)}{add_re}; // {label} real")
-            lines.append(f"    si[{flat}] = {network_output(idx + n_sparams)}{add_im}; // {label} imag")
+            real_expression = f"({network_output(idx)}{add_re})"
+            imag_expression = f"({network_output(idx + n_sparams)}{add_im})"
+            if response_scale != 1.0:
+                scale_literal = veriloga_float(response_scale)
+                real_expression = f"({scale_literal})*{real_expression}"
+                imag_expression = f"({scale_literal})*{imag_expression}"
+            lines.append(f"    sr[{flat}] = {real_expression}; // {label} real")
+            lines.append(f"    si[{flat}] = {imag_expression}; // {label} imag")
         lines.append("")
 
         _append_veriloga_s_to_y_conversion(lines, nports)
@@ -3265,6 +3281,7 @@ def veriloga_module_text(
         "folded_output_scaler": folded_output_scaler,
         "uses_coarse_inputs": bool(uses_coarse_inputs),
         "adds_coarse_to_output": bool(adds_coarse_to_output),
+        "rf_response_scale": response_scale,
         "embedded_coarse_model": bool(coarse_embedded),
         "coarse_model": (
             {
@@ -3392,6 +3409,7 @@ def write_veriloga_package(
     frequency_expression: str = "$freq",
     uses_coarse_inputs: bool = False,
     adds_coarse_to_output: bool = False,
+    rf_response_scale: float = 1.0,
     parameter_input_scales: dict[str, float] | None = None,
     output_domain: str = "s",
     fold_input_scaler: bool = False,
@@ -3425,6 +3443,7 @@ def write_veriloga_package(
         frequency_expression=frequency_expression,
         uses_coarse_inputs=uses_coarse_inputs,
         adds_coarse_to_output=adds_coarse_to_output,
+        rf_response_scale=rf_response_scale,
         parameter_input_scales=parameter_input_scales,
         output_domain=output_domain,
         fold_input_scaler=fold_input_scaler,
@@ -5042,6 +5061,7 @@ def write_ads_hb_mlp_package(
     output_domain: str = "s",
     uses_coarse_inputs: bool = False,
     adds_coarse_to_output: bool = False,
+    rf_response_scale: float = 1.0,
     embedded_coarse_model: dict[str, object] | None = None,
     dc_equivalent_resistance_ohm: float | None = None,
     dc_resistance_source_kind: object = None,
@@ -5065,6 +5085,9 @@ def write_ads_hb_mlp_package(
         raise ValueError("ADS HB output domain must be 's' or 'y'")
     if response_domain == "y" and (uses_coarse_inputs or adds_coarse_to_output):
         raise ValueError("Direct-Y ADS HB export does not support KBNN coarse hooks")
+    response_scale = float(rf_response_scale)
+    if not math.isfinite(response_scale) or response_scale <= 0.0:
+        raise ValueError("ADS HB RF response scale must be positive and finite")
     if not math.isfinite(z0) or z0 <= 0.0:
         raise ValueError("ADS HB reference impedance must be positive and finite")
     if (combined_sdd or fold_mlp_scalers or eliminate_constant_outputs) and (
@@ -5198,6 +5221,10 @@ def write_ads_hb_mlp_package(
         else:
             real_expression = real_name
             imag_expression = imag_name
+        if response_scale != 1.0:
+            scale_literal = veriloga_float(response_scale)
+            real_expression = f"({scale_literal})*({real_expression})"
+            imag_expression = f"({scale_literal})*({imag_expression})"
         fitted_name = f"{prefix}_rf_{label.lower()}"
         lines.append(f"{fitted_name}=complex(({real_expression}),({imag_expression}))")
         fitted_response_names.append(fitted_name)
@@ -5365,6 +5392,7 @@ def write_ads_hb_mlp_package(
         "fully_self_contained": True,
         "uses_coarse_inputs": bool(uses_coarse_inputs),
         "adds_coarse_to_output": bool(adds_coarse_to_output),
+        "rf_response_scale": response_scale,
         "embedded_coarse_model": embedded_coarse_model is not None,
         "source_model_dir": source_model_dir,
         "dc_equivalent_resistance_ohm": dc_resistance,
@@ -5496,6 +5524,7 @@ def write_ads_hb_mlp_package(
             output_domain=output_domain,
             uses_coarse_inputs=uses_coarse_inputs,
             adds_coarse_to_output=adds_coarse_to_output,
+            rf_response_scale=rf_response_scale,
             embedded_coarse_model=embedded_coarse_model,
             dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
             dc_resistance_source_kind=dc_resistance_source_kind,
@@ -5566,6 +5595,7 @@ def write_ads_hb_mlp_package(
             output_domain=output_domain,
             uses_coarse_inputs=uses_coarse_inputs,
             adds_coarse_to_output=adds_coarse_to_output,
+            rf_response_scale=rf_response_scale,
             embedded_coarse_model=embedded_coarse_model,
             dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
             dc_resistance_source_kind=dc_resistance_source_kind,
@@ -5639,6 +5669,7 @@ def write_ads_hb_mlp_package(
             output_domain=output_domain,
             uses_coarse_inputs=uses_coarse_inputs,
             adds_coarse_to_output=adds_coarse_to_output,
+            rf_response_scale=rf_response_scale,
             embedded_coarse_model=embedded_coarse_model,
             dc_equivalent_resistance_ohm=dc_equivalent_resistance_ohm,
             dc_resistance_source_kind=dc_resistance_source_kind,
@@ -6519,7 +6550,17 @@ class MLP:
             tuple[float, np.ndarray],
         ]
         | None = None,
+        indexed_extra_loss_gradient: Callable[
+            [np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+            tuple[float, np.ndarray],
+        ]
+        | None = None,
     ) -> list[dict[str, float]]:
+        if extra_loss_gradient is not None and indexed_extra_loss_gradient is not None:
+            raise ValueError(
+                "Specify only one of extra_loss_gradient and "
+                "indexed_extra_loss_gradient"
+            )
         if output_weights is None:
             output_weights = np.ones(y_train.shape[1], dtype=float)
         else:
@@ -6608,6 +6649,16 @@ class MLP:
                         yb,
                         sample_weights[indices],
                     )
+                elif indexed_extra_loss_gradient is not None:
+                    _extra_loss, extra_delta = indexed_extra_loss_gradient(
+                        pred,
+                        yb,
+                        sample_weights[indices],
+                        indices,
+                    )
+                else:
+                    extra_delta = None
+                if extra_delta is not None:
                     extra_delta = np.asarray(extra_delta, dtype=float)
                     if extra_delta.shape != delta.shape:
                         raise ValueError(
@@ -6681,6 +6732,14 @@ class MLP:
                     train_prediction,
                     y_train,
                     sample_weights,
+                )
+                train_loss += float(extra_train_loss)
+            elif indexed_extra_loss_gradient is not None:
+                extra_train_loss, _extra_train_gradient = indexed_extra_loss_gradient(
+                    train_prediction,
+                    y_train,
+                    sample_weights,
+                    np.arange(len(x_train), dtype=int),
                 )
                 train_loss += float(extra_train_loss)
             val_prediction = (

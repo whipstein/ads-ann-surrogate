@@ -94,7 +94,10 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
 def build_model_arg_parser() -> argparse.ArgumentParser:
     """Build the parser used only for model-backend selection."""
 
-    parser = argparse.ArgumentParser(add_help=False)
+    # Backend options are intentionally opaque to this small dispatcher.  In
+    # particular, KBNN's ``--mode`` must not be treated as an abbreviation of
+    # this parser's ``--model`` option.
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument(
         "--model",
         dest="model_type",
