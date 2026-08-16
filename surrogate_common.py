@@ -10641,6 +10641,57 @@ def cleanup_trial_dir(trial_dir: Path, keep_trial_models: bool) -> None:
             path.unlink()
 
 
+def cache_point_generation_fallback(
+    sweep_dir: Path,
+    cache_dir: Path,
+    trial: int,
+    selection_metric: str,
+    metric: float,
+    row: dict[str, object],
+    keep_trial_models: bool = False,
+) -> bool:
+    """Retain one trial's error observations without retaining its model.
+
+    Sweep cleanup deliberately removes the potentially large per-trial
+    verification CSVs.  A failed-passivity sweep still needs one such CSV for
+    the next GP acquisition round, so keep only the lowest-error completed
+    trial in a transient cache.  The cache never contains model files and is
+    explicitly marked as ineligible for export.
+    """
+
+    trial_dir = sweep_dir / "trials" / f"trial_{trial:04d}"
+    metrics_path = trial_dir / "verification_metrics.csv"
+    if not metrics_path.is_file():
+        return False
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True)
+    cached_metrics_path = cache_dir / metrics_path.name
+    if keep_trial_models:
+        shutil.copy2(metrics_path, cached_metrics_path)
+    else:
+        shutil.move(metrics_path, cached_metrics_path)
+    summary_path = trial_dir / "verification_summary.json"
+    if summary_path.is_file():
+        shutil.copy2(summary_path, cache_dir / summary_path.name)
+    manifest = {
+        "status": "passivity_ineligible",
+        "purpose": "gp_point_generation_only",
+        "eligible_for_export": False,
+        "source_trial": int(trial),
+        "selection_metric": selection_metric,
+        "metric": float(metric),
+        "passivity": {
+            "max_singular_value": row.get("passivity_max_singular_value"),
+            "violating_points": row.get("passivity_violating_points"),
+        },
+    }
+    (cache_dir / "point_generation_source.json").write_text(
+        json.dumps(manifest, indent=2)
+    )
+    return True
+
+
 def markdown_escape(value: object) -> str:
     text = "" if value is None else str(value)
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
@@ -11252,6 +11303,7 @@ def write_sweep_markdown(
     best_available_config: dict[str, object] | None = None,
     best_available_metric: float | None = None,
     best_available_passivity: dict[str, object] | None = None,
+    point_generation_fallback: dict[str, object] | None = None,
 ) -> None:
     sorted_rows = sorted(
         rows,
@@ -11299,6 +11351,31 @@ def write_sweep_markdown(
                     f"violations `{metric_text(best_available_passivity.get('violating_points'))}`."
                 )
             lines.append("")
+        if point_generation_fallback:
+            fallback_path = str(
+                point_generation_fallback.get(
+                    "path", "point_generation_fallback/verification_metrics.csv"
+                )
+            )
+            source_trial = point_generation_fallback.get("source_trial")
+            source_metric = point_generation_fallback.get("metric")
+            lines.extend(
+                [
+                    "## GP Point-Generation Fallback",
+                    "",
+                    "The verification-error observations from the lowest-error "
+                    f"completed trial (trial `{markdown_escape(source_trial)}`, "
+                    f"metric `{metric_text(source_metric)}`) were retained at "
+                    f"[`{markdown_escape(fallback_path)}`]({markdown_escape(fallback_path)}).",
+                    "",
+                    "This trial did not satisfy the passivity criteria. It is "
+                    "available only for selecting more geometry points and remains "
+                    "ineligible for model export. Pass the sweep directory to "
+                    "`points suggest-additional` together with "
+                    "`--allow-nonpassive` to use it.",
+                    "",
+                ]
+            )
     if reproduction_command:
         lines.extend(
             [
@@ -11332,8 +11409,8 @@ def write_sweep_markdown(
             )
     lines.extend(
         [
-            "| Rank | Trial | Metric | Search stage | Predicted objective | Search uncertainty | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Trial plots | Error |",
-            "| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
+            "| Rank | Trial | Metric | Search stage | Predicted objective | Search uncertainty | Categorical coverage | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Trial plots | Error |",
+            "| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     known = {
@@ -11363,6 +11440,7 @@ def write_sweep_markdown(
         "adaptive_stage",
         "adaptive_predicted_objective",
         "adaptive_uncertainty",
+        "adaptive_category_coverage",
     }
     for rank, row in enumerate(sorted_rows, start=1):
         config = ", ".join(
@@ -11380,6 +11458,7 @@ def write_sweep_markdown(
                     markdown_escape(row.get("adaptive_stage", "")),
                     metric_text(row.get("adaptive_predicted_objective")),
                     metric_text(row.get("adaptive_uncertainty")),
+                    markdown_escape(row.get("adaptive_category_coverage", "")),
                     metric_text(row.get("rmse_abs")),
                     metric_text(row.get("max_abs")),
                     metric_text(row.get("evm_pct")),
@@ -12166,13 +12245,29 @@ def add_adaptive_search_arguments(parser: argparse.ArgumentParser) -> None:
         "--adaptive-initial-trials",
         type=int,
         default=6,
-        help="Space-filling trials completed before GP-guided selection. Default: 6.",
+        help=(
+            "Category-balanced, maximin-separated trials completed before "
+            "GP-guided selection. Automatically expands to cover every level of "
+            "the largest categorical domain once when the trial budget permits. "
+            "Default: 6."
+        ),
     )
     parser.add_argument(
         "--adaptive-candidate-pool",
         type=int,
         default=512,
         help="Candidate configurations considered by adaptive search. Default: 512.",
+    )
+    parser.add_argument(
+        "--adaptive-category-balance",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum categorical coverage as a fraction of equal allocation "
+            "during GP-guided trials. 0 allows unrestricted exploitation after "
+            "the balanced initial stage; 1 keeps categorical marginals nearly "
+            "equal. Default: 0.5."
+        ),
     )
     parser.add_argument(
         "--adaptive-exploration",
@@ -12321,7 +12416,12 @@ def build_adaptive_candidate_pool(
     candidate_pool: int,
     hidden_width_step: int,
     seed: int,
-) -> tuple[list[dict[str, object]], list[str], set[str]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[str],
+    set[str],
+    dict[str, list[object]],
+]:
     if max_trials <= 0:
         raise ValueError("--max-trials must be positive for adaptive search")
     if candidate_pool <= 0:
@@ -12344,6 +12444,11 @@ def build_adaptive_candidate_pool(
         str(spec["name"])
         for spec in specs
         if spec.get("scale") == "log" and spec.get("kind") in {"float", "int"}
+    }
+    categorical_values = {
+        str(spec["name"]): list(spec["values"])  # type: ignore[arg-type]
+        for spec in specs
+        if spec.get("kind") == "categorical"
     }
 
     sampled_values: dict[str, list[object]] = {}
@@ -12413,7 +12518,7 @@ def build_adaptive_candidate_pool(
             "configuration(s)",
             file=sys.stderr,
         )
-    return candidates, columns, log_parameters
+    return candidates, columns, log_parameters, categorical_values
 
 
 def apply_candidate_overrides(
@@ -12740,6 +12845,144 @@ def _adaptive_matern52(lhs: np.ndarray, rhs: np.ndarray, length_scale: float) ->
     )
 
 
+def adaptive_categorical_domains(
+    candidates: Sequence[dict[str, object]],
+    configured_values: object,
+) -> dict[str, list[str]]:
+    """Return optimized categorical levels that remain in the candidate pool."""
+
+    if not isinstance(configured_values, dict):
+        return {}
+    domains: dict[str, list[str]] = {}
+    for raw_name, raw_levels in configured_values.items():
+        if not isinstance(raw_levels, (list, tuple)):
+            continue
+        name = str(raw_name)
+        present = {
+            str(candidate.get(name))
+            for candidate in candidates
+            if candidate.get(name) is not None
+        }
+        levels: list[str] = []
+        for raw_level in raw_levels:
+            level = str(raw_level)
+            if level in present and level not in levels:
+                levels.append(level)
+        for level in sorted(present):
+            if level not in levels:
+                levels.append(level)
+        if len(levels) > 1:
+            domains[name] = levels
+    return domains
+
+
+def adaptive_category_balance_key(
+    candidates: Sequence[dict[str, object]],
+    selected_indices: Sequence[int],
+    candidate_index: int,
+    domains: dict[str, list[str]],
+) -> tuple[int, float]:
+    """Score marginal categorical coverage after adding one candidate.
+
+    Fewer unseen levels is the first priority.  Once all levels have appeared,
+    squared deviation from equal marginal counts keeps the initial design as
+    even as possible without requiring the full Cartesian product.
+    """
+
+    trial_count = len(selected_indices) + 1
+    unseen = 0
+    imbalance = 0.0
+    proposed_indices = [*selected_indices, candidate_index]
+    for name, levels in domains.items():
+        counts = {level: 0 for level in levels}
+        for index in proposed_indices:
+            level = str(candidates[index].get(name))
+            if level in counts:
+                counts[level] += 1
+        unseen += sum(count == 0 for count in counts.values())
+        target = trial_count / len(levels)
+        imbalance += sum((count - target) ** 2 for count in counts.values())
+    return unseen, imbalance
+
+
+def adaptive_category_deficit(
+    candidates: Sequence[dict[str, object]],
+    selected_indices: Sequence[int],
+    candidate_index: int,
+    domains: dict[str, list[str]],
+    balance_ratio: float,
+) -> int:
+    """Return the remaining categorical coverage-floor deficit."""
+
+    trial_count = len(selected_indices) + 1
+    proposed_indices = [*selected_indices, candidate_index]
+    deficit = 0
+    for name, levels in domains.items():
+        minimum_count = int(
+            math.floor(balance_ratio * trial_count / len(levels) + EPS)
+        )
+        if minimum_count <= 0:
+            continue
+        counts = {level: 0 for level in levels}
+        for index in proposed_indices:
+            level = str(candidates[index].get(name))
+            if level in counts:
+                counts[level] += 1
+        deficit += sum(
+            max(0, minimum_count - count) for count in counts.values()
+        )
+    return deficit
+
+
+def adaptive_category_final_deficit(
+    candidates: Sequence[dict[str, object]],
+    selected_indices: Sequence[int],
+    candidate_index: int,
+    domains: dict[str, list[str]],
+    balance_ratio: float,
+    planned_trials: int,
+) -> int:
+    """Measure whether remaining slots can still satisfy the final floor."""
+
+    trial_count = len(selected_indices) + 1
+    remaining_trials = max(0, planned_trials - trial_count)
+    proposed_indices = [*selected_indices, candidate_index]
+    infeasible_deficit = 0
+    for name, levels in domains.items():
+        final_minimum = int(
+            math.floor(balance_ratio * planned_trials / len(levels) + EPS)
+        )
+        counts = {level: 0 for level in levels}
+        for index in proposed_indices:
+            level = str(candidates[index].get(name))
+            if level in counts:
+                counts[level] += 1
+        remaining_need = sum(
+            max(0, final_minimum - count) for count in counts.values()
+        )
+        infeasible_deficit += max(0, remaining_need - remaining_trials)
+    return infeasible_deficit
+
+
+def adaptive_category_coverage_text(
+    candidates: Sequence[dict[str, object]],
+    selected_indices: Sequence[int],
+    domains: dict[str, list[str]],
+) -> str | None:
+    if not domains:
+        return None
+    parts: list[str] = []
+    for name, levels in domains.items():
+        counts = {level: 0 for level in levels}
+        for index in selected_indices:
+            level = str(candidates[index].get(name))
+            if level in counts:
+                counts[level] += 1
+        values = ", ".join(f"{level}={counts[level]}" for level in levels)
+        parts.append(f"{name}: {values}")
+    return "; ".join(parts)
+
+
 def select_adaptive_candidate(
     candidates: Sequence[dict[str, object]],
     remaining_indices: Sequence[int],
@@ -12755,13 +12998,48 @@ def select_adaptive_candidate(
         columns,
         set(getattr(args, "adaptive_log_parameters", set())),
     )
-    initial_trials = max(1, int(getattr(args, "adaptive_initial_trials", 6)))
+    categorical_domains = adaptive_categorical_domains(
+        candidates,
+        getattr(args, "adaptive_categorical_values", {}),
+    )
+    requested_initial_trials = max(
+        1, int(getattr(args, "adaptive_initial_trials", 6))
+    )
+    category_level_floor = max(
+        (len(levels) for levels in categorical_domains.values()),
+        default=1,
+    )
+    planned_trials = min(
+        len(candidates),
+        max(1, int(getattr(args, "max_trials", len(candidates)))),
+    )
+    initial_trials = min(
+        planned_trials,
+        max(requested_initial_trials, category_level_floor),
+    )
     usable_row_indices, targets = adaptive_observation_targets(rows, args)
     if len(selected_indices) < initial_trials or len(usable_row_indices) < 2:
+        balanced_indices = list(remaining_indices)
+        if categorical_domains:
+            balance_keys = {
+                candidate_index: adaptive_category_balance_key(
+                    candidates,
+                    selected_indices,
+                    candidate_index,
+                    categorical_domains,
+                )
+                for candidate_index in remaining_indices
+            }
+            best_balance = min(balance_keys.values())
+            balanced_indices = [
+                candidate_index
+                for candidate_index in remaining_indices
+                if balance_keys[candidate_index] == best_balance
+            ]
         if not selected_indices:
             center = np.full(features.shape[1], 0.5, dtype=float)
             index = min(
-                remaining_indices,
+                balanced_indices,
                 key=lambda candidate_index: float(
                     np.linalg.norm(features[candidate_index] - center)
                 ),
@@ -12769,7 +13047,7 @@ def select_adaptive_candidate(
         else:
             selected_features = features[np.asarray(selected_indices, dtype=int)]
             index = max(
-                remaining_indices,
+                balanced_indices,
                 key=lambda candidate_index: float(
                     np.min(
                         np.linalg.norm(
@@ -12782,6 +13060,11 @@ def select_adaptive_candidate(
             "adaptive_stage": "initial_maximin",
             "adaptive_predicted_objective": None,
             "adaptive_uncertainty": None,
+            "adaptive_category_coverage": adaptive_category_coverage_text(
+                candidates,
+                [*selected_indices, index],
+                categorical_domains,
+            ),
         }
 
     observed_candidate_indices = [selected_indices[index] for index in usable_row_indices]
@@ -12806,11 +13089,45 @@ def select_adaptive_candidate(
         factor = np.linalg.cholesky(covariance + np.eye(size, dtype=float) * 1e-3)
     alpha = np.linalg.solve(factor.T, np.linalg.solve(factor, normalized_targets))
     exploration = max(0.0, float(getattr(args, "adaptive_exploration", 1.5)))
-    best_index = int(remaining_indices[0])
+    category_balance = float(
+        getattr(args, "adaptive_category_balance", 0.5)
+    )
+    gp_candidate_indices = list(remaining_indices)
+    if categorical_domains and category_balance > 0.0:
+        deficit_keys = {
+            candidate_index: (
+                adaptive_category_final_deficit(
+                    candidates,
+                    selected_indices,
+                    candidate_index,
+                    categorical_domains,
+                    category_balance,
+                    planned_trials,
+                ),
+                adaptive_category_deficit(
+                    candidates,
+                    selected_indices,
+                    candidate_index,
+                    categorical_domains,
+                    category_balance,
+                ),
+            )
+            for candidate_index in remaining_indices
+        }
+        minimum_deficit = min(deficit_keys.values())
+        if minimum_deficit != (0, 0) or any(
+            deficit > minimum_deficit for deficit in deficit_keys.values()
+        ):
+            gp_candidate_indices = [
+                candidate_index
+                for candidate_index in remaining_indices
+                if deficit_keys[candidate_index] == minimum_deficit
+            ]
+    best_index = int(gp_candidate_indices[0])
     best_score = float("inf")
     best_mean = 0.0
     best_uncertainty = 0.0
-    for candidate_index in remaining_indices:
+    for candidate_index in gp_candidate_indices:
         kernel = np.asarray(
             [
                 _adaptive_matern52(
@@ -12835,6 +13152,11 @@ def select_adaptive_candidate(
         "adaptive_stage": "gp_lcb",
         "adaptive_predicted_objective": best_mean,
         "adaptive_uncertainty": best_uncertainty,
+        "adaptive_category_coverage": adaptive_category_coverage_text(
+            candidates,
+            [*selected_indices, best_index],
+            categorical_domains,
+        ),
     }
 
 
@@ -12998,6 +13320,9 @@ def sweep_result_row(
             "adaptive_predicted_objective"
         ),
         "adaptive_uncertainty": result.get("adaptive_uncertainty"),
+        "adaptive_category_coverage": result.get(
+            "adaptive_category_coverage"
+        ),
         **candidate,
         "rmse_abs": summary.get("rmse_abs"),
         "max_abs": summary.get("max_abs"),
@@ -13051,10 +13376,19 @@ def run_sweep_command(
     if adaptive_search:
         adaptive_initial_trials = int(getattr(args, "adaptive_initial_trials", 6))
         adaptive_exploration = float(getattr(args, "adaptive_exploration", 1.5))
+        adaptive_category_balance = float(
+            getattr(args, "adaptive_category_balance", 0.5)
+        )
         if adaptive_initial_trials <= 0:
             raise ValueError("--adaptive-initial-trials must be positive")
         if not math.isfinite(adaptive_exploration) or adaptive_exploration < 0.0:
             raise ValueError("--adaptive-exploration must be finite and non-negative")
+        if (
+            not math.isfinite(adaptive_category_balance)
+            or adaptive_category_balance < 0.0
+            or adaptive_category_balance > 1.0
+        ):
+            raise ValueError("--adaptive-category-balance must be between 0 and 1")
 
     rows: list[dict[str, object]] = []
     best_row: dict[str, object] | None = None
@@ -13067,6 +13401,13 @@ def run_sweep_command(
     best_dir = out_dir / "best_model"
     if best_dir.exists():
         shutil.rmtree(best_dir)
+    point_fallback_dir = out_dir / "point_generation_fallback"
+    point_fallback_cache_dir = out_dir / ".point_generation_fallback"
+    for stale_fallback_dir in (point_fallback_dir, point_fallback_cache_dir):
+        if stale_fallback_dir.exists():
+            shutil.rmtree(stale_fallback_dir)
+    point_fallback_metric: float | None = None
+    point_fallback_trial: int | None = None
     live_best_trial: int | None = None
     live_promotion_warning: str | None = None
     jobs = configure_parallel_numeric_threads(getattr(args, "jobs", 1))
@@ -13123,11 +13464,33 @@ def run_sweep_command(
 
     def handle_result(result: dict[str, object]) -> None:
         nonlocal best_row, best_metric, live_best_trial, live_promotion_warning
+        nonlocal point_fallback_metric, point_fallback_trial
         trial_index = int(result["trial"])
         candidate = dict(result["candidate"])  # type: ignore[arg-type]
         metric_value = result.get("metric")
         row = sweep_result_row(args, result, candidate)
         rows.append(row)
+        point_metric = sweep_row_metric(row, args.selection_metric)
+        trial_error = str(row.get("error") or "").strip()
+        if (
+            point_metric is not None
+            and not trial_error
+            and (
+                point_fallback_metric is None
+                or point_metric < point_fallback_metric
+            )
+            and cache_point_generation_fallback(
+                out_dir,
+                point_fallback_cache_dir,
+                trial_index,
+                args.selection_metric,
+                point_metric,
+                row,
+                keep_trial_models=bool(getattr(args, "keep_trial_models", False)),
+            )
+        ):
+            point_fallback_metric = point_metric
+            point_fallback_trial = trial_index
         _, current_best_row, current_best_metric = rerank_sweep_rows(
             rows,
             selection_metric=args.selection_metric,
@@ -13168,7 +13531,6 @@ def run_sweep_command(
             f"pv={passivity_violations:>{passivity_violations_width}} "
             f"sigma={passivity_max_sigma:>{passivity_sigma_width}}"
         )
-        trial_error = str(row.get("error") or "").strip()
         exclusion_reasons = sweep_row_exclusion_reasons(
             row,
             selection_metric=args.selection_metric,
@@ -13316,6 +13678,14 @@ def run_sweep_command(
             "passivity criteria. All completed trials remain in this report and "
             "the diagnostic artifacts so trends can still be analyzed."
         )
+        point_fallback_payload: dict[str, object] | None = None
+        if point_fallback_cache_dir.is_dir():
+            point_fallback_cache_dir.rename(point_fallback_dir)
+            point_fallback_payload = {
+                "path": "point_generation_fallback/verification_metrics.csv",
+                "source_trial": point_fallback_trial,
+                "metric": point_fallback_metric,
+            }
         (out_dir / best_config_filename).write_text(
             json.dumps(
                 {
@@ -13331,6 +13701,14 @@ def run_sweep_command(
                     "best_available_config": fallback_config,
                     "best_available_passivity": fallback_passivity,
                     "best_model_dir": None,
+                    "point_generation_fallback_dir": (
+                        "point_generation_fallback"
+                        if point_fallback_payload is not None
+                        else None
+                    ),
+                    "point_generation_trial": point_fallback_trial,
+                    "point_generation_metric": point_fallback_metric,
+                    "point_generation_export_eligible": False,
                     "failure": failure_message,
                 },
                 indent=2,
@@ -13348,9 +13726,19 @@ def run_sweep_command(
             best_available_config=fallback_config,
             best_available_metric=fallback_metric,
             best_available_passivity=fallback_passivity,
+            point_generation_fallback=point_fallback_payload,
         )
         print(f"warning: {failure_message}", file=sys.stderr, flush=True)
+        if point_fallback_payload is not None:
+            print(
+                "warning: retained passivity-ineligible verification errors in "
+                f"{point_fallback_dir}; use --allow-nonpassive for GP point generation",
+                file=sys.stderr,
+                flush=True,
+            )
         return 2
+    if point_fallback_cache_dir.exists():
+        shutil.rmtree(point_fallback_cache_dir)
     best_candidate = {
         key: best_row[key]
         for key in effective_result_columns

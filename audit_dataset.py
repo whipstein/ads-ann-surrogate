@@ -22,6 +22,7 @@ from typing import Sequence
 
 import numpy as np
 
+from cli_options import add_options_json_argument, parse_args_with_options_json
 from generate_points import parameter_specs_from_geometry_metadata
 from surrogate_common import (
     MDIFBlock,
@@ -59,6 +60,36 @@ class GeometryDomain:
     source_paths: list[Path]
     parameters: dict[str, dict[str, object]]
     inferred: bool
+
+
+AUDIT_VERDICT_COLORS = {
+    "PASS": "\033[32m",
+    "WARNING": "\033[33m",
+    "FAIL": "\033[31m",
+}
+ANSI_RESET = "\033[0m"
+
+
+def format_audit_verdict_line(
+    verdict: str,
+    stream: object | None = None,
+) -> str:
+    """Return a colored verdict line for terminals and plain text otherwise."""
+
+    line = f"dataset audit: {verdict}"
+    output = sys.stdout if stream is None else stream
+    is_terminal = bool(
+        hasattr(output, "isatty")
+        and output.isatty()  # type: ignore[attr-defined]
+    )
+    if (
+        not is_terminal
+        or "NO_COLOR" in os.environ
+        or os.environ.get("TERM", "").lower() == "dumb"
+    ):
+        return line
+    color = AUDIT_VERDICT_COLORS.get(verdict)
+    return f"{color}{line}{ANSI_RESET}" if color else line
 
 
 def issue(
@@ -1261,6 +1292,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neighbor-outlier-factor", type=float, default=5.0, help="Nearest-neighbor response jump warning factor above the median. Default: 5.")
     parser.add_argument("--neighbor-min-relative-jump", type=float, default=0.05, help="Minimum relative response RMSE for a neighbor warning. Default: 0.05.")
     parser.add_argument("--fail-on-warnings", action="store_true", help="Return nonzero status for warnings as well as errors.")
+    add_options_json_argument(parser, recursive=False)
     return parser
 
 
@@ -1872,7 +1904,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     )
     markdown_path.write_text("\n".join(markdown))
 
-    print(f"dataset audit: {verdict}")
+    print(format_audit_verdict_line(verdict))
     print(
         "blocks: "
         f"fine train={role_counts.get(('fine', 'train'), 0)}, "
@@ -1917,7 +1949,12 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_with_options_json(
+        parser,
+        argv,
+        workflow="audit",
+        command="audit",
+    )
     validate_args(parser, args)
     try:
         return run_audit(args)[0]

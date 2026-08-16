@@ -25,6 +25,12 @@ from html import escape as html_escape
 from pathlib import Path
 from typing import Iterable, Pattern, Sequence
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from cli_options import add_options_json_argument, parse_args_with_options_json
+
 
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 DURATION_UNIT = r"(?:sec(?:ond)?s?|min(?:ute)?s?|hours?|hrs?|ms|us|µs|μs|ns|s|h)"
@@ -1732,11 +1738,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "parsed from each log."
         ),
     )
+    add_options_json_argument(parser, recursive=False)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parse_args_with_options_json(
+        parser,
+        argv,
+        workflow="hb-report",
+        command="hb-report",
+    )
     if args.labels is not None and len(args.labels) != len(args.logs):
         raise SystemExit("--labels must provide exactly one name for each LOG")
     if args.logs.count("-") > 1:

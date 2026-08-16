@@ -16,6 +16,7 @@ from typing import Sequence
 
 import numpy as np
 
+from cli_options import add_options_json_argument, parse_args_with_options_json
 from surrogate_common import *  # noqa: F401,F403,E402
 
 VERSION = "0.2.0-rc3"
@@ -618,27 +619,30 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
             "activation": parse_text_options(args.activation_options)[0],
             "learning_rate": parse_float_options(args.learning_rates)[0],
         }
-        candidates, columns, log_parameters = build_adaptive_candidate_pool(
-            base_config,
-            args.optimize_parameter,
-            {
-                "activation": "str",
-                "batch_size": "int",
-                "epochs": "int",
-                "hidden_layers": "hidden_layers",
-                "learning_rate": "float",
-                "order": "int",
-                "patience": "int",
-                "pole_damping": "float",
-                "ridge": "float",
-            },
-            max_trials=args.max_trials,
-            candidate_pool=args.adaptive_candidate_pool,
-            hidden_width_step=args.adaptive_hidden_width_step,
-            seed=args.seed,
+        candidates, columns, log_parameters, categorical_values = (
+            build_adaptive_candidate_pool(
+                base_config,
+                args.optimize_parameter,
+                {
+                    "activation": "str",
+                    "batch_size": "int",
+                    "epochs": "int",
+                    "hidden_layers": "hidden_layers",
+                    "learning_rate": "float",
+                    "order": "int",
+                    "patience": "int",
+                    "pole_damping": "float",
+                    "ridge": "float",
+                },
+                max_trials=args.max_trials,
+                candidate_pool=args.adaptive_candidate_pool,
+                hidden_width_step=args.adaptive_hidden_width_step,
+                seed=args.seed,
+            )
         )
         args.adaptive_result_columns = columns
         args.adaptive_log_parameters = log_parameters
+        args.adaptive_categorical_values = categorical_values
         return candidates
     axes = {
         "order": parse_int_options(args.orders),
@@ -1996,12 +2000,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--mdif", required=True)
     inspect.add_argument("--split-var", default="dataset")
     inspect.set_defaults(func=command_inspect)
+    add_options_json_argument(parser)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_with_options_json(parser, argv, model="neuro-tf")
     try:
         return int(args.func(args))
     except Exception as exc:

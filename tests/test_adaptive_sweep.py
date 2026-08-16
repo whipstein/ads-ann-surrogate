@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 import dnn
 import kbnn
 import neuro_tf
@@ -20,32 +22,35 @@ from surrogate_common import (
 
 class AdaptiveSweepTests(unittest.TestCase):
     def test_numeric_and_hidden_layer_ranges_build_unique_pool(self) -> None:
-        candidates, columns, log_parameters = build_adaptive_candidate_pool(
-            {
-                "freq_transform": "log",
-                "hidden_layers": "64,64",
-                "activation": "tanh",
-                "learning_rate": 0.002,
-            },
-            [
-                "learning_rate=1e-4:1e-2:log",
-                "hidden_layers=1:4x32:256:log",
-            ],
-            {
-                "freq_transform": "str",
-                "hidden_layers": "hidden_layers",
-                "activation": "str",
-                "learning_rate": "float",
-            },
-            max_trials=12,
-            candidate_pool=80,
-            hidden_width_step=8,
-            seed=19,
+        candidates, columns, log_parameters, categorical_values = (
+            build_adaptive_candidate_pool(
+                {
+                    "freq_transform": "log",
+                    "hidden_layers": "64,64",
+                    "activation": "tanh",
+                    "learning_rate": 0.002,
+                },
+                [
+                    "learning_rate=1e-4:1e-2:log",
+                    "hidden_layers=1:4x32:256:log",
+                ],
+                {
+                    "freq_transform": "str",
+                    "hidden_layers": "hidden_layers",
+                    "activation": "str",
+                    "learning_rate": "float",
+                },
+                max_trials=12,
+                candidate_pool=80,
+                hidden_width_step=8,
+                seed=19,
+            )
         )
         self.assertGreaterEqual(len(candidates), 12)
         self.assertEqual(len(candidates), len({str(candidate) for candidate in candidates}))
         self.assertIn("learning_rate", log_parameters)
         self.assertIn("hidden_layers", columns)
+        self.assertEqual(categorical_values, {})
         for candidate in candidates:
             self.assertGreaterEqual(float(candidate["learning_rate"]), 1e-4)
             self.assertLessEqual(float(candidate["learning_rate"]), 1e-2)
@@ -105,6 +110,158 @@ class AdaptiveSweepTests(unittest.TestCase):
         self.assertIsNotNone(diagnostics["adaptive_predicted_objective"])
         self.assertIsNotNone(diagnostics["adaptive_uncertainty"])
 
+    def test_initial_adaptive_trials_balance_all_categorical_margins(self) -> None:
+        candidates = [
+            {
+                "activation": activation,
+                "freq_transform": transform,
+                "learning_rate": learning_rate,
+            }
+            for learning_rate in (0.001, 0.002, 0.003, 0.004)
+            for activation in ("tanh", "relu")
+            for transform in ("log", "linear", "log-linear")
+        ]
+        args = argparse.Namespace(
+            selection_metric="rmse_abs",
+            require_passive=False,
+            max_passivity_violations=None,
+            max_passivity_sigma=None,
+            adaptive_initial_trials=6,
+            adaptive_exploration=1.5,
+            adaptive_log_parameters={"learning_rate"},
+            adaptive_categorical_values={
+                "activation": ["tanh", "relu"],
+                "freq_transform": ["log", "linear", "log-linear"],
+            },
+            max_trials=6,
+        )
+        selected: list[int] = []
+        remaining = list(range(len(candidates)))
+        rows: list[dict[str, object]] = []
+        final_diagnostics: dict[str, object] = {}
+        for trial in range(6):
+            index, final_diagnostics = select_adaptive_candidate(
+                candidates,
+                remaining_indices=remaining,
+                selected_indices=selected,
+                rows=rows,
+                args=args,
+                columns=["activation", "freq_transform", "learning_rate"],
+            )
+            remaining.remove(index)
+            selected.append(index)
+            rows.append({"rmse_abs": 1.0 - 0.05 * trial})
+
+        activation_counts = {
+            value: sum(candidates[index]["activation"] == value for index in selected)
+            for value in ("tanh", "relu")
+        }
+        transform_counts = {
+            value: sum(
+                candidates[index]["freq_transform"] == value for index in selected
+            )
+            for value in ("log", "linear", "log-linear")
+        }
+        self.assertEqual(activation_counts, {"tanh": 3, "relu": 3})
+        self.assertEqual(
+            transform_counts,
+            {"log": 2, "linear": 2, "log-linear": 2},
+        )
+        self.assertIn(
+            "activation: tanh=3, relu=3",
+            str(final_diagnostics["adaptive_category_coverage"]),
+        )
+
+    def test_categorical_levels_expand_too_small_initial_stage(self) -> None:
+        candidates = [
+            {"activation": activation, "learning_rate": learning_rate}
+            for learning_rate in (0.001, 0.002, 0.003)
+            for activation in ("tanh", "relu", "sigmoid")
+        ]
+        args = argparse.Namespace(
+            selection_metric="rmse_abs",
+            require_passive=False,
+            max_passivity_violations=None,
+            max_passivity_sigma=None,
+            adaptive_initial_trials=2,
+            adaptive_exploration=1.5,
+            adaptive_log_parameters={"learning_rate"},
+            adaptive_categorical_values={
+                "activation": ["tanh", "relu", "sigmoid"]
+            },
+            max_trials=5,
+        )
+        selected: list[int] = []
+        remaining = list(range(len(candidates)))
+        rows: list[dict[str, object]] = []
+        stages: list[str] = []
+        for trial in range(3):
+            index, diagnostics = select_adaptive_candidate(
+                candidates,
+                remaining_indices=remaining,
+                selected_indices=selected,
+                rows=rows,
+                args=args,
+                columns=["activation", "learning_rate"],
+            )
+            remaining.remove(index)
+            selected.append(index)
+            rows.append({"rmse_abs": 0.5 - 0.05 * trial})
+            stages.append(str(diagnostics["adaptive_stage"]))
+        self.assertEqual(stages, ["initial_maximin"] * 3)
+        self.assertEqual(
+            {candidates[index]["activation"] for index in selected},
+            {"tanh", "relu", "sigmoid"},
+        )
+
+    def test_gp_stage_preserves_configured_categorical_coverage_floor(self) -> None:
+        candidates = [
+            {"activation": activation, "learning_rate": learning_rate}
+            for learning_rate in np.linspace(0.0005, 0.01, 20)
+            for activation in ("tanh", "relu")
+        ]
+        args = argparse.Namespace(
+            selection_metric="rmse_abs",
+            require_passive=False,
+            max_passivity_violations=None,
+            max_passivity_sigma=None,
+            adaptive_initial_trials=4,
+            adaptive_exploration=0.0,
+            adaptive_category_balance=0.5,
+            adaptive_log_parameters={"learning_rate"},
+            adaptive_categorical_values={"activation": ["tanh", "relu"]},
+            max_trials=20,
+        )
+        selected: list[int] = []
+        remaining = list(range(len(candidates)))
+        rows: list[dict[str, object]] = []
+        for _trial in range(20):
+            index, _diagnostics = select_adaptive_candidate(
+                candidates,
+                remaining_indices=remaining,
+                selected_indices=selected,
+                rows=rows,
+                args=args,
+                columns=["activation", "learning_rate"],
+            )
+            remaining.remove(index)
+            selected.append(index)
+            rows.append(
+                {
+                    "rmse_abs": (
+                        0.01
+                        if candidates[index]["activation"] == "relu"
+                        else 1.0
+                    )
+                }
+            )
+        counts = {
+            value: sum(candidates[index]["activation"] == value for index in selected)
+            for value in ("tanh", "relu")
+        }
+        self.assertGreaterEqual(counts["tanh"], 5)
+        self.assertGreater(counts["relu"], counts["tanh"])
+
     def test_all_ineligible_trials_still_write_complete_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = Path(temp_dir) / "sweep"
@@ -119,7 +276,7 @@ class AdaptiveSweepTests(unittest.TestCase):
                 trial_seed_mode="fixed",
                 trial_worst_plots=0,
                 worst_plots=0,
-                keep_trial_models=True,
+                keep_trial_models=False,
                 retrain_best=False,
                 epochs=10,
                 mode="adaptive",
@@ -138,6 +295,21 @@ class AdaptiveSweepTests(unittest.TestCase):
                 trial_dir = Path(out_text) / "trials" / f"trial_{trial:04d}"
                 trial_dir.mkdir(parents=True, exist_ok=True)
                 metric = 0.3 if trial == 1 else 0.2
+                with (trial_dir / "verification_metrics.csv").open(
+                    "w", newline=""
+                ) as stream:
+                    writer = csv.DictWriter(
+                        stream,
+                        fieldnames=["source_index", "evm_pct", "width"],
+                    )
+                    writer.writeheader()
+                    writer.writerow(
+                        {
+                            "source_index": trial,
+                            "evm_pct": metric,
+                            "width": candidate["learning_rate"],
+                        }
+                    )
                 return {
                     "trial": trial,
                     "candidate": candidate,
@@ -193,6 +365,28 @@ class AdaptiveSweepTests(unittest.TestCase):
             payload = json.loads((out_dir / "best.json").read_text())
             self.assertEqual(payload["status"], "no_eligible_trial")
             self.assertEqual(payload["best_available_trial"], 2)
+            self.assertEqual(payload["point_generation_trial"], 2)
+            self.assertFalse(payload["point_generation_export_eligible"])
+            fallback_dir = out_dir / "point_generation_fallback"
+            self.assertTrue((fallback_dir / "verification_metrics.csv").is_file())
+            fallback_source = json.loads(
+                (fallback_dir / "point_generation_source.json").read_text()
+            )
+            self.assertEqual(fallback_source["source_trial"], 2)
+            self.assertEqual(
+                fallback_source["purpose"], "gp_point_generation_only"
+            )
+            self.assertFalse(fallback_source["eligible_for_export"])
+            self.assertFalse(
+                (
+                    out_dir
+                    / "trials"
+                    / "trial_0002"
+                    / "verification_metrics.csv"
+                ).exists()
+            )
+            self.assertIn("## GP Point-Generation Fallback", summary_text)
+            self.assertIn("--allow-nonpassive", summary_text)
             stats_path = (
                 out_dir
                 / "sweep_diagnostics"
@@ -222,12 +416,19 @@ class AdaptiveSweepTests(unittest.TestCase):
                 "learning_rate=1e-4:5e-3:log",
                 "--optimize-parameter",
                 "hidden_layers=1:3x32:128",
+                "--optimize-parameter",
+                "activation=tanh,relu",
             ]
         )
         candidates = dnn.sweep_candidate_grid(args)
         self.assertGreaterEqual(len(candidates), 8)
         self.assertEqual(args.adaptive_result_columns[:4], dnn.DNN_SWEEP_RESULT_COLUMNS)
         self.assertIn("learning_rate", args.adaptive_log_parameters)
+        self.assertEqual(
+            args.adaptive_categorical_values,
+            {"activation": ["tanh", "relu"]},
+        )
+        self.assertEqual(args.adaptive_category_balance, 0.5)
 
     def test_kbnn_adaptive_trial_applies_dynamic_training_controls(self) -> None:
         parser = kbnn.build_arg_parser()

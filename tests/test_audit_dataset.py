@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -60,6 +61,40 @@ def generated_geometry_json(root: Path, stem: str = "geometries") -> Path:
 
 
 class DatasetAuditTests(unittest.TestCase):
+    def test_terminal_audit_verdict_colors(self) -> None:
+        class TerminalStream(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        expected = {
+            "PASS": "\033[32m",
+            "WARNING": "\033[33m",
+            "FAIL": "\033[31m",
+        }
+        with mock.patch.object(AUDIT.os, "environ", {"TERM": "xterm-256color"}):
+            for verdict, color in expected.items():
+                with self.subTest(verdict=verdict):
+                    self.assertEqual(
+                        AUDIT.format_audit_verdict_line(verdict, TerminalStream()),
+                        f"{color}dataset audit: {verdict}\033[0m",
+                    )
+
+    def test_nonterminal_and_no_color_audit_verdicts_remain_plain(self) -> None:
+        self.assertEqual(
+            AUDIT.format_audit_verdict_line("PASS", io.StringIO()),
+            "dataset audit: PASS",
+        )
+
+        class TerminalStream(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        with mock.patch.object(AUDIT.os, "environ", {"NO_COLOR": "1"}):
+            self.assertEqual(
+                AUDIT.format_audit_verdict_line("FAIL", TerminalStream()),
+                "dataset audit: FAIL",
+            )
+
     def test_passive_consistent_dataset_passes_and_writes_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

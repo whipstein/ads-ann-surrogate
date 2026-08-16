@@ -82,6 +82,7 @@ and ADS export helpers live in `surrogate_common.py`.
 |-- dnn.py                                DNN backend and implementation
 |-- kbnn.py                               KBNN backend and implementation
 |-- neuro_tf.py                           Neuro-TF backend and implementation
+|-- cli_options.py                        Shared structured options-JSON loading and validation
 |-- surrogate_common.py                   Shared training, reporting, and ADS export utilities
 |-- generate_points.py                    Internal point-generation implementation
 |-- audit_dataset.py                      Internal MDIF-audit implementation
@@ -91,6 +92,7 @@ and ADS export helpers live in `surrogate_common.py`.
 |-- kbnn_sample_fine.mdif
 |-- kbnn_sample_coarse.mdif
 |-- neuro_tf_sample_training_verification.mdif
+|-- options.example.json                  Reusable options-JSON template
 |-- MODEL_PLUGIN_API.md                   Guide for adding another model family
 `-- README.md                              Integrated workflow and command reference
 ```
@@ -110,6 +112,90 @@ dispatcher calls the relevant internal script and returns its exit status:
 
 Run `python3 surrogate.py --help` for the routes above, then append `--help` to
 the selected route or model command for its complete option list.
+
+### Reusable Options JSON
+
+Use `--options-json PATH` with any primary command to keep stable settings out
+of command history. Explicit CLI options always override JSON values, so a
+saved baseline can be reused and changed one setting at a time:
+
+```bash
+python3 surrogate.py --model dnn optimize \
+  --options-json options.json \
+  --mdif train_verify.mdif \
+  --out-dir dnn_opt \
+  --max-trials 40
+```
+
+[`options.example.json`](options.example.json) is a complete starting template.
+Its structure is:
+
+```json
+{
+  "schema_version": 1,
+  "common": {},
+  "commands": {
+    "fit": {
+      "frequency_weights": "default=1;1GHz=3;2GHz:4GHz=2",
+      "passivity_mode": "auto",
+      "reciprocity_mode": "enforce",
+      "seed": 1234
+    },
+    "optimize": {
+      "require_passive": true,
+      "selection_metric": "weighted_evm_pct"
+    }
+  },
+  "models": {
+    "dnn": {
+      "commands": {
+        "fit": {
+          "sparam_weights": "diag=1;offdiag=0.2"
+        }
+      }
+    }
+  },
+  "workflows": {
+    "audit": {
+      "common": {
+        "expect_reciprocal": true
+      }
+    }
+  }
+}
+```
+
+The headings have deliberately narrow meanings:
+
+| Heading | Applies to |
+| --- | --- |
+| Root `common` or `generic` | Every command that uses this JSON. Keep this empty unless an option truly exists on every intended command. Flat root option keys are accepted as shorthand. |
+| Root `commands` | Every matching command. The special `fit` heading means `train` and `optimize`; `export` means every `export-*` command; `all` means every command. |
+| `models.MODEL.common` | Every selected command for only `dnn`, `kbnn`, or `neuro-tf`. Flat option keys inside a model section are shorthand for this level. |
+| `models.MODEL.commands` | A command or command-group override for one model family. This is the right place for DNN/KBNN S-parameter weights. |
+| `workflows.WORKFLOW.common` | Defaults for only `points`, `audit`, or `hb-report`. |
+| `workflows.WORKFLOW.commands` | Per-command workflow defaults, such as separate `generate` and `suggest-additional` point settings. |
+
+Values are merged from broad to specific: root common, root command, selected
+model/workflow common, then selected model/workflow command. The CLI has final
+precedence. Option keys may use hyphens or underscores and may include or omit
+the leading `--`. JSON arrays supply repeatable or multi-value options;
+booleans supply flag options; `null` leaves the parser default unchanged.
+Unknown options, invalid choices, invalid types, misspelled headings, and
+unsupported schema versions stop before the command runs.
+
+Good candidates for persistent JSON defaults are:
+
+| Scope | Recommended stable options |
+| --- | --- |
+| All fits | `frequency_weights`, `passivity_mode`, `passivity_margin`, `reciprocity_mode`, `reciprocity_tolerance`, `seed`, `progress_interval`, `dc_open_threshold`, and `dc_open_resistance` |
+| DNN fits | `sparam_weights`, `output_domain`, `target_z0`, and `max_y_condition` |
+| KBNN fits | `sparam_weights`, `coarse_sparam_weights`, `coarse_frequency_weights`, `mode`, coarse-network architecture, and coarse progress settings |
+| Neuro-TF fits | `order`, `pole_damping`, and `ridge` |
+| Optimization | `selection_metric`, `require_passive`, passivity limits, `trial_seed_mode`, `trial_worst_plots`, and adaptive-search controls |
+| Exact export command | `module_name`, `parameter_input_scales`, `z0`, `dc_port_paths`, and DC thresholds; use the exact command heading because not every export accepts every option |
+| Audit | `expect_reciprocal` and the passivity, reciprocity, grid, duplicate, and neighbor tolerances |
+| Point generation/update | Initial method and rounding, or GP acquisition, exploration, candidate-pool, and minimum-distance settings |
 
 For a single lookup location, use [Appendix D: Complete CLI Command and Option
 Reference](#appendix-d-complete-cli-command-and-option-reference). It lists
@@ -433,6 +519,12 @@ reported in the coverage CSV for diagnosis, but does not create a warning when
 it remains inside the declared range. Use `--fail-on-warnings` for CI-style
 strict checking.
 
+When standard output is an interactive terminal, the first status line is
+green for `PASS`, yellow for `WARNING`, and red for `FAIL`. Redirected output,
+captured logs, and Markdown/JSON artifacts remain plain text. Set the standard
+`NO_COLOR` environment variable, or use a terminal with `TERM=dumb`, to disable
+ANSI color explicitly.
+
 For example, a frequency-grid warning now identifies both the reason and what
 to inspect:
 
@@ -661,10 +753,28 @@ The practical workflow is:
 `--adaptive-candidate-pool` is the number of unevaluated configurations made
 available to the optimizer; it is not the number of models fitted.
 `--max-trials` is the fitting budget. `--adaptive-initial-trials` controls how
-many maximin-separated trials run before GP guidance, and
-`--adaptive-exploration` controls how strongly the later lower-confidence-bound
-selection favors uncertain regions. Adaptive fitting is sequential and forces
-one job because every new selection uses the preceding trial results.
+many category-balanced, maximin-separated trials run before GP guidance. For
+every categorical `--optimize-parameter`, the initial selector first minimizes
+unseen and underrepresented levels, then maximizes distance among candidates
+with equally good category balance. If the requested initial count is smaller
+than the largest categorical domain, it is automatically raised enough to try
+each level once when the total trial budget permits. This balances each
+categorical parameter marginally without requiring every Cartesian combination.
+After initialization, the GP may deliberately favor a better-performing
+category, but `--adaptive-category-balance 0.5` keeps every level at no less
+than half of its equal-allocation count by default. Set it to `1` for nearly
+equal marginal coverage throughout the search or `0` for unrestricted GP
+exploitation after initialization. The report's `Categorical coverage` column
+shows cumulative counts at every trial. `--adaptive-exploration` controls how strongly the later
+lower-confidence-bound selection favors uncertain regions. Adaptive fitting is
+sequential and forces one job because every new selection uses the preceding
+trial results.
+
+In the sweep Markdown table, `Trial` is the chronological iteration and
+`Rank` is the final post-fit ordering. `Metric` is the measured selection
+error, while `Predicted objective` is the value estimated before that trial
+ran. `Categorical coverage` gives the cumulative per-level counts as of that
+trial; the model-specific `*_sweep_results.csv` is sorted directly by trial.
 
 Supported adaptive domains by model are:
 
@@ -688,6 +798,7 @@ python3 surrogate.py --model dnn optimize \
   --optimize-parameter 'hidden_layers=1:4x32:256:log' \
   --adaptive-initial-trials 8 \
   --adaptive-candidate-pool 768 \
+  --adaptive-category-balance 0.5 \
   --adaptive-exploration 1.5 \
   --max-trials 32 \
   --selection-metric weighted_evm_pct \
@@ -1034,7 +1145,7 @@ Assume:
 - `geometries.json` is the companion metadata written when that CSV was
   generated and contains the parameter names, ranges, units, and linear/log
   scaling;
-- `outputs/dnn_adaptive/best_model/` is the winning optimize result; and
+- `outputs/dnn_adaptive/` is the optimize result containing `best_model/`; and
 - the fit's verification metrics use the same geometry parameters.
 
 Request eight additional training geometries with this complete command:
@@ -1042,7 +1153,7 @@ Request eight additional training geometries with this complete command:
 ```bash
 python3 surrogate.py points suggest-additional \
   --count 8 \
-  --fit-dir outputs/dnn_adaptive/best_model \
+  --fit-dir outputs/dnn_adaptive \
   --existing-points geometries.csv \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -1065,7 +1176,7 @@ The important inputs are:
 
 | Input | Purpose |
 | --- | --- |
-| `--fit-dir` | Directory containing the current fit's `verification_metrics.csv`. For a successful optimize run, use its `best_model/` directory. |
+| `--fit-dir` | Current fit/model directory or optimize/sweep root. A successful sweep root resolves `best_model/` automatically. If every completed model failed only the passivity criteria, add `--allow-nonpassive` to use its retained acquisition-only error observations. |
 | `--existing-points` | CSV of already simulated geometries that must not be suggested again. Its same-stem JSON is loaded automatically as the parameter domain. Repeat for multiple CSVs. `--existing-mdif` can be used together with it. |
 | `--parameter-json` | Explicit geometry metadata source when no original point CSV is supplied, such as an MDIF-only workflow. It is normally unnecessary. |
 | `--parameter` | Optional backward-compatible domain override. Repeat it for every parameter only when intentionally bypassing the generated JSON. |
@@ -1137,17 +1248,18 @@ audit set that never supplies GP error observations.
 | Current model result | GP error input |
 | --- | --- |
 | Direct `train` run | `--fit-dir outputs/dnn_model` (or the corresponding KBNN/Neuro-TF model directory) |
-| Successful DNN optimize run | `--fit-dir outputs/dnn_adaptive/best_model` |
-| Successful KBNN optimize run | `--fit-dir outputs/kbnn_adaptive/best_model` |
-| Successful Neuro-TF optimize run | `--fit-dir outputs/neuro_tf_adaptive/best_model` |
-| All optimize trials failed the passivity criteria | Run optimize with `--keep-trial-models`, take `best_available_trial` from the best-config JSON, and use `--verification-metrics <sweep>/trials/trial_NNNN/verification_metrics.csv`. |
+| Successful DNN optimize run | `--fit-dir outputs/dnn_adaptive` (the selector resolves `best_model/`) |
+| Successful KBNN optimize run | `--fit-dir outputs/kbnn_adaptive` (the selector resolves `best_model/`) |
+| Successful Neuro-TF optimize run | `--fit-dir outputs/neuro_tf_adaptive` (the selector resolves `best_model/`) |
+| All optimize trials failed only the passivity criteria | `--fit-dir <sweep> --allow-nonpassive` uses the automatically retained lowest-error completed trial for point selection only. |
 
-For example, if an all-ineligible report identifies one-based trial 7:
+For example, after an all-passivity-ineligible DNN optimize run:
 
 ```bash
 python3 surrogate.py points suggest-additional \
   --count 8 \
-  --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
+  --fit-dir outputs/dnn_adaptive \
+  --allow-nonpassive \
   --existing-points geometries.csv \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -1324,10 +1436,10 @@ generation options.
 
 #### GP Additions From a Successful DNN Optimize Run
 
-For an optimize or sweep result, point `--fit-dir` at `best_model/`, not at the
-sweep root. The promoted model directory contains the winning trial's
-`verification_metrics.csv`. `--existing-mdif` prevents the selector from
-requesting a geometry already present in the simulated MDIF:
+For an optimize or sweep result, `--fit-dir` may point at either the sweep root
+or `best_model/`. From the sweep root, the selector automatically resolves the
+promoted model's `verification_metrics.csv`. `--existing-mdif` prevents the
+selector from requesting a geometry already present in the simulated MDIF:
 
 ```bash
 python3 surrogate.py points suggest-additional \
@@ -1401,15 +1513,16 @@ python3 surrogate.py points suggest-additional \
 
 #### GP Additions When Every Optimize Trial Failed Passivity
 
-An all-ineligible sweep has no `best_model/`. Run the optimization with
-`--keep-trial-models`, open its Markdown report, and use the closest available
-trial identified there. For example, if the report identifies trial 7, point
-directly to that retained trial's metrics:
+An all-ineligible sweep has no `best_model/`. The sweep now retains the
+verification errors from the completed trial with the lowest raw selection
+metric under `point_generation_fallback/`; it does not retain or promote that
+trial's model files. Explicitly opt in to those observations:
 
 ```bash
 python3 surrogate.py points suggest-additional \
   --count 10 \
-  --verification-metrics outputs/dnn_adaptive/trials/trial_0007/verification_metrics.csv \
+  --fit-dir outputs/dnn_adaptive \
+  --allow-nonpassive \
   --parameter-json geometries.json \
   --existing-mdif train_verify.mdif \
   --acquisition gp-ucb \
@@ -1424,10 +1537,14 @@ python3 surrogate.py points suggest-additional \
   --out outputs/gp_from_ineligible_trial.csv
 ```
 
-The `best_available_trial` field in the sweep's best-config JSON gives the same
-one-based trial number. Without `--keep-trial-models`, nonwinning trial
-`verification_metrics.csv` files are intentionally removed after the sweep,
-so they cannot be used for a later GP round.
+The sweep best-config JSON records `point_generation_trial`,
+`point_generation_metric`, and `point_generation_fallback_dir`. The fallback's
+`point_generation_source.json` repeats the source trial, metric, and passivity
+result and marks `eligible_for_export` as `false`. This mechanism supplies an
+error surface for GP acquisition only: it does not classify the failed model
+as acceptable, make it exportable, or weaken passivity checks during refitting.
+Only the selected fallback CSV is retained, so `--keep-trial-models` is no
+longer required for this workflow.
 
 #### A Second GP Acquisition Round
 
@@ -1680,6 +1797,7 @@ unambiguous.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: non-GP <code>error-distance</code> or Matérn-5/2 <code>gp-ucb</code>. Default: <code>gp-ucb</code>. | <nobr><code>--acquisition error-distance</code></nobr> |
+| <nobr><code>--allow-nonpassive</code></nobr> | <code>suggest-additional</code> | Allows an all-passivity-ineligible optimize/sweep run's retained verification errors to drive point selection. This is an explicit acquisition-only opt-in and never makes the source model exportable. | <nobr><code>--fit-dir outputs/dnn_adaptive --allow-nonpassive</code></nobr> |
 | <nobr><code>--exploration-weight FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative GP-UCB multiplier $\kappa$ on posterior log-error uncertainty. Default: <code>2.0</code>. | <nobr><code>--exploration-weight 2.5</code></nobr> |
 | <nobr><code>--gp-error-floor FLOAT</code></nobr> | <code>suggest-additional</code> | Positive floor applied before taking the natural logarithm of geometry error. Default: <code>1e-12</code>. | <nobr><code>--gp-error-floor 1e-9</code></nobr> |
 | <nobr><code>--gp-length-scale FLOAT</code></nobr> | <code>suggest-additional</code> | Optional positive Matérn-5/2 length scale in normalized geometry coordinates. When omitted, it is selected by log marginal likelihood. | <nobr><code>--gp-length-scale 0.4</code></nobr> |
@@ -1708,7 +1826,7 @@ unambiguous.
 | <nobr><code>--candidate-count INT</code></nobr> | <code>suggest-additional</code> | Positive candidate-pool size. Default: the greater of 1000 and <code>count * candidate-factor</code>. | <nobr><code>--candidate-count 5000</code></nobr> |
 | <nobr><code>--candidate-factor INT</code></nobr> | <code>suggest-additional</code> | Positive candidate multiplier used when <code>--candidate-count</code> is omitted. Default: <code>200</code>. | <nobr><code>--candidate-factor 300</code></nobr> |
 | <nobr><code>--existing-mdif PATH</code></nobr> | <code>suggest-additional</code> | Repeatable MDIF containing previously simulated parameter points to avoid. | <nobr><code>--existing-mdif training.mdif</code></nobr> |
-| <nobr><code>--fit-dir PATH</code></nobr> | <code>suggest-additional</code> | Fit directory containing <code>verification_metrics.csv</code>. Ignored when <code>--verification-metrics</code> is given. | <nobr><code>--fit-dir outputs/dnn_model</code></nobr> |
+| <nobr><code>--fit-dir PATH</code></nobr> | <code>suggest-additional</code> | Direct fit/model directory or optimize/sweep root. A sweep root resolves <code>best_model/verification_metrics.csv</code>, or its acquisition-only fallback when <code>--allow-nonpassive</code> is present. Ignored when <code>--verification-metrics</code> is given. | <nobr><code>--fit-dir outputs/dnn_adaptive</code></nobr> |
 | <nobr><code>--focus-power FLOAT</code></nobr> | <code>suggest-additional</code> | With <code>--acquisition error-distance</code>, non-negative exponent applied to verification-error scores. Default: <code>1.0</code>. | <nobr><code>--focus-power 1.5</code></nobr> |
 | <nobr><code>--focus-radius FLOAT</code></nobr> | <code>suggest-additional</code> | With <code>--acquisition error-distance</code>, positive unit-cube radius around high-error verification points. Default: <code>0.25</code>. | <nobr><code>--focus-radius 0.2</code></nobr> |
 | <nobr><code>--metric NAME</code></nobr> | <code>suggest-additional</code> | Verification-metrics column used to target errors; <code>auto</code> selects a known available metric. Default: <code>evm_pct</code>. | <nobr><code>--metric auto</code></nobr> |
@@ -2859,9 +2977,10 @@ the **Subcommands** column includes accepted command aliases.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--adaptive-candidate-pool INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Raw candidate configurations requested for adaptive search. The generator requests at least `--max-trials`, removes duplicates, and warns if the requested ranges contain fewer unique configurations. Must be positive. Default: `512`. | <nobr><code>--adaptive-candidate-pool 768</code></nobr> |
+| <nobr><code>--adaptive-category-balance FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Categorical coverage floor during GP-guided trials, expressed from `0` (unrestricted after balanced initialization) to `1` (nearly equal marginal counts). Default: `0.5`. | <nobr><code>--adaptive-category-balance 0.75</code></nobr> |
 | <nobr><code>--adaptive-exploration FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Non-negative GP lower-confidence-bound uncertainty multiplier. Larger values explore uncertain configurations more strongly. Default: `1.5`. | <nobr><code>--adaptive-exploration 2</code></nobr> |
 | <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
-| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximin-separated trials evaluated before GP guidance. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
+| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Category-balanced, maximin-separated trials evaluated before GP guidance. Categorical marginal counts differ by at most one when the candidate pool permits; the count is raised to cover every level once if necessary. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir dnn_sweep/best_model_passive</code></nobr> |
 | <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
@@ -3601,9 +3720,10 @@ the **Subcommands** column includes accepted command aliases.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--adaptive-candidate-pool INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Raw candidate configurations requested for adaptive search. The generator requests at least `--max-trials`, removes duplicates, and warns if the requested ranges contain fewer unique configurations. Must be positive. Default: `512`. | <nobr><code>--adaptive-candidate-pool 768</code></nobr> |
+| <nobr><code>--adaptive-category-balance FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Categorical coverage floor during GP-guided trials, expressed from `0` (unrestricted after balanced initialization) to `1` (nearly equal marginal counts). Default: `0.5`. | <nobr><code>--adaptive-category-balance 0.75</code></nobr> |
 | <nobr><code>--adaptive-exploration FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Non-negative GP lower-confidence-bound uncertainty multiplier. Larger values explore uncertain configurations more strongly. Default: `1.5`. | <nobr><code>--adaptive-exploration 2</code></nobr> |
 | <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
-| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximin-separated trials evaluated before GP guidance. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
+| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Category-balanced, maximin-separated trials evaluated before GP guidance. Categorical marginal counts differ by at most one when the candidate pool permits; the count is raised to cover every level once if necessary. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir kbnn_sweep/best_model_passive</code></nobr> |
 | <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
@@ -4016,9 +4136,10 @@ the **Subcommands** column includes accepted command aliases.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--adaptive-candidate-pool INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Raw candidate configurations requested for adaptive search. The generator requests at least `--max-trials`, removes duplicates, and warns if the requested ranges contain fewer unique configurations. Must be positive. Default: `512`. | <nobr><code>--adaptive-candidate-pool 768</code></nobr> |
+| <nobr><code>--adaptive-category-balance FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Categorical coverage floor during GP-guided trials, expressed from `0` (unrestricted after balanced initialization) to `1` (nearly equal marginal counts). Default: `0.5`. | <nobr><code>--adaptive-category-balance 0.75</code></nobr> |
 | <nobr><code>--adaptive-exploration FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Non-negative GP lower-confidence-bound uncertainty multiplier. Larger values explore uncertain configurations more strongly. Default: `1.5`. | <nobr><code>--adaptive-exploration 2</code></nobr> |
 | <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
-| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximin-separated trials evaluated before GP guidance. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
+| <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Category-balanced, maximin-separated trials evaluated before GP guidance. Categorical marginal counts differ by at most one when the candidate pool permits; the count is raised to cover every level once if necessary. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
 | <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
@@ -5465,6 +5586,17 @@ chosen length scale, selection mode, nugget, exploration weight, and log
 marginal likelihood. The companion `*_fit_error_regions.csv` ranks the source
 error geometries used by both acquisition modes.
 
+When passivity criteria reject every completed optimize trial, the sweep
+retains one acquisition source at
+`point_generation_fallback/verification_metrics.csv`. This is the completed
+trial with the lowest finite raw selection metric, because the purpose of this
+fallback is to locate geometry-dependent fitting error rather than to promote
+a nearly passive model. Its `point_generation_source.json` records the source
+trial, error metric, and passivity result. `suggest-additional` will use the
+file only with `--allow-nonpassive`, writes that provenance into the suggested
+points JSON, and prints a warning. No model weights are placed in the fallback
+directory, and the source remains ineligible for ADS or Verilog-A export.
+
 Practical tuning guidance:
 
 | Observation | Adjustment |
@@ -5567,9 +5699,32 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 | Option | Applies to | Explanation | Example |
 | --- | --- | --- | --- |
 | `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help` |
+| `--options-json PATH` | Every primary command | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model` |
 | `workflow` | Non-model commands | Positional route: `points`, `audit`, or `hb-report`. | `python3 surrogate.py points generate --help` |
 
-### D.3 Point generation options
+### D.3 Options JSON schema and precedence
+
+The full reusable-options explanation and recommended groups are in
+[Reusable Options JSON](#reusable-options-json), and the copyable template is
+[`options.example.json`](options.example.json).
+
+| JSON location | Merge order | Typical contents | Example |
+| --- | ---: | --- | --- |
+| Root flat keys, `generic`, or `common` | 1 | A true catchall for every intended invocation. | `"seed": 1234` |
+| Root `commands.all`, `commands.fit`/`commands.export`, then exact command | 2 | Cross-model command defaults. | `"fit": {"frequency_weights": "default=1;1GHz=3"}` |
+| Selected `models.MODEL` or `workflows.WORKFLOW` flat/common keys | 3 | Family- or workflow-wide defaults. | `"audit": {"common": {"expect_reciprocal": true}}` |
+| Selected scope's `commands` group and exact command | 4 | The most specific JSON override. | `"dnn": {"commands": {"fit": {"sparam_weights": "diag=1;offdiag=0.2"}}}` |
+| Explicit command line | 5 | One-run changes; always highest precedence. | `--frequency-weights 'default=2;5GHz=8'` |
+
+Keys may use `frequency_weights`, `frequency-weights`, or
+`--frequency-weights`. Scalars retain normal parser typing, JSON booleans set
+flag options, arrays set repeatable/multi-value options, and `null` leaves the
+built-in default unchanged. A JSON value can satisfy a normally required
+option such as `mdif` or `out_dir`, although keeping run-specific paths on the
+CLI is usually clearer. The selected command rejects unknown keys or invalid
+values before doing work.
+
+### D.4 Point generation options
 
 Options are alphabetized. The **generate** and **suggest** labels below mean
 `points generate` and `points suggest-additional`.
@@ -5594,14 +5749,15 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | `--verification-count INT` | Generate | Number of new tail points labeled verification. Default: `0`; range extension preserves the original split ratio when omitted. | `--verification-count 8` |
 | `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files; JSON and coverage PNG remain combined. | `--write-split-files` |
 
-### D.4 Adaptive additional-point options
+### D.5 Adaptive additional-point options
 
 These options apply only to `points suggest-additional`; the shared sampling
-options in D.3 also apply where marked.
+options in D.4 also apply where marked.
 
 | Option | Explanation | Example |
 | --- | --- | --- |
 | `--acquisition {gp-ucb,error-distance}` | Selection method. Default: `gp-ucb`; `error-distance` is the legacy non-GP selector. | `--acquisition gp-ucb` |
+| `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive` |
 | `--analysis-out PATH` | Ranked current-fit error-region CSV. Default: `<out>_fit_error_regions.csv`. | `--analysis-out additions_regions.csv` |
 | `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, count * candidate-factor)`. | `--candidate-count 4000` |
 | `--candidate-factor INT` | Candidate multiplier when `--candidate-count` is omitted. Default: `200`. | `--candidate-factor 300` |
@@ -5609,7 +5765,7 @@ options in D.3 also apply where marked.
 | `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. | `--existing-mdif train_verify.mdif` |
 | `--existing-points PATH` | Repeatable CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. | `--existing-points geometries.csv` |
 | `--exploration-weight FLOAT` | GP-UCB uncertainty multiplier; larger values explore more. Default: `2.0`. | `--exploration-weight 2.5` |
-| `--fit-dir PATH` | Fit or best-model directory containing `verification_metrics.csv`. | `--fit-dir dnn_opt/best_model` |
+| `--fit-dir PATH` | Fit/model directory or optimize/sweep root. A sweep root resolves `best_model/verification_metrics.csv`, or `point_generation_fallback/verification_metrics.csv` with `--allow-nonpassive`. | `--fit-dir dnn_opt` |
 | `--focus-power FLOAT` | Exponent on measured verification-error scores for legacy error-distance selection. Default: `1.0`. | `--focus-power 1.5` |
 | `--focus-radius FLOAT` | Normalized radius around high-error verification points for legacy selection. Default: `0.25`. | `--focus-radius 0.2` |
 | `--gp-error-floor FLOAT` | Positive floor before the GP log-error transform. Default: `1e-12`. | `--gp-error-floor 1e-10` |
@@ -5637,7 +5793,7 @@ python3 surrogate.py points suggest-additional \
   --out additions.csv
 ```
 
-### D.5 Dataset audit options
+### D.6 Dataset audit options
 
 All options apply to `audit` and are alphabetized.
 
@@ -5668,7 +5824,7 @@ All options apply to `audit` and are alphabetized.
 | `--verification-mdif PATH` | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif` |
 | `--verify-values LIST` | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification` |
 
-### D.6 Shared model fitting options
+### D.7 Shared model fitting options
 
 Unless stated otherwise, these options apply to all models for both `train` and
 `optimize`. Defaults are the same across models except where noted.
@@ -5703,7 +5859,7 @@ Unless stated otherwise, these options apply to all models for both `train` and
 | `--verify-values LIST` | All-model fit | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification` |
 | `--worst-plots INT` | All-model fit | Number of worst verification S/Y plot pairs. Default: `6`; `0` disables. | `--worst-plots 4` |
 
-### D.7 Optimization and reranking options
+### D.8 Optimization and reranking options
 
 `optimize` and `sweep` are identical commands. These options apply to all-model
 optimize unless the applicability column says otherwise.
@@ -5712,9 +5868,10 @@ optimize unless the applicability column says otherwise.
 | --- | --- | --- | --- |
 | `--activations LIST` | All-model optimize | Comma-separated activation candidates; aliases are `--activation-options` and single-value `--activation`. Default: `tanh,relu`. | `--activations tanh,relu` |
 | `--adaptive-candidate-pool INT` | All-model optimize | Candidate configurations considered by adaptive search. Default: `512`. | `--adaptive-candidate-pool 768` |
+| `--adaptive-category-balance FLOAT` | All-model optimize | GP-stage categorical coverage floor from `0` (unrestricted after balanced initialization) to `1` (nearly equal marginal counts). Default: `0.5`. | `--adaptive-category-balance 0.75` |
 | `--adaptive-exploration FLOAT` | All-model optimize | GP lower-confidence-bound uncertainty multiplier. Default: `1.5`. | `--adaptive-exploration 2` |
 | `--adaptive-hidden-width-step INT` | All-model optimize | Width quantization for structured hidden-layer ranges. Default: `8`. | `--adaptive-hidden-width-step 16` |
-| `--adaptive-initial-trials INT` | All-model optimize | Space-filling trials completed before GP guidance. Default: `6`. | `--adaptive-initial-trials 8` |
+| `--adaptive-initial-trials INT` | All-model optimize | Category-balanced, maximin-separated trials before GP guidance. Marginal category counts differ by at most one when possible, and the count is raised to cover all levels once when needed. Default: `6`. | `--adaptive-initial-trials 8` |
 | `--best-model-dir PATH` | DNN/KBNN `rerank-sweep` | Destination used by `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | `--best-model-dir dnn_opt/best_passive` |
 | `--jobs INT` | All-model optimize | Parallel workers for grid/random search; adaptive search is sequential. Default: `1`. | `--jobs 4` |
 | `--keep-trial-models` | All-model optimize | Retains every full trial model so a later rerank can promote it. | `--keep-trial-models` |
@@ -5734,7 +5891,7 @@ optimize unless the applicability column says otherwise.
 | `--trial-seed-mode {fixed,indexed}` | All-model optimize | `fixed` reuses `--seed`; `indexed` uses seed plus trial number. Default: `fixed`. | `--trial-seed-mode fixed` |
 | `--trial-worst-plots INT` | All-model optimize | Worst-case plot pairs written per trial. Default: `1`; `0` speeds large searches. | `--trial-worst-plots 0` |
 
-### D.8 DNN-only fitting options
+### D.9 DNN-only fitting options
 
 | Option | Applies to | Explanation | Example |
 | --- | --- | --- | --- |
@@ -5746,7 +5903,7 @@ optimize unless the applicability column says otherwise.
 | `--sparam-weights SPEC` | DNN fit | S-parameter loss and weighted-selection priorities; rules are applied left to right. | `--sparam-weights 'diag=1;offdiag=0.2'` |
 | `--target-z0 FLOAT` | DNN fit | Reference impedance used to build direct-Y targets. Default: `50`. | `--target-z0 50` |
 
-### D.9 KBNN-only fitting options
+### D.10 KBNN-only fitting options
 
 The fine fit must receive exactly one reusable coarse source for `residual` or
 `prior-input`: either `--coarse-mdif` to fit it jointly or
@@ -5779,7 +5936,7 @@ The fine fit must receive exactly one reusable coarse source for `residual` or
 | `--passivity-penalty FLOAT` | KBNN fit | Reconstructed fine-response passivity-loss weight. Default: `10`. | `--passivity-penalty 20` |
 | `--sparam-weights SPEC` | KBNN fit | Fine loss and weighted-selection priorities. | `--sparam-weights 'diag=1;offdiag=0.2'` |
 
-### D.10 Neuro-TF-only fitting options
+### D.11 Neuro-TF-only fitting options
 
 Neuro-TF does not expose `--sparam-weights`; use `--frequency-weights` and the
 response/passivity selection metrics. The rational coefficient fit is shared by
@@ -5794,7 +5951,7 @@ all S-parameters.
 | `--ridge FLOAT` | Neuro-TF `train`; single-value optimize form | Ridge regularization for rational least squares. Default: `1e-8`. | `--ridge 1e-8` |
 | `--ridges LIST` | Neuro-TF optimize | Ridge candidates. Default: `1e-10,1e-8,1e-6`; aliases: `--ridge-values`, single-value `--ridge`. | `--ridges 1e-10,1e-8,1e-6` |
 
-### D.11 Prediction, inspection, and common export options
+### D.12 Prediction, inspection, and common export options
 
 | Option | Applies to | Explanation | Example |
 | --- | --- | --- | --- |
@@ -5830,7 +5987,7 @@ all S-parameters.
 | `--allow-coarse-hooks` | KBNN `export-veriloga` | Allows the legacy non-self-contained residual/prior-input export with zero-default coarse hooks when no coarse model is available. | `--allow-coarse-hooks` |
 | `--coarse-model-dir PATH` | KBNN predict, MDIF/HB/VA export | Explicit matching frozen coarse DNN; recorded or packaged coarse data is otherwise used when available. | `--coarse-model-dir kbnn_model/coarse_model` |
 
-### D.12 ADS ANN export options
+### D.13 ADS ANN export options
 
 These apply to DNN and KBNN `export-ads-ann`; Neuro-TF has no ADS ANN export
 subcommand. Input/split options also appear in D.6 because ADS ANN rebuilds its
@@ -5866,7 +6023,7 @@ training tables from MDIF rather than importing local weights.
 | `--verification-mdif PATH` | DNN/KBNN ADS ANN | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif` |
 | `--verify-values LIST` | DNN/KBNN ADS ANN | Verification-label override. | `--verify-values verification` |
 
-### D.13 ADS HB solver-report options
+### D.14 ADS HB solver-report options
 
 The `hb-report` route accepts one or more positional `LOG` files. Use `-` once
 to read a log from standard input.
@@ -5881,7 +6038,7 @@ to read a log from standard input.
 | `--power-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--power-regex 'Pin=(?P<value>[-+0-9.]+)(?P<unit>dBm)'` |
 | `--wall-clock-seconds SECONDS [...]` | Optional elapsed-time overrides, exactly one per log. Alias: `--elapsed-seconds`. | `--wall-clock-seconds 75.2 63.8` |
 
-### D.14 Copyable end-to-end command set
+### D.15 Copyable end-to-end command set
 
 This compact example shows the normal command order while keeping every action
 on the primary entry point:

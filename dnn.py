@@ -25,6 +25,7 @@ from typing import Sequence
 
 import numpy as np
 
+from cli_options import add_options_json_argument, parse_args_with_options_json
 from surrogate_common import (  # noqa: E402
     EPS,
     DEFAULT_DC_OPEN_RESISTANCE_OHM,
@@ -2004,28 +2005,31 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
             "learning_rate": parse_float_options(args.learning_rates)[0],
             "passivity_penalty": float(args.passivity_penalty),
         }
-        candidates, columns, log_parameters = build_adaptive_candidate_pool(
-            base_config,
-            args.optimize_parameter,
-            {
-                "activation": "str",
-                "batch_size": "int",
-                "epochs": "int",
-                "freq_transform": "str",
-                "hidden_layers": "hidden_layers",
-                "learning_rate": "float",
-                "output_domain": "str",
-                "passivity_penalty": "float",
-                "patience": "int",
-                "target_z0": "float",
-            },
-            max_trials=args.max_trials,
-            candidate_pool=args.adaptive_candidate_pool,
-            hidden_width_step=args.adaptive_hidden_width_step,
-            seed=args.seed,
+        candidates, columns, log_parameters, categorical_values = (
+            build_adaptive_candidate_pool(
+                base_config,
+                args.optimize_parameter,
+                {
+                    "activation": "str",
+                    "batch_size": "int",
+                    "epochs": "int",
+                    "freq_transform": "str",
+                    "hidden_layers": "hidden_layers",
+                    "learning_rate": "float",
+                    "output_domain": "str",
+                    "passivity_penalty": "float",
+                    "patience": "int",
+                    "target_z0": "float",
+                },
+                max_trials=args.max_trials,
+                candidate_pool=args.adaptive_candidate_pool,
+                hidden_width_step=args.adaptive_hidden_width_step,
+                seed=args.seed,
+            )
         )
         args.adaptive_result_columns = columns
         args.adaptive_log_parameters = log_parameters
+        args.adaptive_categorical_values = categorical_values
         return candidates
     axes = {
         "freq_transform": parse_text_options(args.freq_transform_options),
@@ -2706,12 +2710,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--mdif", required=True)
     inspect.add_argument("--split-var", default="dataset")
     inspect.set_defaults(func=command_inspect)
+    add_options_json_argument(parser)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_with_options_json(parser, argv, model="dnn")
     try:
         return int(args.func(args))
     except Exception as exc:

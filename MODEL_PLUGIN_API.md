@@ -17,6 +17,7 @@ For a new model named `my_model`, add:
 ```text
 .
 |-- surrogate.py
+|-- cli_options.py
 |-- surrogate_common.py
 |-- my_model.py
 |-- my_model_sample_training_verification.mdif
@@ -36,6 +37,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from cli_options import add_options_json_argument, parse_args_with_options_json
 from surrogate_common import (
     MDIFBlock,
     MLP,
@@ -66,7 +68,7 @@ from surrogate_common import (
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    args = parse_args_with_options_json(parser, argv, model="my-model")
     return int(args.func(args))
 
 if __name__ == "__main__":
@@ -492,10 +494,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--trial-seed-mode", choices=["fixed", "indexed"], default="fixed")
     sweep.set_defaults(func=command_sweep)
 
+    add_options_json_argument(parser)
     return parser
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parse_args_with_options_json(parser, argv, model="my-model")
     return args.func(args)
 ```
 
@@ -653,12 +657,14 @@ configuration is trained again after all trials finish.
 ## Implementation Checklist
 
 1. Add a unique root-level `<plugin>.py` model script.
-2. Import reusable infrastructure directly from `surrogate_common.py`.
+2. Import reusable infrastructure from `surrogate_common.py` and the shared
+   options-JSON parser from `cli_options.py`.
 3. Implement the script with `train_model`, `command_train`, `predict_blocks`,
    `save`, and `load`.
 4. Add `sweep_candidate_grid`, `namespace_for_trial`, a sweep worker, and
    `command_sweep` using `run_sweep_command`.
-5. Add `build_arg_parser` and `main`.
+5. Add `build_arg_parser` and `main`, including `add_options_json_argument`
+   and `parse_args_with_options_json` so the backend follows the primary CLI.
 6. Add `--loss-interval` and `--progress-interval` to neural training/sweep
    parsers, and add `--retrain-best` to sweep parsers.
 7. Reuse `write_training_verification_artifacts` for verification outputs.

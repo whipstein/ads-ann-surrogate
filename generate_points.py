@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from cli_options import add_options_json_argument, parse_args_with_options_json
+
 
 UNIT_SCALES = {
     "": 1.0,
@@ -2208,6 +2210,7 @@ def build_generate_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also write *_train.csv and *_verification.csv files beside the combined CSV.",
     )
+    add_options_json_argument(parser, recursive=False)
     return parser
 
 
@@ -2236,7 +2239,19 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     parser.add_argument("--count", type=int, required=True, help="Number of additional points to suggest.")
     parser.add_argument(
         "--fit-dir",
-        help="Training or sweep trial directory containing verification_metrics.csv.",
+        help=(
+            "Training/model directory containing verification_metrics.csv, or an "
+            "optimize/sweep directory containing best_model."
+        ),
+    )
+    parser.add_argument(
+        "--allow-nonpassive",
+        action="store_true",
+        help=(
+            "When an optimize/sweep run has no passivity-eligible best_model, use "
+            "its retained point_generation_fallback verification errors for point "
+            "selection only. This does not make that model export-eligible."
+        ),
     )
     parser.add_argument(
         "--verification-metrics",
@@ -2370,6 +2385,7 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         "--analysis-out",
         help="Ranked current-fit error-region CSV path. Default: <out>_fit_error_regions.csv.",
     )
+    add_options_json_argument(parser, recursive=False)
     return parser
 
 
@@ -2626,14 +2642,69 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
 
 def verification_metrics_path(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Path:
+    fallback_manifest: Path | None = None
     if args.verification_metrics:
         path = Path(args.verification_metrics)
+        sibling_manifest = path.parent / "point_generation_source.json"
+        if sibling_manifest.is_file():
+            fallback_manifest = sibling_manifest
     elif args.fit_dir:
-        path = Path(args.fit_dir) / "verification_metrics.csv"
+        fit_dir = Path(args.fit_dir)
+        direct_path = fit_dir / "verification_metrics.csv"
+        best_model_path = fit_dir / "best_model" / "verification_metrics.csv"
+        fallback_path = (
+            fit_dir / "point_generation_fallback" / "verification_metrics.csv"
+        )
+        parent_fallback_path = (
+            fit_dir.parent
+            / "point_generation_fallback"
+            / "verification_metrics.csv"
+        )
+        if direct_path.is_file():
+            path = direct_path
+            sibling_manifest = fit_dir / "point_generation_source.json"
+            if sibling_manifest.is_file():
+                fallback_manifest = sibling_manifest
+        elif best_model_path.is_file():
+            path = best_model_path
+        elif fallback_path.is_file():
+            path = fallback_path
+            fallback_manifest = fallback_path.parent / "point_generation_source.json"
+        elif fit_dir.name == "best_model" and parent_fallback_path.is_file():
+            path = parent_fallback_path
+            fallback_manifest = (
+                parent_fallback_path.parent / "point_generation_source.json"
+            )
+        else:
+            path = direct_path
     else:
         parser.error("Either --fit-dir or --verification-metrics is required")
     if not path.exists():
-        parser.error(f"Verification metrics file does not exist: {path}")
+        parser.error(
+            f"Verification metrics file does not exist: {path}. For an optimize "
+            "run, pass the sweep directory or its best_model directory."
+        )
+    if fallback_manifest is not None:
+        if not getattr(args, "allow_nonpassive", False):
+            parser.error(
+                "Only a passivity-ineligible point-generation fallback is "
+                "available. Add --allow-nonpassive to use its verification errors "
+                "for point selection; it will remain ineligible for model export."
+            )
+        try:
+            source_payload = json.loads(fallback_manifest.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"Could not read point-generation fallback metadata: {exc}")
+        args.nonpassive_source = source_payload
+        source_trial = source_payload.get("source_trial", "unknown")
+        print(
+            "warning: using verification errors from passivity-ineligible trial "
+            f"{source_trial} for point selection only; this model is not eligible "
+            "for export",
+            file=sys.stderr,
+        )
+    else:
+        args.nonpassive_source = None
     return path
 
 
@@ -2707,6 +2778,11 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         return 2
 
     acquisition_metadata: dict[str, object] = {}
+    acquisition_metadata["verification_metrics_source"] = str(metrics_path)
+    if getattr(args, "nonpassive_source", None):
+        acquisition_metadata["nonpassive_point_generation_source"] = (
+            args.nonpassive_source
+        )
     if getattr(args, "parameter_metadata_source", None):
         acquisition_metadata["parameter_metadata_source"] = (
             args.parameter_metadata_source
@@ -2810,11 +2886,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "suggest-additional":
         parser = build_suggest_parser()
-        args = parser.parse_args(raw_args)
+        args = parse_args_with_options_json(
+            parser,
+            raw_args,
+            workflow="points",
+            command="suggest-additional",
+        )
         return command_suggest_additional(args, parser)
 
     parser = build_generate_parser()
-    args = parser.parse_args(raw_args)
+    args = parse_args_with_options_json(
+        parser,
+        raw_args,
+        workflow="points",
+        command="generate",
+    )
     return command_generate(args, parser)
 
 

@@ -79,6 +79,28 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertIn(model_type, output.getvalue())
         for workflow in surrogate.WORKFLOW_SCRIPTS:
             self.assertIn(workflow, output.getvalue())
+        self.assertIn("--options-json", output.getvalue())
+
+    def test_options_json_can_precede_model_or_workflow_route(self) -> None:
+        cases = (
+            (
+                ["--options-json", "defaults.json", "--model", "dnn", "train", "--mdif", "x"],
+                ["train", "--mdif", "x", "--options-json", "defaults.json"],
+            ),
+            (
+                ["--options-json=defaults.json", "audit", "--mdif", "x"],
+                ["--mdif", "x", "--options-json", "defaults.json"],
+            ),
+        )
+        for command, forwarded in cases:
+            with self.subTest(command=command):
+                completed = mock.Mock(returncode=0)
+                with mock.patch(
+                    "surrogate.subprocess.run", return_value=completed
+                ) as run:
+                    status = surrogate.main(command)
+                self.assertEqual(status, 0)
+                self.assertEqual(run.call_args.args[0][2:], forwarded)
 
     def test_every_model_backend_exists(self) -> None:
         for script_name in surrogate.MODEL_SCRIPTS.values():

@@ -10,6 +10,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from cli_options import (
+    OptionsJSONError,
+    add_options_json_argument,
+    extract_options_json_argument,
+)
+
 
 MODEL_SCRIPTS = {
     "dnn": "dnn.py",
@@ -75,6 +81,7 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         metavar="{dnn,kbnn,neuro-tf}",
         help="Model family whose backend should receive the command",
     )
+    add_options_json_argument(parser, recursive=False)
     parser.add_argument(
         "workflow",
         nargs="?",
@@ -169,13 +176,23 @@ def dispatch_workflow(workflow: str, workflow_args: Sequence[str]) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    if not raw_args or raw_args in (["-h"], ["--help"]):
+    try:
+        options_json, routing_args = extract_options_json_argument(raw_args)
+    except OptionsJSONError as exc:
+        build_arg_parser().error(str(exc))
+    options_args = (
+        ["--options-json", options_json] if options_json is not None else []
+    )
+    if not routing_args or routing_args in (["-h"], ["--help"]):
         build_arg_parser().print_help()
         return 0
-    if raw_args[0] in WORKFLOW_SCRIPTS:
-        return dispatch_workflow(raw_args[0], raw_args[1:])
-    args, backend_args = parse_dispatch_args(raw_args)
-    return dispatch(args.model_type, backend_args)
+    if routing_args[0] in WORKFLOW_SCRIPTS:
+        return dispatch_workflow(
+            routing_args[0],
+            [*routing_args[1:], *options_args],
+        )
+    args, backend_args = parse_dispatch_args(routing_args)
+    return dispatch(args.model_type, [*backend_args, *options_args])
 
 
 if __name__ == "__main__":

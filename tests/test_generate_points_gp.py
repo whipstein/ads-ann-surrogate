@@ -410,6 +410,114 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             )
             self.assertTrue(all(row["predicted_error"] == "" for row in rows))
 
+    def test_sweep_root_resolves_promoted_best_model_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sweep_dir = Path(temp_dir) / "sweep"
+            metrics = sweep_dir / "best_model" / "verification_metrics.csv"
+            metrics.parent.mkdir(parents=True)
+            metrics.write_text(
+                "source_index,evm_pct,p\n1,0.2,0.25\n2,0.4,0.75\n"
+            )
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(sweep_dir)]
+            )
+            self.assertEqual(
+                POINTS.verification_metrics_path(args, parser),
+                metrics,
+            )
+            self.assertIsNone(args.nonpassive_source)
+
+    def test_nonpassive_sweep_fallback_requires_explicit_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sweep_dir = Path(temp_dir) / "sweep"
+            fallback_dir = sweep_dir / "point_generation_fallback"
+            fallback_dir.mkdir(parents=True)
+            metrics = fallback_dir / "verification_metrics.csv"
+            metrics.write_text(
+                "source_index,evm_pct,p\n1,0.2,0.25\n2,0.4,0.75\n"
+            )
+            source = {
+                "status": "passivity_ineligible",
+                "purpose": "gp_point_generation_only",
+                "eligible_for_export": False,
+                "source_trial": 7,
+                "selection_metric": "evm_pct",
+                "metric": 0.2,
+            }
+            (fallback_dir / "point_generation_source.json").write_text(
+                json.dumps(source)
+            )
+            parser = POINTS.build_suggest_parser()
+            blocked_args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(sweep_dir)]
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    POINTS.verification_metrics_path(blocked_args, parser)
+
+            allowed_args = parser.parse_args(
+                [
+                    "--count",
+                    "1",
+                    "--fit-dir",
+                    str(sweep_dir),
+                    "--allow-nonpassive",
+                ]
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                resolved = POINTS.verification_metrics_path(allowed_args, parser)
+            self.assertEqual(resolved, metrics)
+            self.assertEqual(allowed_args.nonpassive_source["source_trial"], 7)
+            self.assertIn("point selection only", stderr.getvalue())
+
+            legacy_best_args = parser.parse_args(
+                [
+                    "--count",
+                    "1",
+                    "--fit-dir",
+                    str(sweep_dir / "best_model"),
+                    "--allow-nonpassive",
+                ]
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    POINTS.verification_metrics_path(legacy_best_args, parser),
+                    metrics,
+                )
+
+            output = Path(temp_dir) / "additional.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(
+                        POINTS.main(
+                            [
+                                "suggest-additional",
+                                "--parameter",
+                                "p=0:1",
+                                "--count",
+                                "1",
+                                "--fit-dir",
+                                str(sweep_dir),
+                                "--allow-nonpassive",
+                                "--candidate-count",
+                                "12",
+                                "--lhs-candidates",
+                                "2",
+                                "--out",
+                                str(output),
+                            ]
+                        ),
+                        0,
+                    )
+            metadata = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual(
+                metadata["nonpassive_point_generation_source"]["source_trial"],
+                7,
+            )
+            self.assertEqual(metadata["verification_metrics_source"], str(metrics))
+
 
 if __name__ == "__main__":
     unittest.main()
