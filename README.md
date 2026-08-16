@@ -7,6 +7,7 @@ parameterized RF/microwave S-parameter MDIF data.
 
 ```mermaid
 flowchart TD
+    CONFIG["Configure options JSON<br/>surrogate.py options init"]
     POINTS["Generate initial points<br/>surrogate.py points generate"]
     SIM["Run EM or ADS simulations<br/>produce training and verification MDIF"]
     AUDIT["Audit raw MDIF<br/>surrogate.py audit"]
@@ -27,6 +28,9 @@ flowchart TD
     ADS["Integrate with ADS<br/>sampled MDIF, HB SDD, Verilog-A, or ANN"]
     COMMON["Shared infrastructure<br/>surrogate_common.py"]
 
+    CONFIG --> POINTS
+    CONFIG --> AUDIT
+    CONFIG --> FIT
     POINTS --> SIM --> AUDIT --> CLI
     CLI --> DNN
     CLI --> KBNN
@@ -43,30 +47,35 @@ flowchart TD
     COMMON --> FIT
     COMMON --> EXPORT
 
-    click POINTS href "README.md#1-generate-initial-points" "Open initial point generation"
-    click SIM href "README.md#2-simulate-and-audit-the-dataset" "Open simulation and input-data requirements"
-    click AUDIT href "README.md#audit-training-and-verification-data" "Open dataset auditing"
-    click CLI href "README.md#unified-model-cli" "Open the unified model CLI"
-    click DNN href "README.md#b3-dnn-direct-response-surrogate" "Open the DNN formulation"
-    click KBNN href "README.md#b4-kbnn-fitted-coarse-knowledge-based-surrogate" "Open the KBNN formulation"
-    click NTF href "README.md#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate" "Open the Neuro-TF formulation"
-    click FIT href "README.md#shared-training-and-optimization-workflow" "Open fitting and optimization"
-    click VERIFY href "README.md#fitting-output-artifacts" "Open fitting and verification outputs"
-    click ACCEPT href "README.md#5-refit-and-iterate" "Open the iteration criteria"
-    click UPDATE href "README.md#4-update-or-extend-the-sampling-points" "Open point updating"
-    click SIMNEW href "README.md#5-refit-and-iterate" "Open the refitting loop"
-    click REFIT href "README.md#5-refit-and-iterate" "Open the refitting loop"
-    click EXPORT href "README.md#export-commands" "Open model export commands"
-    click ADS href "README.md#choose-the-ads-handoff" "Open ADS integration choices"
-    click COMMON href "README.md#repository-layout" "Open the repository layout"
+    click CONFIG "README.md#configure-the-workflow-with-optionsjson"
+    click POINTS "README.md#1-generate-initial-points"
+    click SIM "README.md#2-simulate-and-audit-the-dataset"
+    click AUDIT "README.md#audit-training-and-verification-data"
+    click CLI "README.md#unified-model-cli"
+    click DNN "README.md#b3-dnn-direct-response-surrogate"
+    click KBNN "README.md#b4-kbnn-fitted-coarse-knowledge-based-surrogate"
+    click NTF "README.md#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate"
+    click FIT "README.md#shared-training-and-optimization-workflow"
+    click VERIFY "README.md#fitting-output-artifacts"
+    click ACCEPT "README.md#5-refit-and-iterate"
+    click UPDATE "README.md#4-update-or-extend-the-sampling-points"
+    click SIMNEW "README.md#5-refit-and-iterate"
+    click REFIT "README.md#5-refit-and-iterate"
+    click EXPORT "README.md#export-commands"
+    click ADS "README.md#choose-the-ads-handoff"
+    click COMMON "README.md#repository-layout"
 ```
 
-Each flowchart block links to the corresponding section when the Markdown
-renderer permits Mermaid links. The same destinations are available in the
-linked workflow list below. Direct formulation links are also available for
+The diagram uses Mermaid's simple quoted-URL click syntax for compatibility
+with Mermaid 10 and 11. If a Markdown viewer disables Mermaid links, use these
+equivalent links: [options JSON](#configure-the-workflow-with-optionsjson),
+[point generation](#1-generate-initial-points),
+[data audit](#audit-training-and-verification-data),
+[model fitting](#shared-training-and-optimization-workflow),
 [DNN](#b3-dnn-direct-response-surrogate),
-[KBNN](#b4-kbnn-fitted-coarse-knowledge-based-surrogate), and
-[Neuro-TF](#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate).
+[KBNN](#b4-kbnn-fitted-coarse-knowledge-based-surrogate),
+[Neuro-TF](#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate), and
+[ADS export](#choose-the-ads-handoff).
 
 The code uses a flat script-first layout. `surrogate.py` is the primary entry
 point for the entire workflow: it dispatches point generation, data auditing,
@@ -104,6 +113,7 @@ dispatcher calls the relevant internal script and returns its exit status:
 
 | Workflow | Primary command |
 | --- | --- |
+| Generate a starter options JSON | `python3 surrogate.py options init [--out options.json]` |
 | Generate or extend geometry points | `python3 surrogate.py points generate [OPTIONS]` |
 | Select adaptive points | `python3 surrogate.py points suggest-additional [OPTIONS]` |
 | Audit MDIF data | `python3 surrogate.py audit [OPTIONS]` |
@@ -113,94 +123,221 @@ dispatcher calls the relevant internal script and returns its exit status:
 Run `python3 surrogate.py --help` for the routes above, then append `--help` to
 the selected route or model command for its complete option list.
 
-### Reusable Options JSON
+## Configure the Workflow with `options.json`
 
-Use `--options-json PATH` with any primary command to keep stable settings out
-of command history. Explicit CLI options always override JSON values, so a
-saved baseline can be reused and changed one setting at a time:
+The options JSON is an optional project configuration file. It can hold point
+ranges, input-data paths, parameter names, fitting choices, output directories,
+and export settings. The same file can be used by every primary command; each
+command reads only the section that applies to it and rejects misspelled or
+unsupported options before doing work.
+
+### Generate the Starter File
+
+Create a ready-to-edit file with:
 
 ```bash
-python3 surrogate.py --model dnn optimize \
-  --options-json options.json \
-  --mdif train_verify.mdif \
-  --out-dir dnn_opt \
-  --max-trials 40
+python3 surrogate.py options init --out options.json
 ```
 
-[`options.example.json`](options.example.json) is a complete starting template.
-Its structure is:
+The command creates missing parent directories and refuses to replace an
+existing file. Add `--overwrite` only when replacement is intentional. The
+result matches [`options.example.json`](options.example.json) and includes
+`null` placeholders showing where project-specific paths, parameter names,
+ranges, point counts, and output directories belong. A `null` value is omitted
+when a command runs.
+
+Relative paths inside the JSON are resolved from the directory in which
+`surrogate.py` is run, not from the directory containing the JSON. Running all
+commands from the repository or project root therefore gives predictable path
+behavior.
+
+### Practical Project Configuration
+
+The following is a usable edited example for a three-parameter project. JSON
+arrays represent command-line options that would otherwise be repeated, such
+as multiple `--parameter`, `--geometry-json`, or `--existing-points` options.
 
 ```json
 {
   "schema_version": 1,
   "common": {},
-  "commands": {
-    "fit": {
-      "frequency_weights": "default=1;1GHz=3;2GHz:4GHz=2",
-      "passivity_mode": "auto",
-      "reciprocity_mode": "enforce",
-      "seed": 1234
-    },
-    "optimize": {
-      "require_passive": true,
-      "selection_metric": "weighted_evm_pct"
-    }
-  },
+  "commands": {},
   "models": {
+    "common": {},
+    "commands": {
+      "fit": {
+        "mdif": "data/train_verify.mdif",
+        "verification_mdif": null,
+        "parameter_names": "W,L,H",
+        "frequency_weights": "default=1;1GHz=3;2GHz:4GHz=2",
+        "passivity_mode": "auto",
+        "reciprocity_mode": "enforce",
+        "seed": 1234
+      },
+      "optimize": {
+        "max_trials": 40,
+        "require_passive": true,
+        "selection_metric": "weighted_evm_pct"
+      }
+    },
     "dnn": {
       "commands": {
         "fit": {
+          "output_domain": "s",
           "sparam_weights": "diag=1;offdiag=0.2"
+        },
+        "train": {
+          "out_dir": "outputs/dnn_model"
+        },
+        "optimize": {
+          "out_dir": "outputs/dnn_optimize"
+        },
+        "export-veriloga": {
+          "model_dir": "outputs/dnn_optimize/best_model",
+          "out_dir": "exports/dnn_veriloga",
+          "module_name": "my_dnn_model",
+          "parameter_input_scales": 1.0
+        }
+      }
+    },
+    "kbnn": {
+      "commands": {
+        "fit": {
+          "mdif": "data/fine_train_verify.mdif",
+          "coarse_mdif": "data/coarse_train_verify.mdif",
+          "mode": "residual"
+        },
+        "optimize": {
+          "out_dir": "outputs/kbnn_optimize"
+        }
+      }
+    },
+    "neuro-tf": {
+      "commands": {
+        "fit": {
+          "order": 10
+        },
+        "optimize": {
+          "out_dir": "outputs/neuro_tf_optimize"
         }
       }
     }
   },
   "workflows": {
+    "points": {
+      "commands": {
+        "generate": {
+          "parameter": [
+            "W=0.40mm:0.80mm",
+            "L=1.00mm:1.60mm",
+            "H=0.08mm:0.16mm"
+          ],
+          "count": 32,
+          "verification_count": 8,
+          "method": "maximin-lhs",
+          "decimal_places": 6,
+          "out": "geometries.csv"
+        },
+        "suggest-additional": {
+          "fit_dir": "outputs/dnn_optimize/best_model",
+          "existing_points": ["geometries.csv"],
+          "count": 8,
+          "acquisition": "gp-ucb",
+          "out": "additional_points.csv"
+        }
+      }
+    },
     "audit": {
       "common": {
-        "expect_reciprocal": true
+        "mdif": "data/train_verify.mdif",
+        "geometry_json": ["geometries.json"],
+        "parameter_names": "W,L,H",
+        "expect_reciprocal": true,
+        "out_dir": "outputs/data_audit"
       }
     }
   }
 }
 ```
 
+### Run Commands with the JSON
+
+Supply the same file to each workflow. No other options are needed when all
+required values for that command are populated in the JSON:
+
+```bash
+python3 surrogate.py --options-json options.json points generate
+python3 surrogate.py --options-json options.json audit
+python3 surrogate.py --options-json options.json --model dnn optimize
+python3 surrogate.py --options-json options.json --model dnn export-veriloga
+```
+
+An explicit command-line option overrides the JSON for that invocation. This
+is useful for a one-off trial without editing the saved project settings:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn optimize \
+  --max-trials 80 \
+  --out-dir outputs/dnn_optimize_80_trials
+```
+
+### Where Each Project Setting Goes
+
+| Project setting | JSON location | Notes |
+| --- | --- | --- |
+| Geometry parameter names and ranges | `workflows.points.commands.generate.parameter` | Use an array of `NAME=LOW:HIGH[:linear|log]` strings. This is the JSON equivalent of repeating `--parameter`. |
+| Initial training/verification point counts | `workflows.points.commands.generate.count` and `verification_count` | The generated CSV contains the split labels. |
+| Geometry CSV location | `workflows.points.commands.generate.out` | A same-stem geometry JSON is generated automatically; `geometries.csv` creates `geometries.json`. |
+| GP update inputs and output | `workflows.points.commands.suggest-additional` | Put `fit_dir`, `existing_points`, `count`, and `out` here. The companion geometry JSON supplies the saved parameter ranges automatically. |
+| Training or combined MDIF | `models.commands.fit.mdif` | Put it here when all model families use the same dataset. A model-specific value, such as `models.kbnn.commands.fit.mdif`, overrides it. |
+| Separate verification MDIF | `models.commands.fit.verification_mdif` | Leave `null` when training and verification blocks are combined in `mdif`. |
+| Fitted parameter names | `models.commands.fit.parameter_names` | Usually optional because numeric MDIF `VAR` values are inferred. This selects variables; it does not define their fitting ranges. |
+| KBNN coarse data | `models.kbnn.commands.fit.coarse_mdif` | KBNN-only, so it belongs below the KBNN model node. |
+| Audit data and declared geometry domain | `workflows.audit.common.mdif` and `geometry_json` | `geometry_json` may be an array when the range was extended in multiple campaigns. |
+| Training and optimization outputs | `models.MODEL.commands.train.out_dir` and `models.MODEL.commands.optimize.out_dir` | Keep these model-specific to avoid DNN, KBNN, and Neuro-TF writing into the same directory. |
+| Export input, output, and module settings | `models.MODEL.commands.EXACT_EXPORT_COMMAND` | For example, use `models.dnn.commands.export-veriloga`; exact scope avoids applying unsupported options to other exporters. |
+
+Parameter ranges are intentionally defined for point generation, not model
+fitting. The model is fitted to the parameter values actually present in the
+MDIF. The generated geometry JSON records the intended complete domain and is
+used by auditing and adaptive point generation. `parameter_names` only chooses
+which MDIF variables are model inputs; it does not change or expand a range.
+
+### Scope and Override Rules
+
 The headings have deliberately narrow meanings:
 
 | Heading | Applies to |
 | --- | --- |
 | Root `common` or `generic` | Every command that uses this JSON. Keep this empty unless an option truly exists on every intended command. Flat root option keys are accepted as shorthand. |
-| Root `commands` | Every matching command. The special `fit` heading means `train` and `optimize`; `export` means every `export-*` command; `all` means every command. |
+| Root `commands` | Every matching command across models and workflows. The special `fit` heading means `train` and `optimize`; `export` means every `export-*` command; `all` means every command. |
+| `models.common` or `models.generic` | Every command for DNN, KBNN, and Neuro-TF, but never `points`, `audit`, or `hb-report`. |
+| `models.commands` | Every model family for the matching command or group. Put settings shared by all model types here so they are declared once. |
 | `models.MODEL.common` | Every selected command for only `dnn`, `kbnn`, or `neuro-tf`. Flat option keys inside a model section are shorthand for this level. |
-| `models.MODEL.commands` | A command or command-group override for one model family. This is the right place for DNN/KBNN S-parameter weights. |
+| `models.MODEL.commands` | A command or command-group override for one model family. Values here override the broader root and `models` values. |
 | `workflows.WORKFLOW.common` | Defaults for only `points`, `audit`, or `hb-report`. |
 | `workflows.WORKFLOW.commands` | Per-command workflow defaults, such as separate `generate` and `suggest-additional` point settings. |
 
-Values are merged from broad to specific: root common, root command, selected
-model/workflow common, then selected model/workflow command. The CLI has final
-precedence. Option keys may use hyphens or underscores and may include or omit
-the leading `--`. JSON arrays supply repeatable or multi-value options;
-booleans supply flag options; `null` leaves the parser default unchanged.
-Unknown options, invalid choices, invalid types, misspelled headings, and
-unsupported schema versions stop before the command runs.
+For a model command, values are merged from broad to specific: root common,
+root command, `models.common`, `models.commands`, selected-model common, then
+selected-model command. Within a `commands` object, `all` is applied first,
+then a group such as `fit`, and finally the exact command. Workflow commands
+use the corresponding root and selected-workflow layers. An explicit CLI value
+always has final precedence.
 
-Good candidates for persistent JSON defaults are:
+For example, `models.commands.fit.frequency_weights` applies to all three model
+families. `models.kbnn.commands.fit.frequency_weights` overrides it only for
+KBNN, and an explicit `--frequency-weights` overrides both for one invocation.
 
-| Scope | Recommended stable options |
-| --- | --- |
-| All fits | `frequency_weights`, `passivity_mode`, `passivity_margin`, `reciprocity_mode`, `reciprocity_tolerance`, `seed`, `progress_interval`, `dc_open_threshold`, and `dc_open_resistance` |
-| DNN fits | `sparam_weights`, `output_domain`, `target_z0`, and `max_y_condition` |
-| KBNN fits | `sparam_weights`, `coarse_sparam_weights`, `coarse_frequency_weights`, `mode`, coarse-network architecture, and coarse progress settings |
-| Neuro-TF fits | `order`, `pole_damping`, and `ridge` |
-| Optimization | `selection_metric`, `require_passive`, passivity limits, `trial_seed_mode`, `trial_worst_plots`, and adaptive-search controls |
-| Exact export command | `module_name`, `parameter_input_scales`, `z0`, `dc_port_paths`, and DC thresholds; use the exact command heading because not every export accepts every option |
-| Audit | `expect_reciprocal` and the passivity, reciprocity, grid, duplicate, and neighbor tolerances |
-| Point generation/update | Initial method and rounding, or GP acquisition, exploration, candidate-pool, and minimum-distance settings |
+Option keys may use hyphens or underscores and may include or omit the leading
+`--`. JSON arrays supply repeatable or multi-value options and booleans supply
+flag options. Remove a key or set it to `null` to omit that option. An empty
+string (`""`) is an explicit value and is not equivalent to omission. Unknown
+options, invalid choices, invalid types, misspelled headings, and unsupported
+schema versions stop before the command runs.
 
-For a single lookup location, use [Appendix D: Complete CLI Command and Option
-Reference](#appendix-d-complete-cli-command-and-option-reference). It lists
-every public command and option exposed through `surrogate.py`, with
-applicability, meaning, and a copyable example.
+For the exhaustive option tables, see [Appendix D: Complete CLI Command and
+Option Reference](#appendix-d-complete-cli-command-and-option-reference).
 
 ## Requirements
 
@@ -5677,6 +5814,7 @@ once; comma separation is supported only where the option description says so.
 
 | Command | Purpose | Minimal example |
 | --- | --- | --- |
+| `options init` | Write a ready-to-edit reusable options JSON. `options generate` is an alias; add `--overwrite` to replace an existing file. | `python3 surrogate.py options init --out options.json` |
 | `points generate` | Create an initial design, append a one-sided range extension, and write CSV/JSON/PNG coverage artifacts. | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 24 --out geometries.csv` |
 | `points suggest-additional` | Use saved verification metrics and existing geometry metadata to select another legacy or GP-UCB batch. | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --count 8 --out additions.csv` |
 | `audit` | Check raw MDIF passivity, reciprocity, coverage, grids, duplicates, and train/verification consistency. | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
@@ -5699,32 +5837,56 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 | Option | Applies to | Explanation | Example |
 | --- | --- | --- | --- |
 | `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help` |
-| `--options-json PATH` | Every primary command | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model` |
-| `workflow` | Non-model commands | Positional route: `points`, `audit`, or `hb-report`. | `python3 surrogate.py points generate --help` |
+| `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init`, which creates the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model` |
+| `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help` |
 
-### D.3 Options JSON schema and precedence
+### D.3 Starter options JSON generation
+
+| Option | Applies to | Explanation | Example |
+| --- | --- | --- | --- |
+| `--out PATH` | `options init`, `options generate` | Output path for the generated starter document. Parent directories are created. Default: `options.json`. | `--out config/options.json` |
+| `--overwrite` | `options init`, `options generate` | Allows an existing output file to be replaced. Without this flag, generation stops instead of overwriting user settings. | `--overwrite` |
+
+### D.4 Options JSON schema and precedence
 
 The full reusable-options explanation and recommended groups are in
 [Reusable Options JSON](#reusable-options-json), and the copyable template is
 [`options.example.json`](options.example.json).
 
+Generate the canonical starting structure with:
+
+```bash
+python3 surrogate.py options init --out options.json
+```
+
+For a model command, settings are merged in the following order. Each later
+row overrides an earlier row when both define the same option:
+
 | JSON location | Merge order | Typical contents | Example |
 | --- | ---: | --- | --- |
-| Root flat keys, `generic`, or `common` | 1 | A true catchall for every intended invocation. | `"seed": 1234` |
-| Root `commands.all`, `commands.fit`/`commands.export`, then exact command | 2 | Cross-model command defaults. | `"fit": {"frequency_weights": "default=1;1GHz=3"}` |
-| Selected `models.MODEL` or `workflows.WORKFLOW` flat/common keys | 3 | Family- or workflow-wide defaults. | `"audit": {"common": {"expect_reciprocal": true}}` |
-| Selected scope's `commands` group and exact command | 4 | The most specific JSON override. | `"dnn": {"commands": {"fit": {"sparam_weights": "diag=1;offdiag=0.2"}}}` |
-| Explicit command line | 5 | One-run changes; always highest precedence. | `--frequency-weights 'default=2;5GHz=8'` |
+| Root flat keys, `generic`, or `common` | 1 | A true catchall for every intended invocation. | `"common": {"seed": 1234}` |
+| Root `commands.all`, command group, then exact command | 2 | Defaults intentionally shared by model and workflow commands with the same name. | `"commands": {"fit": {"seed": 1234}}` |
+| `models.generic` or `models.common` | 3 | Defaults for every command in all three model families, but no data workflow. | `"models": {"common": {"seed": 1234}}` |
+| `models.commands.all`, command group, then exact command | 4 | Fit, optimize, or export defaults shared by DNN, KBNN, and Neuro-TF. This is the normal home for common model settings. | `"models": {"commands": {"fit": {"frequency_weights": "default=1;1GHz=3"}}}` |
+| Selected `models.MODEL` flat keys, `generic`, or `common` | 5 | Defaults for one model family. | `"dnn": {"common": {"output_domain": "s"}}` |
+| Selected `models.MODEL.commands` group, then exact command | 6 | The narrowest model-specific JSON override. | `"dnn": {"commands": {"fit": {"sparam_weights": "diag=1;offdiag=0.2"}}}` |
+| Explicit command line | 7 | One-run changes; always highest precedence. | `--frequency-weights 'default=2;5GHz=8'` |
+
+Workflow commands use the root layers followed by the selected
+`workflows.WORKFLOW` common and command layers, then the explicit command line.
+The `fit` group means `train` and `optimize`; `export` means every `export-*`
+command; and `all` applies to every command in that scope.
 
 Keys may use `frequency_weights`, `frequency-weights`, or
 `--frequency-weights`. Scalars retain normal parser typing, JSON booleans set
 flag options, arrays set repeatable/multi-value options, and `null` leaves the
-built-in default unchanged. A JSON value can satisfy a normally required
-option such as `mdif` or `out_dir`, although keeping run-specific paths on the
-CLI is usually clearer. The selected command rejects unknown keys or invalid
-values before doing work.
+built-in default unchanged. Delete a key or set it to `null` to omit it; an
+empty string is an explicit value and is not treated as omission. A JSON value
+can satisfy a normally required option such as `mdif` or `out_dir`, although
+keeping run-specific paths on the CLI is usually clearer. The selected command
+rejects unknown keys or invalid values before doing work.
 
-### D.4 Point generation options
+### D.5 Point generation options
 
 Options are alphabetized. The **generate** and **suggest** labels below mean
 `points generate` and `points suggest-additional`.
@@ -5749,10 +5911,10 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | `--verification-count INT` | Generate | Number of new tail points labeled verification. Default: `0`; range extension preserves the original split ratio when omitted. | `--verification-count 8` |
 | `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files; JSON and coverage PNG remain combined. | `--write-split-files` |
 
-### D.5 Adaptive additional-point options
+### D.6 Adaptive additional-point options
 
 These options apply only to `points suggest-additional`; the shared sampling
-options in D.4 also apply where marked.
+options in D.5 also apply where marked.
 
 | Option | Explanation | Example |
 | --- | --- | --- |
@@ -5793,7 +5955,7 @@ python3 surrogate.py points suggest-additional \
   --out additions.csv
 ```
 
-### D.6 Dataset audit options
+### D.7 Dataset audit options
 
 All options apply to `audit` and are alphabetized.
 
@@ -5824,7 +5986,7 @@ All options apply to `audit` and are alphabetized.
 | `--verification-mdif PATH` | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif` |
 | `--verify-values LIST` | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification` |
 
-### D.7 Shared model fitting options
+### D.8 Shared model fitting options
 
 Unless stated otherwise, these options apply to all models for both `train` and
 `optimize`. Defaults are the same across models except where noted.
@@ -5859,7 +6021,7 @@ Unless stated otherwise, these options apply to all models for both `train` and
 | `--verify-values LIST` | All-model fit | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification` |
 | `--worst-plots INT` | All-model fit | Number of worst verification S/Y plot pairs. Default: `6`; `0` disables. | `--worst-plots 4` |
 
-### D.8 Optimization and reranking options
+### D.9 Optimization and reranking options
 
 `optimize` and `sweep` are identical commands. These options apply to all-model
 optimize unless the applicability column says otherwise.
@@ -5891,7 +6053,7 @@ optimize unless the applicability column says otherwise.
 | `--trial-seed-mode {fixed,indexed}` | All-model optimize | `fixed` reuses `--seed`; `indexed` uses seed plus trial number. Default: `fixed`. | `--trial-seed-mode fixed` |
 | `--trial-worst-plots INT` | All-model optimize | Worst-case plot pairs written per trial. Default: `1`; `0` speeds large searches. | `--trial-worst-plots 0` |
 
-### D.9 DNN-only fitting options
+### D.10 DNN-only fitting options
 
 | Option | Applies to | Explanation | Example |
 | --- | --- | --- | --- |
@@ -5903,7 +6065,7 @@ optimize unless the applicability column says otherwise.
 | `--sparam-weights SPEC` | DNN fit | S-parameter loss and weighted-selection priorities; rules are applied left to right. | `--sparam-weights 'diag=1;offdiag=0.2'` |
 | `--target-z0 FLOAT` | DNN fit | Reference impedance used to build direct-Y targets. Default: `50`. | `--target-z0 50` |
 
-### D.10 KBNN-only fitting options
+### D.11 KBNN-only fitting options
 
 The fine fit must receive exactly one reusable coarse source for `residual` or
 `prior-input`: either `--coarse-mdif` to fit it jointly or
@@ -5936,7 +6098,7 @@ The fine fit must receive exactly one reusable coarse source for `residual` or
 | `--passivity-penalty FLOAT` | KBNN fit | Reconstructed fine-response passivity-loss weight. Default: `10`. | `--passivity-penalty 20` |
 | `--sparam-weights SPEC` | KBNN fit | Fine loss and weighted-selection priorities. | `--sparam-weights 'diag=1;offdiag=0.2'` |
 
-### D.11 Neuro-TF-only fitting options
+### D.12 Neuro-TF-only fitting options
 
 Neuro-TF does not expose `--sparam-weights`; use `--frequency-weights` and the
 response/passivity selection metrics. The rational coefficient fit is shared by
@@ -5951,7 +6113,7 @@ all S-parameters.
 | `--ridge FLOAT` | Neuro-TF `train`; single-value optimize form | Ridge regularization for rational least squares. Default: `1e-8`. | `--ridge 1e-8` |
 | `--ridges LIST` | Neuro-TF optimize | Ridge candidates. Default: `1e-10,1e-8,1e-6`; aliases: `--ridge-values`, single-value `--ridge`. | `--ridges 1e-10,1e-8,1e-6` |
 
-### D.12 Prediction, inspection, and common export options
+### D.13 Prediction, inspection, and common export options
 
 | Option | Applies to | Explanation | Example |
 | --- | --- | --- | --- |
@@ -5987,10 +6149,10 @@ all S-parameters.
 | `--allow-coarse-hooks` | KBNN `export-veriloga` | Allows the legacy non-self-contained residual/prior-input export with zero-default coarse hooks when no coarse model is available. | `--allow-coarse-hooks` |
 | `--coarse-model-dir PATH` | KBNN predict, MDIF/HB/VA export | Explicit matching frozen coarse DNN; recorded or packaged coarse data is otherwise used when available. | `--coarse-model-dir kbnn_model/coarse_model` |
 
-### D.13 ADS ANN export options
+### D.14 ADS ANN export options
 
 These apply to DNN and KBNN `export-ads-ann`; Neuro-TF has no ADS ANN export
-subcommand. Input/split options also appear in D.6 because ADS ANN rebuilds its
+subcommand. Input/split options also appear in D.7 because ADS ANN rebuilds its
 training tables from MDIF rather than importing local weights.
 
 | Option | Applies to | Explanation | Example |
@@ -6023,7 +6185,7 @@ training tables from MDIF rather than importing local weights.
 | `--verification-mdif PATH` | DNN/KBNN ADS ANN | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif` |
 | `--verify-values LIST` | DNN/KBNN ADS ANN | Verification-label override. | `--verify-values verification` |
 
-### D.14 ADS HB solver-report options
+### D.15 ADS HB solver-report options
 
 The `hb-report` route accepts one or more positional `LOG` files. Use `-` once
 to read a log from standard input.
@@ -6038,7 +6200,7 @@ to read a log from standard input.
 | `--power-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--power-regex 'Pin=(?P<value>[-+0-9.]+)(?P<unit>dBm)'` |
 | `--wall-clock-seconds SECONDS [...]` | Optional elapsed-time overrides, exactly one per log. Alias: `--elapsed-seconds`. | `--wall-clock-seconds 75.2 63.8` |
 
-### D.15 Copyable end-to-end command set
+### D.16 Copyable end-to-end command set
 
 This compact example shows the normal command order while keeping every action
 on the primary entry point:

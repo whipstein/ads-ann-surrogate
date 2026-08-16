@@ -18,7 +18,8 @@ from typing import Mapping, Sequence
 
 OPTIONS_JSON_HELP = (
     "JSON file containing reusable option defaults. Supports common, commands, "
-    "models, and workflows sections; explicit command-line options override it."
+    "model/workflow-wide defaults, and narrower overrides; explicit command-line "
+    "options take precedence."
 )
 
 MODEL_NAMES = {"dnn", "kbnn", "neuro-tf"}
@@ -46,6 +47,102 @@ COMMAND_NAMES = {
 COMMAND_GROUPS = {"all", "fit", "export"}
 NODE_HEADINGS = {"generic", "common", "commands"}
 ROOT_HEADINGS = NODE_HEADINGS | {"schema_version", "models", "workflows"}
+
+
+def starter_options_payload() -> dict[str, object]:
+    """Return a ready-to-edit options document using every supported scope."""
+
+    return {
+        "schema_version": 1,
+        "common": {},
+        "commands": {},
+        "models": {
+            "common": {},
+            "commands": {
+                "fit": {
+                    "frequency_weights": "default=1;1GHz=3;2GHz:4GHz=2",
+                    "mdif": None,
+                    "parameter_names": None,
+                    "passivity_margin": 0.001,
+                    "passivity_mode": "auto",
+                    "progress_interval": 25,
+                    "reciprocity_mode": "enforce",
+                    "reciprocity_tolerance": 1e-6,
+                    "seed": 1234,
+                    "verification_mdif": None,
+                },
+                "optimize": {
+                    "adaptive_category_balance": 0.5,
+                    "require_passive": True,
+                    "selection_metric": "weighted_evm_pct",
+                    "trial_seed_mode": "fixed",
+                    "trial_worst_plots": 0,
+                },
+            },
+            "dnn": {
+                "commands": {
+                    "fit": {
+                        "output_domain": "s",
+                        "sparam_weights": "diag=1;offdiag=0.2",
+                    },
+                    "optimize": {"out_dir": None},
+                    "train": {"out_dir": None},
+                }
+            },
+            "kbnn": {
+                "commands": {
+                    "fit": {
+                        "coarse_mdif": None,
+                        "coarse_sparam_weights": "diag=1;offdiag=0.2",
+                        "mode": "residual",
+                        "sparam_weights": "diag=1;offdiag=0.2",
+                    },
+                    "optimize": {"out_dir": None},
+                    "train": {"out_dir": None},
+                }
+            },
+            "neuro-tf": {
+                "commands": {
+                    "fit": {"order": 10},
+                    "optimize": {"out_dir": None},
+                    "train": {"out_dir": None},
+                }
+            },
+        },
+        "workflows": {
+            "audit": {
+                "common": {
+                    "expect_reciprocal": True,
+                    "geometry_json": None,
+                    "mdif": None,
+                    "out_dir": None,
+                    "parameter_names": None,
+                    "passivity_tolerance": 1e-6,
+                }
+            },
+            "points": {
+                "commands": {
+                    "generate": {
+                        "count": None,
+                        "decimal_places": 6,
+                        "method": "maximin-lhs",
+                        "out": None,
+                        "parameter": None,
+                        "verification_count": None,
+                    },
+                    "suggest-additional": {
+                        "acquisition": "gp-ucb",
+                        "count": None,
+                        "existing_points": None,
+                        "exploration_weight": 2.0,
+                        "fit_dir": None,
+                        "min_distance": 0.05,
+                        "out": None,
+                    },
+                }
+            },
+        },
+    }
 
 
 class OptionsJSONError(ValueError):
@@ -230,7 +327,17 @@ def load_options_json_defaults(
     allowed_models = set(MODEL_NAMES)
     if selected_model_name:
         allowed_models.add(selected_model_name)
+    for heading in ("generic", "common"):
+        if heading in models:
+            _mapping(models[heading], f"options JSON models.{heading}")
+    model_container_commands = _mapping(
+        models.get("commands"),
+        "options JSON models.commands",
+    )
+    _validate_commands(model_container_commands, "options JSON models.commands")
     for raw_name, node in models.items():
+        if raw_name in NODE_HEADINGS:
+            continue
         normalized = normalize_model_name(raw_name)
         if normalized not in allowed_models:
             raise OptionsJSONError(
@@ -286,8 +393,27 @@ def load_options_json_defaults(
     selected_scope: dict[str, object] | None = None
     scope_context = ""
     if model is not None:
+        for heading in ("generic", "common"):
+            if heading in models:
+                _merge_options(
+                    defaults,
+                    _mapping(
+                        models[heading],
+                        f"options JSON models.{heading}",
+                    ),
+                )
+        _merge_options(
+            defaults,
+            _command_defaults(
+                model_container_commands,
+                canonical_command,
+                "options JSON models.commands",
+            ),
+        )
         canonical_model = selected_model_name
         for raw_name, node in models.items():
+            if raw_name in NODE_HEADINGS:
+                continue
             if normalize_model_name(raw_name) == canonical_model:
                 selected_scope = _mapping(
                     node,

@@ -1,6 +1,8 @@
 import contextlib
 import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -79,7 +81,43 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertIn(model_type, output.getvalue())
         for workflow in surrogate.WORKFLOW_SCRIPTS:
             self.assertIn(workflow, output.getvalue())
+        self.assertIn("options", output.getvalue())
         self.assertIn("--options-json", output.getvalue())
+
+    def test_options_init_generates_template_and_requires_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "config" / "options.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = surrogate.main(
+                    ["options", "init", "--out", str(output_path)]
+                )
+            self.assertEqual(status, 0)
+            self.assertTrue(output_path.is_file())
+            self.assertEqual(
+                json.loads(output_path.read_text()),
+                surrogate.starter_options_payload(),
+            )
+            self.assertIn(f"wrote {output_path}", stdout.getvalue())
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = surrogate.main(
+                    ["options", "generate", "--out", str(output_path)]
+                )
+            self.assertEqual(status, 2)
+            self.assertIn("--overwrite", stderr.getvalue())
+
+            status = surrogate.main(
+                [
+                    "options",
+                    "init",
+                    "--out",
+                    str(output_path),
+                    "--overwrite",
+                ]
+            )
+            self.assertEqual(status, 0)
 
     def test_options_json_can_precede_model_or_workflow_route(self) -> None:
         cases = (

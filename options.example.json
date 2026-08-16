@@ -1,39 +1,57 @@
 {
   "schema_version": 1,
   "common": {},
-  "commands": {
-    "fit": {
-      "frequency_weights": "default=1;1GHz=3;2GHz:4GHz=2",
-      "passivity_margin": 0.001,
-      "passivity_mode": "auto",
-      "progress_interval": 25,
-      "reciprocity_mode": "enforce",
-      "reciprocity_tolerance": 1e-06,
-      "seed": 1234
-    },
-    "optimize": {
-      "adaptive_category_balance": 0.5,
-      "require_passive": true,
-      "selection_metric": "weighted_evm_pct",
-      "trial_seed_mode": "fixed",
-      "trial_worst_plots": 0
-    }
-  },
+  "commands": {},
   "models": {
+    "common": {},
+    "commands": {
+      "fit": {
+        "frequency_weights": "default=1;1GHz=3;2GHz:4GHz=2",
+        "mdif": null,
+        "parameter_names": null,
+        "passivity_margin": 0.001,
+        "passivity_mode": "auto",
+        "progress_interval": 25,
+        "reciprocity_mode": "enforce",
+        "reciprocity_tolerance": 1e-06,
+        "seed": 1234,
+        "verification_mdif": null
+      },
+      "optimize": {
+        "adaptive_category_balance": 0.5,
+        "require_passive": true,
+        "selection_metric": "weighted_evm_pct",
+        "trial_seed_mode": "fixed",
+        "trial_worst_plots": 0
+      }
+    },
     "dnn": {
       "commands": {
         "fit": {
           "output_domain": "s",
           "sparam_weights": "diag=1;offdiag=0.2"
+        },
+        "optimize": {
+          "out_dir": null
+        },
+        "train": {
+          "out_dir": null
         }
       }
     },
     "kbnn": {
       "commands": {
         "fit": {
+          "coarse_mdif": null,
           "coarse_sparam_weights": "diag=1;offdiag=0.2",
           "mode": "residual",
           "sparam_weights": "diag=1;offdiag=0.2"
+        },
+        "optimize": {
+          "out_dir": null
+        },
+        "train": {
+          "out_dir": null
         }
       }
     },
@@ -41,6 +59,12 @@
       "commands": {
         "fit": {
           "order": 10
+        },
+        "optimize": {
+          "out_dir": null
+        },
+        "train": {
+          "out_dir": null
         }
       }
     }
@@ -49,19 +73,31 @@
     "audit": {
       "common": {
         "expect_reciprocal": true,
+        "geometry_json": null,
+        "mdif": null,
+        "out_dir": null,
+        "parameter_names": null,
         "passivity_tolerance": 1e-06
       }
     },
     "points": {
       "commands": {
         "generate": {
+          "count": null,
           "decimal_places": 6,
-          "method": "maximin-lhs"
+          "method": "maximin-lhs",
+          "out": null,
+          "parameter": null,
+          "verification_count": null
         },
         "suggest-additional": {
           "acquisition": "gp-ucb",
+          "count": null,
+          "existing_points": null,
           "exploration_weight": 2.0,
-          "min_distance": 0.05
+          "fit_dir": null,
+          "min_distance": 0.05,
+          "out": null
         }
       }
     }

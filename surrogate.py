@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from cli_options import (
     OptionsJSONError,
     add_options_json_argument,
     extract_options_json_argument,
+    starter_options_payload,
 )
 
 
@@ -40,6 +42,14 @@ WORKFLOW_DESCRIPTIONS = {
     "hb-report": "compare ADS HB Newton/Krylov logs and runtimes",
 }
 
+LOCAL_WORKFLOWS = {
+    "options": "generate a reusable starter options JSON",
+}
+
+
+def workflow_names() -> tuple[str, ...]:
+    return (*LOCAL_WORKFLOWS, *WORKFLOW_SCRIPTS)
+
 
 def normalize_model_type(value: str) -> str:
     """Return the canonical command-line name for a model family."""
@@ -57,11 +67,12 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         ),
         add_help=add_help,
         usage=(
-            "%(prog)s {points,audit,hb-report} [COMMAND] [OPTIONS]\n"
+            "%(prog)s {options,points,audit,hb-report} [COMMAND] [OPTIONS]\n"
             "       %(prog)s --model {dnn,kbnn,neuro-tf} COMMAND [OPTIONS]"
         ),
         epilog=(
             "Examples:\n"
+            "  python3 surrogate.py options init --out options.json\n"
             "  python3 surrogate.py points generate --parameter W=1mm:2mm "
             "--count 24 --out geometries.csv\n"
             "  python3 surrogate.py audit --mdif data.mdif\n"
@@ -85,13 +96,16 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "workflow",
         nargs="?",
-        choices=tuple(WORKFLOW_SCRIPTS),
-        metavar="{points,audit,hb-report}",
+        choices=workflow_names(),
+        metavar="{options,points,audit,hb-report}",
         help=(
             "Non-model workflow command: "
             + "; ".join(
-                f"{name} = {WORKFLOW_DESCRIPTIONS[name]}"
-                for name in WORKFLOW_SCRIPTS
+                f"{name} = {description}"
+                for name, description in {
+                    **LOCAL_WORKFLOWS,
+                    **WORKFLOW_DESCRIPTIONS,
+                }.items()
             )
         ),
     )
@@ -174,6 +188,49 @@ def dispatch_workflow(workflow: str, workflow_args: Sequence[str]) -> int:
     )
 
 
+def build_options_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="surrogate.py options",
+        description="Generate a reusable starter options JSON.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser(
+        "init",
+        aliases=["generate"],
+        help="Write a documented starter options JSON",
+    )
+    init.add_argument(
+        "--out",
+        default="options.json",
+        help="Output JSON path. Default: options.json.",
+    )
+    init.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing output file.",
+    )
+    return parser
+
+
+def command_options(argv: Sequence[str]) -> int:
+    parser = build_options_parser()
+    args = parser.parse_args(list(argv))
+    out_path = Path(args.out)
+    if out_path.exists() and not args.overwrite:
+        print(
+            f"error: options JSON already exists: {out_path}; use --overwrite to replace it",
+            file=sys.stderr,
+        )
+        return 2
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(starter_options_payload(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"wrote {out_path}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -186,6 +243,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not routing_args or routing_args in (["-h"], ["--help"]):
         build_arg_parser().print_help()
         return 0
+    if routing_args[0] in LOCAL_WORKFLOWS:
+        if options_json is not None:
+            build_options_parser().error(
+                "--options-json cannot be used while generating an options JSON"
+            )
+        return command_options(routing_args[1:])
     if routing_args[0] in WORKFLOW_SCRIPTS:
         return dispatch_workflow(
             routing_args[0],
