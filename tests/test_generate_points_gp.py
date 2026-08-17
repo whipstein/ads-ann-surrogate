@@ -230,6 +230,13 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 ),
                 "additional",
             )
+            self.assertEqual(
+                POINTS.coverage_point_group(
+                    {"dataset": "targeted", "point_origin": "existing"},
+                    "dataset",
+                ),
+                "training",
+            )
             combined_metadata = json.loads(combined_json.read_text())
             self.assertEqual(
                 combined_metadata["generation_kind"],
@@ -256,6 +263,39 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(
                 [parameter.name for parameter in next_parameters],
                 ["W", "R"],
+            )
+            round_two = root / "additional_round_two.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            "--count",
+                            "2",
+                            "--verification-metrics",
+                            str(metrics),
+                            "--existing-points",
+                            str(combined),
+                            "--candidate-count",
+                            "48",
+                            "--lhs-candidates",
+                            "4",
+                            "--out",
+                            str(round_two),
+                        ]
+                    ),
+                    0,
+                )
+            round_two_combined = root / "additional_round_two_training_geometries.csv"
+            with round_two_combined.open(newline="") as stream:
+                round_two_rows = list(csv.DictReader(stream))
+            self.assertEqual(
+                [row["point_origin"] for row in round_two_rows].count("existing"),
+                11,
+            )
+            self.assertEqual(
+                [row["point_origin"] for row in round_two_rows].count("additional"),
+                2,
             )
             self.assertIn("parameter domain:", stdout.getvalue())
             self.assertIn(

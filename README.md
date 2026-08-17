@@ -1607,11 +1607,14 @@ the acquisition diagnostics:
   ranked by the error used to fit the GP.
 
 Both geometry CSVs also receive same-stem parameter-coverage PNGs. Training
-points are blue, verification points are orange, and points introduced by
-`suggest-additional` are green with an explicit **Added** legend entry. The
-same colors are used for both off-diagonal scatter plots and diagonal
-histograms. A `point_origin` column preserves the added-point classification
-even when `--target-dataset train` is used.
+points are blue, verification points are orange, and points introduced by the
+current `suggest-additional` invocation are green with an explicit **Added**
+legend entry. The same colors are used for both off-diagonal scatter plots and
+diagonal histograms. The classification is round-relative: when a cumulative
+CSV is supplied as the next round's `--existing-points`, its prior additions
+become existing training coverage, while only the newly selected batch is
+green. A `point_origin` column keeps this distinction independent of
+`--target-dataset`.
 The cumulative CSV preserves dataset labels from existing CSV rows and assigns
 new rows according to `--target-dataset`; it does not silently move verification
 geometries into training. Points supplied only through `--existing-mdif` are

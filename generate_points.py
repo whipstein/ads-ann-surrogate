@@ -611,6 +611,10 @@ def coverage_point_group(row: dict[str, object], split_var: str) -> str:
             "acquisition",
         }:
             return "additional"
+        if origin_token in {"existing", "original", "prior"}:
+            return coverage_split_group(
+                lookup_row_value(row, split_var) or "train"
+            )
     split_value = lookup_row_value(row, split_var) or "train"
     if normalize_key(split_value) in {
         "additional",
@@ -2397,12 +2401,7 @@ def write_accumulated_training_geometries(
             append_point(
                 point,
                 lookup_row_value(row, split_var) or "train",
-                lookup_row_value(row, "point_origin")
-                or (
-                    "additional"
-                    if coverage_point_group(row, split_var) == "additional"
-                    else "existing"
-                ),
+                "existing",
                 lookup_row_value(row, "method") or "existing",
                 str(lookup_row_value(row, "geometry_source") or source_path),
                 lookup_row_value(row, "source_point_index")
