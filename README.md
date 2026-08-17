@@ -145,8 +145,11 @@ The command creates missing parent directories and refuses to replace an
 existing file. Add `--overwrite` only when replacement is intentional. The
 result matches [`options.example.json`](options.example.json) and includes
 `null` placeholders showing where project-specific paths, parameter names,
-ranges, point counts, and output directories belong. A `null` value is omitted
-when a command runs.
+ranges, point counts, and output directories belong. Every required input for
+every model and workflow command now has a corresponding JSON key, including
+prediction, inspection, reranking, every export type, and the HB report's
+positional log list. A `null` value is omitted when a command runs, so replace
+the required placeholders for commands you intend to use.
 
 Relative paths inside the JSON are resolved from the directory in which
 `surrogate.py` is run, not from the directory containing the JSON. Running all
@@ -175,14 +178,28 @@ directory and every subdirectory and recognizes:
 - complete `surrogate.py` reproduction and export commands embedded in JSON,
   generated Markdown reports, shell files, and logs.
 
-The resulting `options.json` contains only settings that were recovered; it is
-not padded with unrelated starter defaults. Exact saved commands have priority
-over inferred metadata, while an existing options JSON has the highest
-priority because it represents an explicit user configuration. When different
-artifacts contain incompatible values for the same exact JSON setting,
+The resulting `options.json` uses the complete starter structure, then replaces
+its defaults and `null` placeholders with every setting discovery can recover.
+Consequently every command retains its required JSON keys even when a value
+cannot be inferred from the existing artifacts. Exact saved commands have
+priority over inferred metadata, while an existing options JSON has the
+highest priority because it represents an explicit user configuration. When
+different artifacts contain incompatible values for the same exact JSON setting,
 discovery deterministically selects the higher-confidence source (or the newer
 source when confidence is equal), prints a warning, and records both values.
 It never executes a discovered command.
+
+Inputs shared by `train` and `optimize` are recovered into the model's `fit`
+scope. In particular, an MDIF recovered from a training report or audit is
+available to both commands. Discovery also carries the same source MDIF into
+inspection, prediction, ADS ANN export, and audit where applicable, and derives
+standard output locations from a recovered model directory. Therefore a
+discovered DNN configuration can normally be optimized with no repeated
+settings:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn optimize
+```
 
 Discovery also writes `options_discovery.json` beside the requested output by
 default. This provenance report lists every recognized artifact, recovered
@@ -561,9 +578,21 @@ For example, `models.commands.fit.frequency_weights` applies to all three model
 families. `models.kbnn.commands.fit.frequency_weights` overrides it only for
 KBNN, and an explicit `--frequency-weights` overrides both for one invocation.
 
+For compatibility with previously generated JSON files, `train` and
+`optimize` also use the other command's fit-compatible settings as a fallback
+when neither the selected command nor its `fit` group defines that value. This
+includes MDIF paths, frequency/S-parameter weights, architecture single-value
+forms, data splits, DC settings, passivity/reciprocity settings, and fixed
+training controls. It deliberately excludes output directories and
+optimization-only controls, preventing an optimize run from overwriting a
+single trained model. New discovery output writes these shared values into
+`models.MODEL.commands.fit`, which remains the preferred, explicit location.
+
 Option keys may use hyphens or underscores and may include or omit the leading
 `--`. JSON arrays supply repeatable or multi-value options and booleans supply
-flag options. Remove a key or set it to `null` to omit that option. An empty
+flag options. Required positional inputs use their argument name as the JSON
+key; for example, HB logs are stored as `logs: ["baseline.log", "trial.log"]`.
+Remove a key or set it to `null` to omit that option. An empty
 string (`""`) is an explicit value and is not equivalent to omission. Unknown
 options, invalid choices, invalid types, misspelled headings, and unsupported
 schema versions stop before the command runs.
@@ -6282,7 +6311,7 @@ Unless stated otherwise, these options apply to all models for both `train` and
 | `--learning-rate FLOAT` | All-model `train`; single-value form in `optimize` | Adam step size. Default: `0.002`. Use `--learning-rates` for a candidate list. | `--learning-rate 0.001`  | `models.commands.fit.learning_rate` |
 | `--loss-interval INT` | All-model fit | Epoch interval for full train/verification scoring. Default: `1`. | `--loss-interval 5`  | `models.commands.fit.loss_interval` |
 | `--mdif PATH` | All-model fit | Required fine/direct training or combined MDIF. | `--mdif train_verify.mdif`  | `models.commands.fit.mdif` |
-| `--out-dir PATH` | All-model fit | Required model or optimize-report directory. | `--out-dir outputs/model`  | `models.commands.fit.out_dir` |
+| `--out-dir PATH` | All-model fit | Required model or optimize-report directory. Keep train and optimize outputs separate. | `--out-dir outputs/model`  | `models.MODEL.commands.{train,optimize}.out_dir` |
 | `--parameter-names LIST` | All-model fit | Comma-separated numeric geometry/process `VAR` names; inferred when omitted. | `--parameter-names W,L,H`  | `models.commands.fit.parameter_names` |
 | `--passivity-margin FLOAT` | All-model fit | Target margin below unit maximum singular value. Default: `0.001`. | `--passivity-margin 0.001`  | `models.commands.fit.passivity_margin` |
 | `--passivity-mode {auto,enforce,off}` | All-model fit | `auto` protects passive training data, `enforce` always protects a complete S response, and `off` disables protection. Default: `auto`. | `--passivity-mode auto`  | `models.commands.fit.passivity_mode` |
@@ -6464,11 +6493,12 @@ training tables from MDIF rather than importing local weights.
 ### D.15 ADS HB solver-report options
 
 The `hb-report` route accepts one or more positional `LOG` files. Use `-` once
-to read a log from standard input.
+to read a log from standard input. Unlike the route/subcommand selector itself,
+the positional log list can be supplied by the options JSON.
 
 | Option or argument | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- |
-| `LOG [LOG ...]` | Required ADS StatusLevel 4/5 text logs. | `baseline.log trial.log`  | Not supported (positional CLI argument) |
+| `LOG [LOG ...]` | Required ADS StatusLevel 4/5 text logs. In JSON, use a non-empty array; explicit positional CLI logs override it. | `baseline.log trial.log`  | `workflows.hb-report.commands.hb-report.logs` |
 | `--cpu-time-seconds SECONDS [...]` | Optional CPU-time overrides, exactly one per log. | `--cpu-time-seconds 120.5 110.2`  | `workflows.hb-report.commands.hb-report.cpu_time_seconds` |
 | `--frequency-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--frequency-regex 'Freq=(?P<value>[0-9.]+)(?P<unit>GHz)'`  | `workflows.hb-report.commands.hb-report.frequency_regex` |
 | `--labels NAME [...]` | Unique report labels, exactly one per log; defaults to file stems. | `--labels Baseline Trial`  | `workflows.hb-report.commands.hb-report.labels` |

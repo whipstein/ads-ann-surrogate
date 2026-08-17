@@ -5,11 +5,45 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import dnn
 import surrogate
+from de_generated_scripts import parse_ads_hb_solver_log
 from options_discovery import DiscoveryAccumulator, discover_options
 
 
 class OptionsDiscoveryTests(unittest.TestCase):
+    def test_hb_report_logs_are_discovered_and_reusable_without_positionals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report_dir = root / "hb-report"
+            report_dir.mkdir()
+            (report_dir / "ads_hb_solver_summary.json").write_text(
+                json.dumps(
+                    {
+                        "summaries": [
+                            {"model": "Baseline", "source_file": "baseline.log"},
+                            {"model": "Trial", "source_file": "trial.log"},
+                        ],
+                        "report_artifacts": [],
+                        "embedded_plot_artifacts": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload, _ = discover_options(root)
+            options_path = root / "options.json"
+            options_path.write_text(json.dumps(payload), encoding="utf-8")
+            args = parse_ads_hb_solver_log.parse_args_with_options_json(
+                parse_ads_hb_solver_log.build_arg_parser(),
+                ["--options-json", str(options_path)],
+                workflow="hb-report",
+                command="hb-report",
+            )
+
+        self.assertEqual(args.logs, ["baseline.log", "trial.log"])
+        self.assertEqual(args.labels, ["Baseline", "Trial"])
+
     def test_scalar_object_path_collision_is_reported_not_raised(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -163,6 +197,13 @@ class OptionsDiscoveryTests(unittest.TestCase):
             )
 
             payload, report = discover_options(root)
+            discovered_json = root / "discovered.json"
+            discovered_json.write_text(json.dumps(payload), encoding="utf-8")
+            optimize_args = dnn.parse_args_with_options_json(
+                dnn.build_arg_parser(),
+                ["optimize", "--options-json", str(discovered_json)],
+                model="dnn",
+            )
 
         generate = payload["workflows"]["points"]["commands"]["generate"]
         self.assertEqual(generate["count"], 24)
@@ -178,6 +219,8 @@ class OptionsDiscoveryTests(unittest.TestCase):
         self.assertEqual(train["out_dir"], "outputs/dnn")
         self.assertEqual(train["hidden_layers"], "32,16")
         self.assertEqual(train["frequency_weights"], "default=1;2GHz=4")
+        self.assertEqual(optimize_args.mdif, "data/train_verify.mdif")
+        self.assertTrue(optimize_args.out_dir.endswith("dnn_optimize"))
         self.assertIn("model_dir", payload["models"]["dnn"]["commands"]["export-veriloga"])
         self.assertEqual(len(report["recovered_commands"]), 1)
         self.assertGreaterEqual(report["settings_discovered"], 15)

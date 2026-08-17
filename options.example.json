@@ -23,6 +23,15 @@
         "selection_metric": "weighted_evm_pct",
         "trial_seed_mode": "fixed",
         "trial_worst_plots": 0
+      },
+      "inspect-mdif": {
+        "mdif": null
+      },
+      "predict": {
+        "mdif": null
+      },
+      "export-ads-ann": {
+        "mdif": null
       }
     },
     "dnn": {
@@ -31,8 +40,34 @@
           "output_domain": "s",
           "sparam_weights": "diag=1;offdiag=0.2"
         },
+        "export-ads-ann": {
+          "model_dir": null,
+          "out_dir": null
+        },
+        "export-ads-hb": {
+          "model_dir": null,
+          "out_dir": null
+        },
+        "export-ads-mdif": {
+          "freqs": null,
+          "model_dir": null,
+          "out_dir": null,
+          "parameter_grid": null,
+          "template_mdif": null
+        },
+        "export-veriloga": {
+          "model_dir": null,
+          "out_dir": null
+        },
         "optimize": {
           "out_dir": null
+        },
+        "predict": {
+          "model_dir": null,
+          "out_mdif": null
+        },
+        "rerank-sweep": {
+          "sweep_dir": null
         },
         "train": {
           "out_dir": null
@@ -43,12 +78,40 @@
       "commands": {
         "fit": {
           "coarse_mdif": null,
+          "coarse_model_dir": null,
+          "coarse_verification_mdif": null,
           "coarse_sparam_weights": "diag=1;offdiag=0.2",
           "mode": "residual",
           "sparam_weights": "diag=1;offdiag=0.2"
         },
+        "export-ads-ann": {
+          "model_dir": null,
+          "out_dir": null
+        },
+        "export-ads-hb": {
+          "model_dir": null,
+          "out_dir": null
+        },
+        "export-ads-mdif": {
+          "freqs": null,
+          "model_dir": null,
+          "out_dir": null,
+          "parameter_grid": null,
+          "template_mdif": null
+        },
+        "export-veriloga": {
+          "model_dir": null,
+          "out_dir": null
+        },
         "optimize": {
           "out_dir": null
+        },
+        "predict": {
+          "model_dir": null,
+          "out_mdif": null
+        },
+        "rerank-sweep": {
+          "sweep_dir": null
         },
         "train": {
           "out_dir": null
@@ -60,8 +123,27 @@
         "fit": {
           "order": 10
         },
+        "export-ads-hb": {
+          "model_dir": null,
+          "out_dir": null
+        },
+        "export-ads-mdif": {
+          "freqs": null,
+          "model_dir": null,
+          "out_dir": null,
+          "parameter_grid": null,
+          "template_mdif": null
+        },
+        "export-veriloga": {
+          "model_dir": null,
+          "out_dir": null
+        },
         "optimize": {
           "out_dir": null
+        },
+        "predict": {
+          "model_dir": null,
+          "out_mdif": null
         },
         "train": {
           "out_dir": null
@@ -103,6 +185,15 @@
           "out": null,
           "parameter_json": null,
           "verification_metrics": null
+        }
+      }
+    },
+    "hb-report": {
+      "commands": {
+        "hb-report": {
+          "labels": null,
+          "logs": null,
+          "out_dir": "ads_hb_solver_report"
         }
       }
     }

@@ -59,6 +59,81 @@ COMMAND_NAMES = {
 COMMAND_GROUPS = {"all", "fit", "export"}
 NODE_HEADINGS = {"generic", "common", "commands"}
 ROOT_HEADINGS = NODE_HEADINGS | {"schema_version", "models", "workflows"}
+FIT_SHARED_OPTION_KEYS = {
+    "activation",
+    "batch_size",
+    "coarse_activation",
+    "coarse_batch_size",
+    "coarse_epochs",
+    "coarse_freq_transform",
+    "coarse_frequency_weights",
+    "coarse_hidden_layers",
+    "coarse_learning_rate",
+    "coarse_loss_interval",
+    "coarse_mdif",
+    "coarse_model_dir",
+    "coarse_passivity_margin",
+    "coarse_passivity_mode",
+    "coarse_patience",
+    "coarse_progress_interval",
+    "coarse_reciprocity_mode",
+    "coarse_reciprocity_tolerance",
+    "coarse_seed",
+    "coarse_sparam_weights",
+    "coarse_verification_mdif",
+    "coarse_worst_plots",
+    "dc_activation",
+    "dc_batch_size",
+    "dc_epochs",
+    "dc_hidden_layers",
+    "dc_learning_rate",
+    "dc_loss_interval",
+    "dc_open_resistance",
+    "dc_open_threshold",
+    "dc_passivity_tolerance",
+    "dc_patience",
+    "dc_port_paths",
+    "dc_progress_interval",
+    "debug",
+    "epochs",
+    "freq_transform",
+    "frequency_weights",
+    "hidden_layers",
+    "holdout_fraction",
+    "include_coarse_input",
+    "learning_rate",
+    "loss_interval",
+    "max_y_condition",
+    "mdif",
+    "order",
+    "output_domain",
+    "output_scaler_floor",
+    "parameter_names",
+    "passivity_margin",
+    "passivity_mode",
+    "passivity_penalty",
+    "patience",
+    "pole_damping",
+    "progress_interval",
+    "reciprocity_mode",
+    "reciprocity_tolerance",
+    "ridge",
+    "seed",
+    "sparam_weights",
+    "split_var",
+    "target_z0",
+    "train_values",
+    "verification_mdif",
+    "verify_values",
+    "worst_plots",
+}
+
+
+def fit_shared_option_keys(model: str | None = None) -> set[str]:
+    keys = set(FIT_SHARED_OPTION_KEYS)
+    if model is not None and normalize_model_name(model) == "kbnn":
+        keys.add("mode")
+    return keys
 
 
 def starter_options_payload() -> dict[str, object]:
@@ -90,6 +165,9 @@ def starter_options_payload() -> dict[str, object]:
                     "trial_seed_mode": "fixed",
                     "trial_worst_plots": 0,
                 },
+                "inspect-mdif": {"mdif": None},
+                "predict": {"mdif": None},
+                "export-ads-ann": {"mdif": None},
             },
             "dnn": {
                 "commands": {
@@ -97,7 +175,19 @@ def starter_options_payload() -> dict[str, object]:
                         "output_domain": "s",
                         "sparam_weights": "diag=1;offdiag=0.2",
                     },
+                    "export-ads-ann": {"model_dir": None, "out_dir": None},
+                    "export-ads-hb": {"model_dir": None, "out_dir": None},
+                    "export-ads-mdif": {
+                        "freqs": None,
+                        "model_dir": None,
+                        "out_dir": None,
+                        "parameter_grid": None,
+                        "template_mdif": None,
+                    },
+                    "export-veriloga": {"model_dir": None, "out_dir": None},
                     "optimize": {"out_dir": None},
+                    "predict": {"model_dir": None, "out_mdif": None},
+                    "rerank-sweep": {"sweep_dir": None},
                     "train": {"out_dir": None},
                 }
             },
@@ -105,18 +195,42 @@ def starter_options_payload() -> dict[str, object]:
                 "commands": {
                     "fit": {
                         "coarse_mdif": None,
+                        "coarse_model_dir": None,
+                        "coarse_verification_mdif": None,
                         "coarse_sparam_weights": "diag=1;offdiag=0.2",
                         "mode": "residual",
                         "sparam_weights": "diag=1;offdiag=0.2",
                     },
+                    "export-ads-ann": {"model_dir": None, "out_dir": None},
+                    "export-ads-hb": {"model_dir": None, "out_dir": None},
+                    "export-ads-mdif": {
+                        "freqs": None,
+                        "model_dir": None,
+                        "out_dir": None,
+                        "parameter_grid": None,
+                        "template_mdif": None,
+                    },
+                    "export-veriloga": {"model_dir": None, "out_dir": None},
                     "optimize": {"out_dir": None},
+                    "predict": {"model_dir": None, "out_mdif": None},
+                    "rerank-sweep": {"sweep_dir": None},
                     "train": {"out_dir": None},
                 }
             },
             "neuro-tf": {
                 "commands": {
                     "fit": {"order": 10},
+                    "export-ads-hb": {"model_dir": None, "out_dir": None},
+                    "export-ads-mdif": {
+                        "freqs": None,
+                        "model_dir": None,
+                        "out_dir": None,
+                        "parameter_grid": None,
+                        "template_mdif": None,
+                    },
+                    "export-veriloga": {"model_dir": None, "out_dir": None},
                     "optimize": {"out_dir": None},
+                    "predict": {"model_dir": None, "out_mdif": None},
                     "train": {"out_dir": None},
                 }
             },
@@ -156,6 +270,15 @@ def starter_options_payload() -> dict[str, object]:
                         "parameter_json": None,
                         "verification_metrics": None,
                     },
+                }
+            },
+            "hb-report": {
+                "commands": {
+                    "hb-report": {
+                        "labels": None,
+                        "logs": None,
+                        "out_dir": "ads_hb_solver_report",
+                    }
                 }
             },
         },
@@ -365,6 +488,31 @@ def _command_defaults(
     return defaults
 
 
+def _fit_sibling_defaults(
+    commands: Mapping[str, object],
+    command: str,
+    context: str,
+    model: str | None = None,
+) -> dict[str, object]:
+    """Reuse compatible train/optimize values when no shared fit value exists."""
+
+    if command not in {"train", "optimize"}:
+        return {}
+    sibling = "optimize" if command == "train" else "train"
+    normalized: dict[str, dict[str, object]] = {}
+    for raw_name, raw_options in commands.items():
+        normalized[normalize_command_name(raw_name)] = _mapping(
+            raw_options,
+            f"{context}.{raw_name}",
+        )
+    return {
+        key: value
+        for key, value in normalized.get(sibling, {}).items()
+        if str(key).strip().lstrip("-").replace("-", "_")
+        in fit_shared_option_keys(model)
+    }
+
+
 def _record_locations(
     target: dict[str, str],
     source: Mapping[str, object],
@@ -391,6 +539,28 @@ def _command_locations(
             raw_name, options = normalized[key]
             _record_locations(locations, options, f"{context}.{raw_name}")
     return locations
+
+
+def _fit_sibling_locations(
+    commands: Mapping[str, object],
+    command: str,
+    context: str,
+    model: str | None = None,
+) -> dict[str, str]:
+    if command not in {"train", "optimize"}:
+        return {}
+    sibling = "optimize" if command == "train" else "train"
+    for raw_name, raw_options in commands.items():
+        if normalize_command_name(raw_name) != sibling:
+            continue
+        options = _mapping(raw_options, f"options JSON {context}.{raw_name}")
+        return {
+            str(key): f"{context}.{raw_name}.{key} (fit-compatible fallback)"
+            for key in options
+            if str(key).strip().lstrip("-").replace("-", "_")
+            in fit_shared_option_keys(model)
+        }
+    return {}
 
 
 def _node_locations(
@@ -528,6 +698,14 @@ def load_options_json_resolution(
                 )
         _merge_options(
             defaults,
+            _fit_sibling_defaults(
+                model_container_commands,
+                canonical_command,
+                "options JSON models.commands",
+            ),
+        )
+        _merge_options(
+            defaults,
             _command_defaults(
                 model_container_commands,
                 canonical_command,
@@ -562,6 +740,16 @@ def load_options_json_resolution(
             selected_scope.get("commands"),
             f"{scope_context}.commands",
         )
+        if model is not None:
+            _merge_options(
+                defaults,
+                _fit_sibling_defaults(
+                    scope_commands,
+                    canonical_command,
+                    f"{scope_context}.commands",
+                    model=canonical_model,
+                ),
+            )
         _merge_options(
             defaults,
             _command_defaults(
@@ -599,6 +787,13 @@ def load_options_json_resolution(
                     f"models.{heading}",
                 )
         locations.update(
+            _fit_sibling_locations(
+                model_container_commands,
+                canonical_command,
+                "models.commands",
+            )
+        )
+        locations.update(
             _command_locations(
                 model_container_commands,
                 canonical_command,
@@ -616,6 +811,15 @@ def load_options_json_resolution(
             selected_scope.get("commands"),
             f"{scope_context}.commands",
         )
+        if model is not None:
+            locations.update(
+                _fit_sibling_locations(
+                    scope_commands,
+                    canonical_command,
+                    f"{scope_context.removeprefix('options JSON ')}.commands",
+                    model=selected_model_name,
+                )
+            )
         locations.update(
             _command_locations(
                 scope_commands,
@@ -742,14 +946,13 @@ def apply_options_json_defaults(
     """Validate and apply JSON values to the selected argparse command."""
 
     selected = _selected_parser(parser, command)
-    actions = [
-        action
-        for owner in (parser, selected)
-        for action in owner._actions
-        if action.option_strings
-    ]
+    actions = _parser_actions(parser, command)
     option_actions: dict[str, argparse.Action] = {}
+    positional_actions: dict[str, argparse.Action] = {}
     for action in actions:
+        if not action.option_strings:
+            positional_actions[action.dest.replace("-", "_")] = action
+            continue
         for option in action.option_strings:
             if option.startswith("--"):
                 option_actions[option] = action
@@ -782,10 +985,16 @@ def apply_options_json_defaults(
                 "The options JSON cannot enable --explain-options; "
                 "request diagnostics explicitly on the command line"
             )
-        action = option_actions.get(option)
+        positional_key = str(raw_key).strip().lstrip("-").replace("-", "_")
+        action = option_actions.get(option) or positional_actions.get(positional_key)
         if action is None:
-            available = sorted(option_actions)
-            close = get_close_matches(option, available, n=3)
+            close = get_close_matches(option, sorted(option_actions), n=3)
+            if not close:
+                close = get_close_matches(
+                    positional_key,
+                    sorted(positional_actions),
+                    n=3,
+                )
             suggestion = f" Did you mean {', '.join(close)}?" if close else ""
             raise OptionsJSONError(
                 f"Option {option!r} from {source_path} is not valid for "
@@ -801,6 +1010,12 @@ def apply_options_json_defaults(
                     + default_sources.get(raw_key, str(source_path))
                 )
             continue
+        if not action.option_strings and action.nargs == "+":
+            if not isinstance(converted, list) or not converted:
+                raise OptionsJSONError(
+                    f"Positional argument {action.dest!r} from {source_path} "
+                    "requires a non-empty JSON array"
+                )
         applied[action.dest] = converted
         if default_sources is not None:
             applied_sources[action.dest] = default_sources.get(
@@ -808,6 +1023,13 @@ def apply_options_json_defaults(
                 str(source_path),
             )
         supplied_actions.append(action)
+
+        if not action.option_strings:
+            if action.nargs is None:
+                action.nargs = "?"
+            elif action.nargs == "+":
+                action.nargs = "*"
+            action.required = False
 
     selected.set_defaults(**applied)
     for action in supplied_actions:
@@ -839,13 +1061,7 @@ def _explicit_option_updates(
     *,
     command: str,
 ) -> tuple[dict[str, object], dict[str, argparse.Action]]:
-    selected = _selected_parser(parser, command)
-    actions = [
-        action
-        for owner in (parser, selected)
-        for action in owner._actions
-        if action.option_strings
-    ]
+    actions = _parser_actions(parser, command)
     option_actions = {
         option: action
         for action in actions
@@ -877,6 +1093,16 @@ def _explicit_option_updates(
             saved_option.lstrip("-").replace("-", "_"),
             action,
         )
+
+    for action in actions:
+        if action.option_strings:
+            continue
+        value = getattr(args, action.dest, argparse.SUPPRESS)
+        if value is argparse.SUPPRESS or value is None or value == action.default:
+            continue
+        if isinstance(value, (list, tuple)) and not value:
+            continue
+        selected_options[action.dest] = (action.dest.replace("-", "_"), action)
 
     updates: dict[str, object] = {}
     updated_actions: dict[str, argparse.Action] = {}
@@ -1245,7 +1471,15 @@ def print_effective_options(
             is_missing = value is argparse.SUPPRESS or value is None or (
                 isinstance(value, (list, tuple)) and not value
             )
-            source = "CLI positional argument"
+            if action.dest in json_sources:
+                json_source = json_sources[action.dest]
+                source = (
+                    f"parser default; JSON {json_source}"
+                    if json_source.startswith("null ignored at ")
+                    else f"JSON: {json_source}"
+                )
+            else:
+                source = "CLI positional argument"
             if required_actions.get(id(action), False) and is_missing:
                 source = "MISSING REQUIRED ARGUMENT"
                 missing.append(label)

@@ -27,8 +27,10 @@ from cli_options import (
     WORKFLOW_NAMES,
     _explicit_option_updates,
     _relax_parser_requirements_for_explanation,
+    fit_shared_option_keys,
     normalize_command_name,
     normalize_model_name,
+    starter_options_payload,
 )
 
 
@@ -645,6 +647,13 @@ def recover_model_metadata(
         )
     if model == "neuro-tf":
         accumulator.add((*base, "order"), payload.get("n_poles"), path, priority=30)
+    inferred_outputs = {
+        "predict": ("out_mdif", path.parent / "predicted.mdif"),
+        "export-ads-mdif": ("out_dir", path.parent / "ads_mdif_export"),
+        "export-ads-ann": ("out_dir", path.parent / "ads_ann_export"),
+        "export-ads-hb": ("out_dir", path.parent / "ads_hb_export"),
+        "export-veriloga": ("out_dir", path.parent / "veriloga_export"),
+    }
     for command in MODEL_EXPORT_COMMANDS:
         if command == "export-ads-ann" and model == "neuro-tf":
             continue
@@ -653,6 +662,13 @@ def recover_model_metadata(
             accumulator.cli_path(path.parent),
             path,
             priority=25,
+        )
+        output_key, output_path = inferred_outputs[command]
+        accumulator.add(
+            ("models", model, "commands", command, output_key),
+            accumulator.cli_path(output_path),
+            path,
+            priority=15,
         )
 
 
@@ -713,18 +729,48 @@ def recover_audit_summary(
     coarse_verify = sources.get(("coarse", "verification"), [])
     if fine_train:
         accumulator.add((*base, "mdif"), fine_train[0], blocks_path, priority=35)
+        accumulator.add(
+            ("models", "commands", "fit", "mdif"),
+            fine_train[0],
+            blocks_path,
+            priority=25,
+        )
     if fine_verify and fine_verify[0] not in fine_train:
         accumulator.add(
             (*base, "verification_mdif"), fine_verify[0], blocks_path, priority=35
         )
+        accumulator.add(
+            ("models", "commands", "fit", "verification_mdif"),
+            fine_verify[0],
+            blocks_path,
+            priority=25,
+        )
     if coarse_train:
         accumulator.add((*base, "coarse_mdif"), coarse_train[0], blocks_path, priority=35)
+        accumulator.add(
+            ("models", "kbnn", "commands", "fit", "coarse_mdif"),
+            coarse_train[0],
+            blocks_path,
+            priority=25,
+        )
     if coarse_verify and coarse_verify[0] not in coarse_train:
         accumulator.add(
             (*base, "coarse_verification_mdif"),
             coarse_verify[0],
             blocks_path,
             priority=35,
+        )
+        accumulator.add(
+            (
+                "models",
+                "kbnn",
+                "commands",
+                "fit",
+                "coarse_verification_mdif",
+            ),
+            coarse_verify[0],
+            blocks_path,
+            priority=25,
         )
 
 
@@ -752,6 +798,13 @@ def recover_best_config(
     accumulator.add_artifact(path, "optimize_best_config")
     base = ("models", model, "commands", "optimize")
     accumulator.add((*base, "out_dir"), accumulator.cli_path(path.parent), path, priority=50)
+    if model in {"dnn", "kbnn"}:
+        accumulator.add(
+            ("models", model, "commands", "rerank-sweep", "sweep_dir"),
+            accumulator.cli_path(path.parent),
+            path,
+            priority=50,
+        )
     for key in (
         "selection_metric",
         "require_passive",
@@ -792,6 +845,37 @@ def recover_best_config(
             accumulator.add(
                 (*base, "include_coarse_inputs"), "false", path, priority=50
             )
+
+
+def recover_hb_report_summary(
+    accumulator: DiscoveryAccumulator,
+    path: Path,
+    payload: Mapping[str, object],
+) -> None:
+    if path.name != "ads_hb_solver_summary.json":
+        return
+    summaries = payload.get("summaries")
+    if not isinstance(summaries, list) or not summaries:
+        return
+    logs: list[str] = []
+    labels: list[str] = []
+    for row in summaries:
+        if not isinstance(row, dict):
+            continue
+        source_file = str(row.get("source_file") or "").strip()
+        label = str(row.get("model") or "").strip()
+        if source_file:
+            logs.append(source_file)
+            labels.append(label or Path(source_file).stem)
+    if not logs:
+        return
+    accumulator.add_artifact(path, "hb_solver_report")
+    base = ("workflows", "hb-report", "commands", "hb-report")
+    accumulator.add((*base, "logs"), logs, path, priority=35)
+    accumulator.add((*base, "labels"), labels, path, priority=35)
+    accumulator.add(
+        (*base, "out_dir"), accumulator.cli_path(path.parent), path, priority=35
+    )
 
 
 def recover_sweep_results(
@@ -1027,13 +1111,21 @@ def recover_command(
             source,
             priority=priority,
         )
+        if model is not None and command in {"train", "optimize"}:
+            if key in fit_shared_option_keys(model):
+                accumulator.add(
+                    ("models", model, "commands", "fit", key),
+                    value,
+                    source,
+                    priority=max(1, priority - 1),
+                )
     if model is not None and command.startswith("export-"):
         inferred_training_mdif = updates.get("template_mdif")
         if inferred_training_mdif is None and command == "export-ads-ann":
             inferred_training_mdif = updates.get("mdif")
         if inferred_training_mdif is not None:
             accumulator.add(
-                ("models", model, "commands", "train", "mdif"),
+                ("models", model, "commands", "fit", "mdif"),
                 inferred_training_mdif,
                 source,
                 priority=max(1, priority - 15),
@@ -1076,6 +1168,7 @@ def inspect_json(
     recover_model_metadata(accumulator, path, payload)
     recover_audit_summary(accumulator, path, payload)
     recover_best_config(accumulator, path, payload)
+    recover_hb_report_summary(accumulator, path, payload)
     saved_commands = list(command_strings_from_json(payload))
     if saved_commands:
         accumulator.add_artifact(
@@ -1092,6 +1185,148 @@ def inspect_json(
             command_text,
             priority=command_priority,
         )
+
+
+def candidate_source_path(
+    accumulator: DiscoveryAccumulator, candidate: SettingCandidate
+) -> Path:
+    source = Path(candidate.source)
+    return source if source.is_absolute() else accumulator.root / source
+
+
+def add_from_candidate(
+    accumulator: DiscoveryAccumulator,
+    destination: tuple[str, ...],
+    candidate: SettingCandidate,
+    *,
+    priority_adjustment: int = -1,
+) -> None:
+    accumulator.add(
+        destination,
+        candidate.value,
+        candidate_source_path(accumulator, candidate),
+        priority=max(1, candidate.priority + priority_adjustment),
+    )
+
+
+def first_setting_candidate(
+    accumulator: DiscoveryAccumulator,
+    locations: Sequence[tuple[str, ...]],
+) -> SettingCandidate | None:
+    for location in locations:
+        candidate = accumulator.settings.get(location)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def complete_discovered_command_inputs(
+    accumulator: DiscoveryAccumulator,
+) -> None:
+    """Reuse recovered inputs across commands that consume the same artifact."""
+
+    for model in ("dnn", "kbnn", "neuro-tf"):
+        for key in fit_shared_option_keys(model):
+            fit_location = ("models", model, "commands", "fit", key)
+            if fit_location in accumulator.settings:
+                continue
+            candidate = first_setting_candidate(
+                accumulator,
+                [
+                    ("models", model, "commands", "optimize", key),
+                    ("models", model, "commands", "train", key),
+                ],
+            )
+            if candidate is not None:
+                add_from_candidate(accumulator, fit_location, candidate)
+
+        mdif_candidate = first_setting_candidate(
+            accumulator,
+            [
+                ("models", model, "commands", "fit", "mdif"),
+                ("models", "commands", "fit", "mdif"),
+            ],
+        )
+        if mdif_candidate is not None:
+            dependent_commands = ["inspect-mdif", "predict"]
+            if model in {"dnn", "kbnn"}:
+                dependent_commands.append("export-ads-ann")
+            for command in dependent_commands:
+                destination = ("models", model, "commands", command, "mdif")
+                if destination not in accumulator.settings:
+                    add_from_candidate(accumulator, destination, mdif_candidate)
+
+        optimize_out = (
+            "models",
+            model,
+            "commands",
+            "optimize",
+            "out_dir",
+        )
+        train_out_candidate = accumulator.settings.get(
+            ("models", model, "commands", "train", "out_dir")
+        )
+        if optimize_out not in accumulator.settings and train_out_candidate is not None:
+            train_path = Path(str(train_out_candidate.value))
+            optimize_path = train_path.with_name(f"{train_path.name}_optimize")
+            accumulator.add(
+                optimize_out,
+                str(optimize_path),
+                candidate_source_path(accumulator, train_out_candidate),
+                priority=max(1, train_out_candidate.priority - 10),
+            )
+
+        if model in {"dnn", "kbnn"}:
+            rerank_location = (
+                "models",
+                model,
+                "commands",
+                "rerank-sweep",
+                "sweep_dir",
+            )
+            optimize_candidate = accumulator.settings.get(optimize_out)
+            if (
+                rerank_location not in accumulator.settings
+                and optimize_candidate is not None
+            ):
+                add_from_candidate(
+                    accumulator,
+                    rerank_location,
+                    optimize_candidate,
+                )
+
+    audit_mdif = (
+        "workflows",
+        "audit",
+        "commands",
+        "audit",
+        "mdif",
+    )
+    if audit_mdif not in accumulator.settings:
+        candidate = accumulator.settings.get(
+            ("models", "commands", "fit", "mdif")
+        )
+        if candidate is None:
+            candidate = first_setting_candidate(
+                accumulator,
+                [
+                    ("models", model, "commands", "fit", "mdif")
+                    for model in ("dnn", "kbnn", "neuro-tf")
+                ],
+            )
+        if candidate is not None:
+            add_from_candidate(accumulator, audit_mdif, candidate)
+
+
+def overlay_options_payload(
+    target: dict[str, object], source: Mapping[str, object]
+) -> None:
+    for key, value in source.items():
+        existing = target.get(str(key))
+        if isinstance(existing, dict) and isinstance(value, Mapping):
+            overlay_options_payload(existing, value)
+        else:
+            target[str(key)] = json_compatible(value)
 
 
 def discover_options(
@@ -1155,7 +1390,10 @@ def discover_options(
             seen_commands.add(command_key)
             recover_command(accumulator, path, command_text, priority=60)
 
-    payload = accumulator.payload()
+    complete_discovered_command_inputs(accumulator)
+    discovered_payload = accumulator.payload()
+    payload = starter_options_payload()
+    overlay_options_payload(payload, discovered_payload)
     source_report = {
         ".".join(location): {
             "selected_source": accumulator.settings[location].source,
@@ -1168,6 +1406,7 @@ def discover_options(
         "directory": str(root),
         "files_scanned": scanned_files,
         "settings_discovered": len(accumulator.settings),
+        "starter_defaults_included": True,
         "recognized_artifacts": sorted(
             accumulator.artifacts,
             key=lambda item: (str(item["kind"]), str(item["path"])),

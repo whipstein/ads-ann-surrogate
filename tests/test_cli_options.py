@@ -12,10 +12,14 @@ import dnn
 import generate_points
 import kbnn
 import neuro_tf
+from de_generated_scripts import parse_ads_hb_solver_log
 
 from cli_options import (
     add_options_json_argument,
     finalize_options_json_update,
+    fit_shared_option_keys,
+    load_options_json_resolution,
+    normalize_command_name,
     parse_args_with_options_json,
     starter_options_payload,
 )
@@ -39,7 +43,369 @@ def example_parser() -> argparse.ArgumentParser:
 
 
 class OptionsJSONTests(unittest.TestCase):
+    def test_optimize_reuses_fit_compatible_train_settings_when_not_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "dnn": {
+                            "commands": {
+                                "train": {
+                                    "activation": "tanh",
+                                    "frequency_weights": "default=1;2GHz=4",
+                                    "mdif": "training.mdif",
+                                },
+                                "optimize": {"out_dir": "optimization"},
+                            }
+                        }
+                    }
+                },
+            )
+            args = parse_args_with_options_json(
+                dnn.build_arg_parser(),
+                ["optimize", "--options-json", str(config)],
+                model="dnn",
+            )
+
+        self.assertEqual(args.mdif, "training.mdif")
+        self.assertEqual(args.activation_options, "tanh")
+        self.assertEqual(args.frequency_weights, "default=1;2GHz=4")
+        self.assertEqual(args.out_dir, "optimization")
+
+    def test_required_positional_arguments_can_be_loaded_and_updated_in_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "workflows": {
+                        "hb-report": {
+                            "commands": {"hb-report": {"logs": ["saved.log"]}}
+                        }
+                    }
+                },
+            )
+            loaded = parse_args_with_options_json(
+                parse_ads_hb_solver_log.build_arg_parser(),
+                ["--options-json", str(config)],
+                workflow="hb-report",
+                command="hb-report",
+            )
+            self.assertEqual(loaded.logs, ["saved.log"])
+
+            updated = parse_args_with_options_json(
+                parse_ads_hb_solver_log.build_arg_parser(),
+                [
+                    "new-baseline.log",
+                    "new-trial.log",
+                    "--options-json",
+                    str(config),
+                    "--update-options-json",
+                ],
+                workflow="hb-report",
+                command="hb-report",
+            )
+            self.assertEqual(finalize_options_json_update(updated, 0), 0)
+            payload = json.loads(config.read_text())
+
+        self.assertEqual(
+            payload["workflows"]["hb-report"]["commands"]["hb-report"]["logs"],
+            ["new-baseline.log", "new-trial.log"],
+        )
+
+    def test_every_required_repository_argument_is_represented_in_starter_json(self) -> None:
+        model_commands = {
+            "dnn": (
+                dnn.build_arg_parser,
+                (
+                    "train",
+                    "optimize",
+                    "rerank-sweep",
+                    "predict",
+                    "export-ads-mdif",
+                    "export-ads-ann",
+                    "export-ads-hb",
+                    "export-veriloga",
+                    "inspect-mdif",
+                ),
+            ),
+            "kbnn": (
+                kbnn.build_arg_parser,
+                (
+                    "train",
+                    "optimize",
+                    "rerank-sweep",
+                    "predict",
+                    "export-ads-mdif",
+                    "export-ads-ann",
+                    "export-ads-hb",
+                    "export-veriloga",
+                    "inspect-mdif",
+                ),
+            ),
+            "neuro-tf": (
+                neuro_tf.build_arg_parser,
+                (
+                    "train",
+                    "optimize",
+                    "predict",
+                    "export-ads-mdif",
+                    "export-ads-hb",
+                    "export-veriloga",
+                    "inspect-mdif",
+                ),
+            ),
+        }
+        workflow_commands = (
+            (
+                "points",
+                "generate",
+                generate_points.build_generate_parser,
+            ),
+            (
+                "points",
+                "suggest-additional",
+                generate_points.build_suggest_parser,
+            ),
+            ("audit", "audit", audit_dataset.build_parser),
+            (
+                "hb-report",
+                "hb-report",
+                parse_ads_hb_solver_log.build_arg_parser,
+            ),
+        )
+
+        def selected_parser(
+            parser: argparse.ArgumentParser, command: str
+        ) -> argparse.ArgumentParser:
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for raw_name, child in action.choices.items():
+                        if normalize_command_name(raw_name) == command:
+                            return child
+            return parser
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(Path(temp_dir), starter_options_payload())
+            cases: list[tuple[argparse.ArgumentParser, str, dict[str, str]]] = []
+            for model, (builder, commands) in model_commands.items():
+                cases.extend(
+                    (builder(), command, {"model": model})
+                    for command in commands
+                )
+            cases.extend(
+                (builder(), command, {"workflow": workflow})
+                for workflow, command, builder in workflow_commands
+            )
+            for parser, command, scope in cases:
+                with self.subTest(command=command, scope=scope):
+                    defaults, _ = load_options_json_resolution(
+                        config,
+                        command=command,
+                        **scope,
+                    )
+                    child = selected_parser(parser, command)
+                    required = [
+                        action
+                        for action in child._actions
+                        if action.dest != "help"
+                        and (
+                            bool(getattr(action, "required", False))
+                            or (not action.option_strings and action.nargs == "+")
+                        )
+                    ]
+                    self.assertTrue(required, command)
+                    for action in required:
+                        self.assertIn(
+                            action.dest,
+                            defaults,
+                            f"{scope} {command} omits required {action.dest}",
+                        )
+
+    def test_json_can_supply_every_required_repository_argument(self) -> None:
+        cases = [
+            *(
+                (model, command, builder)
+                for model, builder, commands in (
+                    (
+                        "dnn",
+                        dnn.build_arg_parser,
+                        (
+                            "train",
+                            "optimize",
+                            "rerank-sweep",
+                            "predict",
+                            "export-ads-mdif",
+                            "export-ads-ann",
+                            "export-ads-hb",
+                            "export-veriloga",
+                            "inspect-mdif",
+                        ),
+                    ),
+                    (
+                        "kbnn",
+                        kbnn.build_arg_parser,
+                        (
+                            "train",
+                            "optimize",
+                            "rerank-sweep",
+                            "predict",
+                            "export-ads-mdif",
+                            "export-ads-ann",
+                            "export-ads-hb",
+                            "export-veriloga",
+                            "inspect-mdif",
+                        ),
+                    ),
+                    (
+                        "neuro-tf",
+                        neuro_tf.build_arg_parser,
+                        (
+                            "train",
+                            "optimize",
+                            "predict",
+                            "export-ads-mdif",
+                            "export-ads-hb",
+                            "export-veriloga",
+                            "inspect-mdif",
+                        ),
+                    ),
+                )
+                for command in commands
+            )
+        ]
+
+        def child_parser(
+            parser: argparse.ArgumentParser, command: str
+        ) -> argparse.ArgumentParser:
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    return next(
+                        child
+                        for raw_name, child in action.choices.items()
+                        if normalize_command_name(raw_name) == command
+                    )
+            return parser
+
+        def required_values(
+            parser: argparse.ArgumentParser, command: str
+        ) -> dict[str, object]:
+            values: dict[str, object] = {}
+            for action in child_parser(parser, command)._actions:
+                required = bool(getattr(action, "required", False)) or (
+                    not action.option_strings and action.nargs == "+"
+                )
+                if not required or action.dest == "help":
+                    continue
+                if action.dest in {"count"}:
+                    values[action.dest] = 1
+                elif isinstance(action, argparse._AppendAction):
+                    values[action.dest] = ["W=1:2"]
+                elif not action.option_strings:
+                    values[action.dest] = ["simulation.log"]
+                else:
+                    values[action.dest] = f"{action.dest}.value"
+            return values
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index, (model, command, builder) in enumerate(cases):
+                parser = builder()
+                values = required_values(parser, command)
+                config = self.write_config(
+                    root / f"model-{index}",
+                    {
+                        "models": {
+                            model: {"commands": {command: values}}
+                        }
+                    },
+                )
+                args = parse_args_with_options_json(
+                    parser,
+                    [command, "--options-json", str(config)],
+                    model=model,
+                )
+                for key, value in values.items():
+                    self.assertEqual(getattr(args, key), value)
+
+            workflow_cases = (
+                ("points", "generate", generate_points.build_generate_parser),
+                ("points", "suggest-additional", generate_points.build_suggest_parser),
+                ("audit", "audit", audit_dataset.build_parser),
+                (
+                    "hb-report",
+                    "hb-report",
+                    parse_ads_hb_solver_log.build_arg_parser,
+                ),
+            )
+            for index, (workflow, command, builder) in enumerate(workflow_cases):
+                parser = builder()
+                values = required_values(parser, command)
+                config = self.write_config(
+                    root / f"workflow-{index}",
+                    {
+                        "workflows": {
+                            workflow: {"commands": {command: values}}
+                        }
+                    },
+                )
+                args = parse_args_with_options_json(
+                    parser,
+                    ["--options-json", str(config)],
+                    workflow=workflow,
+                    command=command,
+                )
+                for key, value in values.items():
+                    self.assertEqual(getattr(args, key), value)
+
+    def test_all_common_train_optimize_options_are_fit_compatible(self) -> None:
+        excluded_run_controls = {
+            "explain_options",
+            "help",
+            "options_json",
+            "out_dir",
+            "show_options",
+            "update_options_json",
+        }
+        for model, module in (
+            ("dnn", dnn),
+            ("kbnn", kbnn),
+            ("neuro-tf", neuro_tf),
+        ):
+            parser = module.build_arg_parser()
+            children = {
+                normalize_command_name(raw_name): child
+                for action in parser._actions
+                if isinstance(action, argparse._SubParsersAction)
+                for raw_name, child in action.choices.items()
+            }
+
+            def option_names(command: str) -> set[str]:
+                return {
+                    option[2:].replace("-", "_")
+                    for action in children[command]._actions
+                    for option in action.option_strings
+                    if option.startswith("--")
+                }
+
+            missing = (
+                option_names("train")
+                & option_names("optimize")
+                - fit_shared_option_keys(model)
+                - excluded_run_controls
+            )
+            self.assertEqual(missing, set(), model)
+
+    def test_starter_json_exposes_conditional_sampled_mdif_inputs(self) -> None:
+        payload = starter_options_payload()
+        for model in ("dnn", "kbnn", "neuro-tf"):
+            export = payload["models"][model]["commands"]["export-ads-mdif"]
+            self.assertIn("template_mdif", export)
+            self.assertIn("parameter_grid", export)
+            self.assertIn("freqs", export)
+
     def write_config(self, root: Path, payload: dict[str, object]) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
         path = root / "options.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
