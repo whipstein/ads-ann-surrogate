@@ -1507,7 +1507,7 @@ def load_error_regions(
     parameters: Sequence[ParameterSpec],
     metric_name: str,
     bare_values: str,
-) -> tuple[list[ErrorRegion], str]:
+) -> tuple[list[ErrorRegion], str, str]:
     rows = read_csv_rows(metrics_path)
     if not rows:
         raise ValueError(f"{metrics_path} is empty")
@@ -1519,59 +1519,195 @@ def load_error_regions(
         else:
             raise ValueError(f"{metrics_path} does not contain a usable error metric")
 
-    groups: dict[tuple[object, ...], dict[str, object]] = {}
-    for row in rows:
-        point = row_unit_point(row, parameters, bare_values=bare_values)
-        value = csv_number(row.get(metric_name))
-        if point is None or value is None or not in_unit_cube(point):
-            continue
-        point = clamp_unit_point(point)
-        source_index = str(row.get("source_index") or "")
-        key = (source_index, *(round(coord, 12) for coord in point))
-        bucket = groups.setdefault(
-            key,
-            {
-                "source_index": source_index,
-                "point": point,
-                "weighted_sum": 0.0,
-                "weight_sum": 0.0,
-                "worst_sparam": "",
-                "worst_score": -1.0,
-                "row_count": 0,
-            },
-        )
-        score = metric_score_value(metric_name, value)
-        weight = csv_number(row.get("normalized_sparam_weight"))
-        if weight is None or weight <= 0.0:
-            weight = csv_number(row.get("sparam_weight")) or 1.0
-        bucket["weighted_sum"] = float(bucket["weighted_sum"]) + weight * score * score
-        bucket["weight_sum"] = float(bucket["weight_sum"]) + weight
-        bucket["row_count"] = int(bucket["row_count"]) + 1
-        if score > float(bucket["worst_score"]):
-            bucket["worst_score"] = score
-            bucket["worst_sparam"] = str(row.get("sparam") or "")
+    available_columns = list(rows[0])
+    available_normalized = {normalize_key(column) for column in available_columns}
+    missing_parameter_columns = [
+        parameter.name
+        for parameter in parameters
+        if normalize_key(parameter.name) not in available_normalized
+    ]
+    metric_column_missing = normalize_key(metric_name) not in available_normalized
 
-    regions: list[ErrorRegion] = []
-    for bucket in groups.values():
-        weight_sum = float(bucket["weight_sum"])
-        if weight_sum <= 0.0:
-            continue
-        regions.append(
-            ErrorRegion(
-                source_index=str(bucket["source_index"]),
-                unit_point=list(bucket["point"]),  # type: ignore[arg-type]
-                score=math.sqrt(float(bucket["weighted_sum"]) / weight_sum),
-                worst_sparam=str(bucket["worst_sparam"]),
-                worst_sparam_score=float(bucket["worst_score"]),
-                row_count=int(bucket["row_count"]),
+    def attempt(mode: str) -> tuple[list[ErrorRegion], dict[str, object]]:
+        groups: dict[tuple[object, ...], dict[str, object]] = {}
+        usable_metric_rows = 0
+        complete_parameter_rows = 0
+        parsed_parameter_rows = 0
+        accepted_rows = 0
+        invalid_samples: list[str] = []
+        outside_samples: list[str] = []
+        for row in rows:
+            value = csv_number(lookup_row_value(row, metric_name))
+            if value is None:
+                continue
+            usable_metric_rows += 1
+            raw_values = [lookup_row_value(row, parameter.name) for parameter in parameters]
+            if any(raw is None or not str(raw).strip() for raw in raw_values):
+                continue
+            complete_parameter_rows += 1
+            point: list[float] = []
+            invalid = False
+            for parameter, raw in zip(parameters, raw_values):
+                try:
+                    observed = parse_observed_value(raw, parameter, bare_values=mode)
+                    unit_value = unit_coordinate_for_value(observed, parameter)
+                except (ValueError, OverflowError) as exc:
+                    if len(invalid_samples) < 3:
+                        invalid_samples.append(
+                            f"{parameter.name}={raw!r} ({exc})"
+                        )
+                    invalid = True
+                    break
+                if not math.isfinite(unit_value):
+                    if len(invalid_samples) < 3:
+                        invalid_samples.append(
+                            f"{parameter.name}={raw!r} (non-finite normalized value)"
+                        )
+                    invalid = True
+                    break
+                point.append(unit_value)
+            if invalid:
+                continue
+            parsed_parameter_rows += 1
+            if not in_unit_cube(point):
+                if len(outside_samples) < 3:
+                    outside = [
+                        f"{parameter.name}={raw!r} -> u={coordinate:.6g}"
+                        for parameter, raw, coordinate in zip(
+                            parameters, raw_values, point
+                        )
+                        if coordinate < -1e-9 or coordinate > 1.0 + 1e-9
+                    ]
+                    outside_samples.append(", ".join(outside))
+                continue
+            accepted_rows += 1
+            point = clamp_unit_point(point)
+            source_index = str(row.get("source_index") or "")
+            key = (source_index, *(round(coord, 12) for coord in point))
+            bucket = groups.setdefault(
+                key,
+                {
+                    "source_index": source_index,
+                    "point": point,
+                    "weighted_sum": 0.0,
+                    "weight_sum": 0.0,
+                    "worst_sparam": "",
+                    "worst_score": -1.0,
+                    "row_count": 0,
+                },
             )
+            score = metric_score_value(metric_name, value)
+            weight = csv_number(row.get("normalized_sparam_weight"))
+            if weight is None or weight <= 0.0:
+                weight = csv_number(row.get("sparam_weight")) or 1.0
+            bucket["weighted_sum"] = (
+                float(bucket["weighted_sum"]) + weight * score * score
+            )
+            bucket["weight_sum"] = float(bucket["weight_sum"]) + weight
+            bucket["row_count"] = int(bucket["row_count"]) + 1
+            if score > float(bucket["worst_score"]):
+                bucket["worst_score"] = score
+                bucket["worst_sparam"] = str(row.get("sparam") or "")
+
+        regions: list[ErrorRegion] = []
+        for bucket in groups.values():
+            weight_sum = float(bucket["weight_sum"])
+            if weight_sum <= 0.0:
+                continue
+            regions.append(
+                ErrorRegion(
+                    source_index=str(bucket["source_index"]),
+                    unit_point=list(bucket["point"]),  # type: ignore[arg-type]
+                    score=math.sqrt(float(bucket["weighted_sum"]) / weight_sum),
+                    worst_sparam=str(bucket["worst_sparam"]),
+                    worst_sparam_score=float(bucket["worst_score"]),
+                    row_count=int(bucket["row_count"]),
+                )
+            )
+        regions.sort(key=lambda region: region.score, reverse=True)
+        return regions, {
+            "mode": mode,
+            "usable_metric_rows": usable_metric_rows,
+            "complete_parameter_rows": complete_parameter_rows,
+            "parsed_parameter_rows": parsed_parameter_rows,
+            "accepted_rows": accepted_rows,
+            "invalid_samples": invalid_samples,
+            "outside_samples": outside_samples,
+        }
+
+    requested_mode = bare_values
+    modes = ["parameter-units", "base-units"]
+    attempts = [attempt(mode) for mode in modes]
+    if requested_mode == "auto":
+        regions, diagnostics = max(
+            attempts,
+            key=lambda item: (
+                int(item[1]["accepted_rows"]),
+                len(item[0]),
+                item[1]["mode"] == "parameter-units",
+            ),
         )
-    regions.sort(key=lambda region: region.score, reverse=True)
-    if not regions:
-        raise ValueError(
-            f"No rows in {metrics_path} had {metric_name!r} and all requested parameters"
+    else:
+        regions, diagnostics = next(
+            item for item in attempts if item[1]["mode"] == requested_mode
         )
-    return regions, metric_name
+    effective_mode = str(diagnostics["mode"])
+    if regions:
+        return regions, metric_name, effective_mode
+
+    details = [
+        f"Could not use any row in {metrics_path} for metric {metric_name!r}."
+    ]
+    if metric_column_missing:
+        details.append(f"The metric column {metric_name!r} is missing.")
+    elif int(diagnostics["usable_metric_rows"]) == 0:
+        details.append(
+            f"Column {metric_name!r} exists, but every value is blank, non-numeric, or non-finite."
+        )
+    if missing_parameter_columns:
+        details.append(
+            "Missing requested parameter column(s): "
+            + ", ".join(missing_parameter_columns)
+            + "."
+        )
+    for _, item in attempts:
+        details.append(
+            f"With unitless values interpreted as {item['mode']}: "
+            f"{item['usable_metric_rows']} row(s) had a usable metric, "
+            f"{item['complete_parameter_rows']} also had every parameter, "
+            f"{item['parsed_parameter_rows']} parsed, and "
+            f"{item['accepted_rows']} were inside the declared domain."
+        )
+        invalid_samples = item["invalid_samples"]
+        outside_samples = item["outside_samples"]
+        if invalid_samples:
+            details.append("Example invalid value(s): " + "; ".join(invalid_samples))
+        if outside_samples:
+            details.append(
+                "Example out-of-range value(s): " + "; ".join(outside_samples)
+            )
+    if requested_mode != "auto":
+        alternate_regions, alternate_diagnostics = next(
+            item for item in attempts if item[1]["mode"] != requested_mode
+        )
+        if alternate_regions:
+            details.append(
+                f"The alternate --bare-values {alternate_diagnostics['mode']} "
+                f"interpretation would accept "
+                f"{alternate_diagnostics['accepted_rows']} row(s). Use that mode "
+                "or set --bare-values auto."
+            )
+    details.append("Available columns: " + ", ".join(available_columns) + ".")
+    details.append(
+        "Requested domains: "
+        + ", ".join(
+            f"{parameter.name}=[{format_value(parameter.lower, parameter.unit)}, "
+            f"{format_value(parameter.upper, parameter.unit)}]"
+            for parameter in parameters
+        )
+        + "."
+    )
+    raise ValueError("\n".join(details))
 
 
 def error_region_fields(parameters: Sequence[ParameterSpec]) -> list[str]:
@@ -2546,11 +2682,12 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bare-values",
-        choices=["parameter-units", "base-units"],
-        default="parameter-units",
+        choices=["auto", "parameter-units", "base-units"],
+        default="auto",
         help=(
-            "How to interpret unitless values in metrics/MDIF/CSV rows. "
-            "Default: parameter-units."
+            "How to interpret unitless values in metrics/MDIF/CSV rows. auto "
+            "tests declared parameter units and SI base units against the saved "
+            "geometry domain. Default: auto."
         ),
     )
     parser.add_argument(
@@ -2929,7 +3066,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
 
     metrics_path = verification_metrics_path(args, parser)
     try:
-        regions, metric_name = load_error_regions(
+        regions, metric_name, effective_bare_values = load_error_regions(
             metrics_path,
             parameters,
             metric_name=args.metric,
@@ -2937,6 +3074,8 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if args.bare_values == "auto":
+        args.bare_values = effective_bare_values
 
     csv_existing_points = load_existing_points(
         args.existing_points,
@@ -2985,6 +3124,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
 
     acquisition_metadata: dict[str, object] = {}
     acquisition_metadata["verification_metrics_source"] = str(metrics_path)
+    acquisition_metadata["bare_values_interpretation"] = args.bare_values
     if getattr(args, "nonpassive_source", None):
         acquisition_metadata["nonpassive_point_generation_source"] = (
             args.nonpassive_source
@@ -3120,6 +3260,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         f"{candidate_count} {candidate_method} candidate point(s)"
     )
     print(f"acquisition method: {args.acquisition}")
+    print(f"unitless input interpretation: {args.bare_values}")
     if getattr(args, "parameter_metadata_source", None):
         print(f"parameter domain: {args.parameter_metadata_source}")
     if args.acquisition == "gp-ucb":

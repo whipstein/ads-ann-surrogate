@@ -530,6 +530,12 @@ def recover_geometry_metadata(
         (*base, "candidate_method"), payload.get("candidate_method"), path, priority=45
     )
     accumulator.add(
+        (*base, "bare_values"),
+        payload.get("bare_values_interpretation"),
+        path,
+        priority=45,
+    )
+    accumulator.add(
         (*base, "decimal_places"), payload.get("decimal_places"), path, priority=45
     )
     accumulator.add(

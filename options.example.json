@@ -175,6 +175,7 @@
         "suggest-additional": {
           "acquisition": "gp-ucb",
           "allow_nonpassive": false,
+          "bare_values": "auto",
           "combined_out": null,
           "count": null,
           "existing_points": null,

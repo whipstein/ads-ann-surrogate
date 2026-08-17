@@ -227,6 +227,107 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 stdout.getvalue(),
             )
 
+    def test_suggest_auto_detects_unitless_base_unit_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            geometries = root / "geometries.csv"
+            metrics = root / "verification_metrics.csv"
+            output = root / "additional.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0.4mm:0.8mm",
+                            "--count",
+                            "6",
+                            "--verification-count",
+                            "2",
+                            "--lhs-candidates",
+                            "3",
+                            "--out",
+                            str(geometries),
+                        ]
+                    ),
+                    0,
+                )
+            with metrics.open("w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["source_index", "sparam", "evm_pct", "W"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {"source_index": 1, "sparam": "S21", "evm_pct": 0.5, "W": 0.00045}
+                )
+                writer.writerow(
+                    {"source_index": 2, "sparam": "S21", "evm_pct": 1.5, "W": 0.00075}
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            "--verification-metrics",
+                            str(metrics),
+                            "--existing-points",
+                            str(geometries),
+                            "--count",
+                            "1",
+                            "--candidate-count",
+                            "24",
+                            "--lhs-candidates",
+                            "3",
+                            "--out",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
+            metadata = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual(metadata["bare_values_interpretation"], "base-units")
+            self.assertIn(
+                "unitless input interpretation: base-units",
+                stdout.getvalue(),
+            )
+            with self.assertRaises(ValueError) as caught:
+                POINTS.load_error_regions(
+                    metrics,
+                    [POINTS.parse_parameter_spec("W=0.4mm:0.8mm")],
+                    metric_name="evm_pct",
+                    bare_values="parameter-units",
+                )
+            self.assertIn(
+                "alternate --bare-values base-units interpretation would accept",
+                str(caught.exception),
+            )
+
+    def test_unusable_metric_rows_report_the_exact_parameter_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics = Path(temp_dir) / "verification_metrics.csv"
+            metrics.write_text(
+                "source_index,sparam,evm_pct,W\n1,S21,0.5,0.0005\n",
+                encoding="utf-8",
+            )
+            parameters = [
+                POINTS.parse_parameter_spec("W=0.4mm:0.8mm"),
+                POINTS.parse_parameter_spec("L=1mm:2mm"),
+            ]
+            with self.assertRaises(ValueError) as caught:
+                POINTS.load_error_regions(
+                    metrics,
+                    parameters,
+                    metric_name="evm_pct",
+                    bare_values="auto",
+                )
+            message = str(caught.exception)
+            self.assertIn("Missing requested parameter column(s): L", message)
+            self.assertIn("Available columns:", message)
+            self.assertIn("Requested domains:", message)
+
     def test_gp_ucb_prefers_high_error_or_uncertain_regions(self) -> None:
         regions = [
             POINTS.ErrorRegion(
