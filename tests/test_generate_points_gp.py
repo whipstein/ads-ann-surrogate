@@ -239,7 +239,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                         [
                             "generate",
                             "--parameter",
-                            "W=0.4mm:0.8mm",
+                            "W=400um:800um",
                             "--count",
                             "6",
                             "--verification-count",
@@ -252,6 +252,16 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     ),
                     0,
                 )
+            # Geometry points remain expressed as unitless micrometre-scaled
+            # values even though the post-fit metrics below use SI metres.
+            with geometries.open("w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["point_index", "dataset", "W"],
+                )
+                writer.writeheader()
+                writer.writerow({"point_index": 1, "dataset": "train", "W": 500})
+                writer.writerow({"point_index": 2, "dataset": "verification", "W": 700})
             with metrics.open("w", newline="") as stream:
                 writer = csv.DictWriter(
                     stream,
@@ -288,15 +298,20 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     0,
                 )
             metadata = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual(metadata["bare_values_mode"], "auto")
             self.assertEqual(metadata["bare_values_interpretation"], "base-units")
             self.assertIn(
                 "unitless input interpretation: base-units",
                 stdout.getvalue(),
             )
+            self.assertIn(
+                "detected independently for each source",
+                stdout.getvalue(),
+            )
             with self.assertRaises(ValueError) as caught:
                 POINTS.load_error_regions(
                     metrics,
-                    [POINTS.parse_parameter_spec("W=0.4mm:0.8mm")],
+                    [POINTS.parse_parameter_spec("W=400um:800um")],
                     metric_name="evm_pct",
                     bare_values="parameter-units",
                 )

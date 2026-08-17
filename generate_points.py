@@ -1390,6 +1390,32 @@ def row_unit_point(
     return point
 
 
+def resolve_bare_values_for_rows(
+    rows: Sequence[dict[str, object]],
+    parameters: Sequence[ParameterSpec],
+    requested_mode: str,
+) -> str:
+    """Choose a unitless-value convention independently for one input source."""
+
+    if requested_mode != "auto":
+        return requested_mode
+    counts: dict[str, int] = {}
+    for mode in ("parameter-units", "base-units"):
+        counts[mode] = sum(
+            1
+            for row in rows
+            if (
+                (point := row_unit_point(row, parameters, bare_values=mode))
+                is not None
+                and in_unit_cube(point)
+            )
+        )
+    return max(
+        counts,
+        key=lambda mode: (counts[mode], mode == "parameter-units"),
+    )
+
+
 def in_unit_cube(point: Sequence[float], tolerance: float = 1e-9) -> bool:
     return all(-tolerance <= value <= 1.0 + tolerance for value in point)
 
@@ -1482,14 +1508,26 @@ def load_existing_points(
     points: list[list[float]] = []
     for raw_path in csv_paths:
         path = Path(raw_path)
-        for row in read_csv_rows(path):
-            point = row_unit_point(row, parameters, bare_values=bare_values)
+        rows = read_csv_rows(path)
+        source_mode = resolve_bare_values_for_rows(
+            rows,
+            parameters,
+            bare_values,
+        )
+        for row in rows:
+            point = row_unit_point(row, parameters, bare_values=source_mode)
             if point is not None and in_unit_cube(point):
                 points.append(clamp_unit_point(point))
     for raw_path in mdif_paths:
         path = Path(raw_path)
-        for row in read_mdif_parameter_rows(path):
-            point = row_unit_point(row, parameters, bare_values=bare_values)
+        rows = read_mdif_parameter_rows(path)
+        source_mode = resolve_bare_values_for_rows(
+            rows,
+            parameters,
+            bare_values,
+        )
+        for row in rows:
+            point = row_unit_point(row, parameters, bare_values=source_mode)
             if point is not None and in_unit_cube(point):
                 points.append(clamp_unit_point(point))
     return dedupe_points(points)
@@ -2250,9 +2288,15 @@ def write_accumulated_training_geometries(
     ) -> None:
         nonlocal duplicate_count
         if len(point) != len(parameters) or not in_unit_cube(point):
+            coordinates = ", ".join(
+                f"{parameter.name}:u={float(coordinate):.6g} "
+                f"for [{format_value(parameter.lower, parameter.unit)}, "
+                f"{format_value(parameter.upper, parameter.unit)}]"
+                for parameter, coordinate in zip(parameters, point)
+            )
             raise ValueError(
                 f"Geometry source {source} row {source_index} is outside the "
-                "declared parameter domain"
+                f"declared parameter domain ({coordinates})"
             )
         rounded_values = [
             round_parameter_value(
@@ -2284,8 +2328,13 @@ def write_accumulated_training_geometries(
     for raw_path in existing_csv_paths:
         source_path = Path(raw_path)
         _, source_rows = read_csv_table(source_path)
+        source_mode = resolve_bare_values_for_rows(
+            source_rows,
+            parameters,
+            bare_values,
+        )
         for row_number, row in enumerate(source_rows, start=2):
-            point = row_unit_point(row, parameters, bare_values=bare_values)
+            point = row_unit_point(row, parameters, bare_values=source_mode)
             if point is None:
                 raise ValueError(
                     f"Could not read every parameter from {source_path} row "
@@ -2311,8 +2360,13 @@ def write_accumulated_training_geometries(
         )
 
     additional_rows = read_csv_rows(additional_path)
+    additional_mode = resolve_bare_values_for_rows(
+        additional_rows,
+        parameters,
+        bare_values,
+    )
     for row_number, row in enumerate(additional_rows, start=2):
-        point = row_unit_point(row, parameters, bare_values=bare_values)
+        point = row_unit_point(row, parameters, bare_values=additional_mode)
         if point is None:
             raise ValueError(
                 f"Could not read every parameter from {additional_path} row "
@@ -3074,8 +3128,6 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     except ValueError as exc:
         parser.error(str(exc))
-    if args.bare_values == "auto":
-        args.bare_values = effective_bare_values
 
     csv_existing_points = load_existing_points(
         args.existing_points,
@@ -3124,7 +3176,11 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
 
     acquisition_metadata: dict[str, object] = {}
     acquisition_metadata["verification_metrics_source"] = str(metrics_path)
-    acquisition_metadata["bare_values_interpretation"] = args.bare_values
+    acquisition_metadata["bare_values_mode"] = args.bare_values
+    acquisition_metadata["bare_values_interpretation"] = effective_bare_values
+    acquisition_metadata["verification_metrics_bare_values_interpretation"] = (
+        effective_bare_values
+    )
     if getattr(args, "nonpassive_source", None):
         acquisition_metadata["nonpassive_point_generation_source"] = (
             args.nonpassive_source
@@ -3260,7 +3316,16 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         f"{candidate_count} {candidate_method} candidate point(s)"
     )
     print(f"acquisition method: {args.acquisition}")
-    print(f"unitless input interpretation: {args.bare_values}")
+    print(
+        "verification-metrics unitless input interpretation: "
+        f"{effective_bare_values}"
+        + (" (auto-detected)" if args.bare_values == "auto" else "")
+    )
+    if args.bare_values == "auto":
+        print(
+            "other geometry/MDIF inputs: unitless values are detected "
+            "independently for each source"
+        )
     if getattr(args, "parameter_metadata_source", None):
         print(f"parameter domain: {args.parameter_metadata_source}")
     if args.acquisition == "gp-ucb":

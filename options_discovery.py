@@ -531,7 +531,9 @@ def recover_geometry_metadata(
     )
     accumulator.add(
         (*base, "bare_values"),
-        payload.get("bare_values_interpretation"),
+        payload.get("bare_values_mode") or (
+            "auto" if payload.get("bare_values_interpretation") else None
+        ),
         path,
         priority=45,
     )
