@@ -145,6 +145,7 @@ def starter_options_payload() -> dict[str, object]:
                     "suggest-additional": {
                         "acquisition": "gp-ucb",
                         "allow_nonpassive": False,
+                        "combined_out": None,
                         "count": None,
                         "existing_points": None,
                         "exploration_weight": 2.0,

@@ -97,6 +97,8 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                             "R=1:100:log",
                             "--count",
                             "8",
+                            "--verification-count",
+                            "2",
                             "--lhs-candidates",
                             "4",
                             "--out",
@@ -167,7 +169,63 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 metadata["parameter_coverage_plot"],
                 "additional_parameter_coverage.png",
             )
+            combined = root / "additional_training_geometries.csv"
+            combined_json = combined.with_suffix(".json")
+            combined_plot = root / "additional_training_geometries_parameter_coverage.png"
+            self.assertTrue(combined.is_file())
+            self.assertTrue(combined_json.is_file())
+            self.assertTrue(combined_plot.is_file())
+            with combined.open(newline="") as stream:
+                combined_rows = list(csv.DictReader(stream))
+            self.assertEqual(len(combined_rows), 11)
+            self.assertEqual(
+                len({(row["W"], row["R"]) for row in combined_rows}),
+                11,
+            )
+            self.assertEqual(
+                [row["dataset"] for row in combined_rows].count("train"),
+                6,
+            )
+            self.assertEqual(
+                [row["dataset"] for row in combined_rows].count("verification"),
+                2,
+            )
+            self.assertEqual(
+                [row["dataset"] for row in combined_rows].count("targeted"),
+                3,
+            )
+            combined_metadata = json.loads(combined_json.read_text())
+            self.assertEqual(
+                combined_metadata["generation_kind"],
+                "accumulated_training_geometries",
+            )
+            self.assertEqual(combined_metadata["point_count"], 11)
+            self.assertEqual(combined_metadata["new_point_count"], 3)
+            self.assertEqual(
+                combined_metadata["split_counts"],
+                {"train": 6, "verification": 2, "targeted": 3},
+            )
+            self.assertEqual(
+                combined_metadata["next_gp_existing_points"],
+                str(combined),
+            )
+            next_parser = POINTS.build_suggest_parser()
+            next_args = next_parser.parse_args(
+                ["--count", "2", "--existing-points", str(combined)]
+            )
+            next_parameters = POINTS.resolve_suggest_parameters(
+                next_parser,
+                next_args,
+            )
+            self.assertEqual(
+                [parameter.name for parameter in next_parameters],
+                ["W", "R"],
+            )
             self.assertIn("parameter domain:", stdout.getvalue())
+            self.assertIn(
+                f"next GP round: --existing-points {combined}",
+                stdout.getvalue(),
+            )
 
     def test_gp_ucb_prefers_high_error_or_uncertain_regions(self) -> None:
         regions = [

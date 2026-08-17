@@ -45,7 +45,7 @@ WORKFLOW_DESCRIPTIONS = {
 }
 
 LOCAL_WORKFLOWS = {
-    "options": "generate a reusable starter options JSON",
+    "options": "generate or discover a reusable options JSON",
 }
 
 
@@ -75,6 +75,7 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  python3 surrogate.py options init --out options.json\n"
+            "  python3 surrogate.py options discover . --out recovered-options.json\n"
             "  python3 surrogate.py points generate --parameter W=1mm:2mm "
             "--count 24 --out geometries.csv\n"
             "  python3 surrogate.py audit --mdif data.mdif\n"
@@ -193,7 +194,7 @@ def dispatch_workflow(workflow: str, workflow_args: Sequence[str]) -> int:
 def build_options_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="surrogate.py options",
-        description="Generate a reusable starter options JSON.",
+        description="Generate a starter options JSON or discover one from project artifacts.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser(
@@ -211,6 +212,33 @@ def build_options_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace an existing output file.",
     )
+    discover = commands.add_parser(
+        "discover",
+        help="Recursively recover settings from an existing project directory",
+    )
+    discover.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Directory to inspect recursively. Default: current directory.",
+    )
+    discover.add_argument(
+        "--out",
+        default="options.json",
+        help="Recovered options JSON path. Default: options.json.",
+    )
+    discover.add_argument(
+        "--report",
+        help=(
+            "Discovery provenance JSON path. Default: "
+            "<out-stem>_discovery.json beside --out."
+        ),
+    )
+    discover.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing options and discovery-report files.",
+    )
     return parser
 
 
@@ -218,12 +246,67 @@ def command_options(argv: Sequence[str]) -> int:
     parser = build_options_parser()
     args = parser.parse_args(list(argv))
     out_path = Path(args.out)
-    if out_path.exists() and not args.overwrite:
+    report_path: Path | None = None
+    if args.command == "discover":
+        report_path = (
+            Path(args.report)
+            if args.report
+            else out_path.with_name(f"{out_path.stem}_discovery.json")
+        )
+    existing_targets = [
+        path for path in (out_path, report_path) if path is not None and path.exists()
+    ]
+    if existing_targets and not args.overwrite:
         print(
-            f"error: options JSON already exists: {out_path}; use --overwrite to replace it",
+            "error: output already exists: "
+            + ", ".join(map(str, existing_targets))
+            + "; use --overwrite to replace it",
             file=sys.stderr,
         )
         return 2
+    if args.command == "discover":
+        from options_discovery import discover_options
+
+        assert report_path is not None
+        if out_path.resolve() == report_path.resolve():
+            parser.error("--out and --report must name different files")
+        try:
+            payload, report = discover_options(
+                Path(args.directory),
+                excluded_paths=(out_path, report_path),
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        report_path.write_text(
+            json.dumps(report, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"wrote {out_path}")
+        print(f"wrote {report_path}")
+        print(
+            f"discovered {report['settings_discovered']} setting(s) from "
+            f"{len(report['recognized_artifacts'])} recognized artifact(s) and "
+            f"{len(report['recovered_commands'])} recovered command(s)"
+        )
+        if report["conflicts"]:
+            print(
+                f"warning: resolved {len(report['conflicts'])} conflicting setting(s); "
+                f"review {report_path}",
+                file=sys.stderr,
+            )
+        if report["warnings"]:
+            print(
+                f"warning: discovery recorded {len(report['warnings'])} warning(s); "
+                f"review {report_path}",
+                file=sys.stderr,
+            )
+        return 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         json.dumps(starter_options_payload(), indent=2) + "\n",

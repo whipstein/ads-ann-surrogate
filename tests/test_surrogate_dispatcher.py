@@ -86,6 +86,14 @@ class SurrogateDispatcherTests(unittest.TestCase):
         self.assertIn("--update-options-json", output.getvalue())
         self.assertIn("--explain-options", output.getvalue())
 
+    def test_options_help_lists_recursive_discovery(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                surrogate.main(["options", "--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("discover", output.getvalue())
+
     def test_options_init_generates_template_and_requires_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "config" / "options.json"

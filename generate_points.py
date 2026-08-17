@@ -17,6 +17,7 @@ import math
 import os
 import random
 import re
+import shlex
 import sys
 import warnings
 from dataclasses import dataclass
@@ -2064,6 +2065,183 @@ def write_suggested_points_csv(
     )
 
 
+def accumulated_training_geometry_path(path: Path) -> Path:
+    """Return the default cumulative geometry CSV beside a new-point CSV."""
+
+    return path.with_name(f"{path.stem}_training_geometries.csv")
+
+
+def write_accumulated_training_geometries(
+    path: Path,
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    existing_csv_paths: Sequence[str],
+    observed_points: Sequence[tuple[Sequence[float], str, str, object]],
+    additional_path: Path,
+    *,
+    include_normalized: bool,
+    decimal_places: int | None,
+    bare_values: str,
+    method: str,
+    metadata_extra: dict[str, object] | None = None,
+) -> Path:
+    """Write a deduplicated union suitable for the next GP acquisition round."""
+
+    fields = [
+        "point_index",
+        split_var,
+        "split_sequence",
+        "train_sequence",
+        "verification_sequence",
+        "method",
+        "geometry_source",
+        "source_point_index",
+    ]
+    if include_normalized:
+        fields.extend(f"u_{parameter.name}" for parameter in parameters)
+    fields.extend(parameter.name for parameter in parameters)
+
+    records: list[tuple[list[float], str, str, str, object]] = []
+    seen: set[tuple[int, ...]] = set()
+    duplicate_count = 0
+
+    def append_point(
+        point: Sequence[float],
+        dataset: object,
+        source_method: object,
+        source: str,
+        source_index: object,
+    ) -> None:
+        nonlocal duplicate_count
+        if len(point) != len(parameters) or not in_unit_cube(point):
+            raise ValueError(
+                f"Geometry source {source} row {source_index} is outside the "
+                "declared parameter domain"
+            )
+        rounded_values = [
+            round_parameter_value(
+                map_unit_point(float(coordinate), parameter),
+                parameter,
+                decimal_places,
+            )
+            for parameter, coordinate in zip(parameters, point)
+        ]
+        rounded_point = [
+            unit_coordinate_for_value(value, parameter)
+            for parameter, value in zip(parameters, rounded_values)
+        ]
+        key = tuple(int(round(value * 1.0e10)) for value in rounded_point)
+        if key in seen:
+            duplicate_count += 1
+            return
+        seen.add(key)
+        records.append(
+            (
+                rounded_values,
+                str(dataset or "train"),
+                str(source_method or "existing"),
+                source,
+                source_index,
+            )
+        )
+
+    for raw_path in existing_csv_paths:
+        source_path = Path(raw_path)
+        _, source_rows = read_csv_table(source_path)
+        for row_number, row in enumerate(source_rows, start=2):
+            point = row_unit_point(row, parameters, bare_values=bare_values)
+            if point is None:
+                raise ValueError(
+                    f"Could not read every parameter from {source_path} row "
+                    f"{row_number} while building the cumulative geometry CSV"
+                )
+            append_point(
+                point,
+                lookup_row_value(row, split_var) or "train",
+                lookup_row_value(row, "method") or "existing",
+                str(lookup_row_value(row, "geometry_source") or source_path),
+                lookup_row_value(row, "source_point_index")
+                or lookup_row_value(row, "point_index")
+                or row_number - 1,
+            )
+
+    for point, dataset, source, source_index in observed_points:
+        append_point(
+            point,
+            dataset,
+            "existing-observation",
+            source,
+            source_index,
+        )
+
+    additional_rows = read_csv_rows(additional_path)
+    for row_number, row in enumerate(additional_rows, start=2):
+        point = row_unit_point(row, parameters, bare_values=bare_values)
+        if point is None:
+            raise ValueError(
+                f"Could not read every parameter from {additional_path} row "
+                f"{row_number} while building the cumulative geometry CSV"
+            )
+        append_point(
+            point,
+            lookup_row_value(row, split_var) or "train",
+            lookup_row_value(row, "method") or method,
+            str(additional_path),
+            lookup_row_value(row, "point_index") or row_number - 1,
+        )
+
+    split_sequences = {"training": 0, "verification": 0}
+    rows: list[dict[str, object]] = []
+    for point_index, record in enumerate(records, start=1):
+        values, dataset, source_method, source, source_index = record
+        split_group = coverage_split_group(dataset)
+        split_sequences[split_group] += 1
+        split_sequence = split_sequences[split_group]
+        row: dict[str, object] = {
+            "point_index": point_index,
+            split_var: dataset,
+            "split_sequence": split_sequence,
+            "train_sequence": split_sequence if split_group == "training" else "",
+            "verification_sequence": (
+                split_sequence if split_group == "verification" else ""
+            ),
+            "method": source_method,
+            "geometry_source": source,
+            "source_point_index": source_index,
+        }
+        if include_normalized:
+            for parameter, value in zip(parameters, values):
+                row[f"u_{parameter.name}"] = (
+                    f"{unit_coordinate_for_value(value, parameter):.16g}"
+                )
+        for parameter, value in zip(parameters, values):
+            row[parameter.name] = format_value(
+                value,
+                parameter.unit,
+                decimal_places,
+            )
+        rows.append(row)
+
+    write_rows_csv(path, rows, fields)
+    return write_geometry_metadata(
+        path,
+        parameters,
+        rows,
+        split_var,
+        generation_kind="accumulated_training_geometries",
+        method=method,
+        decimal_places=decimal_places,
+        bare_values=bare_values,
+        extra={
+            "additional_points_file": str(additional_path),
+            "existing_geometry_files": list(existing_csv_paths),
+            "deduplicated_input_rows": duplicate_count,
+            "next_gp_existing_points": str(path),
+            **(metadata_extra or {}),
+        },
+    )
+
+
 def parse_methods(raw_methods: Sequence[str]) -> list[str]:
     methods: list[str] = []
     for raw in raw_methods:
@@ -2383,7 +2561,17 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         default="targeted_additional_points.csv",
-        help="Suggested-point CSV path; a same-stem parameter-range JSON is also written.",
+        help=(
+            "New-points-only CSV path. A same-stem JSON/coverage plot and a "
+            "cumulative training-geometry CSV/JSON are also written."
+        ),
+    )
+    parser.add_argument(
+        "--combined-out",
+        help=(
+            "Cumulative CSV containing existing and newly suggested geometries for "
+            "the next GP round. Default: <out>_training_geometries.csv."
+        ),
     )
     parser.add_argument(
         "--analysis-out",
@@ -2750,15 +2938,29 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     except ValueError as exc:
         parser.error(str(exc))
 
-    existing_points = [region.unit_point for region in regions]
-    existing_points.extend(
-        load_existing_points(
-            args.existing_points,
-            args.existing_mdif,
-            parameters,
-            bare_values=args.bare_values,
-        )
+    csv_existing_points = load_existing_points(
+        args.existing_points,
+        [],
+        parameters,
+        bare_values=args.bare_values,
     )
+    mdif_observed_points: list[tuple[list[float], str, str, object]] = []
+    for raw_path in args.existing_mdif:
+        for source_index, point in enumerate(
+            load_existing_points(
+                [],
+                [raw_path],
+                parameters,
+                bare_values=args.bare_values,
+            ),
+            start=1,
+        ):
+            mdif_observed_points.append(
+                (point, "existing", str(raw_path), source_index)
+            )
+    existing_points = [region.unit_point for region in regions]
+    existing_points.extend(csv_existing_points)
+    existing_points.extend(point for point, _, _, _ in mdif_observed_points)
     existing_points = dedupe_points(existing_points)
 
     candidate_count = args.candidate_count or max(1000, args.count * args.candidate_factor)
@@ -2845,7 +3047,26 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
 
     out_path = Path(args.out)
-    analysis_path = Path(args.analysis_out) if args.analysis_out else analysis_output_path(out_path)
+    combined_path = (
+        Path(args.combined_out)
+        if args.combined_out
+        else accumulated_training_geometry_path(out_path)
+    )
+    analysis_path = (
+        Path(args.analysis_out)
+        if args.analysis_out
+        else analysis_output_path(out_path)
+    )
+    if combined_path.resolve() == out_path.resolve():
+        parser.error("--combined-out must be different from --out")
+    if combined_path.resolve() == analysis_path.resolve():
+        parser.error("--combined-out must be different from --analysis-out")
+    if geometry_metadata_path(combined_path).resolve() == geometry_metadata_path(
+        out_path
+    ).resolve():
+        parser.error(
+            "--combined-out must produce a different companion JSON from --out"
+        )
     write_error_regions_csv(analysis_path, regions, parameters)
     metadata_path = write_suggested_points_csv(
         out_path,
@@ -2860,6 +3081,39 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         decimal_places=args.decimal_places,
         acquisition_metadata=acquisition_metadata,
     )
+    method_name = (
+        f"targeted-{candidate_method}"
+        if args.acquisition == "error-distance"
+        else f"{args.acquisition}-{candidate_method}"
+    )
+    observed_points: list[tuple[Sequence[float], str, str, object]] = list(
+        mdif_observed_points
+    )
+    try:
+        combined_metadata_path = write_accumulated_training_geometries(
+            combined_path,
+            parameters,
+            args.split_var,
+            args.existing_points,
+            observed_points,
+            out_path,
+            include_normalized=args.include_normalized,
+            decimal_places=args.decimal_places,
+            bare_values=args.bare_values,
+            method=method_name,
+            metadata_extra={
+                "analysis_metric": metric_name,
+                "acquisition_method": args.acquisition,
+                "candidate_method": candidate_method,
+                "verification_metrics_source": str(metrics_path),
+                "existing_mdif_files": list(args.existing_mdif),
+                "acquisition_occupied_point_count": len(existing_points),
+                "new_point_count": len(suggestions),
+                **acquisition_metadata,
+            },
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(
         f"considered {len(existing_points)} existing point(s) and "
@@ -2879,6 +3133,13 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     print(f"wrote {metadata_path}")
     print(f"wrote {geometry_coverage_plot_path(out_path)}")
     print(f"wrote {analysis_path}")
+    print(f"wrote {combined_path}")
+    print(f"wrote {combined_metadata_path}")
+    print(f"wrote {geometry_coverage_plot_path(combined_path)}")
+    print(
+        "next GP round: --existing-points "
+        f"{shlex.quote(str(combined_path))}"
+    )
     return 0
 
 
