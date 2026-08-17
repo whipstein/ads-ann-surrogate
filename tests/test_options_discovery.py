@@ -6,10 +6,92 @@ import unittest
 from pathlib import Path
 
 import surrogate
-from options_discovery import discover_options
+from options_discovery import DiscoveryAccumulator, discover_options
 
 
 class OptionsDiscoveryTests(unittest.TestCase):
+    def test_scalar_object_path_collision_is_reported_not_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            accumulator = DiscoveryAccumulator(root=root)
+            source = root / "artifact.json"
+            source.write_text("{}", encoding="utf-8")
+            accumulator.add(
+                ("models", "dnn", "commands", "train", "out_dir"),
+                "model",
+                source,
+                priority=50,
+            )
+            accumulator.add(
+                (
+                    "models",
+                    "dnn",
+                    "commands",
+                    "train",
+                    "out_dir",
+                    "out_dir",
+                ),
+                "nested-model",
+                source,
+                priority=40,
+            )
+
+            payload = accumulator.payload()
+
+        self.assertEqual(
+            payload["models"]["dnn"]["commands"]["train"]["out_dir"],
+            "model",
+        )
+        self.assertEqual(len(accumulator.conflicts), 1)
+
+    def test_options_like_nested_value_is_skipped_without_scalar_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "model"
+            model_dir.mkdir()
+            (root / "nested_state.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "models": {
+                            "dnn": {
+                                "commands": {
+                                    "train": {
+                                        "out_dir": {"out_dir": "not-an-option-value"}
+                                    }
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (model_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "parameter_names": ["W"],
+                        "sparam_labels": ["S11"],
+                        "layer_sizes": [2, 8, 2],
+                        "activation": "tanh",
+                        "freq_transform": "log",
+                        "output_domain": "s",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload, report = discover_options(root)
+
+        train = payload["models"]["dnn"]["commands"]["train"]
+        self.assertIsInstance(train["out_dir"], str)
+        self.assertTrue(
+            any(
+                "nested_state.json" in warning
+                and "option value must be" in warning
+                for warning in report["warnings"]
+            )
+        )
+
     def test_recovers_recursive_geometry_model_and_command_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -107,6 +189,7 @@ class OptionsDiscoveryTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
+                        "seed": 77,
                         "models": {
                             "dnn": {
                                 "commands": {
@@ -130,6 +213,7 @@ class OptionsDiscoveryTests(unittest.TestCase):
             payload, report = discover_options(root)
 
         train = payload["models"]["dnn"]["commands"]["train"]
+        self.assertEqual(payload["seed"], 77)
         self.assertEqual(train["activation"], "relu")
         self.assertEqual(train["mdif"], "configured.mdif")
         conflict_settings = {row["setting"] for row in report["conflicts"]}

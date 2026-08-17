@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from cli_options import (
+    COMMAND_GROUPS,
+    COMMAND_NAMES,
+    MODEL_NAMES,
+    NODE_HEADINGS,
     ROOT_HEADINGS,
+    WORKFLOW_NAMES,
     _explicit_option_updates,
     _relax_parser_requirements_for_explanation,
     normalize_command_name,
@@ -118,6 +123,59 @@ class DiscoveryAccumulator:
             priority=priority,
             modified_time=modified_time,
         )
+        incoming_rank = (incoming.priority, incoming.modified_time, incoming.source)
+        prefix_conflicts = [
+            existing_key
+            for existing_key in self.settings
+            if existing_key != key
+            and (
+                existing_key[: len(key)] == key
+                or key[: len(existing_key)] == existing_key
+            )
+        ]
+        if prefix_conflicts:
+            strongest_key = max(
+                prefix_conflicts,
+                key=lambda item: (
+                    self.settings[item].priority,
+                    self.settings[item].modified_time,
+                    self.settings[item].source,
+                ),
+            )
+            strongest = self.settings[strongest_key]
+            strongest_rank = (
+                strongest.priority,
+                strongest.modified_time,
+                strongest.source,
+            )
+            if incoming_rank <= strongest_rank:
+                self.conflicts.append(
+                    {
+                        "setting": ".".join(key),
+                        "selected_setting": ".".join(strongest_key),
+                        "selected_value": strongest.value,
+                        "selected_source": strongest.source,
+                        "other_value": incoming.value,
+                        "other_source": incoming.source,
+                        "resolution": "scalar/object path collision; higher-ranked setting retained",
+                    }
+                )
+                return
+            for existing_key in prefix_conflicts:
+                rejected = self.settings.pop(existing_key)
+                self.setting_sources.pop(existing_key, None)
+                self.conflicts.append(
+                    {
+                        "setting": ".".join(key),
+                        "selected_setting": ".".join(key),
+                        "selected_value": incoming.value,
+                        "selected_source": incoming.source,
+                        "other_setting": ".".join(existing_key),
+                        "other_value": rejected.value,
+                        "other_source": rejected.source,
+                        "resolution": "scalar/object path collision; higher-ranked setting retained",
+                    }
+                )
         existing = self.settings.get(key)
         sources = self.setting_sources.setdefault(key, [])
         if source_text not in sources:
@@ -134,7 +192,6 @@ class DiscoveryAccumulator:
                 self.settings[key] = incoming
             return
 
-        incoming_rank = (incoming.priority, incoming.modified_time, incoming.source)
         existing_rank = (existing.priority, existing.modified_time, existing.source)
         winner, rejected = (
             (incoming, existing) if incoming_rank > existing_rank else (existing, incoming)
@@ -203,14 +260,110 @@ def iter_json_leaves(
     yield prefix, value
 
 
-def is_options_document(payload: object) -> bool:
+def _options_leaf_mapping(value: object, context: str) -> str | None:
+    if not isinstance(value, dict):
+        return f"{context} must be an object"
+    for key, option_value in value.items():
+        if isinstance(option_value, dict):
+            return (
+                f"{context}.{key} is an object, but an option value must be a "
+                "scalar, array, boolean, or null"
+            )
+    return None
+
+
+def _options_commands_mapping(value: object, context: str) -> str | None:
+    if not isinstance(value, dict):
+        return f"{context} must be an object"
+    for raw_command, options in value.items():
+        command = normalize_command_name(str(raw_command))
+        if command not in COMMAND_NAMES | COMMAND_GROUPS:
+            return f"{context} contains unknown command heading {raw_command!r}"
+        problem = _options_leaf_mapping(options, f"{context}.{raw_command}")
+        if problem:
+            return problem
+    return None
+
+
+def _options_scope_node(value: object, context: str) -> str | None:
+    if not isinstance(value, dict):
+        return f"{context} must be an object"
+    for heading in ("generic", "common"):
+        if heading in value:
+            problem = _options_leaf_mapping(value[heading], f"{context}.{heading}")
+            if problem:
+                return problem
+    if "commands" in value:
+        problem = _options_commands_mapping(value["commands"], f"{context}.commands")
+        if problem:
+            return problem
+    for key, option_value in value.items():
+        if key not in NODE_HEADINGS and isinstance(option_value, dict):
+            return (
+                f"{context}.{key} is an object, but a flat option value must be "
+                "a scalar, array, boolean, or null"
+            )
+    return None
+
+
+def options_document_problem(payload: object) -> tuple[bool, str | None]:
+    """Return whether JSON looks like options and why it is not valid, if so."""
+
     if not isinstance(payload, dict):
-        return False
+        return False, None
     headings = set(payload) - {"schema_version"}
-    return bool(headings & ROOT_HEADINGS) and not {
+    candidate = bool(headings & ROOT_HEADINGS) and not {
         "generation_kind",
         "geometry_file",
     }.intersection(payload)
+    if not candidate:
+        return False, None
+    if payload.get("schema_version", 1) != 1:
+        return True, f"unsupported schema_version {payload.get('schema_version')!r}"
+    for heading in ("generic", "common"):
+        if heading in payload:
+            problem = _options_leaf_mapping(payload[heading], heading)
+            if problem:
+                return True, problem
+    if "commands" in payload:
+        problem = _options_commands_mapping(payload["commands"], "commands")
+        if problem:
+            return True, problem
+    models = payload.get("models")
+    if models is not None:
+        if not isinstance(models, dict):
+            return True, "models must be an object"
+        for raw_model, node in models.items():
+            if raw_model in {"generic", "common"}:
+                problem = _options_leaf_mapping(node, f"models.{raw_model}")
+            elif raw_model == "commands":
+                problem = _options_commands_mapping(node, "models.commands")
+            elif normalize_model_name(str(raw_model)) in MODEL_NAMES:
+                problem = _options_scope_node(node, f"models.{raw_model}")
+            else:
+                return True, f"models contains unknown model heading {raw_model!r}"
+            if problem:
+                return True, problem
+    workflows = payload.get("workflows")
+    if workflows is not None:
+        if not isinstance(workflows, dict):
+            return True, "workflows must be an object"
+        for raw_workflow, node in workflows.items():
+            workflow = str(raw_workflow).strip().lower().replace("_", "-")
+            if workflow not in WORKFLOW_NAMES:
+                return True, (
+                    f"workflows contains unknown workflow heading {raw_workflow!r}"
+                )
+            problem = _options_scope_node(node, f"workflows.{raw_workflow}")
+            if problem:
+                return True, problem
+    for key, option_value in payload.items():
+        if key not in ROOT_HEADINGS and isinstance(option_value, dict):
+            return True, (
+                f"{key} is an object, but a root option value must be a scalar, "
+                "array, boolean, or null"
+            )
+    return True, None
 
 
 def recover_options_document(
@@ -221,8 +374,6 @@ def recover_options_document(
     accumulator.add_artifact(path, "options_json")
     for location, value in iter_json_leaves(payload):
         if not location or location == ("schema_version",) or value is None:
-            continue
-        if location[0] not in ROOT_HEADINGS:
             continue
         accumulator.add(location, value, path, priority=100)
 
@@ -913,8 +1064,14 @@ def inspect_json(
     }.issubset(payload):
         accumulator.add_artifact(path, "prior_discovery_report")
         return
-    if is_options_document(payload):
+    options_like, options_problem = options_document_problem(payload)
+    if options_like and options_problem is None:
         recover_options_document(accumulator, path, payload)
+    elif options_like:
+        accumulator.warnings.append(
+            f"Skipped options-like JSON {accumulator.display_path(path)}: "
+            f"{options_problem}."
+        )
     recover_geometry_metadata(accumulator, path, payload)
     recover_model_metadata(accumulator, path, payload)
     recover_audit_summary(accumulator, path, payload)
