@@ -599,6 +599,36 @@ def coverage_split_group(value: object) -> str:
     return "training"
 
 
+def coverage_point_group(row: dict[str, object], split_var: str) -> str:
+    origin = lookup_row_value(row, "point_origin")
+    if origin is not None and str(origin).strip():
+        origin_token = normalize_key(origin)
+        if origin_token in {
+            "additional",
+            "added",
+            "new",
+            "targeted",
+            "acquisition",
+        }:
+            return "additional"
+    split_value = lookup_row_value(row, split_var) or "train"
+    if normalize_key(split_value) in {
+        "additional",
+        "added",
+        "new",
+        "targeted",
+        "acquisition",
+    }:
+        return "additional"
+    split_group = coverage_split_group(split_value)
+    if split_group != "training":
+        return split_group
+    method = normalize_key(lookup_row_value(row, "method") or "")
+    if method.startswith("targeted_") or method.startswith("gp_ucb_"):
+        return "additional"
+    return "training"
+
+
 def write_parameter_coverage_png(
     geometry_path: Path,
     parameters: Sequence[ParameterSpec],
@@ -622,6 +652,7 @@ def write_parameter_coverage_png(
     grouped_points: dict[str, list[list[float]]] = {
         "training": [],
         "verification": [],
+        "additional": [],
     }
     for row_index, row in enumerate(rows, start=1):
         coordinates: list[float] = []
@@ -650,8 +681,7 @@ def write_parameter_coverage_png(
                     f"{parameter.name!r} is outside the declared range"
                 )
             coordinates.append(min(1.0, max(0.0, coordinate)))
-        split_value = lookup_row_value(row, split_var) or "train"
-        grouped_points[coverage_split_group(split_value)].append(coordinates)
+        grouped_points[coverage_point_group(row, split_var)].append(coordinates)
 
     dimension_count = len(parameters)
     render_scale = 2
@@ -672,6 +702,7 @@ def write_parameter_coverage_png(
     plot_inset_bottom = px(25)
     training_color = (37, 99, 235, 255)
     verification_color = (249, 115, 22, 255)
+    additional_color = (22, 163, 74, 255)
     background_color = (248, 250, 252, 255)
     cell_color = (255, 255, 255, 255)
     border_color = (203, 213, 225, 255)
@@ -703,7 +734,8 @@ def write_parameter_coverage_png(
     draw.text(
         (left_margin, px(42)),
         f"{len(grouped_points['training'])} training point(s), "
-        f"{len(grouped_points['verification'])} verification point(s)",
+        f"{len(grouped_points['verification'])} verification point(s), "
+        f"{len(grouped_points['additional'])} added point(s)",
         font=label_font,
         fill=tick_color,
     )
@@ -729,6 +761,21 @@ def write_parameter_coverage_png(
     draw.text(
         (left_margin + px(92), px(66)),
         "Verification",
+        font=label_font,
+        fill=text_color,
+    )
+    draw.ellipse(
+        (
+            left_margin + px(190),
+            px(68),
+            left_margin + px(198),
+            px(76),
+        ),
+        fill=additional_color,
+    )
+    draw.text(
+        (left_margin + px(204), px(66)),
+        "Added",
         font=label_font,
         fill=text_color,
     )
@@ -813,6 +860,7 @@ def write_parameter_coverage_png(
                 for group_name, color in (
                     ("training", training_color),
                     ("verification", verification_color),
+                    ("additional", additional_color),
                 ):
                     histogram_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
                     histogram_draw = ImageDraw.Draw(histogram_layer)
@@ -835,6 +883,7 @@ def write_parameter_coverage_png(
                 for group_name, color in (
                     ("training", training_color),
                     ("verification", verification_color),
+                    ("additional", additional_color),
                 ):
                     for point in grouped_points[group_name]:
                         point_x = plot_left + point[column_index] * plot_width
@@ -2152,6 +2201,7 @@ def write_suggested_points_csv(
         "point_index",
         split_var,
         "additional_sequence",
+        "point_origin",
         "method",
         "acquisition_method",
         "analysis_metric",
@@ -2174,6 +2224,7 @@ def write_suggested_points_csv(
             "point_index": idx,
             split_var: target_dataset,
             "additional_sequence": idx,
+            "point_origin": "additional",
             "method": method_name,
             "acquisition_method": acquisition_method,
             "analysis_metric": metric_name,
@@ -2267,6 +2318,7 @@ def write_accumulated_training_geometries(
         "split_sequence",
         "train_sequence",
         "verification_sequence",
+        "point_origin",
         "method",
         "geometry_source",
         "source_point_index",
@@ -2275,13 +2327,14 @@ def write_accumulated_training_geometries(
         fields.extend(f"u_{parameter.name}" for parameter in parameters)
     fields.extend(parameter.name for parameter in parameters)
 
-    records: list[tuple[list[float], str, str, str, object]] = []
+    records: list[tuple[list[float], str, str, str, str, object]] = []
     seen: set[tuple[int, ...]] = set()
     duplicate_count = 0
 
     def append_point(
         point: Sequence[float],
         dataset: object,
+        point_origin: object,
         source_method: object,
         source: str,
         source_index: object,
@@ -2319,6 +2372,7 @@ def write_accumulated_training_geometries(
             (
                 rounded_values,
                 str(dataset or "train"),
+                str(point_origin or "existing"),
                 str(source_method or "existing"),
                 source,
                 source_index,
@@ -2343,6 +2397,12 @@ def write_accumulated_training_geometries(
             append_point(
                 point,
                 lookup_row_value(row, split_var) or "train",
+                lookup_row_value(row, "point_origin")
+                or (
+                    "additional"
+                    if coverage_point_group(row, split_var) == "additional"
+                    else "existing"
+                ),
                 lookup_row_value(row, "method") or "existing",
                 str(lookup_row_value(row, "geometry_source") or source_path),
                 lookup_row_value(row, "source_point_index")
@@ -2354,6 +2414,7 @@ def write_accumulated_training_geometries(
         append_point(
             point,
             dataset,
+            "existing",
             "existing-observation",
             source,
             source_index,
@@ -2375,6 +2436,7 @@ def write_accumulated_training_geometries(
         append_point(
             point,
             lookup_row_value(row, split_var) or "train",
+            lookup_row_value(row, "point_origin") or "additional",
             lookup_row_value(row, "method") or method,
             str(additional_path),
             lookup_row_value(row, "point_index") or row_number - 1,
@@ -2383,7 +2445,7 @@ def write_accumulated_training_geometries(
     split_sequences = {"training": 0, "verification": 0}
     rows: list[dict[str, object]] = []
     for point_index, record in enumerate(records, start=1):
-        values, dataset, source_method, source, source_index = record
+        values, dataset, point_origin, source_method, source, source_index = record
         split_group = coverage_split_group(dataset)
         split_sequences[split_group] += 1
         split_sequence = split_sequences[split_group]
@@ -2395,6 +2457,7 @@ def write_accumulated_training_geometries(
             "verification_sequence": (
                 split_sequence if split_group == "verification" else ""
             ),
+            "point_origin": point_origin,
             "method": source_method,
             "geometry_source": source,
             "source_point_index": source_index,

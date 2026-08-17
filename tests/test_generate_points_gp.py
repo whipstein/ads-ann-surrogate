@@ -169,6 +169,20 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 metadata["parameter_coverage_plot"],
                 "additional_parameter_coverage.png",
             )
+            with output.open(newline="") as stream:
+                additional_rows = list(csv.DictReader(stream))
+            self.assertTrue(
+                all(row["point_origin"] == "additional" for row in additional_rows)
+            )
+            with Image.open(root / "additional_parameter_coverage.png") as image:
+                additional_plot_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((22, 163, 74), additional_plot_colors)
             combined = root / "additional_training_geometries.csv"
             combined_json = combined.with_suffix(".json")
             combined_plot = root / "additional_training_geometries_parameter_coverage.png"
@@ -193,6 +207,28 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(
                 [row["dataset"] for row in combined_rows].count("targeted"),
                 3,
+            )
+            self.assertEqual(
+                [row["point_origin"] for row in combined_rows].count("additional"),
+                3,
+            )
+            with Image.open(combined_plot) as image:
+                combined_plot_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((37, 99, 235), combined_plot_colors)
+            self.assertIn((249, 115, 22), combined_plot_colors)
+            self.assertIn((22, 163, 74), combined_plot_colors)
+            self.assertEqual(
+                POINTS.coverage_point_group(
+                    {"dataset": "train", "point_origin": "additional"},
+                    "dataset",
+                ),
+                "additional",
             )
             combined_metadata = json.loads(combined_json.read_text())
             self.assertEqual(
