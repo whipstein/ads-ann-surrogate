@@ -1326,10 +1326,11 @@ chosen output directory:
 | KBNN | `kbnn_sweep_results.csv` | `kbnn_sweep_summary.md` | `kbnn_best_config.json` |
 | Neuro-TF | `neurotf_sweep_results.csv` | `neurotf_sweep_summary.md` | `neurotf_best_config.json` |
 
-The report contains the ranked trial table, adaptive search stage and
-uncertainty, inline trend plots, and links to the detailed diagnostics. When an
-eligible winner exists, `best_model/` contains the promoted model and the
-report includes a copyable command for reproducing it by itself.
+The report contains a dedicated **Trial Ranking** section, adaptive search
+stage and uncertainty, inline trend plots, and links to the detailed
+diagnostics. When an eligible winner exists, `best_model/` contains the
+promoted model and the report includes a copyable command for reproducing it by
+itself.
 
 If every completed trial fails training or the passivity constraints, the
 command returns a nonzero status and does not promote `best_model/`, but it

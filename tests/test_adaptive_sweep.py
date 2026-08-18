@@ -357,10 +357,19 @@ class AdaptiveSweepTests(unittest.TestCase):
             self.assertIn("Search stage", summary_text)
             self.assertIn("initial_maximin", summary_text)
             self.assertIn("## Sweep Trend Plots", summary_text)
+            self.assertIn("## Trial Ranking", summary_text)
             self.assertIn(
                 "![Sweep trend plot: test metric trend]"
                 "(sweep_diagnostics/test_metric_trend.svg)",
                 summary_text,
+            )
+            self.assertLess(
+                summary_text.index("## Sweep Trend Plots"),
+                summary_text.index("## Trial Ranking"),
+            )
+            self.assertLess(
+                summary_text.index("## Trial Ranking"),
+                summary_text.index("| Rank | Trial | Metric |"),
             )
             payload = json.loads((out_dir / "best.json").read_text())
             self.assertEqual(payload["status"], "no_eligible_trial")

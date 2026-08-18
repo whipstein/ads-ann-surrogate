@@ -11412,6 +11412,8 @@ def write_sweep_markdown(
             )
     lines.extend(
         [
+            "## Trial Ranking",
+            "",
             "| Rank | Trial | Metric | Search stage | Predicted objective | Search uncertainty | Categorical coverage | RMSE abs | Max abs | EVM % | EVM dB | Weighted RMSE | Weighted EVM % | Weighted EVM dB | RMSE dB | Max dB | Weighted RMSE dB | Max sigma | Violations | Configuration | Trial plots | Error |",
             "| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
