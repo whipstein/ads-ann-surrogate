@@ -1674,15 +1674,17 @@ the acquisition diagnostics:
 - `outputs/gp_round_1_error_regions.csv`: current verification geometries
   ranked by the error used to fit the GP.
 
-Both geometry CSVs also receive same-stem parameter-coverage PNGs. Training
-points are blue, verification points are orange, and points introduced by the
+Both geometry CSVs also receive same-stem parameter-coverage PNGs. Although the
+new-points CSV remains a simulation queue containing only the current batch,
+its plot uses the cumulative geometry inventory: existing training points are
+blue, existing verification points are orange, and points introduced by the
 current `suggest-additional` invocation are green with an explicit **Added**
 legend entry. The same colors are used for both off-diagonal scatter plots and
 diagonal histograms. The classification is round-relative: when a cumulative
 CSV is supplied as the next round's `--existing-points`, its prior additions
-become existing training coverage, while only the newly selected batch is
-green. A `point_origin` column keeps this distinction independent of
-`--target-dataset`.
+become existing training or verification coverage, while only the newly
+selected batch is green. A `point_origin` column keeps this distinction
+independent of `--target-dataset`.
 The title identifies whether the underlying geometry inventory is combined,
 training-only, or verification-only. Its dataset summary and legend include
 only groups actually present instead of displaying empty categories. Explicit
@@ -1696,10 +1698,11 @@ When automatic verification growth adds both datasets in one GP command, the
 main new-points CSV remains the auditable combined result and receives the one
 companion JSON. The command also writes RFPro-ready `<out>_train.csv` and
 `<out>_verification.csv` queues and a correctly scoped coverage PNG beside
-each, without duplicate split JSON files. Current-round additions remain green
-in the combined visual, while the dataset summary states how many are training
-and verification; their retained dataset labels control blue/orange rendering
-after they become existing inputs in the next round.
+each, without duplicate split JSON files. The training plot contains existing
+training plus newly added training points; the verification plot contains
+existing verification plus newly added verification points. Current-round
+additions remain green, while the retained dataset labels control blue/orange
+rendering after they become existing inputs in the next round.
 
 The cumulative CSV preserves dataset labels from existing CSV rows and assigns
 new rows according to `--target-dataset`; it does not silently move verification

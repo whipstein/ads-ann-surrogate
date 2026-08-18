@@ -2477,10 +2477,12 @@ def write_dataset_split_geometry_views(
     split_var: str,
     *,
     bare_values: str = "parameter-units",
+    coverage_rows: Sequence[dict[str, object]] | None = None,
 ) -> list[Path]:
-    """Write RFPro-friendly train/verification CSV and plot views without JSON."""
+    """Write RFPro queues with coverage plots placed in full prior context."""
 
     fields, rows = read_csv_table(source_path)
+    contextual_rows = list(coverage_rows) if coverage_rows is not None else rows
     written: list[Path] = []
     for group, suffix in (("training", "train"), ("verification", "verification")):
         split_rows = [
@@ -2493,12 +2495,20 @@ def write_dataset_split_geometry_views(
         ]
         if not split_rows:
             continue
+        split_coverage_rows = [
+            row
+            for row in contextual_rows
+            if coverage_split_group(
+                lookup_row_value(row, split_var) or "train"
+            )
+            == group
+        ]
         split_path = split_output_path(source_path, suffix)
         write_rows_csv(split_path, split_rows, fields)
         plot_path = write_parameter_coverage_png(
             split_path,
             parameters,
-            split_rows,
+            split_coverage_rows or split_rows,
             split_var,
             bare_values=bare_values,
         )
@@ -4034,6 +4044,12 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             "companion_json": str(geometry_metadata_path(out_path)),
             "separate_split_json_files": False,
         }
+    acquisition_metadata["parameter_coverage_context"] = {
+        "source": str(combined_path),
+        "includes_existing_points": True,
+        "current_batch_origin": "additional",
+        "existing_point_origin": "existing",
+    }
     write_error_regions_csv(analysis_path, regions, parameters)
     metadata_path = write_suggested_points_csv(
         out_path,
@@ -4049,22 +4065,29 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         decimal_places=args.decimal_places,
         acquisition_metadata=acquisition_metadata,
     )
-    split_view_paths: list[Path] = []
-    if automatic_verification_suggestions:
-        split_view_paths = write_dataset_split_geometry_views(
-            out_path,
-            parameters,
-            args.split_var,
-            bare_values=args.bare_values,
-        )
     method_name = (
         f"targeted-{candidate_method}"
         if args.acquisition == "error-distance"
         else f"{args.acquisition}-{candidate_method}"
     )
-    observed_points: list[tuple[Sequence[float], str, str, object]] = list(
-        mdif_observed_points
-    )
+    csv_existing_keys = {
+        tuple(int(round(value * 1.0e10)) for value in point)
+        for point in csv_existing_points
+    }
+    observed_points: list[tuple[Sequence[float], str, str, object]] = [
+        (
+            region.unit_point,
+            "verification",
+            str(metrics_path),
+            region.source_index,
+        )
+        for region in regions
+        if tuple(
+            int(round(value * 1.0e10)) for value in region.unit_point
+        )
+        not in csv_existing_keys
+    ]
+    observed_points.extend(mdif_observed_points)
     try:
         combined_metadata_path = write_accumulated_training_geometries(
             combined_path,
@@ -4090,6 +4113,23 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     except ValueError as exc:
         parser.error(str(exc))
+    _, coverage_context_rows = read_csv_table(combined_path)
+    write_parameter_coverage_png(
+        out_path,
+        parameters,
+        coverage_context_rows,
+        args.split_var,
+        bare_values=args.bare_values,
+    )
+    split_view_paths: list[Path] = []
+    if automatic_verification_suggestions:
+        split_view_paths = write_dataset_split_geometry_views(
+            out_path,
+            parameters,
+            args.split_var,
+            bare_values=args.bare_values,
+            coverage_rows=coverage_context_rows,
+        )
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(
         f"considered {len(existing_points)} existing point(s) and "

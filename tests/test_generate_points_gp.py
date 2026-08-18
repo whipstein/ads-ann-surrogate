@@ -144,6 +144,45 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertTrue(
                 (root / "round_3_verification_parameter_coverage.png").is_file()
             )
+            with Image.open(
+                root / "round_3_parameter_coverage.png"
+            ) as image:
+                combined_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((37, 99, 235), combined_colors)
+            self.assertIn((249, 115, 22), combined_colors)
+            self.assertIn((22, 163, 74), combined_colors)
+            with Image.open(
+                root / "round_3_train_parameter_coverage.png"
+            ) as image:
+                training_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((37, 99, 235), training_colors)
+            self.assertIn((22, 163, 74), training_colors)
+            self.assertNotIn((249, 115, 22), training_colors)
+            with Image.open(
+                root / "round_3_verification_parameter_coverage.png"
+            ) as image:
+                verification_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((249, 115, 22), verification_colors)
+            self.assertIn((22, 163, 74), verification_colors)
+            self.assertNotIn((37, 99, 235), verification_colors)
             metadata = json.loads(output.with_suffix(".json").read_text())
             policy = metadata["automatic_verification"]
             self.assertEqual(policy["projected_training_count"], 48)
@@ -390,6 +429,8 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     or []
                 }
             self.assertIn((22, 163, 74), additional_plot_colors)
+            self.assertIn((37, 99, 235), additional_plot_colors)
+            self.assertIn((249, 115, 22), additional_plot_colors)
             combined = root / "additional_training_geometries.csv"
             combined_json = combined.with_suffix(".json")
             combined_plot = root / "additional_training_geometries_parameter_coverage.png"
