@@ -27,6 +27,25 @@ from surrogate_common import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def load_generated_ads_qt_runtime(module_name: str) -> dict[str, object]:
+    """Execute the generated helper with a real temporary module identity."""
+
+    module = types.ModuleType(module_name)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        exec(
+            compile(ads_qt_runtime_helper_script(), "ads_qt_runtime.py", "exec"),
+            module.__dict__,
+        )
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+    return module.__dict__
+
+
 class SurrogateDispatcherTests(unittest.TestCase):
     def test_dispatch_forwards_backend_arguments_and_exit_status(self) -> None:
         completed = mock.Mock(returncode=7)
@@ -344,23 +363,25 @@ class SurrogateDispatcherTests(unittest.TestCase):
             compile(helper_source, "ads_qt_runtime.py", "exec")
             compile(training_source, "train_ads_ann.py", "exec")
             self.assertLess(
-                training_source.index("ensure_qapplication()"),
+                training_source.index("create_or_reuse_qapplication()"),
                 training_source.index("import keysight.ads.ann as ann"),
             )
             self.assertIn("finally:", helper_source)
-            self.assertIn("environment_restored", helper_source)
+            self.assertIn("QCoreApplication.libraryPaths()", helper_source)
+            self.assertIn('"QT_PLUGIN_PATH"', helper_source)
+            self.assertIn('("HPEESOF_DIR", "EMPROHOME")', helper_source)
+            self.assertIn("resolved_root.rglob(plugin_name)", helper_source)
+            self.assertIn('os.environ.get("DISPLAY")', helper_source)
+            self.assertIn('os.environ.get("WAYLAND_DISPLAY")', helper_source)
+            self.assertIn("environment_was_restored", helper_source)
+            self.assertEqual(
+                manifest["qt_runtime"]["plugin_discovery"],
+                "configured_paths_then_bounded_product_roots",
+            )
             self.assertIn("ads_qt_runtime.py", (out_dir / "ADS_ANN_README.md").read_text())
 
     def test_ads_qt_runtime_helper_restores_platform_plugin_environment(self) -> None:
-        helper_globals = {"__name__": "ads_qt_runtime_test"}
-        exec(
-            compile(
-                ads_qt_runtime_helper_script(),
-                "ads_qt_runtime.py",
-                "exec",
-            ),
-            helper_globals,
-        )
+        helper_globals = load_generated_ads_qt_runtime("ads_qt_runtime_test")
         observed_paths: list[str | None] = []
 
         class FakeQApplication:
@@ -373,25 +394,28 @@ class SurrogateDispatcherTests(unittest.TestCase):
                     os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH")
                 )
 
+            def platformName(self):
+                return "test-platform"
+
         pyside = types.ModuleType("PySide6")
         pyside.__file__ = str(ROOT / "fake_ads" / "PySide6" / "__init__.py")
         pyside.__version__ = "test"
-        qtcore = types.ModuleType("PySide6.QtCore")
-        qtcore.qVersion = lambda: "test-qt"
         qtwidgets = types.ModuleType("PySide6.QtWidgets")
         qtwidgets.QApplication = FakeQApplication
 
         with tempfile.TemporaryDirectory() as temp_dir:
             plugin_dir = Path(temp_dir) / "platforms"
-            helper_globals["locate_qt_platform_plugins"] = lambda: (
-                plugin_dir,
-                {"platform_plugin_directory": str(plugin_dir)},
+            plugin_file = plugin_dir / helper_globals[
+                "expected_qt_platform_plugin"
+            ]()
+            helper_globals["locate_qt_platform_plugin"] = (
+                lambda _pyside_file: plugin_file
             )
+            helper_globals["validate_linux_plugin"] = lambda _plugin_file: None
             with mock.patch.dict(
                 sys.modules,
                 {
                     "PySide6": pyside,
-                    "PySide6.QtCore": qtcore,
                     "PySide6.QtWidgets": qtwidgets,
                 },
             ):
@@ -400,18 +424,18 @@ class SurrogateDispatcherTests(unittest.TestCase):
                     {"QT_QPA_PLATFORM_PLUGIN_PATH": "original-qt-path"},
                     clear=False,
                 ):
-                    application, details = helper_globals[
-                        "ensure_qapplication"
+                    runtime = helper_globals[
+                        "create_or_reuse_qapplication"
                     ]()
-                    self.assertIsInstance(application, FakeQApplication)
+                    self.assertIsInstance(runtime.application, FakeQApplication)
                     self.assertEqual(
                         os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"],
                         "original-qt-path",
                     )
                 with mock.patch.dict(os.environ, {}, clear=False):
                     os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
-                    _application, absent_details = helper_globals[
-                        "ensure_qapplication"
+                    absent_runtime = helper_globals[
+                        "create_or_reuse_qapplication"
                     ]()
                     self.assertNotIn(
                         "QT_QPA_PLATFORM_PLUGIN_PATH",
@@ -419,9 +443,129 @@ class SurrogateDispatcherTests(unittest.TestCase):
                     )
 
         self.assertEqual(observed_paths, [str(plugin_dir), str(plugin_dir)])
-        self.assertTrue(details["temporary_environment_redirect"])
-        self.assertTrue(details["environment_restored"])
-        self.assertTrue(absent_details["environment_restored"])
+        self.assertTrue(runtime.application_was_created)
+        self.assertTrue(runtime.environment_was_restored)
+        self.assertTrue(absent_runtime.environment_was_restored)
+        details = helper_globals["qt_runtime_diagnostics"](runtime)
+        self.assertEqual(details["qt_platform"], "test-platform")
+        self.assertEqual(details["application_ownership"], "created_by_script")
+
+    def test_ads_qt_runtime_locator_uses_qt_configured_library_paths(self) -> None:
+        helper_globals = load_generated_ads_qt_runtime(
+            "ads_qt_runtime_locator_test"
+        )
+
+        class FakeQLibraryInfo:
+            class LibraryPath:
+                PluginsPath = "plugins"
+
+            @staticmethod
+            def path(_library_path):
+                return ""
+
+        class FakeQCoreApplication:
+            configured_paths: list[str] = []
+
+            @classmethod
+            def libraryPaths(cls):
+                return cls.configured_paths
+
+        qtcore = types.ModuleType("PySide6.QtCore")
+        qtcore.QLibraryInfo = FakeQLibraryInfo
+        qtcore.QCoreApplication = FakeQCoreApplication
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugin_root = Path(temp_dir) / "qt_plugins"
+            plugin_dir = plugin_root / "platforms"
+            plugin_dir.mkdir(parents=True)
+            plugin_file = plugin_dir / helper_globals[
+                "expected_qt_platform_plugin"
+            ]()
+            plugin_file.touch()
+            FakeQCoreApplication.configured_paths = [str(plugin_root)]
+            with mock.patch.dict(
+                sys.modules,
+                {"PySide6.QtCore": qtcore},
+            ):
+                located = helper_globals["locate_qt_platform_plugin"](
+                    Path(temp_dir) / "PySide6" / "__init__.py"
+                )
+
+        self.assertEqual(located, plugin_file.resolve())
+
+    def test_ads_qt_runtime_helper_reuses_existing_application_without_search(self) -> None:
+        helper_globals = load_generated_ads_qt_runtime(
+            "ads_qt_runtime_reuse_test"
+        )
+        existing_application = object()
+
+        class FakeQApplication:
+            @classmethod
+            def instance(cls):
+                return existing_application
+
+        pyside = types.ModuleType("PySide6")
+        pyside.__file__ = str(ROOT / "fake_ads" / "PySide6" / "__init__.py")
+        qtwidgets = types.ModuleType("PySide6.QtWidgets")
+        qtwidgets.QApplication = FakeQApplication
+
+        def unexpected_search(_pyside_file):
+            self.fail("Qt plugin discovery ran despite an existing QApplication")
+
+        helper_globals["locate_qt_platform_plugin"] = unexpected_search
+        with mock.patch.dict(
+            sys.modules,
+            {"PySide6": pyside, "PySide6.QtWidgets": qtwidgets},
+        ), mock.patch.dict(
+            os.environ,
+            {"QT_QPA_PLATFORM_PLUGIN_PATH": "existing-path"},
+            clear=False,
+        ):
+            runtime = helper_globals["create_or_reuse_qapplication"]()
+            self.assertEqual(
+                os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"),
+                "existing-path",
+            )
+
+        self.assertIs(runtime.application, existing_application)
+        self.assertFalse(runtime.application_was_created)
+        self.assertIsNone(runtime.plugin_file)
+        self.assertTrue(runtime.environment_was_restored)
+
+    def test_ads_qt_runtime_helper_requires_linux_display_for_new_application(self) -> None:
+        helper_globals = load_generated_ads_qt_runtime(
+            "ads_qt_runtime_display_test"
+        )
+
+        class FakeQApplication:
+            @classmethod
+            def instance(cls):
+                return None
+
+            def __init__(self, _argv):
+                raise AssertionError(
+                    "QApplication must not start without a Linux display"
+                )
+
+        pyside = types.ModuleType("PySide6")
+        pyside.__file__ = str(ROOT / "fake_ads" / "PySide6" / "__init__.py")
+        qtwidgets = types.ModuleType("PySide6.QtWidgets")
+        qtwidgets.QApplication = FakeQApplication
+        helper_globals["locate_qt_platform_plugin"] = (
+            lambda _pyside_file: Path("/fake/platforms/libqxcb.so")
+        )
+        helper_globals["validate_linux_plugin"] = lambda _plugin_file: None
+
+        with mock.patch.dict(
+            sys.modules,
+            {"PySide6": pyside, "PySide6.QtWidgets": qtwidgets},
+        ), mock.patch.object(sys, "platform", "linux"), mock.patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No DISPLAY or WAYLAND_DISPLAY"):
+                helper_globals["create_or_reuse_qapplication"]()
 
 
 if __name__ == "__main__":

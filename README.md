@@ -2617,13 +2617,20 @@ API requires a Harmonic Balance license.
 
 1. `ads_qt_runtime.py` imports PySide6 from the active ADS interpreter.
 2. If ADS already owns a `QApplication`, it is reused without changing any Qt
-   environment variables.
-3. Otherwise, the helper queries that PySide6/Qt runtime for its plugin root and
-   checks the package-relative `plugins/platforms` layouts.
+   environment variables or searching for plugins.
+3. Otherwise, the helper first checks deterministic runtime evidence:
+   `QLibraryInfo.PluginsPath`, `QCoreApplication.libraryPaths()`, standard
+   PySide6 `plugins/platforms` layouts, and the existing
+   `QT_QPA_PLATFORM_PLUGIN_PATH` and `QT_PLUGIN_PATH` entries.
 4. It requires the platform binary that matches the operating system:
    `qwindows.dll` on Windows, `libqxcb.so` on Linux, or `libqcocoa.dylib` on
-   macOS. It does not recursively combine unrelated Qt installations.
-5. On Linux, `ldd` is checked for unresolved dependencies before Qt starts.
+   macOS. Only if the deterministic paths fail does it perform a bounded
+   recursive fallback search under the imported PySide6 package, `sys.prefix`,
+   the Keysight product root inferred from `sys.executable`, `HPEESOF_DIR`, and
+   `EMPROHOME`.
+5. On Linux, `ldd` is checked for unresolved dependencies before Qt starts. A
+   newly created application requires `DISPLAY` or `WAYLAND_DISPLAY` unless
+   the caller explicitly selected `QT_QPA_PLATFORM=offscreen` or `minimal`.
 6. `QT_QPA_PLATFORM_PLUGIN_PATH` is redirected only around
    `QApplication([])` construction. A `finally` block restores the exact prior
    value—or removes the variable if it was originally absent.
@@ -2668,11 +2675,11 @@ Linux:
 "$HPEESOF_DIR/tools/python/bin/python3" ads_qt_runtime.py
 ```
 
-The helper prints the active Python executable, PySide6 file/version, Qt
-version, platform plugin, whether an existing application was reused, and
-whether the environment was restored. Run this helper using the same route that
-fails—standalone ADS Python, ADS Python Utilities, or a live ADS process—because
-different launchers can have different Qt paths.
+The helper prints the active Python executable, PySide6 package location,
+selected platform plugin, active Qt platform, whether the application was
+created or reused, and whether the environment was restored. Run this helper
+using the same route that fails—standalone ADS Python, ADS Python Utilities, or
+a live ADS process—because different launchers can have different Qt paths.
 
 Expected output with `--ads-output-format all`:
 

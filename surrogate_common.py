@@ -1624,171 +1624,238 @@ def ads_qt_runtime_helper_script() -> str:
     """Return the scoped Qt bootstrap shipped with ADS ANN packages."""
 
     return '''#!/usr/bin/env python3
-"""Create an ADS-compatible QApplication without permanently changing Qt paths."""
+"""Create or reuse a Keysight-compatible QApplication with scoped Qt setup.
+
+This file is copied into each ADS ANN export package so the package never
+depends on the development machine or the Codex skill directory.
+"""
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
-QT_PLATFORM_PATH_VARIABLE = "QT_QPA_PLATFORM_PLUGIN_PATH"
+@dataclass(frozen=True)
+class QtRuntime:
+    application: Any
+    pyside_file: Path
+    plugin_file: Path | None
+    application_was_created: bool
+    environment_was_restored: bool
 
 
-def expected_platform_plugin() -> str:
+def expected_qt_platform_plugin() -> str:
     if sys.platform.startswith("linux"):
         return "libqxcb.so"
     if sys.platform == "win32":
         return "qwindows.dll"
     if sys.platform == "darwin":
         return "libqcocoa.dylib"
-    raise RuntimeError(f"Unsupported Qt platform {sys.platform!r}")
+    raise RuntimeError(f"Unsupported Qt platform: {sys.platform}")
 
 
-def _unique_paths(paths):
-    result = []
-    for path in paths:
+def locate_qt_platform_plugin(pyside_file: Path) -> Path:
+    """Check configured/package paths, then bounded product fallback roots."""
+
+    from PySide6.QtCore import QCoreApplication, QLibraryInfo
+
+    plugin_name = expected_qt_platform_plugin()
+    directories: list[Path] = []
+
+    def add_directory(path: Path) -> None:
         try:
-            resolved = Path(path).resolve()
+            resolved = path.expanduser().resolve()
+        except OSError:
+            return
+        if resolved not in directories:
+            directories.append(resolved)
+
+    def add_plugin_root(path: Path) -> None:
+        add_directory(path)
+        if path.name != "platforms":
+            add_directory(path / "platforms")
+
+    qt_plugins_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    if qt_plugins_path:
+        add_plugin_root(Path(qt_plugins_path))
+    for library_path in QCoreApplication.libraryPaths():
+        if library_path:
+            add_plugin_root(Path(library_path))
+
+    pyside_root = pyside_file.parent
+    add_directory(pyside_root / "plugins" / "platforms")
+    add_directory(pyside_root / "Qt" / "plugins" / "platforms")
+    for environment_name in (
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_PLUGIN_PATH",
+    ):
+        for entry in os.environ.get(environment_name, "").split(os.pathsep):
+            if entry:
+                add_plugin_root(Path(entry))
+
+    for directory in directories:
+        plugin_file = directory / plugin_name
+        if plugin_file.is_file():
+            return plugin_file
+
+    fallback_roots = [pyside_root, Path(sys.prefix)]
+    executable = Path(sys.executable).resolve()
+    for ancestor in executable.parents:
+        if ancestor.name.lower() == "tools":
+            fallback_roots.append(ancestor.parent)
+            break
+    for environment_name in ("HPEESOF_DIR", "EMPROHOME"):
+        value = os.environ.get(environment_name)
+        if value:
+            fallback_roots.append(Path(value))
+
+    searched_roots: list[Path] = []
+    for root in fallback_roots:
+        try:
+            resolved_root = root.expanduser().resolve()
         except OSError:
             continue
-        if resolved not in result:
-            result.append(resolved)
-    return result
+        if not resolved_root.is_dir() or resolved_root in searched_roots:
+            continue
+        searched_roots.append(resolved_root)
+        try:
+            for match in resolved_root.rglob(plugin_name):
+                if match.is_file():
+                    return match
+        except OSError:
+            continue
+
+    checked = [str(path / plugin_name) for path in directories]
+    checked.extend(f"recursive: {root}" for root in searched_roots)
+    details = "\\n  ".join(checked) if checked else "(no valid search roots)"
+    raise RuntimeError(
+        f"Qt platform plugin {plugin_name!r} was not found automatically.\\n"
+        f"PySide6: {pyside_file}\\nSearched:\\n  {details}\\n"
+        "Run the ADS Qt runtime diagnostic with this exact interpreter."
+    )
 
 
-def _linux_unresolved_dependencies(plugin_path: Path):
+def validate_linux_plugin(plugin_file: Path) -> None:
     if not sys.platform.startswith("linux"):
-        return []
+        return
     try:
-        completed = subprocess.run(
-            ["ldd", str(plugin_path)],
+        result = subprocess.run(
+            ["ldd", str(plugin_file)],
             check=False,
             capture_output=True,
             text=True,
         )
-    except (FileNotFoundError, OSError):
-        return []
-    return [
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not inspect Qt plugin {plugin_file}: {error}"
+        ) from error
+    unresolved = [
         line.strip()
-        for line in completed.stdout.splitlines()
+        for line in (result.stdout + result.stderr).splitlines()
         if "not found" in line
     ]
+    if unresolved:
+        details = "\\n  ".join(unresolved)
+        raise RuntimeError(
+            f"Qt found {plugin_file}, but required libraries are missing:\\n"
+            f"  {details}"
+        )
 
 
-def locate_qt_platform_plugins():
-    """Locate the platform plugin belonging to the imported PySide6/Qt runtime."""
+def create_or_reuse_qapplication() -> QtRuntime:
+    """Reuse product-owned Qt, or create script-owned Qt with scoped redirect."""
 
     try:
         import PySide6
-        from PySide6.QtCore import QLibraryInfo, qVersion
     except Exception as error:
         raise RuntimeError(
-            "PySide6 could not be imported. Run this package with the Python "
-            "interpreter bundled with the target ADS installation; do not install "
-            "a second PySide6 into that interpreter."
+            "PySide6 could not be imported. Run with the bundled Keysight "
+            f"interpreter or directly in ADS/EMPro/RFPro, not {sys.executable!r}."
         ) from error
 
-    pyside_root = Path(PySide6.__file__).resolve().parent
-    qt_plugins_root = Path(
-        QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
-    )
-    candidates = _unique_paths(
-        [
-            qt_plugins_root / "platforms",
-            pyside_root / "plugins" / "platforms",
-            pyside_root / "Qt" / "plugins" / "platforms",
-        ]
-    )
-    plugin_name = expected_platform_plugin()
-    checked = []
-    for directory in candidates:
-        plugin_path = directory / plugin_name
-        checked.append(str(plugin_path))
-        if not plugin_path.is_file():
-            continue
-        unresolved = _linux_unresolved_dependencies(plugin_path)
-        if unresolved:
+    from PySide6.QtWidgets import QApplication
+
+    pyside_file = Path(PySide6.__file__).resolve()
+    application = QApplication.instance()
+    if application is not None:
+        return QtRuntime(application, pyside_file, None, False, True)
+
+    plugin_file = locate_qt_platform_plugin(pyside_file)
+    validate_linux_plugin(plugin_file)
+    if sys.platform.startswith("linux"):
+        selected_platform = os.environ.get("QT_QPA_PLATFORM", "").lower()
+        has_display = bool(
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        )
+        if not has_display and selected_platform not in {"offscreen", "minimal"}:
             raise RuntimeError(
-                f"Qt platform plugin {plugin_path} exists but has unresolved "
-                "shared-library dependencies: " + "; ".join(unresolved)
+                "No DISPLAY or WAYLAND_DISPLAY is available for graphical "
+                "Keysight Qt. Launch from a graphical session; this bootstrap "
+                "does not force offscreen mode."
             )
-        return directory, {
-            "python_executable": sys.executable,
-            "pyside6_file": str(Path(PySide6.__file__).resolve()),
-            "pyside6_version": getattr(PySide6, "__version__", None),
-            "qt_version": qVersion(),
-            "platform": sys.platform,
-            "platform_plugin": str(plugin_path),
-            "platform_plugin_directory": str(directory),
-            "checked_platform_plugins": checked,
-        }
 
-    raise RuntimeError(
-        f"Could not find {plugin_name} for the imported PySide6 runtime at "
-        f"{pyside_root}. Checked: " + ", ".join(checked)
-    )
-
-
-def ensure_qapplication():
-    """Reuse ADS's QApplication or create one with a temporary plugin redirect."""
-
-    try:
-        import PySide6
-        from PySide6.QtCore import qVersion
-        from PySide6.QtWidgets import QApplication
-    except Exception as error:
-        raise RuntimeError(
-            "PySide6/QtWidgets could not be imported from the active ADS Python."
-        ) from error
-
-    existing = QApplication.instance()
-    if existing is not None:
-        return existing, {
-            "python_executable": sys.executable,
-            "pyside6_file": str(Path(PySide6.__file__).resolve()),
-            "pyside6_version": getattr(PySide6, "__version__", None),
-            "qt_version": qVersion(),
-            "platform": sys.platform,
-            "reused_existing_qapplication": True,
-            "temporary_environment_redirect": False,
-            "environment_restored": True,
-        }
-
-    plugin_directory, details = locate_qt_platform_plugins()
-    was_set = QT_PLATFORM_PATH_VARIABLE in os.environ
-    previous = os.environ.get(QT_PLATFORM_PATH_VARIABLE)
-    os.environ[QT_PLATFORM_PATH_VARIABLE] = str(plugin_directory)
+    variable = "QT_QPA_PLATFORM_PLUGIN_PATH"
+    was_set = variable in os.environ
+    previous = os.environ.get(variable)
+    os.environ[variable] = str(plugin_file.parent)
     try:
         application = QApplication([])
     finally:
         if was_set:
-            assert previous is not None
-            os.environ[QT_PLATFORM_PATH_VARIABLE] = previous
+            os.environ[variable] = previous if previous is not None else ""
         else:
-            os.environ.pop(QT_PLATFORM_PATH_VARIABLE, None)
+            os.environ.pop(variable, None)
 
-    details.update(
-        {
-            "reused_existing_qapplication": False,
-            "temporary_environment_redirect": True,
-            "environment_restored": (
-                os.environ.get(QT_PLATFORM_PATH_VARIABLE) == previous
-                if was_set
-                else QT_PLATFORM_PATH_VARIABLE not in os.environ
-            ),
-        }
+    restored = (
+        os.environ.get(variable) == previous
+        if was_set
+        else variable not in os.environ
     )
-    return application, details
+    return QtRuntime(application, pyside_file, plugin_file, True, restored)
+
+
+def qt_runtime_diagnostics(runtime: QtRuntime) -> dict[str, object]:
+    """Return JSON-safe diagnostics for the ANN extraction summary."""
+
+    ownership = (
+        "created_by_script"
+        if runtime.application_was_created
+        else "reused_from_ads_empro_rfpro"
+    )
+    plugin = (
+        str(runtime.plugin_file)
+        if runtime.plugin_file is not None
+        else "already loaded by product; search path unchanged"
+    )
+    return {
+        "python_executable": sys.executable,
+        "pyside6_file": str(runtime.pyside_file),
+        "platform_plugin": plugin,
+        "qt_platform": runtime.application.platformName(),
+        "application_ownership": ownership,
+        "application_was_created": runtime.application_was_created,
+        "environment_was_restored": runtime.environment_was_restored,
+    }
+
+
+def print_qt_diagnostics(runtime: QtRuntime) -> None:
+    details = qt_runtime_diagnostics(runtime)
+    print(f"Python executable: {details['python_executable']}")
+    print(f"PySide6 package: {details['pyside6_file']}")
+    print(f"Qt platform plugin: {details['platform_plugin']}")
+    print(f"Qt platform: {details['qt_platform']}")
+    print(f"QApplication: {details['application_ownership']}")
+    print(f"Qt environment restored: {details['environment_was_restored']}")
 
 
 def main():
-    application, details = ensure_qapplication()
-    assert application is not None
-    print(json.dumps(details, indent=2))
+    qt_runtime = create_or_reuse_qapplication()
+    print_qt_diagnostics(qt_runtime)
 
 
 if __name__ == "__main__":
@@ -1804,7 +1871,7 @@ import os
 
 import pandas as pd
 
-from ads_qt_runtime import ensure_qapplication
+from ads_qt_runtime import create_or_reuse_qapplication, qt_runtime_diagnostics
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -1819,7 +1886,9 @@ def main():
     # Keep this reference alive for the complete ADS ANN operation. When this
     # script owns the application, the helper redirects the platform-plugin
     # path only during QApplication creation and restores it immediately.
-    qt_application, qt_runtime = ensure_qapplication()
+    qt_runtime_handle = create_or_reuse_qapplication()
+    qt_application = qt_runtime_handle.application
+    qt_runtime = qt_runtime_diagnostics(qt_runtime_handle)
     import keysight.ads.ann as ann
 
     manifest = json.loads((PACKAGE_DIR / "ads_ann_manifest.json").read_text())
@@ -1891,6 +1960,7 @@ def main():
     # Explicit use documents the required lifetime for static analyzers and
     # prevents an over-eager refactor from dropping the application reference.
     assert qt_application is not None
+    assert qt_runtime_handle.application is qt_application
 
 
 if __name__ == "__main__":
@@ -2008,13 +2078,15 @@ handoff; it does not contain the separate DC network saved by the local fit.
    the workspace `data` directory.
 3. Use the Python interpreter from the same ADS installation that will run the
    simulation. Do not use a system Python merely because it can import pandas.
-4. `train_ads_ann.py` calls `ads_qt_runtime.ensure_qapplication()` before
-   importing `keysight.ads.ann`. If ADS already owns a `QApplication`, the
-   helper reuses it and does not touch Qt paths. Otherwise it selects the
-   operating-system platform plugin from the imported PySide6/Qt runtime,
-   temporarily redirects `QT_QPA_PLATFORM_PLUGIN_PATH` only while constructing
-   the application, restores the exact previous environment in a `finally`
-   block, and keeps the application alive through extraction.
+4. `train_ads_ann.py` calls
+   `ads_qt_runtime.create_or_reuse_qapplication()` before importing
+   `keysight.ads.ann`. If ADS already owns a `QApplication`, the helper reuses
+   it immediately and does not search for plugins or touch Qt paths. Otherwise
+   it checks Qt's configured paths, standard PySide6 layouts, and existing Qt
+   path variables before a bounded search of the active Python and Keysight
+   product roots. It temporarily redirects `QT_QPA_PLATFORM_PLUGIN_PATH` only
+   while constructing the application, restores the exact previous environment
+   in a `finally` block, and keeps the application alive through extraction.
 5. In VS Code, use **ADS Python Utilities: Configure Python Interpreter Path**,
    then run the script through the extension command
    `keysight-technologies.ael-debug.runPythonScript`. The visible command label
@@ -2038,11 +2110,13 @@ To test only the Qt bootstrap under the same launcher, run:
 python ads_qt_runtime.py
 ```
 
-It reports the Python executable, PySide6 and Qt versions, selected platform
-plugin, and whether the previous environment was restored. On Linux it checks
-`libqxcb.so` with `ldd` before creating the application and raises a readable
-error for unresolved dependencies. It does not force the `offscreen` platform
-or permanently alter the ADS/Qt environment.
+It reports the Python executable, PySide6 package, selected platform plugin,
+active Qt platform, application ownership, and whether the previous environment
+was restored. On Linux it checks `libqxcb.so` with `ldd` before creating the
+application and raises a readable error for unresolved dependencies. A new
+application also requires `DISPLAY` or `WAYLAND_DISPLAY` unless the caller has
+explicitly selected `QT_QPA_PLATFORM=offscreen` or `minimal`. The helper never
+forces a headless platform or permanently alters the ADS/Qt environment.
 
 ## Step 2: Train and Check the Native ANN
 
@@ -2282,8 +2356,24 @@ def write_ads_ann_package(
         "qt_runtime": {
             "application_policy": "reuse_existing_or_scoped_create",
             "platform_plugin_source": "active_ads_pyside6_runtime",
+            "plugin_discovery": "configured_paths_then_bounded_product_roots",
+            "configured_path_sources": [
+                "QLibraryInfo.PluginsPath",
+                "QCoreApplication.libraryPaths",
+                "PySide6 package plugin layouts",
+                "QT_QPA_PLATFORM_PLUGIN_PATH",
+                "QT_PLUGIN_PATH",
+            ],
+            "bounded_fallback_roots": [
+                "PySide6 package root",
+                "sys.prefix",
+                "product root inferred from sys.executable",
+                "HPEESOF_DIR",
+                "EMPROHOME",
+            ],
             "temporary_environment_variable": "QT_QPA_PLATFORM_PLUGIN_PATH",
             "environment_restored_after_application_creation": True,
+            "linux_display_required_unless_platform": ["offscreen", "minimal"],
             "headless_platform_forced": False,
         },
         "input_columns": list(input_columns),
