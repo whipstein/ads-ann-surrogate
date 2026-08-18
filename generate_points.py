@@ -3086,8 +3086,271 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     return 0
 
 
+def _resolved_existing_path(raw_path: object, config_path: Path) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    supplied = Path(text).expanduser()
+    candidates = [supplied] if supplied.is_absolute() else [
+        Path.cwd() / supplied,
+        Path(__file__).resolve().parent / supplied,
+        config_path.parent / supplied,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _command_options(command: object) -> dict[str, str]:
+    if not command:
+        return {}
+    try:
+        tokens = shlex.split(str(command))
+    except ValueError:
+        return {}
+    options: dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        if "=" in token:
+            name, value = token.split("=", 1)
+            options[name] = value
+            index += 1
+            continue
+        if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+            options[token] = tokens[index + 1]
+            index += 2
+            continue
+        options[token] = "true"
+        index += 1
+    return options
+
+
+def _best_config_records(
+    sweep_dir: Path,
+    target_model_dir: Path,
+) -> list[tuple[Path, dict[str, object]]]:
+    records: list[tuple[Path, dict[str, object]]] = []
+    config_paths = sorted(
+        sweep_dir.glob("*_best_config.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    target_resolved = target_model_dir.resolve()
+    for config_path in config_paths:
+        try:
+            payload = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("status") == "no_eligible_trial":
+            continue
+        raw_model_dir = payload.get("best_model_dir")
+        if raw_model_dir:
+            raw_path = Path(str(raw_model_dir)).expanduser()
+            model_candidates = [raw_path] if raw_path.is_absolute() else [
+                Path.cwd() / raw_path,
+                Path(__file__).resolve().parent / raw_path,
+                config_path.parent / raw_path,
+            ]
+            if not any(candidate.resolve() == target_resolved for candidate in model_candidates):
+                continue
+        elif "reranked" in config_path.name and target_model_dir.name == "best_model":
+            # A rerank report is not necessarily promoted over the primary model.
+            continue
+        records.append((config_path, payload))
+    return records
+
+
+def _selected_trial_metrics_path(
+    sweep_dir: Path,
+    target_model_dir: Path,
+) -> Path | None:
+    for _config_path, payload in _best_config_records(sweep_dir, target_model_dir):
+        raw_trial = payload.get("trial", payload.get("best_trial"))
+        try:
+            trial = int(raw_trial)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        candidate = (
+            sweep_dir
+            / "trials"
+            / f"trial_{trial:04d}"
+            / "verification_metrics.csv"
+        )
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _recover_promoted_verification_metrics(
+    sweep_dir: Path,
+    target_model_dir: Path,
+) -> tuple[Path | None, str | None]:
+    """Rebuild metrics for sweep output created before promotion retained them."""
+
+    predicted_path = target_model_dir / "predicted_verification.mdif"
+    metadata_path = target_model_dir / "metadata.json"
+    if not predicted_path.is_file() or not metadata_path.is_file():
+        return None, None
+
+    records = _best_config_records(sweep_dir, target_model_dir)
+    if not records:
+        return None, None
+    config_path, payload = records[0]
+    command_options = _command_options(payload.get("reproduction_command"))
+    raw_fit_data = payload.get("fit_data")
+    fit_data = raw_fit_data if isinstance(raw_fit_data, dict) else {}
+
+    def setting(json_name: str, cli_name: str, default: object = None) -> object:
+        value = fit_data.get(json_name)
+        if value is not None and value != "":
+            return value
+        return command_options.get(cli_name, default)
+
+    mdif_path = _resolved_existing_path(setting("mdif", "--mdif"), config_path)
+    verification_mdif_path = _resolved_existing_path(
+        setting("verification_mdif", "--verification-mdif"),
+        config_path,
+    )
+    if mdif_path is None and verification_mdif_path is None:
+        return (
+            None,
+            "the selected model artifacts do not identify a readable source MDIF",
+        )
+
+    try:
+        from surrogate_common import (
+            parse_csv_set,
+            parse_sparam_weights,
+            positive_frequency_blocks,
+            read_mdif,
+            split_blocks,
+            verification_metrics,
+            write_csv,
+        )
+
+        metadata = json.loads(metadata_path.read_text())
+        parameter_names = [str(name) for name in metadata["parameter_names"]]
+        labels = [str(label) for label in metadata["sparam_labels"]]
+        if verification_mdif_path is not None:
+            truth_blocks = read_mdif(verification_mdif_path)
+        else:
+            assert mdif_path is not None
+            source_blocks = read_mdif(mdif_path)
+            split = split_blocks(
+                source_blocks,
+                split_var=str(setting("split_var", "--split-var", "dataset")),
+                train_values=parse_csv_set(
+                    str(setting("train_values", "--train-values", "train,training"))
+                ),
+                verify_values=parse_csv_set(
+                    str(
+                        setting(
+                            "verify_values",
+                            "--verify-values",
+                            "verify,verification,test,validation",
+                        )
+                    )
+                ),
+                holdout_fraction=float(
+                    setting("holdout_fraction", "--holdout-fraction", 0.2)
+                ),
+                seed=int(setting("seed", "--seed", 1234)),
+            )
+            truth_blocks = split.verify
+        predicted_blocks = read_mdif(predicted_path)
+        truth_rf = positive_frequency_blocks(
+            truth_blocks,
+            purpose="verification-metrics recovery",
+        )
+        predicted_rf = positive_frequency_blocks(
+            predicted_blocks,
+            purpose="verification-metrics recovery",
+        )
+        if len(truth_rf) != len(predicted_rf):
+            raise ValueError(
+                f"truth has {len(truth_rf)} verification block(s), but the saved "
+                f"prediction has {len(predicted_rf)}"
+            )
+        for block_index, (truth, predicted) in enumerate(
+            zip(truth_rf, predicted_rf),
+            start=1,
+        ):
+            if len(truth.freq_hz) != len(predicted.freq_hz) or any(
+                not math.isclose(
+                    float(truth_frequency),
+                    float(predicted_frequency),
+                    rel_tol=1e-10,
+                    abs_tol=1e-6,
+                )
+                for truth_frequency, predicted_frequency in zip(
+                    truth.freq_hz,
+                    predicted.freq_hz,
+                )
+            ):
+                raise ValueError(
+                    "the saved prediction frequency grid does not match source "
+                    f"verification block {block_index}"
+                )
+            mismatched_parameters = [
+                name
+                for name in parameter_names
+                if str(truth.params.get(name, ""))
+                != str(predicted.params.get(name, ""))
+            ]
+            if mismatched_parameters:
+                raise ValueError(
+                    "the saved prediction geometry does not match source "
+                    f"verification block {block_index} for parameter(s): "
+                    + ", ".join(mismatched_parameters)
+                )
+        raw_sparam_weights = metadata.get("sparam_weights")
+        if isinstance(raw_sparam_weights, dict):
+            sparam_weights = {
+                str(name): float(value)
+                for name, value in raw_sparam_weights.items()
+            }
+        else:
+            sparam_weights = parse_sparam_weights(
+                labels,
+                command_options.get("--sparam-weights"),
+            )
+        raw_frequency_weights = metadata.get("frequency_weights")
+        frequency_weights = (
+            str(raw_frequency_weights)
+            if raw_frequency_weights is not None and raw_frequency_weights != ""
+            else command_options.get("--frequency-weights")
+        )
+        metric_rows, _summary = verification_metrics(
+            truth_rf,
+            predicted_rf,
+            labels,
+            parameter_names,
+            sparam_weights=sparam_weights,
+            frequency_weights=frequency_weights,
+        )
+        if not metric_rows:
+            raise ValueError("the recovered verification comparison produced no rows")
+        recovered_path = target_model_dir / "verification_metrics.csv"
+        write_csv(recovered_path, metric_rows)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return None, str(exc)
+
+    print(
+        "recovered missing promoted verification metrics from the saved "
+        f"verification prediction and source data: {recovered_path}",
+        file=sys.stderr,
+    )
+    return recovered_path, None
+
+
 def verification_metrics_path(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Path:
     fallback_manifest: Path | None = None
+    recovery_error: str | None = None
     if args.verification_metrics:
         path = Path(args.verification_metrics)
         sibling_manifest = path.parent / "point_generation_source.json"
@@ -3121,13 +3384,38 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
                 parent_fallback_path.parent / "point_generation_source.json"
             )
         else:
-            path = direct_path
+            sweep_dir = (
+                fit_dir.parent if fit_dir.name.startswith("best_model") else fit_dir
+            )
+            target_model_dir = (
+                fit_dir
+                if fit_dir.name.startswith("best_model")
+                else fit_dir / "best_model"
+            )
+            selected_trial_path = _selected_trial_metrics_path(
+                sweep_dir,
+                target_model_dir,
+            )
+            if selected_trial_path is not None:
+                path = selected_trial_path
+            else:
+                recovered_path, recovery_error = _recover_promoted_verification_metrics(
+                    sweep_dir,
+                    target_model_dir,
+                )
+                path = recovered_path or direct_path
     else:
         parser.error("Either --fit-dir or --verification-metrics is required")
     if not path.exists():
+        recovery_detail = (
+            f" Automatic recovery was attempted but failed: {recovery_error}."
+            if recovery_error
+            else ""
+        )
         parser.error(
             f"Verification metrics file does not exist: {path}. For an optimize "
             "run, pass the sweep directory or its best_model directory."
+            f"{recovery_detail}"
         )
     if fallback_manifest is not None:
         if not getattr(args, "allow_nonpassive", False):

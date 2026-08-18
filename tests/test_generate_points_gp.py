@@ -678,6 +678,113 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             )
             self.assertIsNone(args.nonpassive_source)
 
+    def test_missing_promoted_metrics_are_recovered_without_refitting(self) -> None:
+        import surrogate_common
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sweep_dir = root / "sweep"
+            best_model_dir = sweep_dir / "best_model"
+            best_model_dir.mkdir(parents=True)
+            source_mdif = Path(__file__).resolve().parents[1] / (
+                "dnn_sample_training_verification.mdif"
+            )
+            source_blocks = surrogate_common.read_mdif(source_mdif)
+            split = surrogate_common.split_blocks(
+                source_blocks,
+                split_var="dataset",
+                train_values={"train", "training"},
+                verify_values={"verify", "verification", "test", "validation"},
+                holdout_fraction=0.2,
+                seed=1234,
+            )
+            labels = surrogate_common.common_sparameter_labels(source_blocks)
+            surrogate_common.write_mdif(
+                best_model_dir / "predicted_verification.mdif",
+                split.verify,
+                labels,
+            )
+            (best_model_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "parameter_names": ["L", "W"],
+                        "sparam_labels": labels,
+                        "sparam_weights": {label: 1.0 for label in labels},
+                        "frequency_weights": None,
+                    }
+                )
+            )
+            (sweep_dir / "dnn_best_config.json").write_text(
+                json.dumps(
+                    {
+                        "trial": 3,
+                        "best_model_dir": str(best_model_dir),
+                        "reproduction_command": (
+                            "python3 surrogate.py --model dnn train "
+                            f"--mdif {source_mdif} --split-var dataset "
+                            "--train-values train,training "
+                            "--verify-values verify,verification,test,validation "
+                            "--holdout-fraction 0.2 --seed 1234"
+                        ),
+                    }
+                )
+            )
+
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(sweep_dir)]
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                recovered = POINTS.verification_metrics_path(args, parser)
+
+            self.assertEqual(
+                recovered,
+                best_model_dir / "verification_metrics.csv",
+            )
+            self.assertTrue(recovered.is_file())
+            with recovered.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertTrue(rows)
+            self.assertIn("L", rows[0])
+            self.assertIn("W", rows[0])
+            self.assertIn(
+                "recovered missing promoted verification metrics",
+                stderr.getvalue(),
+            )
+
+    def test_missing_promoted_metrics_resolve_from_retained_selected_trial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sweep_dir = Path(temp_dir) / "sweep"
+            best_model_dir = sweep_dir / "best_model"
+            best_model_dir.mkdir(parents=True)
+            retained_metrics = (
+                sweep_dir
+                / "trials"
+                / "trial_0007"
+                / "verification_metrics.csv"
+            )
+            retained_metrics.parent.mkdir(parents=True)
+            retained_metrics.write_text(
+                "source_index,evm_pct,p\n1,0.2,0.25\n"
+            )
+            (sweep_dir / "dnn_best_config.json").write_text(
+                json.dumps(
+                    {
+                        "trial": 7,
+                        "best_model_dir": str(best_model_dir),
+                    }
+                )
+            )
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(best_model_dir)]
+            )
+            self.assertEqual(
+                POINTS.verification_metrics_path(args, parser),
+                retained_metrics,
+            )
+
     def test_nonpassive_sweep_fallback_requires_explicit_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             sweep_dir = Path(temp_dir) / "sweep"

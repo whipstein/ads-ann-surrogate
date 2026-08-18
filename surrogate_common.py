@@ -10667,10 +10667,13 @@ def cache_point_generation_fallback(
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True)
     cached_metrics_path = cache_dir / metrics_path.name
-    if keep_trial_models:
-        shutil.copy2(metrics_path, cached_metrics_path)
-    else:
-        shutil.move(metrics_path, cached_metrics_path)
+    # Keep the trial artifact in place until promotion has had a chance to copy
+    # it into best_model/.  Moving it here used to create a subtle successful-
+    # sweep failure: the model was promoted after this cache operation, so the
+    # promoted directory contained every artifact except verification_metrics.csv.
+    # cleanup_trial_dir() still removes the trial copy when trial retention is
+    # disabled, so copying here does not retain additional per-trial artifacts.
+    shutil.copy2(metrics_path, cached_metrics_path)
     summary_path = trial_dir / "verification_summary.json"
     if summary_path.is_file():
         shutil.copy2(summary_path, cache_dir / summary_path.name)
@@ -13804,6 +13807,18 @@ def run_sweep_command(
                 "best_model_dir": str(best_dir),
                 "best_model_source": best_model_source,
                 "promotion_warning": live_promotion_warning,
+                "verification_metrics": str(
+                    best_dir / "verification_metrics.csv"
+                ),
+                "fit_data": {
+                    "mdif": getattr(args, "mdif", None),
+                    "verification_mdif": getattr(args, "verification_mdif", None),
+                    "split_var": getattr(args, "split_var", None),
+                    "train_values": getattr(args, "train_values", None),
+                    "verify_values": getattr(args, "verify_values", None),
+                    "holdout_fraction": getattr(args, "holdout_fraction", None),
+                    "seed": getattr(best_args, "seed", None),
+                },
                 "reproduction_command": reproduction_command,
             },
             indent=2,

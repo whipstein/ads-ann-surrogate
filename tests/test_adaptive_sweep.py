@@ -397,6 +397,92 @@ class AdaptiveSweepTests(unittest.TestCase):
             self.assertTrue(stats)
             self.assertTrue(any(row["all_mean"] for row in stats))
 
+    def test_passing_sweep_promotes_verification_metrics_before_trial_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir) / "sweep"
+            args = argparse.Namespace(
+                out_dir=str(out_dir),
+                selection_metric="rmse_abs",
+                require_passive=True,
+                max_passivity_violations=None,
+                max_passivity_sigma=None,
+                jobs=1,
+                seed=1234,
+                trial_seed_mode="fixed",
+                trial_worst_plots=0,
+                worst_plots=0,
+                keep_trial_models=False,
+                retrain_best=False,
+                epochs=10,
+                mode="random",
+                mdif="combined.mdif",
+                verification_mdif=None,
+                split_var="dataset",
+                train_values="train,training",
+                verify_values="verify,verification,test,validation",
+                holdout_fraction=0.2,
+            )
+            candidates = [{"learning_rate": 0.001, "hidden_layers": "32"}]
+
+            def worker(payload):
+                _values, candidate, out_text, trial, _plots = payload
+                trial_dir = Path(out_text) / "trials" / f"trial_{trial:04d}"
+                trial_dir.mkdir(parents=True, exist_ok=True)
+                (trial_dir / "model.npz").write_bytes(b"model")
+                (trial_dir / "metadata.json").write_text("{}")
+                (trial_dir / "verification_metrics.csv").write_text(
+                    "source_index,evm_pct,width\n1,0.2,0.5\n"
+                )
+                return {
+                    "trial": trial,
+                    "candidate": candidate,
+                    "summary": {
+                        "rmse_abs": 0.2,
+                        "passivity": {
+                            "max_singular_value": 0.99,
+                            "violating_points": 0,
+                        },
+                    },
+                    "metric": 0.2,
+                    "trial_seed": 1234,
+                    "plot_paths": [],
+                }
+
+            def namespace_for_trial(_args, _candidate, _out, _trial, plots):
+                return argparse.Namespace(seed=1234, worst_plots=plots)
+
+            status = run_sweep_command(
+                args,
+                candidates,
+                worker_func=worker,
+                namespace_for_trial_func=namespace_for_trial,
+                train_func=lambda _args: 0,
+                result_columns=["learning_rate", "hidden_layers"],
+                results_filename="results.csv",
+                best_config_filename="best_config.json",
+                summary_filename="summary.md",
+                diagnostics_prefix="test",
+                train_command_prefix=None,
+            )
+
+            self.assertEqual(status, 0)
+            promoted_metrics = out_dir / "best_model" / "verification_metrics.csv"
+            self.assertTrue(promoted_metrics.is_file())
+            self.assertIn("0.2", promoted_metrics.read_text())
+            self.assertFalse(
+                (
+                    out_dir
+                    / "trials"
+                    / "trial_0001"
+                    / "verification_metrics.csv"
+                ).exists()
+            )
+            best_config = json.loads((out_dir / "best_config.json").read_text())
+            self.assertEqual(
+                best_config["verification_metrics"],
+                str(promoted_metrics),
+            )
+
     def test_dnn_adaptive_cli_builds_requested_search_space(self) -> None:
         parser = dnn.build_arg_parser()
         args = parser.parse_args(
