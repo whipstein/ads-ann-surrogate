@@ -1611,13 +1611,56 @@ def metadata_csv(metadata: dict[str, object], key: str) -> str | None:
     return None
 
 
-def infer_uniform_hidden_layout(hidden_layers: Sequence[int]) -> tuple[int, int]:
-    if not hidden_layers:
-        return 1, 20
-    if any(layer <= 0 for layer in hidden_layers):
-        raise ValueError("Hidden layer sizes must be positive")
-    neurons = int(round(float(np.mean(hidden_layers))))
-    return len(hidden_layers), max(1, neurons)
+ADS_ANN_DEFAULT_HIDDEN_LAYERS = 2
+ADS_ANN_DEFAULT_NEURONS_PER_LAYER = 20
+
+
+def resolve_ads_ann_layout(
+    hidden_layers: int | None,
+    neurons_per_layer: int | None,
+) -> tuple[int, int]:
+    """Resolve independent ADS ANN sizes without inheriting a local MLP layout."""
+
+    resolved_hidden_layers = (
+        ADS_ANN_DEFAULT_HIDDEN_LAYERS
+        if hidden_layers is None
+        else int(hidden_layers)
+    )
+    resolved_neurons = (
+        ADS_ANN_DEFAULT_NEURONS_PER_LAYER
+        if neurons_per_layer is None
+        else int(neurons_per_layer)
+    )
+    if resolved_hidden_layers <= 0:
+        raise ValueError("--ads-hidden-layers must be positive")
+    if resolved_neurons <= 0:
+        raise ValueError("--ads-neurons-per-layer must be positive")
+    return resolved_hidden_layers, resolved_neurons
+
+
+def ads_ann_parameter_count(
+    num_inputs: int,
+    num_outputs: int,
+    num_hidden_layers: int,
+    num_neurons_per_layer: int,
+) -> int:
+    """Estimate scalar weights and biases in the uniform ADS ANN layout."""
+
+    if min(
+        num_inputs,
+        num_outputs,
+        num_hidden_layers,
+        num_neurons_per_layer,
+    ) <= 0:
+        raise ValueError("ADS ANN dimensions must all be positive")
+    first_hidden = (num_inputs + 1) * num_neurons_per_layer
+    hidden_transitions = (
+        (num_hidden_layers - 1)
+        * (num_neurons_per_layer + 1)
+        * num_neurons_per_layer
+    )
+    output_layer = (num_neurons_per_layer + 1) * num_outputs
+    return first_hidden + hidden_transitions + output_layer
 
 
 def ads_qt_runtime_helper_script() -> str:
@@ -1865,10 +1908,12 @@ if __name__ == "__main__":
 
 def ads_ann_training_script() -> str:
     return """#!/usr/bin/env python3
+import argparse
 from pathlib import Path
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 from ads_qt_runtime import create_or_reuse_qapplication, qt_runtime_diagnostics
@@ -1882,22 +1927,150 @@ def enum_value(enum_cls, name):
     return getattr(enum_cls, name)
 
 
-def main():
-    # Keep this reference alive for the complete ADS ANN operation. When this
-    # script owns the application, the helper redirects the platform-plugin
-    # path only during QApplication creation and restores it immediately.
-    qt_runtime_handle = create_or_reuse_qapplication()
-    qt_application = qt_runtime_handle.application
-    qt_runtime = qt_runtime_diagnostics(qt_runtime_handle)
-    import keysight.ads.ann as ann
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train the native ADS ANN contained in this export package."
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="validate data and report ANN size without importing Qt or ADS ANN",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="enable the public ADS ANN native verbose mode",
+    )
+    return parser.parse_args()
 
+
+def phase(message):
+    print(f"[ADS ANN] {message}", flush=True)
+
+
+def network_parameter_count(num_inputs, num_outputs, hidden_layers, neurons):
+    first_hidden = (num_inputs + 1) * neurons
+    hidden_transitions = (hidden_layers - 1) * (neurons + 1) * neurons
+    output_layer = (neurons + 1) * num_outputs
+    return first_hidden + hidden_transitions + output_layer
+
+
+def preflight(manifest, training_df):
+    settings = manifest["ads_ann"]
+    input_columns = list(manifest["input_columns"])
+    output_columns = list(manifest["output_columns"])
+    required_columns = input_columns + output_columns
+    duplicate_columns = sorted(
+        {name for name in required_columns if required_columns.count(name) > 1}
+    )
+    if duplicate_columns:
+        raise ValueError(
+            "Input/output column names overlap or repeat: "
+            + ", ".join(duplicate_columns)
+        )
+    missing_columns = [
+        name for name in required_columns if name not in training_df.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Training CSV is missing manifest columns: "
+            + ", ".join(missing_columns)
+        )
+    if training_df.empty:
+        raise ValueError("The ADS ANN training CSV has no rows")
+
+    numeric = training_df[required_columns].apply(pd.to_numeric, errors="coerce")
+    values = numeric.to_numpy(dtype=float)
+    nonfinite_count = int(values.size - np.count_nonzero(np.isfinite(values)))
+    if nonfinite_count:
+        raise ValueError(
+            f"Training CSV has {nonfinite_count} nonnumeric, NaN, or infinite "
+            "values in ANN input/output columns"
+        )
+
+    hidden_layers = int(settings["num_hidden_layers"])
+    neurons = int(settings["num_neurons_per_layer"])
+    if hidden_layers <= 0 or neurons <= 0:
+        raise ValueError("ADS ANN hidden-layer and neuron counts must be positive")
+    parameter_count = network_parameter_count(
+        len(input_columns),
+        len(output_columns),
+        hidden_layers,
+        neurons,
+    )
+    dense_state_gib = (parameter_count * parameter_count * 8) / (1024**3)
+    warnings = []
+    if dense_state_gib >= 1.0:
+        warnings.append(
+            "This architecture is large for the ADS quasi-Newton extractor. "
+            "Re-export with --ads-hidden-layers 2 --ads-neurons-per-layer 20 "
+            "before treating a native allocation failure as a dataset problem."
+        )
+    return {
+        "training_rows": int(len(training_df)),
+        "num_inputs": len(input_columns),
+        "num_outputs": len(output_columns),
+        "hidden_layers": hidden_layers,
+        "neurons_per_hidden_layer": neurons,
+        "estimated_trainable_parameters": parameter_count,
+        "dense_quasi_newton_state_estimate_gib": dense_state_gib,
+        "dense_state_note": (
+            "Diagnostic size of one dense float64 square matrix over all "
+            "estimated ANN parameters; ADS does not document its exact allocation."
+        ),
+        "training_numeric_data_mib": values.nbytes / (1024**2),
+        "warnings": warnings,
+    }
+
+
+def allocation_error(stage, summary, error):
+    return RuntimeError(
+        "ADS ANN raised a native allocation failure during "
+        f"{stage}: {error}. The requested network has "
+        f"{summary['estimated_trainable_parameters']} estimated trainable "
+        "parameters; one dense float64 square matrix at that dimension is "
+        f"approximately {summary['dense_quasi_newton_state_estimate_gib']:.3f} "
+        "GiB. This matrix size is diagnostic, not a documented ADS allocation. "
+        "Re-export with --ads-hidden-layers 2 --ads-neurons-per-layer 20 and "
+        "retry. If that still fails, run train_ads_ann.py --preflight-only and "
+        "compare the reported stage, dimensions, ADS release, and interpreter."
+    )
+
+
+def main():
+    args = parse_args()
     manifest = json.loads((PACKAGE_DIR / "ads_ann_manifest.json").read_text())
     settings = manifest["ads_ann"]
     input_columns = manifest["input_columns"]
     output_columns = manifest["output_columns"]
     training_df = pd.read_csv(PACKAGE_DIR / manifest["training_csv"])
+    summary = preflight(manifest, training_df)
+    phase("preflight complete")
+    print(json.dumps(summary, indent=2), flush=True)
+    if args.preflight_only:
+        return
 
-    setup = ann.AnnSetup(len(input_columns), len(output_columns))
+    # Keep this reference alive for the complete ADS ANN operation. When this
+    # script owns the application, the helper redirects the platform-plugin
+    # path only during QApplication creation and restores it immediately.
+    phase("creating or reusing QApplication")
+    qt_runtime_handle = create_or_reuse_qapplication()
+    qt_application = qt_runtime_handle.application
+    qt_runtime = qt_runtime_diagnostics(qt_runtime_handle)
+    phase("importing keysight.ads.ann")
+    try:
+        import keysight.ads.ann as ann
+    except MemoryError as error:
+        raise allocation_error("keysight.ads.ann import", summary, error) from error
+
+    if args.verbose:
+        ann.set_verbose(True)
+    phase("resetting process-local ADS ANN state")
+    try:
+        ann.reset()
+        setup = ann.AnnSetup(len(input_columns), len(output_columns))
+    except MemoryError as error:
+        raise allocation_error("AnnSetup construction", summary, error) from error
     setup.seed = int(settings["seed"])
     setup.num_hidden_layers = int(settings["num_hidden_layers"])
     setup.num_neurons_per_layer = int(settings["num_neurons_per_layer"])
@@ -1918,17 +2091,26 @@ def main():
     setup.training_stop_tolerance = float(settings["training_stop_tolerance"])
     setup.output_format = enum_value(ann.OutputFormat, settings["output_format"])
 
-    ann.configure_setup(setup)
-    training_fit = ann.auxiliary_functions.extract_inmemory(
-        input_data=training_df,
-        input_columns=input_columns,
-        output_columns=output_columns,
-        ann_saving_names=settings["output_prefix"],
-    )
+    phase("configuring native ADS ANN")
+    try:
+        ann.configure_setup(setup)
+    except MemoryError as error:
+        raise allocation_error("ANN configuration", summary, error) from error
+    phase("training native ADS ANN")
+    try:
+        training_fit = ann.auxiliary_functions.extract_inmemory(
+            input_data=training_df,
+            input_columns=input_columns,
+            output_columns=output_columns,
+            ann_saving_names=settings["output_prefix"],
+        )
+    except MemoryError as error:
+        raise allocation_error("ANN extraction/training", summary, error) from error
     training_fit.to_csv(PACKAGE_DIR / "ads_ann_training_fit.csv", index=False)
 
     verification_csv = manifest.get("verification_csv")
     if verification_csv:
+        phase("verifying native ADS ANN")
         struc_file = PACKAGE_DIR / f"{settings['output_prefix']}.struc"
         if struc_file.exists():
             fresh_setup = ann.AnnSetup(1, 1)
@@ -1939,11 +2121,17 @@ def main():
             verify_df[input_columns],
             input_columns=None,
         )
-        if len(prediction_df.columns) == len(output_columns):
-            prediction_df.columns = [f"pred_{name}" for name in output_columns]
+        prediction_only = prediction_df.iloc[:, len(input_columns):].copy()
+        if len(prediction_only.columns) != len(output_columns):
+            raise ValueError(
+                "ADS ANN verification returned "
+                f"{len(prediction_only.columns)} outputs; expected "
+                f"{len(output_columns)}"
+            )
+        prediction_only.columns = [f"pred_{name}" for name in output_columns]
         truth_df = verify_df[output_columns].rename(columns={name: f"truth_{name}" for name in output_columns})
         result_df = pd.concat(
-            [verify_df[input_columns].reset_index(drop=True), truth_df.reset_index(drop=True), prediction_df.reset_index(drop=True)],
+            [verify_df[input_columns].reset_index(drop=True), truth_df.reset_index(drop=True), prediction_only.reset_index(drop=True)],
             axis=1,
         )
         result_df.to_csv(PACKAGE_DIR / "ads_ann_verification_prediction.csv", index=False)
@@ -1954,6 +2142,7 @@ def main():
         "input_columns": input_columns,
         "output_columns": output_columns,
         "expected_native_outputs": expected,
+        "preflight": summary,
         "qt_runtime": qt_runtime,
     }, indent=2))
 
@@ -2050,6 +2239,8 @@ S-parameter weights in the manifest but does not apply them inside ADS ANN.
 - ADS activation: `{settings["neuron_activation_function_type"]}`
 - ADS optimizer: `{settings["modeler_optimizer"]}`
 - ADS output format: `{settings["output_format"]}`
+- Estimated trainable parameters: `{settings["estimated_trainable_parameters"]}`
+- Dense quasi-Newton diagnostic matrix: `{settings["dense_quasi_newton_state_estimate_gib"]:.3f}` GiB
 
 ## What This Package Does—and Does Not Do
 
@@ -2120,9 +2311,27 @@ forces a headless platform or permanently alters the ADS/Qt environment.
 
 ## Step 2: Train and Check the Native ANN
 
-Run `train_ads_ann.py`. For the selected output format, ADS ANN is expected to
-write {expected_files}. The script also writes `ads_ann_training_fit.csv` and,
-when verification data exists, `ads_ann_verification_prediction.csv`.
+Start with a non-native preflight, which validates the CSV/manifest interface
+and reports the requested network size without importing Qt or ADS ANN:
+
+```text
+python train_ads_ann.py --preflight-only
+```
+
+Pay particular attention to `estimated_trainable_parameters` and
+`dense_quasi_newton_state_estimate_gib`. The latter is the size of one dense
+float64 square matrix over the estimated ANN parameters; it is a diagnostic,
+not a claim about ADS's undocumented internal allocation. If it reaches GiB
+scale, re-export with `--ads-hidden-layers 2 --ads-neurons-per-layer 20` before
+running the native extractor.
+
+Then run `python train_ads_ann.py`. Add `--verbose` to enable the documented ADS
+ANN native verbose mode. The script prints each native phase, resets stale
+process-local ANN setup state, and translates `MemoryError` allocation failures
+into a message containing the failing phase and requested architecture. For the
+selected output format, ADS ANN is expected to write {expected_files}. The
+script also writes `ads_ann_training_fit.csv` and, when verification data
+exists, `ads_ann_verification_prediction.csv`.
 
 Before opening a schematic:
 
@@ -2340,6 +2549,23 @@ def write_ads_ann_package(
     out_dir.mkdir(parents=True, exist_ok=True)
     settings = dict(settings)
     settings["expected_output_suffixes"] = ads_ann_expected_suffixes(str(settings["output_format"]))
+    parameter_count = ads_ann_parameter_count(
+        len(input_columns),
+        len(output_columns),
+        int(settings["num_hidden_layers"]),
+        int(settings["num_neurons_per_layer"]),
+    )
+    settings["estimated_trainable_parameters"] = parameter_count
+    settings["dense_quasi_newton_state_estimate_gib"] = (
+        parameter_count * parameter_count * 8 / (1024**3)
+    )
+    settings["allocation_warning"] = (
+        "GiB-scale dense quasi-Newton diagnostic. Prefer "
+        "--ads-hidden-layers 2 --ads-neurons-per-layer 20 unless this larger "
+        "native ADS ANN layout has been validated on the target machine."
+        if settings["dense_quasi_newton_state_estimate_gib"] >= 1.0
+        else None
+    )
     training_csv = "ads_ann_training.csv"
     verification_csv = "ads_ann_verification.csv" if x_verify is not None and y_verify is not None else None
     qt_runtime_helper = "ads_qt_runtime.py"

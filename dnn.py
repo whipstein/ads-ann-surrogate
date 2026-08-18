@@ -64,7 +64,6 @@ from surrogate_common import (  # noqa: E402
     infer_complete_sparameter_ports,
     infer_parameter_names,
     load_sweep_rows,
-    infer_uniform_hidden_layout,
     load_or_write_trial_summary,
     make_training_progress_callback,
     metadata_csv,
@@ -93,6 +92,7 @@ from surrogate_common import (  # noqa: E402
     read_mdif,
     read_model_metadata,
     resolve_export_dc_conductance_model,
+    resolve_ads_ann_layout,
     rerank_sweep_rows,
     run_sweep_command,
     sparam_sort_key,
@@ -1497,13 +1497,10 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         y_verify = None
 
     requested_hidden_layers = parse_hidden_layers(args.hidden_layers)
-    default_hidden_layers, default_neurons = infer_uniform_hidden_layout(requested_hidden_layers)
-    ads_hidden_layers = args.ads_hidden_layers if args.ads_hidden_layers is not None else default_hidden_layers
-    ads_neurons = args.ads_neurons_per_layer if args.ads_neurons_per_layer is not None else default_neurons
-    if ads_hidden_layers <= 0:
-        raise ValueError("--ads-hidden-layers must be positive")
-    if ads_neurons <= 0:
-        raise ValueError("--ads-neurons-per-layer must be positive")
+    ads_hidden_layers, ads_neurons = resolve_ads_ann_layout(
+        args.ads_hidden_layers,
+        args.ads_neurons_per_layer,
+    )
 
     settings = {
         "seed": args.seed,
@@ -1543,13 +1540,14 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             "requested_hidden_layers": requested_hidden_layers,
             "ads_layout_note": (
                 "ADS ANN exposes a uniform hidden-layer width in the documented API. "
-                "The package uses --ads-hidden-layers/--ads-neurons-per-layer, or derives "
-                "them from --hidden-layers when those overrides are omitted."
+                "The package uses explicit --ads-hidden-layers/--ads-neurons-per-layer "
+                "values, or the ADS-safe documented-example defaults of 2 layers and "
+                "20 neurons per layer. Local model layers are recorded but not inherited."
             ),
         },
         extra_notes=[
             "This export retrains the DNN in ADS ANN; it does not import NumPy model.npz weights.",
-            "When --model-dir is supplied, metadata from that trained or optimized model is used to seed the ADS ANN architecture/settings.",
+            "When --model-dir is supplied, its labels, transforms, activation, and other compatible settings seed the export; local hidden-layer sizes are recorded but not inherited by ADS ANN.",
             "The package records S-parameter weights in the manifest. ADS ANN's documented Python API does not expose direct per-output loss weights, so the included ADS training script does not apply those weights.",
             "Any source-model frequency weights are recorded in the manifest but are not applied because the documented ADS ANN API does not expose per-sample loss weights.",
             "The native ADS ANN output predicts fine S-parameter real/imaginary values directly.",
@@ -2630,7 +2628,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_ann.add_argument("--verification-mdif", help="Optional separate verification MDIF")
     export_ann.add_argument(
         "--model-dir",
-        help="Optional trained model directory, or sweep/optimize best_model directory, used for architecture metadata",
+        help="Optional trained model or best_model directory used for labels and compatible export metadata; ADS hidden sizes remain independent",
     )
     export_ann.add_argument("--out-dir", required=True, help="Output directory for the ADS ANN package")
     export_ann.add_argument("--split-var")
@@ -2645,8 +2643,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sparam-weights",
         help="Optional S-parameter weights to record in the ADS ANN manifest; defaults to model metadata when --model-dir is supplied",
     )
-    export_ann.add_argument("--ads-hidden-layers", type=int, help="Override ADS AnnSetup.num_hidden_layers")
-    export_ann.add_argument("--ads-neurons-per-layer", type=int, help="Override ADS AnnSetup.num_neurons_per_layer")
+    export_ann.add_argument("--ads-hidden-layers", type=int, help="Override ADS AnnSetup.num_hidden_layers; default 2")
+    export_ann.add_argument("--ads-neurons-per-layer", type=int, help="Override ADS AnnSetup.num_neurons_per_layer; default 20")
     export_ann.add_argument(
         "--ads-optimizer",
         choices=["quasi-newton", "bayesian-regularization"],

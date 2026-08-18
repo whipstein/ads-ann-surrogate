@@ -2549,8 +2549,11 @@ $$
 
 `train_ads_ann.py` then trains a new network through `keysight.ads.ann`. It does
 not load the weights in `model.npz`. The ADS ANN API uses one common neuron
-count for all hidden layers; a nonuniform local architecture is approximated
-unless `--ads-hidden-layers` and `--ads-neurons-per-layer` are specified.
+count for all hidden layers. Local DNN/KBNN layer sizes are recorded but are no
+longer inherited automatically: unless overridden, ADS ANN export uses the
+documented-example layout of two hidden layers with 20 neurons each. This keeps
+the quasi-Newton native allocation practical; use `--ads-hidden-layers` and
+`--ads-neurons-per-layer` deliberately when increasing it.
 Local per-S-parameter/frequency weights, passivity enforcement, and reciprocity
 projection are not transferred automatically to this retrained network.
 
@@ -2566,8 +2569,8 @@ python3 surrogate.py --model dnn export-ads-ann \
   --mdif train_verify.mdif \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_ads_ann \
-  --ads-hidden-layers 3 \
-  --ads-neurons-per-layer 128 \
+  --ads-hidden-layers 2 \
+  --ads-neurons-per-layer 20 \
   --ads-iterations 1000 \
   --ads-output-format all
 ```
@@ -2680,6 +2683,24 @@ selected platform plugin, active Qt platform, whether the application was
 created or reused, and whether the environment was restored. Run this helper
 using the same route that fails—standalone ADS Python, ADS Python Utilities, or
 a live ADS process—because different launchers can have different Qt paths.
+
+Before invoking the native extractor, validate the package and inspect the ANN
+size without importing Qt or `keysight.ads.ann`:
+
+```text
+python train_ads_ann.py --preflight-only
+```
+
+This reports row/input/output counts, estimated ANN parameter count, numeric
+data size, and the size of one dense float64 square matrix over those
+parameters. The matrix value is a diagnostic for quasi-Newton allocation risk,
+not a documented ADS memory formula. A GiB-scale result is a strong reason to
+re-export with `--ads-hidden-layers 2 --ads-neurons-per-layer 20`.
+
+The normal command is `python train_ads_ann.py`; add `--verbose` to enable the
+public ADS ANN verbose mode. The script prints its current phase, resets stale
+process-local ADS ANN configuration, and identifies whether a native allocation
+failure occurred during import, setup, configuration, or extraction.
 
 Expected output with `--ads-output-format all`:
 
@@ -3902,10 +3923,10 @@ the **Subcommands** column includes accepted command aliases.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--ads-hidden-layers INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_hidden_layers`. If omitted, this is derived from `--hidden-layers`. | <nobr><code>--ads-hidden-layers 3</code></nobr> |
+| <nobr><code>--ads-hidden-layers INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_hidden_layers`. Default: `2`; local model layers are not inherited because large quasi-Newton models can require excessive native memory. | <nobr><code>--ads-hidden-layers 2</code></nobr> |
 | <nobr><code>--ads-iterations INT</code></nobr> | <code>export-ads-ann</code> | ADS ANN maximum training iterations. Default: `500`. | <nobr><code>--ads-iterations 1000</code></nobr> |
 | <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | <code>export-ads-ann</code> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
-| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. If omitted, this is derived from the average of `--hidden-layers`. | <nobr><code>--ads-neurons-per-layer 128</code></nobr> |
+| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. Default: `20`, matching Keysight's in-memory extraction example. | <nobr><code>--ads-neurons-per-layer 20</code></nobr> |
 | <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
 | <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
@@ -4653,10 +4674,10 @@ the **Subcommands** column includes accepted command aliases.
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--ads-ann-target {native,fine}</code></nobr> | <code>export-ads-ann</code> | ADS ANN target definition. `native` preserves the KBNN target, so residual mode outputs `delta_S*`; `fine` trains ADS ANN to output final fine S-parameters directly. Default: `native`. | <nobr><code>--ads-ann-target native</code></nobr> |
-| <nobr><code>--ads-hidden-layers INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_hidden_layers`. If omitted, this is derived from `--hidden-layers`. | <nobr><code>--ads-hidden-layers 2</code></nobr> |
+| <nobr><code>--ads-hidden-layers INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_hidden_layers`. Default: `2`; local model layers are not inherited because large quasi-Newton models can require excessive native memory. | <nobr><code>--ads-hidden-layers 2</code></nobr> |
 | <nobr><code>--ads-iterations INT</code></nobr> | <code>export-ads-ann</code> | ADS ANN maximum training iterations. Default: `500`. | <nobr><code>--ads-iterations 1000</code></nobr> |
 | <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | <code>export-ads-ann</code> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
-| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. If omitted, this is derived from the average of `--hidden-layers`. | <nobr><code>--ads-neurons-per-layer 64</code></nobr> |
+| <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. Default: `20`, matching Keysight's in-memory extraction example. | <nobr><code>--ads-neurons-per-layer 20</code></nobr> |
 | <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
 | <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
@@ -6955,10 +6976,10 @@ training tables from MDIF rather than importing local weights.
 | --- | --- | --- | --- | --- |
 | `--activation {tanh,relu}` | DNN/KBNN ADS ANN | Architecture override; otherwise model metadata is used when supplied. | `--activation tanh`  | `models.MODEL.commands.export-ads-ann.activation` |
 | `--ads-ann-target {native,fine}` | KBNN ADS ANN only | `native` preserves the KBNN target; `fine` asks ADS ANN to predict final fine S directly. Default: `native`. | `--ads-ann-target fine`  | `models.MODEL.commands.export-ads-ann.ads_ann_target` |
-| `--ads-hidden-layers INT` | DNN/KBNN ADS ANN | Overrides ADS `AnnSetup.num_hidden_layers`. | `--ads-hidden-layers 3`  | `models.MODEL.commands.export-ads-ann.ads_hidden_layers` |
+| `--ads-hidden-layers INT` | DNN/KBNN ADS ANN | Overrides ADS `AnnSetup.num_hidden_layers`; default `2`. Local model layers are not inherited. | `--ads-hidden-layers 2`  | `models.MODEL.commands.export-ads-ann.ads_hidden_layers` |
 | `--ads-iterations INT` | DNN/KBNN ADS ANN | ADS maximum training iterations. Default: `500`. | `--ads-iterations 1000`  | `models.MODEL.commands.export-ads-ann.ads_iterations` |
 | `--ads-network-training-type {standard,adjoint,classification}` | DNN/KBNN ADS ANN | ADS network training type. Default: `standard`. | `--ads-network-training-type standard`  | `models.MODEL.commands.export-ads-ann.ads_network_training_type` |
-| `--ads-neurons-per-layer INT` | DNN/KBNN ADS ANN | Overrides ADS neurons per hidden layer. | `--ads-neurons-per-layer 128`  | `models.MODEL.commands.export-ads-ann.ads_neurons_per_layer` |
+| `--ads-neurons-per-layer INT` | DNN/KBNN ADS ANN | Overrides ADS neurons per hidden layer; default `20`. | `--ads-neurons-per-layer 20`  | `models.MODEL.commands.export-ads-ann.ads_neurons_per_layer` |
 | `--ads-optimizer {quasi-newton,bayesian-regularization}` | DNN/KBNN ADS ANN | ADS modeler optimizer. Default: `quasi-newton`. | `--ads-optimizer quasi-newton`  | `models.MODEL.commands.export-ads-ann.ads_optimizer` |
 | `--ads-output-format {all,verilog-a,c-code,equation,struct-scale}` | DNN/KBNN ADS ANN | Native artifact type requested from ADS. Default: `all`. | `--ads-output-format all`  | `models.MODEL.commands.export-ads-ann.ads_output_format` |
 | `--ads-training-stop-tolerance FLOAT` | DNN/KBNN ADS ANN | ADS RMSE stop tolerance. Default: `0`. | `--ads-training-stop-tolerance 0`  | `models.MODEL.commands.export-ads-ann.ads_training_stop_tolerance` |
@@ -6970,7 +6991,7 @@ training tables from MDIF rather than importing local weights.
 | `--include-coarse-input` | KBNN ADS ANN only | Includes coarse S among network inputs. | `--include-coarse-input`  | `models.MODEL.commands.export-ads-ann.include_coarse_input` |
 | `--mdif PATH` | DNN/KBNN ADS ANN | Required direct/fine MDIF. | `--mdif train_verify.mdif`  | `models.MODEL.commands.export-ads-ann.mdif` |
 | `--mode {plain,residual,prior-input}` | KBNN ADS ANN only | KBNN target formulation override. | `--mode residual`  | `models.MODEL.commands.export-ads-ann.mode` |
-| `--model-dir PATH` | DNN/KBNN ADS ANN | Optional local model or `best_model` directory used for architecture metadata. | `--model-dir dnn_opt/best_model`  | `models.MODEL.commands.export-ads-ann.model_dir` |
+| `--model-dir PATH` | DNN/KBNN ADS ANN | Optional local model or `best_model` directory used for labels and compatible export metadata. Local hidden sizes are recorded but not inherited by ADS ANN. | `--model-dir dnn_opt/best_model`  | `models.MODEL.commands.export-ads-ann.model_dir` |
 | `--out-dir PATH` | DNN/KBNN ADS ANN | Required package directory. | `--out-dir ads_ann`  | `models.MODEL.commands.export-ads-ann.out_dir` |
 | `--output-prefix NAME` | DNN/KBNN ADS ANN | Generated ADS artifact prefix. Defaults: `dnn_ads_ann` or `kbnn_ads_ann`. | `--output-prefix filter_ann`  | `models.MODEL.commands.export-ads-ann.output_prefix` |
 | `--parameter-names LIST` | DNN/KBNN ADS ANN | Geometry/process inputs; inferred when omitted. | `--parameter-names W,L,H`  | `models.MODEL.commands.export-ads-ann.parameter_names` |

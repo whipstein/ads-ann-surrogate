@@ -16,9 +16,11 @@ from surrogate_common import (
     ADS_EXPORT_TEMPLATE_FILENAME,
     MDIFBlock,
     ads_qt_runtime_helper_script,
+    ads_ann_parameter_count,
     build_ads_export_blocks,
     build_training_export_commands,
     read_mdif,
+    resolve_ads_ann_layout,
     write_ads_export_template,
     write_ads_ann_package,
 )
@@ -47,6 +49,19 @@ def load_generated_ads_qt_runtime(module_name: str) -> dict[str, object]:
 
 
 class SurrogateDispatcherTests(unittest.TestCase):
+    def test_ads_ann_layout_uses_small_independent_defaults(self) -> None:
+        self.assertEqual(resolve_ads_ann_layout(None, None), (2, 20))
+        self.assertEqual(resolve_ads_ann_layout(3, 48), (3, 48))
+        with self.assertRaisesRegex(ValueError, "ads-hidden-layers"):
+            resolve_ads_ann_layout(0, 20)
+        with self.assertRaisesRegex(ValueError, "ads-neurons-per-layer"):
+            resolve_ads_ann_layout(2, 0)
+
+    def test_ads_ann_parameter_count_includes_weights_and_biases(self) -> None:
+        # (2 inputs + bias) * 20, one 20-to-20 hidden transition,
+        # and (20 hidden + bias) * 2 outputs.
+        self.assertEqual(ads_ann_parameter_count(2, 2, 2, 20), 522)
+
     def test_dispatch_forwards_backend_arguments_and_exit_status(self) -> None:
         completed = mock.Mock(returncode=7)
         with mock.patch("surrogate.subprocess.run", return_value=completed) as run:
@@ -378,6 +393,14 @@ class SurrogateDispatcherTests(unittest.TestCase):
                 manifest["qt_runtime"]["plugin_discovery"],
                 "configured_paths_then_bounded_product_roots",
             )
+            self.assertEqual(
+                manifest["ads_ann"]["estimated_trainable_parameters"],
+                ads_ann_parameter_count(2, 2, 2, 32),
+            )
+            self.assertIn("--preflight-only", training_source)
+            self.assertIn("ann.reset()", training_source)
+            self.assertIn("except MemoryError as error", training_source)
+            self.assertIn("dense_quasi_newton_state_estimate_gib", training_source)
             self.assertIn("ads_qt_runtime.py", (out_dir / "ADS_ANN_README.md").read_text())
 
     def test_ads_qt_runtime_helper_restores_platform_plugin_environment(self) -> None:
