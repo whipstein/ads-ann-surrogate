@@ -1620,6 +1620,182 @@ def infer_uniform_hidden_layout(hidden_layers: Sequence[int]) -> tuple[int, int]
     return len(hidden_layers), max(1, neurons)
 
 
+def ads_qt_runtime_helper_script() -> str:
+    """Return the scoped Qt bootstrap shipped with ADS ANN packages."""
+
+    return '''#!/usr/bin/env python3
+"""Create an ADS-compatible QApplication without permanently changing Qt paths."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+QT_PLATFORM_PATH_VARIABLE = "QT_QPA_PLATFORM_PLUGIN_PATH"
+
+
+def expected_platform_plugin() -> str:
+    if sys.platform.startswith("linux"):
+        return "libqxcb.so"
+    if sys.platform == "win32":
+        return "qwindows.dll"
+    if sys.platform == "darwin":
+        return "libqcocoa.dylib"
+    raise RuntimeError(f"Unsupported Qt platform {sys.platform!r}")
+
+
+def _unique_paths(paths):
+    result = []
+    for path in paths:
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            continue
+        if resolved not in result:
+            result.append(resolved)
+    return result
+
+
+def _linux_unresolved_dependencies(plugin_path: Path):
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        completed = subprocess.run(
+            ["ldd", str(plugin_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return []
+    return [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if "not found" in line
+    ]
+
+
+def locate_qt_platform_plugins():
+    """Locate the platform plugin belonging to the imported PySide6/Qt runtime."""
+
+    try:
+        import PySide6
+        from PySide6.QtCore import QLibraryInfo, qVersion
+    except Exception as error:
+        raise RuntimeError(
+            "PySide6 could not be imported. Run this package with the Python "
+            "interpreter bundled with the target ADS installation; do not install "
+            "a second PySide6 into that interpreter."
+        ) from error
+
+    pyside_root = Path(PySide6.__file__).resolve().parent
+    qt_plugins_root = Path(
+        QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    )
+    candidates = _unique_paths(
+        [
+            qt_plugins_root / "platforms",
+            pyside_root / "plugins" / "platforms",
+            pyside_root / "Qt" / "plugins" / "platforms",
+        ]
+    )
+    plugin_name = expected_platform_plugin()
+    checked = []
+    for directory in candidates:
+        plugin_path = directory / plugin_name
+        checked.append(str(plugin_path))
+        if not plugin_path.is_file():
+            continue
+        unresolved = _linux_unresolved_dependencies(plugin_path)
+        if unresolved:
+            raise RuntimeError(
+                f"Qt platform plugin {plugin_path} exists but has unresolved "
+                "shared-library dependencies: " + "; ".join(unresolved)
+            )
+        return directory, {
+            "python_executable": sys.executable,
+            "pyside6_file": str(Path(PySide6.__file__).resolve()),
+            "pyside6_version": getattr(PySide6, "__version__", None),
+            "qt_version": qVersion(),
+            "platform": sys.platform,
+            "platform_plugin": str(plugin_path),
+            "platform_plugin_directory": str(directory),
+            "checked_platform_plugins": checked,
+        }
+
+    raise RuntimeError(
+        f"Could not find {plugin_name} for the imported PySide6 runtime at "
+        f"{pyside_root}. Checked: " + ", ".join(checked)
+    )
+
+
+def ensure_qapplication():
+    """Reuse ADS's QApplication or create one with a temporary plugin redirect."""
+
+    try:
+        import PySide6
+        from PySide6.QtCore import qVersion
+        from PySide6.QtWidgets import QApplication
+    except Exception as error:
+        raise RuntimeError(
+            "PySide6/QtWidgets could not be imported from the active ADS Python."
+        ) from error
+
+    existing = QApplication.instance()
+    if existing is not None:
+        return existing, {
+            "python_executable": sys.executable,
+            "pyside6_file": str(Path(PySide6.__file__).resolve()),
+            "pyside6_version": getattr(PySide6, "__version__", None),
+            "qt_version": qVersion(),
+            "platform": sys.platform,
+            "reused_existing_qapplication": True,
+            "temporary_environment_redirect": False,
+            "environment_restored": True,
+        }
+
+    plugin_directory, details = locate_qt_platform_plugins()
+    was_set = QT_PLATFORM_PATH_VARIABLE in os.environ
+    previous = os.environ.get(QT_PLATFORM_PATH_VARIABLE)
+    os.environ[QT_PLATFORM_PATH_VARIABLE] = str(plugin_directory)
+    try:
+        application = QApplication([])
+    finally:
+        if was_set:
+            assert previous is not None
+            os.environ[QT_PLATFORM_PATH_VARIABLE] = previous
+        else:
+            os.environ.pop(QT_PLATFORM_PATH_VARIABLE, None)
+
+    details.update(
+        {
+            "reused_existing_qapplication": False,
+            "temporary_environment_redirect": True,
+            "environment_restored": (
+                os.environ.get(QT_PLATFORM_PATH_VARIABLE) == previous
+                if was_set
+                else QT_PLATFORM_PATH_VARIABLE not in os.environ
+            ),
+        }
+    )
+    return application, details
+
+
+def main():
+    application, details = ensure_qapplication()
+    assert application is not None
+    print(json.dumps(details, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
 def ads_ann_training_script() -> str:
     return """#!/usr/bin/env python3
 from pathlib import Path
@@ -1627,7 +1803,8 @@ import json
 import os
 
 import pandas as pd
-import keysight.ads.ann as ann
+
+from ads_qt_runtime import ensure_qapplication
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -1639,6 +1816,12 @@ def enum_value(enum_cls, name):
 
 
 def main():
+    # Keep this reference alive for the complete ADS ANN operation. When this
+    # script owns the application, the helper redirects the platform-plugin
+    # path only during QApplication creation and restores it immediately.
+    qt_application, qt_runtime = ensure_qapplication()
+    import keysight.ads.ann as ann
+
     manifest = json.loads((PACKAGE_DIR / "ads_ann_manifest.json").read_text())
     settings = manifest["ads_ann"]
     input_columns = manifest["input_columns"]
@@ -1702,7 +1885,12 @@ def main():
         "input_columns": input_columns,
         "output_columns": output_columns,
         "expected_native_outputs": expected,
+        "qt_runtime": qt_runtime,
     }, indent=2))
+
+    # Explicit use documents the required lifetime for static analyzers and
+    # prevents an over-eager refactor from dropping the application reference.
+    assert qt_application is not None
 
 
 if __name__ == "__main__":
@@ -1742,6 +1930,7 @@ that can parse the MDIF data, then copy the whole folder to the ADS machine.
 - `ads_ann_verification.csv`: numeric verification table, when verification data is available
 - `ads_ann_manifest.json`: column names, model settings, and target metadata
 - `train_ads_ann.py`: ADS Python script that trains and extracts the native ANN
+- `ads_qt_runtime.py`: scoped ADS/PySide6 QApplication and platform-plugin helper
 - `ADS_ANN_README.md`: this usage note
 
 ## ADS Reference Used
@@ -1819,7 +2008,14 @@ handoff; it does not contain the separate DC network saved by the local fit.
    the workspace `data` directory.
 3. Use the Python interpreter from the same ADS installation that will run the
    simulation. Do not use a system Python merely because it can import pandas.
-4. In VS Code, use **ADS Python Utilities: Configure Python Interpreter Path**,
+4. `train_ads_ann.py` calls `ads_qt_runtime.ensure_qapplication()` before
+   importing `keysight.ads.ann`. If ADS already owns a `QApplication`, the
+   helper reuses it and does not touch Qt paths. Otherwise it selects the
+   operating-system platform plugin from the imported PySide6/Qt runtime,
+   temporarily redirects `QT_QPA_PLATFORM_PLUGIN_PATH` only while constructing
+   the application, restores the exact previous environment in a `finally`
+   block, and keeps the application alive through extraction.
+5. In VS Code, use **ADS Python Utilities: Configure Python Interpreter Path**,
    then run the script through the extension command
    `keysight-technologies.ael-debug.runPythonScript`. The visible command label
    can vary by extension release. Alternatively, run from an ADS command shell:
@@ -1835,6 +2031,18 @@ handoff; it does not contain the separate DC network saved by the local fit.
    ```text
    "$HPEESOF_DIR/tools/python/bin/python3" train_ads_ann.py
    ```
+
+To test only the Qt bootstrap under the same launcher, run:
+
+```text
+python ads_qt_runtime.py
+```
+
+It reports the Python executable, PySide6 and Qt versions, selected platform
+plugin, and whether the previous environment was restored. On Linux it checks
+`libqxcb.so` with `ldd` before creating the application and raises a readable
+error for unresolved dependencies. It does not force the `offscreen` platform
+or permanently alter the ADS/Qt environment.
 
 ## Step 2: Train and Check the Native ANN
 
@@ -2060,6 +2268,7 @@ def write_ads_ann_package(
     settings["expected_output_suffixes"] = ads_ann_expected_suffixes(str(settings["output_format"]))
     training_csv = "ads_ann_training.csv"
     verification_csv = "ads_ann_verification.csv" if x_verify is not None and y_verify is not None else None
+    qt_runtime_helper = "ads_qt_runtime.py"
     write_ads_ann_csv(out_dir / training_csv, input_columns, output_columns, x_train, y_train)
     if verification_csv:
         write_ads_ann_csv(out_dir / verification_csv, input_columns, output_columns, x_verify, y_verify)
@@ -2069,6 +2278,14 @@ def write_ads_ann_package(
         "model_kind": model_kind,
         "training_csv": training_csv,
         "verification_csv": verification_csv,
+        "qt_runtime_helper": qt_runtime_helper,
+        "qt_runtime": {
+            "application_policy": "reuse_existing_or_scoped_create",
+            "platform_plugin_source": "active_ads_pyside6_runtime",
+            "temporary_environment_variable": "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "environment_restored_after_application_creation": True,
+            "headless_platform_forced": False,
+        },
         "input_columns": list(input_columns),
         "output_columns": list(output_columns),
         "parameter_names": list(parameter_names),
@@ -2099,6 +2316,7 @@ def write_ads_ann_package(
     if extra_manifest:
         manifest.update(extra_manifest)
     (out_dir / "ads_ann_manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out_dir / qt_runtime_helper).write_text(ads_qt_runtime_helper_script())
     (out_dir / "train_ads_ann.py").write_text(ads_ann_training_script())
     (out_dir / "ADS_ANN_README.md").write_text(
         ads_ann_readme(

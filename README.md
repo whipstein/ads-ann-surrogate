@@ -2514,9 +2514,10 @@ python3 surrogate.py --model dnn export-ads-ann \
   --ads-output-format all
 ```
 
-The ADS ANN export writes a portable package plus `train_ads_ann.py`; run that
-script with ADS Python on the ADS machine to produce the native `.inc`, `.c`,
-`.equation`, `.struc`, and `.scale` artifacts.
+The ADS ANN export writes a portable package with `train_ads_ann.py` and the
+scoped `ads_qt_runtime.py` bootstrap; run the trainer with ADS Python on the ADS
+machine to produce the native `.inc`, `.c`, `.equation`, `.struc`, and `.scale`
+artifacts.
 
 ### Native ADS ANN: Detailed ADS Integration
 
@@ -2599,6 +2600,7 @@ my_workspace_wrk/
       ads_ann_training.csv
       ads_ann_verification.csv
       train_ads_ann.py
+      ads_qt_runtime.py
       ADS_ANN_README.md
 ```
 
@@ -2610,6 +2612,27 @@ workspace `data/` directory.
 The Python interpreter and ANN module must come from the same ADS installation
 used for simulation. Keysight's ADS 2025 release notes state that the ANN Python
 API requires a Harmonic Balance license.
+
+`train_ads_ann.py` initializes Qt before importing `keysight.ads.ann`:
+
+1. `ads_qt_runtime.py` imports PySide6 from the active ADS interpreter.
+2. If ADS already owns a `QApplication`, it is reused without changing any Qt
+   environment variables.
+3. Otherwise, the helper queries that PySide6/Qt runtime for its plugin root and
+   checks the package-relative `plugins/platforms` layouts.
+4. It requires the platform binary that matches the operating system:
+   `qwindows.dll` on Windows, `libqxcb.so` on Linux, or `libqcocoa.dylib` on
+   macOS. It does not recursively combine unrelated Qt installations.
+5. On Linux, `ldd` is checked for unresolved dependencies before Qt starts.
+6. `QT_QPA_PLATFORM_PLUGIN_PATH` is redirected only around
+   `QApplication([])` construction. A `finally` block restores the exact prior
+   value—or removes the variable if it was originally absent.
+7. The returned application remains referenced for the entire ANN extraction.
+
+This is a process-local, temporary bootstrap. It does not edit the shell,
+registry, ADS launcher, `hpeesofsim.cfg`, or a persistent user setting. It also
+does not force `QT_QPA_PLATFORM=offscreen`, because that could hide a missing
+display or an ADS operation that genuinely requires a graphical session.
 
 From the package directory, use the ADS-bundled interpreter:
 
@@ -2630,6 +2653,26 @@ With VS Code and ADS Python Utilities, configure the ADS interpreter, open
 `keysight-technologies.ael-debug.runPythonScript` (its visible label can vary by
 extension release). The script changes its working directory to the package
 directory, so generated files remain together.
+
+To validate just the Qt runtime with the exact same interpreter and launcher:
+
+Windows:
+
+```text
+"%HPEESOF_DIR%/tools/python/python.exe" ads_qt_runtime.py
+```
+
+Linux:
+
+```text
+"$HPEESOF_DIR/tools/python/bin/python3" ads_qt_runtime.py
+```
+
+The helper prints the active Python executable, PySide6 file/version, Qt
+version, platform plugin, whether an existing application was reused, and
+whether the environment was restored. Run this helper using the same route that
+fails—standalone ADS Python, ADS Python Utilities, or a live ADS process—because
+different launchers can have different Qt paths.
 
 Expected output with `--ads-output-format all`:
 
@@ -3544,10 +3587,11 @@ python3 surrogate.py --model dnn export-ads-ann \
 ```
 
 The export writes `ads_ann_training.csv`, optional
-`ads_ann_verification.csv`, `ads_ann_manifest.json`, `train_ads_ann.py`, and
-`ADS_ANN_README.md`. Run `train_ads_ann.py` with the ADS Python interpreter on
-a licensed ADS machine. This path retrains the network in ADS ANN; it does not
-import the local NumPy `model.npz` weights.
+`ads_ann_verification.csv`, `ads_ann_manifest.json`, `train_ads_ann.py`,
+`ads_qt_runtime.py`, and `ADS_ANN_README.md`. Run `train_ads_ann.py` with the
+ADS Python interpreter on a licensed ADS machine. The Qt helper is invoked
+automatically before `keysight.ads.ann` is imported. This path retrains the
+network in ADS ANN; it does not import the local NumPy `model.npz` weights.
 
 ADS reference used:
 
@@ -4310,12 +4354,14 @@ emit final fine S-parameter outputs directly; that is simpler to consume in ADS
 but does not preserve the residual target that usually reduces sample count.
 
 The export writes `ads_ann_training.csv`, optional
-`ads_ann_verification.csv`, `ads_ann_manifest.json`, `train_ads_ann.py`, and
-`ADS_ANN_README.md`. Run `train_ads_ann.py` with the ADS Python interpreter on
-a licensed ADS machine. This path retrains the network in ADS ANN; it does not
-import the local NumPy `model.npz` weights. Consequently, this separate ADS ANN
-retraining workflow still accepts raw coarse MDIF data; it is distinct from
-local KBNN fitting, prediction, sampled-MDIF export, and direct Verilog-A export.
+`ads_ann_verification.csv`, `ads_ann_manifest.json`, `train_ads_ann.py`,
+`ads_qt_runtime.py`, and `ADS_ANN_README.md`. Run `train_ads_ann.py` with the
+ADS Python interpreter on a licensed ADS machine. The Qt helper is invoked
+automatically before `keysight.ads.ann` is imported. This path retrains the
+network in ADS ANN; it does not import the local NumPy `model.npz` weights.
+Consequently, this separate ADS ANN retraining workflow still accepts raw
+coarse MDIF data; it is distinct from local KBNN fitting, prediction,
+sampled-MDIF export, and direct Verilog-A export.
 
 ADS reference used:
 

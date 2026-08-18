@@ -1,8 +1,10 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,10 +15,12 @@ import surrogate
 from surrogate_common import (
     ADS_EXPORT_TEMPLATE_FILENAME,
     MDIFBlock,
+    ads_qt_runtime_helper_script,
     build_ads_export_blocks,
     build_training_export_commands,
     read_mdif,
     write_ads_export_template,
+    write_ads_ann_package,
 )
 
 
@@ -303,6 +307,121 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertIn(ADS_EXPORT_TEMPLATE_FILENAME, sampled)
             self.assertIn("--dc-mdif", sampled)
             self.assertIn("source.mdif", sampled)
+
+    def test_ads_ann_package_bootstraps_qt_before_importing_ann(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir) / "ads_ann"
+            settings = {
+                "seed": 1234,
+                "num_hidden_layers": 2,
+                "num_neurons_per_layer": 32,
+                "neuron_activation_function_type": "TANH",
+                "network_training_type": "STANDARD",
+                "modeler_optimizer": "LM",
+                "max_training_iterations": 100,
+                "training_stop_tolerance": 1e-6,
+                "output_format": "ALL",
+                "output_prefix": "test_ann",
+            }
+            manifest = write_ads_ann_package(
+                out_dir=out_dir,
+                model_kind="DNN",
+                input_columns=["W", "freq_hz"],
+                output_columns=["fine_S11_real", "fine_S11_imag"],
+                x_train=np.asarray([[0.5e-3, 1.0e9]]),
+                y_train=np.asarray([[0.1, -0.2]]),
+                x_verify=None,
+                y_verify=None,
+                settings=settings,
+                parameter_names=["W"],
+                sparam_labels=["S11"],
+                target_description="test response",
+            )
+
+            self.assertEqual(manifest["qt_runtime_helper"], "ads_qt_runtime.py")
+            helper_source = (out_dir / "ads_qt_runtime.py").read_text()
+            training_source = (out_dir / "train_ads_ann.py").read_text()
+            compile(helper_source, "ads_qt_runtime.py", "exec")
+            compile(training_source, "train_ads_ann.py", "exec")
+            self.assertLess(
+                training_source.index("ensure_qapplication()"),
+                training_source.index("import keysight.ads.ann as ann"),
+            )
+            self.assertIn("finally:", helper_source)
+            self.assertIn("environment_restored", helper_source)
+            self.assertIn("ads_qt_runtime.py", (out_dir / "ADS_ANN_README.md").read_text())
+
+    def test_ads_qt_runtime_helper_restores_platform_plugin_environment(self) -> None:
+        helper_globals = {"__name__": "ads_qt_runtime_test"}
+        exec(
+            compile(
+                ads_qt_runtime_helper_script(),
+                "ads_qt_runtime.py",
+                "exec",
+            ),
+            helper_globals,
+        )
+        observed_paths: list[str | None] = []
+
+        class FakeQApplication:
+            @classmethod
+            def instance(cls):
+                return None
+
+            def __init__(self, _argv):
+                observed_paths.append(
+                    os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH")
+                )
+
+        pyside = types.ModuleType("PySide6")
+        pyside.__file__ = str(ROOT / "fake_ads" / "PySide6" / "__init__.py")
+        pyside.__version__ = "test"
+        qtcore = types.ModuleType("PySide6.QtCore")
+        qtcore.qVersion = lambda: "test-qt"
+        qtwidgets = types.ModuleType("PySide6.QtWidgets")
+        qtwidgets.QApplication = FakeQApplication
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugin_dir = Path(temp_dir) / "platforms"
+            helper_globals["locate_qt_platform_plugins"] = lambda: (
+                plugin_dir,
+                {"platform_plugin_directory": str(plugin_dir)},
+            )
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "PySide6": pyside,
+                    "PySide6.QtCore": qtcore,
+                    "PySide6.QtWidgets": qtwidgets,
+                },
+            ):
+                with mock.patch.dict(
+                    os.environ,
+                    {"QT_QPA_PLATFORM_PLUGIN_PATH": "original-qt-path"},
+                    clear=False,
+                ):
+                    application, details = helper_globals[
+                        "ensure_qapplication"
+                    ]()
+                    self.assertIsInstance(application, FakeQApplication)
+                    self.assertEqual(
+                        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"],
+                        "original-qt-path",
+                    )
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+                    _application, absent_details = helper_globals[
+                        "ensure_qapplication"
+                    ]()
+                    self.assertNotIn(
+                        "QT_QPA_PLATFORM_PLUGIN_PATH",
+                        os.environ,
+                    )
+
+        self.assertEqual(observed_paths, [str(plugin_dir), str(plugin_dir)])
+        self.assertTrue(details["temporary_environment_redirect"])
+        self.assertTrue(details["environment_restored"])
+        self.assertTrue(absent_details["environment_restored"])
 
 
 if __name__ == "__main__":
