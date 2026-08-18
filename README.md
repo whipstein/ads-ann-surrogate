@@ -695,6 +695,70 @@ regions. The acquisition-verification points influence GP selection, so they
 are not an unbiased final test set; reserve a separate final audit set that is
 never supplied to `suggest-additional`.
 
+### Automatic Acquisition-Verification Growth
+
+The acquisition-verification column above is a **lean initial count**, not a
+fixed count for an entire adaptive campaign. In six dimensions, eight points
+is the $d+2$ starting set: it is enough to begin GP-UCB, but it gives the GP
+only eight locations at which to observe the current surrogate's
+geometry-level error. Additional training points improve the surrogate without
+increasing that error-observation count.
+
+`points suggest-additional --acquisition gp-ucb` therefore grows the
+acquisition-verification set automatically during training acquisitions. The
+default milestone policy is:
+
+$$
+n_{\mathrm{train},0}=\max(4d,12),\qquad
+\Delta n_{\mathrm{train}}=2d,
+$$
+
+and each crossed training milestone adds
+
+$$
+\Delta n_{\mathrm{verify}}=
+\max\!\left(2,\left\lceil\frac{2d}{3}\right\rceil\right)
+$$
+
+verification points. One command adds no more than
+$\max(d+2,6)$ automatic verification points, so an older campaign can catch up
+without creating an unexpectedly unbounded simulation batch. The requested
+`--count` remains the number of primary training suggestions; automatically
+triggered verification points are additional rows and are reported before the
+output paths.
+
+For six dimensions, the initial anchor is 24 training and 8 verification
+points. The first verification-growth milestone is 36 projected training
+points and raises the target to 12 verification points. The second milestone
+is 48 training points and raises the target to 16. Thus a campaign that already
+has 40 training and 8 verification points and requests eight more training
+points automatically receives eight catch-up verification points, producing
+eight training plus eight verification simulations in that command.
+
+Automatic verification points use the current GP with at least `3.0`
+exploration weight and `2.0` novelty power so they improve error-observation
+coverage rather than simply duplicating the strongest exploitation region.
+They are labeled `verification`, must remain out of model training, and become
+inputs to the next fit's `verification_metrics.csv`. The output JSON records
+the complete policy calculation, including the observed counts, projected
+training count, milestone interval, verification target, and points actually
+selected. It records both the generated verification inventory and the number
+of distinct geometries found in `verification_metrics.csv`; the larger count
+is used so queued-but-not-yet-simulated verification points are not generated
+again. The CLI prints the same decision, including the next scheduled training
+trigger, in a compact status line.
+
+The automatic policy applies only when the primary batch is a GP-UCB training
+batch. Set `--verification-policy off` to disable it, or use
+`--verification-interval`, `--verification-batch`, and
+`--verification-max-add` to override the milestone spacing, growth amount, and
+per-command catch-up cap. A parameter-range extension remains a separate
+reason to add verification coverage even if no ordinary milestone was crossed.
+
+These acquisition-verification points influence later GP selections and are
+therefore not an unbiased final test. Maintain a separate final audit set that
+is never supplied to `suggest-additional`.
+
 ### How Many Points for the Initial Non-GP Design
 
 Treat each point as one geometry/process setting with a full frequency sweep;
@@ -761,10 +825,14 @@ coordinates so coverage is visually comparable, while the axes retain the
 declared physical endpoint values and units. The PNG uses a two-times
 high-resolution canvas so it opens at a document-scale size in normal image
 viewers, and it does not require Matplotlib. When `--write-split-files` is
-used, one matrix describes the complete combined geometry, so the separate
-train/verification CSVs do not receive duplicate JSON or plot files. Range
-extensions plot the complete original-plus-appended set. Targeted
-additional-point CSVs receive their own JSON and coverage matrix. They also
+used, the combined geometry retains the single companion JSON and its complete
+training-plus-verification matrix. Each RFPro-friendly split CSV also receives
+its own coverage PNG, but not a duplicate JSON. A training-only split plot
+contains only the blue training group, while a verification-only split plot
+contains only the orange verification group. Range extensions plot the
+complete original-plus-appended set and apply the same combined/split
+behavior. Targeted additional-point CSVs receive their own JSON and coverage
+matrix. They also
 produce a deduplicated `<out>_training_geometries.csv`, same-stem JSON, and
 coverage matrix containing the prior occupied inputs plus the new batch. The
 latest cumulative CSV/JSON pair becomes the geometry input for the next GP
@@ -1615,6 +1683,24 @@ CSV is supplied as the next round's `--existing-points`, its prior additions
 become existing training coverage, while only the newly selected batch is
 green. A `point_origin` column keeps this distinction independent of
 `--target-dataset`.
+The title identifies whether the underlying geometry inventory is combined,
+training-only, or verification-only. Its dataset summary and legend include
+only groups actually present instead of displaying empty categories. Explicit
+`dataset` values take precedence. If an RFPro-oriented split CSV omits that
+column, the plotter and cumulative-geometry writer recognize unambiguous
+`_train`, `_training`, `_verification`, `_verify`, `_validation`, and `_test`
+filename suffixes. Files without an explicit split or a recognized split-file
+suffix default to training.
+
+When automatic verification growth adds both datasets in one GP command, the
+main new-points CSV remains the auditable combined result and receives the one
+companion JSON. The command also writes RFPro-ready `<out>_train.csv` and
+`<out>_verification.csv` queues and a correctly scoped coverage PNG beside
+each, without duplicate split JSON files. Current-round additions remain green
+in the combined visual, while the dataset summary states how many are training
+and verification; their retained dataset labels control blue/orange rendering
+after they become existing inputs in the next round.
+
 The cumulative CSV preserves dataset labels from existing CSV rows and assigns
 new rows according to `--target-dataset`; it does not silently move verification
 geometries into training. Points supplied only through `--existing-mdif` are
@@ -1631,6 +1717,23 @@ The selector first looks for `geometries.json` beside
 `geometries.json`; split generation intentionally does not create duplicate
 JSON files. Use `--parameter-json PATH` only when the CSV/JSON names no longer
 match or when occupied points are supplied only through `--existing-mdif`.
+
+For a persistent RFPro split-file workflow, pass both inventories; the option
+is repeatable and the cumulative plot preserves their roles:
+
+```bash
+python3 surrogate.py --options-json options.json points suggest-additional \
+  --existing-points geometries_train.csv \
+  --existing-points geometries_verification.csv \
+  --fit-dir outputs/current_fit \
+  --count 8 \
+  --target-dataset train \
+  --out gp_round_2.csv
+```
+
+If duplicate coordinates appear in separate inputs, verification status wins
+regardless of input order so a held-out point is not silently reclassified as
+training in the cumulative inventory or the automatic policy count.
 
 #### After Simulating the First GP Batch
 
@@ -2232,6 +2335,10 @@ unambiguous.
 | <nobr><code>--gp-error-floor FLOAT</code></nobr> | <code>suggest-additional</code> | Positive floor applied before taking the natural logarithm of geometry error. Default: <code>1e-12</code>. | <nobr><code>--gp-error-floor 1e-9</code></nobr> |
 | <nobr><code>--gp-length-scale FLOAT</code></nobr> | <code>suggest-additional</code> | Optional positive Matérn-5/2 length scale in normalized geometry coordinates. When omitted, it is selected by log marginal likelihood. | <nobr><code>--gp-length-scale 0.4</code></nobr> |
 | <nobr><code>--gp-noise-variance FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative normalized covariance nugget for GP stability and noisy error observations. Default: <code>1e-6</code>. | <nobr><code>--gp-noise-variance 1e-5</code></nobr> |
+| <nobr><code>--verification-batch INT</code></nobr> | <code>suggest-additional</code> | Automatic acquisition-verification points per crossed training milestone. Default: <code>max(2, ceil(2*d/3))</code>. | <nobr><code>--verification-batch 4</code></nobr> |
+| <nobr><code>--verification-interval INT</code></nobr> | <code>suggest-additional</code> | Positive training-point growth between automatic verification milestones. Default: <code>2*d</code>. | <nobr><code>--verification-interval 12</code></nobr> |
+| <nobr><code>--verification-max-add INT</code></nobr> | <code>suggest-additional</code> | Positive cap on automatic verification points added by one command, including catch-up. Default: <code>max(d+2, 6)</code>. | <nobr><code>--verification-max-add 8</code></nobr> |
+| <nobr><code>--verification-policy {auto,off}</code></nobr> | <code>suggest-additional</code> | Enables or disables milestone-based acquisition-verification growth for GP-UCB training batches. Default: <code>auto</code>. | <nobr><code>--verification-policy off</code></nobr> |
 
 ### Output and Dataset Splits
 
@@ -2239,22 +2346,22 @@ unambiguous.
 | --- | --- | --- | --- |
 | <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked fit-error-region CSV. Default: <code>&lt;out&gt;_fit_error_regions.csv</code>. | <nobr><code>--analysis-out error_regions.csv</code></nobr> |
 | <nobr><code>--combined-out PATH</code></nobr> | <code>suggest-additional</code> | Deduplicated cumulative geometry CSV containing prior CSV/MDIF points and the new suggestions. Its same-stem JSON and coverage PNG are also written. Default: <code>&lt;out&gt;_training_geometries.csv</code>. | <nobr><code>--combined-out gp_round_1_training_geometries.csv</code></nobr> |
-| <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of new points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. | <nobr><code>--count 80</code></nobr> |
+| <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of primary points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. For a GP-UCB training suggestion, automatically triggered verification points are additional to this count and are reported explicitly. | <nobr><code>--count 80</code></nobr> |
 | <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. After the first acquisition, use the latest <code>*_training_geometries.csv</code> cumulative output. The option remains repeatable for compatibility and multiple independent sources. | <nobr><code>--existing-points gp_round_1_training_geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
 | <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Primary output CSV path with same-stem JSON and coverage PNG. For <code>suggest-additional</code>, this file contains only the new points to simulate; the cumulative history is written separately through <code>--combined-out</code>. | <nobr><code>--out gp_round_1_points.csv</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to suggested points. Default: <code>targeted</code>. | <nobr><code>--target-dataset train</code></nobr> |
+| <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to primary suggested points. Default: <code>train</code>; automatic verification additions are labeled <code>verification</code> independently. | <nobr><code>--target-dataset train</code></nobr> |
 | <nobr><code>--verification-count INT</code></nobr> | <code>generate</code> | Number of new tail points labeled verification; must be smaller than <code>--count</code>. Default: <code>0</code>, or the original split ratio during a range extension. | <nobr><code>--verification-count 16</code></nobr> |
-| <nobr><code>--write-split-files</code></nobr> | <code>generate</code> | Also writes separate <code>*_train.csv</code> and, when applicable, <code>*_verification.csv</code> files. | <nobr><code>--write-split-files</code></nobr> |
+| <nobr><code>--write-split-files</code></nobr> | <code>generate</code> | Also writes separate <code>*_train.csv</code> and, when applicable, <code>*_verification.csv</code> files. The combined geometry keeps the one companion JSON; each split CSV receives a correctly scoped coverage PNG without a duplicate JSON. | <nobr><code>--write-split-files</code></nobr> |
 
 ### Existing Input and Targeted Selection
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
 | <nobr><code>--bare-values MODE</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Interprets unitless values from existing input rows. Generate accepts <code>parameter-units</code> or <code>base-units</code> and defaults to parameter units. Suggest also accepts and defaults to <code>auto</code>, which tests both interpretations independently for the metrics file and each geometry/MDIF source against the saved domain. This supports generated values expressed in <code>um</code> even when ADS rewrites fitted metrics in unitless SI base units. | <nobr><code>--bare-values auto</code></nobr> |
-| <nobr><code>--candidate-count INT</code></nobr> | <code>suggest-additional</code> | Positive candidate-pool size. Default: the greater of 1000 and <code>count * candidate-factor</code>. | <nobr><code>--candidate-count 5000</code></nobr> |
+| <nobr><code>--candidate-count INT</code></nobr> | <code>suggest-additional</code> | Positive candidate-pool size. Default: the greater of 1000 and the planned primary-plus-automatic-verification count times <code>candidate-factor</code>. | <nobr><code>--candidate-count 5000</code></nobr> |
 | <nobr><code>--candidate-factor INT</code></nobr> | <code>suggest-additional</code> | Positive candidate multiplier used when <code>--candidate-count</code> is omitted. Default: <code>200</code>. | <nobr><code>--candidate-factor 300</code></nobr> |
 | <nobr><code>--existing-mdif PATH</code></nobr> | <code>suggest-additional</code> | Repeatable MDIF containing previously simulated parameter points to avoid. | <nobr><code>--existing-mdif training.mdif</code></nobr> |
 | <nobr><code>--fit-dir PATH</code></nobr> | <code>suggest-additional</code> | Direct fit/model directory or optimize/sweep root. A sweep root resolves <code>best_model/verification_metrics.csv</code>, or its acquisition-only fallback when <code>--allow-nonpassive</code> is present. Ignored when <code>--verification-metrics</code> is given. | <nobr><code>--fit-dir outputs/dnn_adaptive</code></nobr> |
@@ -6206,7 +6313,7 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | Option | Applies to | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- | --- |
 | `--bare-values MODE` | Generate, suggest | Interprets unitless values read from existing CSV, MDIF, or metrics. Generate accepts `parameter-units` and `base-units` and defaults to parameter units. Suggest additionally accepts and defaults to `auto`, selecting parameter or SI base units independently for the metrics file and each geometry/MDIF source according to the saved geometry domain. | `--bare-values auto`  | `workflows.points.commands.{generate,suggest-additional}.bare_values` |
-| `--count INT` | Generate, suggest | Number of new points. Required for suggestions and ordinary generation; a range extension can infer a density-based recommendation when omitted. | `--count 12`  | `workflows.points.commands.{generate,suggest-additional}.count` |
+| `--count INT` | Generate, suggest | Number of primary new points. Required for suggestions and ordinary generation; a range extension can infer a density-based recommendation when omitted. GP-UCB may append separately reported automatic verification points beyond this primary count. | `--count 12`  | `workflows.points.commands.{generate,suggest-additional}.count` |
 | `--decimal-places INT` | Generate, suggest | Rounds newly generated values in their declared units; allowed range is 0 through 15. | `--decimal-places 4`  | `workflows.points.commands.{generate,suggest-additional}.decimal_places` |
 | `--existing-points PATH` | Generate | Original CSV retained and appended when `--extend-range` is used. | `--existing-points geometries.csv`  | `workflows.points.commands.generate.existing_points` |
 | `--extend-range NAME=LOW:HIGH` | Generate | Extends exactly one existing parameter on one side and samples only the added slab. Requires `--existing-points`. | `--extend-range W=0.4mm:1.0mm`  | `workflows.points.commands.generate.extend_range` |
@@ -6221,7 +6328,7 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | `--skip INT` | Generate, suggest | Skips leading Sobol or Halton sequence points. Default: `0`. | `--skip 32`  | `workflows.points.commands.{generate,suggest-additional}.skip` |
 | `--split-var NAME` | Generate, suggest | CSV column used for dataset labels. Default: `dataset`. | `--split-var dataset`  | `workflows.points.commands.{generate,suggest-additional}.split_var` |
 | `--verification-count INT` | Generate | Number of new tail points labeled verification. Default: `0`; range extension preserves the original split ratio when omitted. | `--verification-count 8`  | `workflows.points.commands.generate.verification_count` |
-| `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files; JSON and coverage PNG remain combined. | `--write-split-files`  | `workflows.points.commands.generate.write_split_files` |
+| `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files. JSON remains combined; the combined and each split CSV receive coverage PNGs containing only their applicable dataset groups. | `--write-split-files`  | `workflows.points.commands.generate.write_split_files` |
 
 ### D.6 Adaptive additional-point options
 
@@ -6233,7 +6340,7 @@ options in D.5 also apply where marked.
 | `--acquisition {gp-ucb,error-distance}` | Selection method. Default: `gp-ucb`; `error-distance` is the legacy non-GP selector. | `--acquisition gp-ucb`  | `workflows.points.commands.suggest-additional.acquisition` |
 | `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive`  | `workflows.points.commands.suggest-additional.allow_nonpassive` |
 | `--analysis-out PATH` | Ranked current-fit error-region CSV. Default: `<out>_fit_error_regions.csv`. | `--analysis-out additions_regions.csv`  | `workflows.points.commands.suggest-additional.analysis_out` |
-| `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, count * candidate-factor)`. | `--candidate-count 4000`  | `workflows.points.commands.suggest-additional.candidate_count` |
+| `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, planned total * candidate-factor)`, where planned total includes triggered automatic verification points. | `--candidate-count 4000`  | `workflows.points.commands.suggest-additional.candidate_count` |
 | `--candidate-factor INT` | Candidate multiplier when `--candidate-count` is omitted. Default: `200`. | `--candidate-factor 300`  | `workflows.points.commands.suggest-additional.candidate_factor` |
 | `--candidate-method NAME` | Candidate generator: `maximin-lhs`, `minimax-lhs`, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--candidate-method sobol`  | `workflows.points.commands.suggest-additional.candidate_method` |
 | `--combined-out PATH` | Cumulative existing-plus-new geometry CSV for the next GP round; a same-stem JSON and coverage PNG are also written. Default: `<out>_training_geometries.csv`. | `--combined-out additions_training_geometries.csv`  | `workflows.points.commands.suggest-additional.combined_out` |
@@ -6251,8 +6358,12 @@ options in D.5 also apply where marked.
 | `--novelty-power FLOAT` | Exponent on candidate distance/diversity. Default: `1.0`. | `--novelty-power 2`  | `workflows.points.commands.suggest-additional.novelty_power` |
 | `--out PATH` | New-points-only simulation CSV; a same-stem JSON and PNG are also written, in addition to the cumulative output. Default: `targeted_additional_points.csv`. | `--out additions.csv`  | `workflows.points.commands.suggest-additional.out` |
 | `--parameter-json PATH` | Explicit geometry metadata JSON. Normally inferred beside `--existing-points`. | `--parameter-json geometries.json`  | `workflows.points.commands.suggest-additional.parameter_json` |
-| `--target-dataset NAME` | Dataset label written on suggested points. Default: `targeted`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
+| `--target-dataset NAME` | Dataset label written on primary suggested points. Default: `train`; automatic verification additions remain `verification`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
+| `--verification-batch INT` | Automatic acquisition-verification points per crossed training milestone. Default: `max(2, ceil(2*d/3))`. | `--verification-batch 4`  | `workflows.points.commands.suggest-additional.verification_batch` |
+| `--verification-interval INT` | Positive training growth between automatic verification milestones. Default: `2*d`. | `--verification-interval 12`  | `workflows.points.commands.suggest-additional.verification_interval` |
+| `--verification-max-add INT` | Per-command cap on automatic verification catch-up. Default: `max(d+2, 6)`. | `--verification-max-add 8`  | `workflows.points.commands.suggest-additional.verification_max_add` |
 | `--verification-metrics PATH` | Direct metrics CSV path; overrides `--fit-dir`. | `--verification-metrics dnn_model/verification_metrics.csv`  | `workflows.points.commands.suggest-additional.verification_metrics` |
+| `--verification-policy {auto,off}` | Enables or disables milestone-based verification growth for GP-UCB training batches. Default: `auto`. | `--verification-policy off`  | `workflows.points.commands.suggest-additional.verification_policy` |
 
 Complete GP-UCB example without re-entering parameter ranges:
 

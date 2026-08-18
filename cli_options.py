@@ -269,7 +269,12 @@ def starter_options_payload() -> dict[str, object]:
                         "min_distance": 0.05,
                         "out": None,
                         "parameter_json": None,
+                        "target_dataset": "train",
+                        "verification_batch": None,
+                        "verification_interval": None,
+                        "verification_max_add": None,
                         "verification_metrics": None,
+                        "verification_policy": "auto",
                     },
                 }
             },

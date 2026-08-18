@@ -599,7 +599,25 @@ def coverage_split_group(value: object) -> str:
     return "training"
 
 
-def coverage_point_group(row: dict[str, object], split_var: str) -> str:
+def geometry_file_split_group(path: Path) -> str | None:
+    """Infer a split only from an unambiguous split-file suffix."""
+
+    stem = path.stem.lower()
+    suffix_groups = {
+        "training": ("_train", "_training"),
+        "verification": ("_verification", "_verify", "_validation", "_test"),
+    }
+    for group, suffixes in suffix_groups.items():
+        if any(stem.endswith(suffix) for suffix in suffixes):
+            return group
+    return None
+
+
+def coverage_point_group(
+    row: dict[str, object],
+    split_var: str,
+    default_dataset: object = "train",
+) -> str:
     origin = lookup_row_value(row, "point_origin")
     if origin is not None and str(origin).strip():
         origin_token = normalize_key(origin)
@@ -613,9 +631,9 @@ def coverage_point_group(row: dict[str, object], split_var: str) -> str:
             return "additional"
         if origin_token in {"existing", "original", "prior"}:
             return coverage_split_group(
-                lookup_row_value(row, split_var) or "train"
+                lookup_row_value(row, split_var) or default_dataset or "train"
             )
-    split_value = lookup_row_value(row, split_var) or "train"
+    split_value = lookup_row_value(row, split_var) or default_dataset or "train"
     if normalize_key(split_value) in {
         "additional",
         "added",
@@ -658,6 +676,8 @@ def write_parameter_coverage_png(
         "verification": [],
         "additional": [],
     }
+    default_dataset = geometry_file_split_group(geometry_path) or "train"
+    dataset_counts = {"training": 0, "verification": 0}
     for row_index, row in enumerate(rows, start=1):
         coordinates: list[float] = []
         for parameter in parameters:
@@ -685,7 +705,17 @@ def write_parameter_coverage_png(
                     f"{parameter.name!r} is outside the declared range"
                 )
             coordinates.append(min(1.0, max(0.0, coordinate)))
-        grouped_points[coverage_point_group(row, split_var)].append(coordinates)
+        grouped_points[
+            coverage_point_group(
+                row,
+                split_var,
+                default_dataset=default_dataset,
+            )
+        ].append(coordinates)
+        dataset_group = coverage_split_group(
+            lookup_row_value(row, split_var) or default_dataset
+        )
+        dataset_counts[dataset_group] += 1
 
     dimension_count = len(parameters)
     render_scale = 2
@@ -729,60 +759,72 @@ def write_parameter_coverage_png(
 
     image = Image.new("RGBA", (width, height), background_color)
     draw = ImageDraw.Draw(image)
+    present_dataset_groups = [
+        name for name in ("training", "verification")
+        if dataset_counts[name]
+    ]
+    coverage_scope = (
+        "combined"
+        if len(present_dataset_groups) > 1
+        else (
+            f"{present_dataset_groups[0]}-only"
+            if present_dataset_groups
+            else "empty"
+        )
+    )
     draw.text(
         (left_margin, px(12)),
-        f"Parameter coverage: {geometry_path.name}",
+        f"Parameter coverage: {coverage_scope.replace('-', ' ')}",
         font=title_font,
         fill=title_color,
     )
+    group_labels = {
+        "training": "Training",
+        "verification": "Verification",
+        "additional": "Added",
+    }
+    group_colors = {
+        "training": training_color,
+        "verification": verification_color,
+        "additional": additional_color,
+    }
+    present_groups = [
+        name for name in ("training", "verification", "additional")
+        if grouped_points[name]
+    ]
     draw.text(
         (left_margin, px(42)),
-        f"{len(grouped_points['training'])} training point(s), "
-        f"{len(grouped_points['verification'])} verification point(s), "
-        f"{len(grouped_points['additional'])} added point(s)",
+        (
+            "Dataset: "
+            + ", ".join(
+                f"{dataset_counts[name]} {name}"
+                for name in present_dataset_groups
+            )
+            + " | Visual: "
+            + (
+                ", ".join(
+                    f"{len(grouped_points[name])} {group_labels[name].lower()}"
+                    for name in present_groups
+                )
+                or "0 points"
+            )
+        ),
         font=label_font,
         fill=tick_color,
     )
-    draw.ellipse(
-        (left_margin - px(4), px(68), left_margin + px(4), px(76)),
-        fill=training_color,
-    )
-    draw.text(
-        (left_margin + px(10), px(66)),
-        "Training",
-        font=label_font,
-        fill=text_color,
-    )
-    draw.ellipse(
-        (
-            left_margin + px(78),
-            px(68),
-            left_margin + px(86),
-            px(76),
-        ),
-        fill=verification_color,
-    )
-    draw.text(
-        (left_margin + px(92), px(66)),
-        "Verification",
-        font=label_font,
-        fill=text_color,
-    )
-    draw.ellipse(
-        (
-            left_margin + px(190),
-            px(68),
-            left_margin + px(198),
-            px(76),
-        ),
-        fill=additional_color,
-    )
-    draw.text(
-        (left_margin + px(204), px(66)),
-        "Added",
-        font=label_font,
-        fill=text_color,
-    )
+    legend_x = left_margin
+    for group_name in present_groups:
+        draw.ellipse(
+            (legend_x - px(4), px(68), legend_x + px(4), px(76)),
+            fill=group_colors[group_name],
+        )
+        draw.text(
+            (legend_x + px(10), px(66)),
+            group_labels[group_name],
+            font=label_font,
+            fill=text_color,
+        )
+        legend_x += px(112 if group_name == "verification" else 82)
 
     for column, parameter in enumerate(parameters):
         center_x = left_margin + column * cell_size + cell_size / 2
@@ -861,11 +903,8 @@ def write_parameter_coverage_png(
                     histograms[group_name] = counts
                     maximum_count = max(maximum_count, *counts)
                 bar_width = plot_width / bin_count
-                for group_name, color in (
-                    ("training", training_color),
-                    ("verification", verification_color),
-                    ("additional", additional_color),
-                ):
+                for group_name in present_groups:
+                    color = group_colors[group_name]
                     histogram_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
                     histogram_draw = ImageDraw.Draw(histogram_layer)
                     for bin_index, count in enumerate(histograms[group_name]):
@@ -884,11 +923,8 @@ def write_parameter_coverage_png(
                     image = Image.alpha_composite(image, histogram_layer)
                     draw = ImageDraw.Draw(image)
             else:
-                for group_name, color in (
-                    ("training", training_color),
-                    ("verification", verification_color),
-                    ("additional", additional_color),
-                ):
+                for group_name in present_groups:
+                    color = group_colors[group_name]
                     for point in grouped_points[group_name]:
                         point_x = plot_left + point[column_index] * plot_width
                         point_y = plot_bottom - point[row_index] * plot_height
@@ -972,8 +1008,9 @@ def write_geometry_metadata(
     bare_values: str = "parameter-units",
 ) -> Path:
     split_counts: dict[str, int] = {}
+    inferred_split = geometry_file_split_group(geometry_path)
     for row in rows:
-        split_value = str(row.get(split_var, "")).strip()
+        split_value = str(row.get(split_var, "") or inferred_split or "").strip()
         if split_value:
             split_counts[split_value] = split_counts.get(split_value, 0) + 1
 
@@ -1076,7 +1113,14 @@ def parameter_specs_from_geometry_metadata(path: Path) -> list[ParameterSpec]:
 
 def companion_geometry_metadata_candidates(csv_path: Path) -> list[Path]:
     candidates = [geometry_metadata_path(csv_path)]
-    for suffix in ("_train", "_verification"):
+    for suffix in (
+        "_train",
+        "_training",
+        "_verification",
+        "_verify",
+        "_validation",
+        "_test",
+    ):
         if csv_path.stem.endswith(suffix):
             combined_path = csv_path.with_name(
                 f"{csv_path.stem[:-len(suffix)]}{csv_path.suffix or '.csv'}"
@@ -1204,7 +1248,13 @@ def write_points_csv(
             split_rows = [row for row in rows if row.get(split_var) == split_value]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
-            written.append(split_path)
+            split_plot_path = write_parameter_coverage_png(
+                split_path,
+                parameters,
+                split_rows,
+                split_var,
+            )
+            written.extend([split_path, split_plot_path])
     return written
 
 
@@ -1387,7 +1437,14 @@ def write_range_extension_csv(
             ]
             split_path = split_output_path(path, split_value)
             write_rows_csv(split_path, split_rows, fields)
-            written.append(split_path)
+            split_plot_path = write_parameter_coverage_png(
+                split_path,
+                plan.overall_parameters,
+                split_rows,
+                split_var,
+                bare_values=bare_values,
+            )
+            written.extend([split_path, split_plot_path])
     return written
 
 
@@ -1584,6 +1641,110 @@ def load_existing_points(
             if point is not None and in_unit_cube(point):
                 points.append(clamp_unit_point(point))
     return dedupe_points(points)
+
+
+def existing_csv_dataset_counts(
+    csv_paths: Sequence[str],
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    bare_values: str,
+) -> dict[str, int]:
+    """Count unique training/verification geometries across separate or combined CSVs."""
+
+    assignments: dict[tuple[int, ...], str] = {}
+    for raw_path in csv_paths:
+        path = Path(raw_path)
+        rows = read_csv_rows(path)
+        source_mode = resolve_bare_values_for_rows(
+            rows,
+            parameters,
+            bare_values,
+        )
+        inferred_dataset = geometry_file_split_group(path) or "train"
+        for row in rows:
+            point = row_unit_point(row, parameters, bare_values=source_mode)
+            if point is None or not in_unit_cube(point):
+                continue
+            key = tuple(int(round(value * 1.0e10)) for value in point)
+            group = coverage_split_group(
+                lookup_row_value(row, split_var) or inferred_dataset
+            )
+            # When the same geometry appears in independent train and
+            # verification inventories, preserve held-out status regardless of
+            # CLI source order.
+            if assignments.get(key) != "verification" or group == "verification":
+                assignments[key] = group
+    return {
+        "training": sum(group == "training" for group in assignments.values()),
+        "verification": sum(
+            group == "verification" for group in assignments.values()
+        ),
+    }
+
+
+def automatic_verification_plan(
+    *,
+    dimensions: int,
+    existing_training_count: int,
+    verification_observation_count: int,
+    requested_training_count: int,
+    enabled: bool,
+    interval: int | None = None,
+    batch: int | None = None,
+    max_add: int | None = None,
+) -> dict[str, object]:
+    """Plan milestone-based acquisition-verification growth for GP-UCB."""
+
+    initial_training = max(4 * dimensions, 12)
+    initial_verification = max(dimensions + 2, 6)
+    effective_interval = interval if interval is not None else max(2 * dimensions, 1)
+    effective_batch = batch if batch is not None else max(
+        2,
+        int(math.ceil(2 * dimensions / 3.0)),
+    )
+    effective_max_add = max_add if max_add is not None else initial_verification
+    if effective_interval <= 0:
+        raise ValueError("--verification-interval must be positive")
+    if effective_batch <= 0:
+        raise ValueError("--verification-batch must be positive")
+    if effective_max_add <= 0:
+        raise ValueError("--verification-max-add must be positive")
+
+    projected_training = existing_training_count + requested_training_count
+    completed_milestones = max(
+        0,
+        (projected_training - initial_training) // effective_interval,
+    )
+    target_verification = (
+        initial_verification + completed_milestones * effective_batch
+    )
+    needed = max(0, target_verification - verification_observation_count)
+    added = (
+        min(needed, effective_max_add)
+        if enabled and completed_milestones > 0
+        else 0
+    )
+    next_trigger = (
+        initial_training + (completed_milestones + 1) * effective_interval
+    )
+    return {
+        "enabled": bool(enabled),
+        "dimensions": dimensions,
+        "initial_training_anchor": initial_training,
+        "initial_verification_target": initial_verification,
+        "existing_training_count": existing_training_count,
+        "requested_training_count": requested_training_count,
+        "projected_training_count": projected_training,
+        "verification_observation_count": verification_observation_count,
+        "training_interval": effective_interval,
+        "verification_batch": effective_batch,
+        "maximum_additional_verification_per_command": effective_max_add,
+        "completed_growth_milestones": completed_milestones,
+        "target_verification_count": target_verification,
+        "needed_verification_count": needed,
+        "additional_verification_count": added,
+        "next_training_trigger": next_trigger,
+    }
 
 
 def metric_score_value(metric_name: str, value: float) -> float:
@@ -2189,6 +2350,7 @@ def write_suggested_points_csv(
     parameters: Sequence[ParameterSpec],
     split_var: str,
     target_dataset: str,
+    target_datasets: Sequence[str] | None,
     candidate_method: str,
     acquisition_method: str,
     metric_name: str,
@@ -2222,11 +2384,20 @@ def write_suggested_points_csv(
         fields.extend(f"u_{parameter.name}" for parameter in parameters)
     fields.extend(parameter.name for parameter in parameters)
 
+    if target_datasets is not None and len(target_datasets) != len(suggestions):
+        raise ValueError(
+            "One target dataset label is required for every suggested point"
+        )
     rows: list[dict[str, object]] = []
     for idx, suggestion in enumerate(suggestions, start=1):
+        point_dataset = (
+            str(target_datasets[idx - 1])
+            if target_datasets is not None
+            else target_dataset
+        )
         row: dict[str, object] = {
             "point_index": idx,
-            split_var: target_dataset,
+            split_var: point_dataset,
             "additional_sequence": idx,
             "point_origin": "additional",
             "method": method_name,
@@ -2300,6 +2471,41 @@ def accumulated_training_geometry_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}_training_geometries.csv")
 
 
+def write_dataset_split_geometry_views(
+    source_path: Path,
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    *,
+    bare_values: str = "parameter-units",
+) -> list[Path]:
+    """Write RFPro-friendly train/verification CSV and plot views without JSON."""
+
+    fields, rows = read_csv_table(source_path)
+    written: list[Path] = []
+    for group, suffix in (("training", "train"), ("verification", "verification")):
+        split_rows = [
+            row
+            for row in rows
+            if coverage_split_group(
+                lookup_row_value(row, split_var) or "train"
+            )
+            == group
+        ]
+        if not split_rows:
+            continue
+        split_path = split_output_path(source_path, suffix)
+        write_rows_csv(split_path, split_rows, fields)
+        plot_path = write_parameter_coverage_png(
+            split_path,
+            parameters,
+            split_rows,
+            split_var,
+            bare_values=bare_values,
+        )
+        written.extend([split_path, plot_path])
+    return written
+
+
 def write_accumulated_training_geometries(
     path: Path,
     parameters: Sequence[ParameterSpec],
@@ -2332,7 +2538,7 @@ def write_accumulated_training_geometries(
     fields.extend(parameter.name for parameter in parameters)
 
     records: list[tuple[list[float], str, str, str, str, object]] = []
-    seen: set[tuple[int, ...]] = set()
+    seen: dict[tuple[int, ...], int] = {}
     duplicate_count = 0
 
     def append_point(
@@ -2370,8 +2576,24 @@ def write_accumulated_training_geometries(
         key = tuple(int(round(value * 1.0e10)) for value in rounded_point)
         if key in seen:
             duplicate_count += 1
+            existing_index = seen[key]
+            existing_record = records[existing_index]
+            existing_dataset = existing_record[1]
+            new_dataset = str(dataset or "train")
+            if (
+                coverage_split_group(existing_dataset) != "verification"
+                and coverage_split_group(new_dataset) == "verification"
+            ):
+                records[existing_index] = (
+                    existing_record[0],
+                    new_dataset,
+                    existing_record[2],
+                    existing_record[3],
+                    existing_record[4],
+                    existing_record[5],
+                )
             return
-        seen.add(key)
+        seen[key] = len(records)
         records.append(
             (
                 rounded_values,
@@ -2386,6 +2608,7 @@ def write_accumulated_training_geometries(
     for raw_path in existing_csv_paths:
         source_path = Path(raw_path)
         _, source_rows = read_csv_table(source_path)
+        inferred_source_dataset = geometry_file_split_group(source_path) or "train"
         source_mode = resolve_bare_values_for_rows(
             source_rows,
             parameters,
@@ -2400,7 +2623,7 @@ def write_accumulated_training_geometries(
                 )
             append_point(
                 point,
-                lookup_row_value(row, split_var) or "train",
+                lookup_row_value(row, split_var) or inferred_source_dataset,
                 "existing",
                 lookup_row_value(row, "method") or "existing",
                 str(lookup_row_value(row, "geometry_source") or source_path),
@@ -2670,7 +2893,15 @@ def build_suggest_parser() -> argparse.ArgumentParser:
             "same-stem JSON from --existing-points."
         ),
     )
-    parser.add_argument("--count", type=int, required=True, help="Number of additional points to suggest.")
+    parser.add_argument(
+        "--count",
+        type=int,
+        required=True,
+        help=(
+            "Number of primary additional points to suggest. Automatic GP-UCB "
+            "verification points are appended beyond this count when triggered."
+        ),
+    )
     parser.add_argument(
         "--fit-dir",
         help=(
@@ -2764,7 +2995,10 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--candidate-count",
         type=int,
-        help="Number of candidate points to score. Default: max(1000, count * candidate-factor).",
+        help=(
+            "Number of candidate points to score. Default: max(1000, "
+            "planned-primary-and-verification-count * candidate-factor)."
+        ),
     )
     parser.add_argument(
         "--candidate-factor",
@@ -2808,8 +3042,42 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-dataset",
-        default="targeted",
-        help="Dataset label assigned to suggested points. Default: targeted.",
+        default="train",
+        help="Dataset label assigned to primary suggested points. Default: train.",
+    )
+    parser.add_argument(
+        "--verification-policy",
+        choices=["auto", "off"],
+        default="auto",
+        help=(
+            "Automatically add acquisition-verification points as cumulative "
+            "training count crosses dimension-based milestones. Applies to "
+            "GP-UCB training batches. Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--verification-interval",
+        type=int,
+        help=(
+            "Training-point growth between automatic verification milestones. "
+            "Default: 2*d."
+        ),
+    )
+    parser.add_argument(
+        "--verification-batch",
+        type=int,
+        help=(
+            "Verification points added at each crossed milestone. Default: "
+            "max(2, ceil(2*d/3))."
+        ),
+    )
+    parser.add_argument(
+        "--verification-max-add",
+        type=int,
+        help=(
+            "Maximum automatic verification points added by one command, "
+            "including catch-up. Default: max(d+2, 6)."
+        ),
     )
     parser.add_argument(
         "--out",
@@ -3464,6 +3732,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error("--gp-noise-variance must be non-negative")
     if args.gp_error_floor <= 0.0:
         parser.error("--gp-error-floor must be positive")
+    for option_name in (
+        "verification_interval",
+        "verification_batch",
+        "verification_max_add",
+    ):
+        value = getattr(args, option_name)
+        if value is not None and value <= 0:
+            parser.error(f"--{option_name.replace('_', '-')} must be positive")
     validate_shared_sampling_args(parser, args)
     parameters = resolve_suggest_parameters(parser, args)
     validate_parameter_decimal_places(parser, parameters, args.decimal_places)
@@ -3504,7 +3780,54 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     existing_points.extend(point for point, _, _, _ in mdif_observed_points)
     existing_points = dedupe_points(existing_points)
 
-    candidate_count = args.candidate_count or max(1000, args.count * args.candidate_factor)
+    existing_dataset_counts = existing_csv_dataset_counts(
+        args.existing_points,
+        parameters,
+        args.split_var,
+        args.bare_values,
+    )
+    verification_metrics_geometry_count = len(regions)
+    existing_verification_geometry_count = existing_dataset_counts["verification"]
+    effective_verification_count = max(
+        existing_verification_geometry_count,
+        verification_metrics_geometry_count,
+    )
+    primary_is_training = (
+        coverage_split_group(args.target_dataset) == "training"
+    )
+    automatic_verification_enabled = (
+        args.acquisition == "gp-ucb"
+        and args.verification_policy == "auto"
+        and primary_is_training
+    )
+    preliminary_verification_plan = automatic_verification_plan(
+        dimensions=len(parameters),
+        existing_training_count=existing_dataset_counts["training"],
+        verification_observation_count=effective_verification_count,
+        requested_training_count=args.count if primary_is_training else 0,
+        enabled=automatic_verification_enabled,
+        interval=args.verification_interval,
+        batch=args.verification_batch,
+        max_add=args.verification_max_add,
+    )
+    preliminary_verification_plan["policy"] = args.verification_policy
+    preliminary_verification_plan["existing_verification_geometry_count"] = (
+        existing_verification_geometry_count
+    )
+    preliminary_verification_plan["verification_metrics_geometry_count"] = (
+        verification_metrics_geometry_count
+    )
+    preliminary_verification_plan["verification_count_basis"] = (
+        "maximum of existing verification geometry inventory and distinct "
+        "verification-metrics geometries"
+    )
+    planned_total_count = args.count + int(
+        preliminary_verification_plan["additional_verification_count"]
+    )
+    candidate_count = args.candidate_count or max(
+        1000,
+        planned_total_count * args.candidate_factor,
+    )
     candidate_method = (
         "maximin-lhs"
         if args.candidate_method == "minimax-lhs"
@@ -3539,6 +3862,8 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         acquisition_metadata["parameter_metadata_source"] = (
             args.parameter_metadata_source
         )
+    target_datasets: list[str]
+    automatic_verification_suggestions: list[SuggestedPoint] = []
     if args.acquisition == "gp-ucb":
         try:
             suggestions, gp_model = select_gp_ucb_points(
@@ -3555,6 +3880,80 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             )
         except ValueError as exc:
             parser.error(str(exc))
+        verification_plan = automatic_verification_plan(
+            dimensions=len(parameters),
+            existing_training_count=existing_dataset_counts["training"],
+            verification_observation_count=effective_verification_count,
+            requested_training_count=(
+                len(suggestions) if primary_is_training else 0
+            ),
+            enabled=automatic_verification_enabled,
+            interval=args.verification_interval,
+            batch=args.verification_batch,
+            max_add=args.verification_max_add,
+        )
+        verification_plan["policy"] = args.verification_policy
+        verification_plan["existing_verification_geometry_count"] = (
+            existing_verification_geometry_count
+        )
+        verification_plan["verification_metrics_geometry_count"] = (
+            verification_metrics_geometry_count
+        )
+        verification_plan["verification_count_basis"] = (
+            "maximum of existing verification geometry inventory and distinct "
+            "verification-metrics geometries"
+        )
+        if not automatic_verification_enabled:
+            verification_plan["reason"] = (
+                "policy set to off"
+                if args.verification_policy == "off"
+                else "the requested primary batch is verification rather than training"
+            )
+        automatic_verification_count = int(
+            verification_plan["additional_verification_count"]
+        )
+        if automatic_verification_count:
+            verification_existing_points = [
+                *existing_points,
+                *(suggestion.unit_point for suggestion in suggestions),
+            ]
+            try:
+                automatic_verification_suggestions, _verification_gp_model = (
+                    select_gp_ucb_points(
+                        candidates,
+                        regions,
+                        verification_existing_points,
+                        count=automatic_verification_count,
+                        exploration_weight=max(args.exploration_weight, 3.0),
+                        novelty_power=max(args.novelty_power, 2.0),
+                        min_distance=max(args.min_distance, 1.0e-9),
+                        length_scale=args.gp_length_scale,
+                        noise_variance=args.gp_noise_variance,
+                        error_floor=args.gp_error_floor,
+                    )
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
+            if len(automatic_verification_suggestions) < automatic_verification_count:
+                print(
+                    "warning: selected "
+                    f"{len(automatic_verification_suggestions)} of "
+                    f"{automatic_verification_count} automatic verification "
+                    "points; increase --candidate-count or lower --min-distance",
+                    file=sys.stderr,
+                )
+        verification_plan["selected_additional_verification_count"] = len(
+            automatic_verification_suggestions
+        )
+        verification_plan["selection_exploration_weight"] = max(
+            args.exploration_weight,
+            3.0,
+        )
+        verification_plan["selection_novelty_power"] = max(
+            args.novelty_power,
+            2.0,
+        )
+        acquisition_metadata["automatic_verification"] = verification_plan
         acquisition_metadata["gp"] = {
             "kernel": "matern52_isotropic",
             "target_transform": "natural_log_error",
@@ -3574,6 +3973,11 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                 "until more simulated error observations are available",
                 file=sys.stderr,
             )
+        target_datasets = [args.target_dataset] * len(suggestions)
+        suggestions = [*suggestions, *automatic_verification_suggestions]
+        target_datasets.extend(
+            ["verification"] * len(automatic_verification_suggestions)
+        )
     else:
         suggestions = select_targeted_points(
             candidates,
@@ -3585,9 +3989,19 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             novelty_power=args.novelty_power,
             min_distance=args.min_distance,
         )
-    if len(suggestions) < args.count:
+        target_datasets = [args.target_dataset] * len(suggestions)
+        acquisition_metadata["automatic_verification"] = {
+            **preliminary_verification_plan,
+            "enabled": False,
+            "reason": "automatic verification applies only to GP-UCB training batches",
+            "selected_additional_verification_count": 0,
+        }
+    primary_suggestion_count = len(suggestions) - len(
+        automatic_verification_suggestions
+    )
+    if primary_suggestion_count < args.count:
         print(
-            f"warning: selected {len(suggestions)} of {args.count} requested points; "
+            f"warning: selected {primary_suggestion_count} of {args.count} requested points; "
             "increase --candidate-count or lower --min-distance",
             file=sys.stderr,
         )
@@ -3613,6 +4027,13 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error(
             "--combined-out must produce a different companion JSON from --out"
         )
+    if automatic_verification_suggestions:
+        acquisition_metadata["rfpro_split_files"] = {
+            "training": str(split_output_path(out_path, "train")),
+            "verification": str(split_output_path(out_path, "verification")),
+            "companion_json": str(geometry_metadata_path(out_path)),
+            "separate_split_json_files": False,
+        }
     write_error_regions_csv(analysis_path, regions, parameters)
     metadata_path = write_suggested_points_csv(
         out_path,
@@ -3620,6 +4041,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parameters,
         split_var=args.split_var,
         target_dataset=args.target_dataset,
+        target_datasets=target_datasets,
         candidate_method=candidate_method,
         acquisition_method=args.acquisition,
         metric_name=metric_name,
@@ -3627,6 +4049,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         decimal_places=args.decimal_places,
         acquisition_metadata=acquisition_metadata,
     )
+    split_view_paths: list[Path] = []
+    if automatic_verification_suggestions:
+        split_view_paths = write_dataset_split_geometry_views(
+            out_path,
+            parameters,
+            args.split_var,
+            bare_values=args.bare_values,
+        )
     method_name = (
         f"targeted-{candidate_method}"
         if args.acquisition == "error-distance"
@@ -3685,9 +4115,34 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             f"Matérn-5/2 length scale: {gp_model.length_scale:.6g}, "
             f"exploration weight: {args.exploration_weight:.6g}"
         )
+        verification_plan = acquisition_metadata["automatic_verification"]
+        assert isinstance(verification_plan, dict)
+        added_verification = int(
+            verification_plan.get("selected_additional_verification_count", 0)
+        )
+        if verification_plan.get("enabled"):
+            print(
+                "automatic verification: "
+                f"{added_verification} point(s) added; projected training "
+                f"count {verification_plan['projected_training_count']}, "
+                "current acquisition-verification inventory "
+                f"{verification_plan['verification_observation_count']}, "
+                f"target {verification_plan['target_verification_count']}, "
+                f"interval {verification_plan['training_interval']} training "
+                "point(s), next scheduled trigger at "
+                f"{verification_plan['next_training_trigger']} training point(s)"
+            )
+        else:
+            reason = verification_plan.get("reason")
+            print(
+                "automatic verification: disabled"
+                + (f" ({reason})" if reason else "")
+            )
     print(f"wrote {out_path}")
     print(f"wrote {metadata_path}")
     print(f"wrote {geometry_coverage_plot_path(out_path)}")
+    for split_view_path in split_view_paths:
+        print(f"wrote {split_view_path}")
     print(f"wrote {analysis_path}")
     print(f"wrote {combined_path}")
     print(f"wrote {combined_metadata_path}")

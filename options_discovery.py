@@ -540,6 +540,34 @@ def recover_geometry_metadata(
     accumulator.add(
         (*base, "decimal_places"), payload.get("decimal_places"), path, priority=45
     )
+    automatic_verification = payload.get("automatic_verification")
+    if isinstance(automatic_verification, dict):
+        accumulator.add(
+            (*base, "verification_policy"),
+            automatic_verification.get("policy"),
+            path,
+            priority=45,
+        )
+        accumulator.add(
+            (*base, "verification_interval"),
+            automatic_verification.get("training_interval"),
+            path,
+            priority=45,
+        )
+        accumulator.add(
+            (*base, "verification_batch"),
+            automatic_verification.get("verification_batch"),
+            path,
+            priority=45,
+        )
+        accumulator.add(
+            (*base, "verification_max_add"),
+            automatic_verification.get(
+                "maximum_additional_verification_per_command"
+            ),
+            path,
+            priority=45,
+        )
     accumulator.add(
         (*base, "verification_metrics"),
         payload.get("verification_metrics_source"),

@@ -185,7 +185,12 @@
           "min_distance": 0.05,
           "out": null,
           "parameter_json": null,
-          "verification_metrics": null
+          "target_dataset": "train",
+          "verification_batch": null,
+          "verification_interval": null,
+          "verification_max_add": null,
+          "verification_metrics": null,
+          "verification_policy": "auto"
         }
       }
     },

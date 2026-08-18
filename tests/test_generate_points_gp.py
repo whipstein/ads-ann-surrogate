@@ -16,6 +16,140 @@ class GaussianAdaptivePointTests(unittest.TestCase):
         parser = POINTS.build_suggest_parser()
         args = parser.parse_args(["--count", "2"])
         self.assertEqual(args.acquisition, "gp-ucb")
+        self.assertEqual(args.verification_policy, "auto")
+        self.assertEqual(args.target_dataset, "train")
+
+    def test_six_dimensional_verification_growth_policy_catches_up(self) -> None:
+        before_trigger = POINTS.automatic_verification_plan(
+            dimensions=6,
+            existing_training_count=24,
+            verification_observation_count=8,
+            requested_training_count=8,
+            enabled=True,
+        )
+        self.assertEqual(before_trigger["projected_training_count"], 32)
+        self.assertEqual(before_trigger["additional_verification_count"], 0)
+        self.assertEqual(before_trigger["next_training_trigger"], 36)
+
+        first_growth = POINTS.automatic_verification_plan(
+            dimensions=6,
+            existing_training_count=32,
+            verification_observation_count=8,
+            requested_training_count=8,
+            enabled=True,
+        )
+        self.assertEqual(first_growth["target_verification_count"], 12)
+        self.assertEqual(first_growth["additional_verification_count"], 4)
+
+        catch_up = POINTS.automatic_verification_plan(
+            dimensions=6,
+            existing_training_count=40,
+            verification_observation_count=8,
+            requested_training_count=8,
+            enabled=True,
+        )
+        self.assertEqual(catch_up["projected_training_count"], 48)
+        self.assertEqual(catch_up["target_verification_count"], 16)
+        self.assertEqual(catch_up["additional_verification_count"], 8)
+
+    def test_gp_suggest_automatically_writes_rfpro_verification_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            geometries = root / "geometries.csv"
+            metrics = root / "verification_metrics.csv"
+            output = root / "round_3.csv"
+            generate_args = ["generate"]
+            for index in range(1, 7):
+                generate_args.extend(["--parameter", f"P{index}=0:1"])
+            generate_args.extend(
+                [
+                    "--count",
+                    "48",
+                    "--verification-count",
+                    "8",
+                    "--lhs-candidates",
+                    "4",
+                    "--out",
+                    str(geometries),
+                ]
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(POINTS.main(generate_args), 0)
+            with geometries.open(newline="") as stream:
+                geometry_rows = list(csv.DictReader(stream))
+            verification_rows = [
+                row for row in geometry_rows if row["dataset"] == "verification"
+            ]
+            with metrics.open("w", newline="") as stream:
+                fields = [
+                    "source_index",
+                    "sparam",
+                    "evm_pct",
+                    *(f"P{index}" for index in range(1, 7)),
+                ]
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                for index, row in enumerate(verification_rows, start=1):
+                    writer.writerow(
+                        {
+                            "source_index": index,
+                            "sparam": "S21",
+                            "evm_pct": 0.5 + index / 10.0,
+                            **{f"P{item}": row[f"P{item}"] for item in range(1, 7)},
+                        }
+                    )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            "--count",
+                            "8",
+                            "--verification-metrics",
+                            str(metrics),
+                            "--existing-points",
+                            str(geometries),
+                            "--candidate-count",
+                            "96",
+                            "--lhs-candidates",
+                            "4",
+                            "--target-dataset",
+                            "train",
+                            "--out",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
+
+            with output.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 16)
+            self.assertEqual(sum(row["dataset"] == "train" for row in rows), 8)
+            self.assertEqual(
+                sum(row["dataset"] == "verification" for row in rows),
+                8,
+            )
+            training_queue = root / "round_3_train.csv"
+            verification_queue = root / "round_3_verification.csv"
+            self.assertTrue(training_queue.is_file())
+            self.assertTrue(verification_queue.is_file())
+            self.assertFalse(training_queue.with_suffix(".json").exists())
+            self.assertFalse(verification_queue.with_suffix(".json").exists())
+            self.assertTrue(
+                (root / "round_3_train_parameter_coverage.png").is_file()
+            )
+            self.assertTrue(
+                (root / "round_3_verification_parameter_coverage.png").is_file()
+            )
+            metadata = json.loads(output.with_suffix(".json").read_text())
+            policy = metadata["automatic_verification"]
+            self.assertEqual(policy["projected_training_count"], 48)
+            self.assertEqual(policy["target_verification_count"], 16)
+            self.assertEqual(policy["selected_additional_verification_count"], 8)
+            self.assertIn("automatic verification: 8 point(s) added", stdout.getvalue())
 
     def test_split_points_csv_uses_single_combined_geometry_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -45,17 +179,47 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 )
 
             train_points = root / "geometries_train.csv"
+            verification_points = root / "geometries_verification.csv"
             coverage_plot = root / "geometries_parameter_coverage.png"
+            train_coverage_plot = (
+                root / "geometries_train_parameter_coverage.png"
+            )
+            verification_coverage_plot = (
+                root / "geometries_verification_parameter_coverage.png"
+            )
             self.assertTrue(train_points.is_file())
+            self.assertTrue(verification_points.is_file())
             self.assertTrue(geometries.with_suffix(".json").is_file())
             self.assertTrue(coverage_plot.is_file())
             self.assertFalse(train_points.with_suffix(".json").exists())
-            self.assertFalse(
-                (root / "geometries_train_parameter_coverage.png").exists()
-            )
+            self.assertFalse(verification_points.with_suffix(".json").exists())
+            self.assertTrue(train_coverage_plot.is_file())
+            self.assertTrue(verification_coverage_plot.is_file())
             self.assertFalse(
                 (root / "geometries_parameter_coverage.svg").exists()
             )
+            with Image.open(train_coverage_plot) as image:
+                train_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((37, 99, 235), train_colors)
+            self.assertNotIn((249, 115, 22), train_colors)
+            self.assertNotIn((22, 163, 74), train_colors)
+            with Image.open(verification_coverage_plot) as image:
+                verification_colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((249, 115, 22), verification_colors)
+            self.assertNotIn((37, 99, 235), verification_colors)
+            self.assertNotIn((22, 163, 74), verification_colors)
             metadata = json.loads(geometries.with_suffix(".json").read_text())
             self.assertEqual(
                 metadata["parameter_coverage_plot"],
@@ -78,6 +242,49 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(
                 args.parameter_metadata_source,
                 str(geometries.with_suffix(".json")),
+            )
+
+    def test_split_filename_classifies_rfpro_rows_without_dataset_column(self) -> None:
+        parameters = [
+            POINTS.parse_parameter_spec("W=0.4mm:0.8mm"),
+            POINTS.parse_parameter_spec("L=1mm:2mm"),
+        ]
+        rows = [
+            {"W": "0.45mm", "L": "1.2mm"},
+            {"W": "0.75mm", "L": "1.8mm"},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            verification_path = Path(temp_dir) / "rfpro_verification.csv"
+            plot_path = POINTS.write_parameter_coverage_png(
+                verification_path,
+                parameters,
+                rows,
+                "dataset",
+            )
+            with Image.open(plot_path) as image:
+                colors = {
+                    color
+                    for _, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+            self.assertIn((249, 115, 22), colors)
+            self.assertNotIn((37, 99, 235), colors)
+            self.assertEqual(
+                POINTS.geometry_file_split_group(verification_path),
+                "verification",
+            )
+            self.assertEqual(
+                POINTS.geometry_file_split_group(
+                    Path(temp_dir) / "rfpro_train.csv"
+                ),
+                "training",
+            )
+            self.assertIsNone(
+                POINTS.geometry_file_split_group(
+                    Path(temp_dir) / "gp_round_training_geometries.csv"
+                )
             )
 
     def test_suggest_infers_parameters_from_existing_points_json(self) -> None:
@@ -198,7 +405,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             )
             self.assertEqual(
                 [row["dataset"] for row in combined_rows].count("train"),
-                6,
+                9,
             )
             self.assertEqual(
                 [row["dataset"] for row in combined_rows].count("verification"),
@@ -206,7 +413,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             )
             self.assertEqual(
                 [row["dataset"] for row in combined_rows].count("targeted"),
-                3,
+                0,
             )
             self.assertEqual(
                 [row["point_origin"] for row in combined_rows].count("additional"),
@@ -246,7 +453,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(combined_metadata["new_point_count"], 3)
             self.assertEqual(
                 combined_metadata["split_counts"],
-                {"train": 6, "verification": 2, "targeted": 3},
+                {"train": 9, "verification": 2},
             )
             self.assertEqual(
                 combined_metadata["next_gp_existing_points"],
