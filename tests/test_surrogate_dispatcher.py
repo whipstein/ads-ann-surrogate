@@ -7,8 +7,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 import surrogate
-from surrogate_common import build_training_export_commands
+from surrogate_common import (
+    ADS_EXPORT_TEMPLATE_FILENAME,
+    MDIFBlock,
+    build_ads_export_blocks,
+    build_training_export_commands,
+    read_mdif,
+    write_ads_export_template,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -238,6 +247,62 @@ class SurrogateDispatcherTests(unittest.TestCase):
                     command,
                 )
                 self.assertNotIn(f" {script_name} ", command)
+
+    def test_generated_template_is_preferred_and_is_not_used_as_dc_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "model"
+            model_dir.mkdir()
+            source_mdif = root / "source.mdif"
+            source_mdif.write_text("source placeholder")
+            frequencies = np.asarray([0.0, 1.0e9, 2.0e9])
+            blocks = [
+                MDIFBlock(
+                    params={"dataset": "train", "W": "0.5mm"},
+                    freq_hz=frequencies,
+                    sparams={"S11": np.ones(3, dtype=complex)},
+                    source_index=8,
+                )
+            ]
+            template_path = model_dir / ADS_EXPORT_TEMPLATE_FILENAME
+            summary = write_ads_export_template(
+                template_path,
+                blocks,
+                ["W"],
+                ["S11"],
+            )
+
+            parsed = read_mdif(template_path)
+            self.assertEqual(summary["block_count"], 1)
+            self.assertEqual(parsed[0].params, {"W": "0.5mm"})
+            np.testing.assert_array_equal(
+                parsed[0].sparams["S11"],
+                np.zeros(3, dtype=complex),
+            )
+            auto_blocks = build_ads_export_blocks(
+                None,
+                [],
+                None,
+                ["W"],
+                ["S11"],
+                model_dir=model_dir,
+            )
+            self.assertEqual(auto_blocks[0].params, {"W": "0.5mm"})
+            np.testing.assert_array_equal(auto_blocks[0].freq_hz, frequencies)
+
+            commands = dict(
+                build_training_export_commands(
+                    ROOT / "dnn.py",
+                    model_dir,
+                    dc_mdif=source_mdif,
+                    include_veriloga=True,
+                    model_type="dnn",
+                )
+            )
+            sampled = commands["Sampled ADS MDIF"]
+            self.assertIn(ADS_EXPORT_TEMPLATE_FILENAME, sampled)
+            self.assertIn("--dc-mdif", sampled)
+            self.assertIn("source.mdif", sampled)
 
 
 if __name__ == "__main__":

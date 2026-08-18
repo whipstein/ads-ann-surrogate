@@ -36,6 +36,7 @@ from cli_options import (
     parse_args_with_options_json,
 )
 from surrogate_common import (  # noqa: E402
+    ADS_EXPORT_TEMPLATE_FILENAME,
     DB_MAG_FLOOR,
     DCConductanceModel,
     EPS,
@@ -111,6 +112,7 @@ from surrogate_common import (  # noqa: E402
     veriloga_command_defaults,
     write_training_verification_artifacts,
     write_ads_ann_package,
+    write_ads_export_template,
     write_ads_export_package,
     write_csv,
     write_history,
@@ -1906,6 +1908,8 @@ def train_model(args: argparse.Namespace) -> tuple[KBNN, list[MDIFBlock], list[M
 def kbnn_export_commands(
     model_dir: Path,
     template_mdif: str | Path | None = None,
+    *,
+    dc_mdif: str | Path | None = None,
 ) -> list[tuple[str, str]]:
     """Build runnable export commands for a fitted composite KBNN report."""
 
@@ -1913,6 +1917,7 @@ def kbnn_export_commands(
         Path(__file__),
         model_dir,
         template_mdif,
+        dc_mdif=dc_mdif,
         include_veriloga=True,
         model_type="kbnn",
     )
@@ -1957,6 +1962,14 @@ def command_train(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     assert metadata is not None
+    _, _, all_fine_blocks = split_fine_blocks(args)
+    template_path = out_dir / ADS_EXPORT_TEMPLATE_FILENAME
+    metadata["ads_export_template"] = write_ads_export_template(
+        template_path,
+        all_fine_blocks,
+        parameter_names,
+        labels,
+    )
     model.save(out_dir, metadata=metadata)
     write_history(
         out_dir / "dc_training_history.csv",
@@ -2110,7 +2123,7 @@ def command_train(args: argparse.Namespace) -> int:
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
-    export_commands = kbnn_export_commands(out_dir, args.mdif)
+    export_commands = kbnn_export_commands(out_dir, dc_mdif=args.mdif)
     write_training_markdown(
         out_dir / "training_summary.md",
         model_kind="KBNN",
@@ -2125,6 +2138,7 @@ def command_train(args: argparse.Namespace) -> int:
         print(json.dumps({
             "out_dir": str(out_dir),
             "training_summary": str(out_dir / "training_summary.md"),
+            "ads_export_template": str(template_path),
             "composite_manifest": str(composite_manifest),
             "mode": model.mode,
             "include_coarse_input": model.include_coarse_input,
@@ -2210,6 +2224,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         freqs_spec=args.freqs,
         parameter_names=model.parameter_names,
         sparam_labels=model.sparam_labels,
+        model_dir=model_dir,
     )
     if model.mode == "plain":
         if args.coarse_model_dir:
@@ -3146,7 +3161,7 @@ def command_sweep(args: argparse.Namespace) -> int:
     best_dir = Path(prepared_args.out_dir) / "best_model"
     update_training_export_commands(
         best_dir / "training_summary.md",
-        kbnn_export_commands(best_dir, args.mdif),
+        kbnn_export_commands(best_dir, dc_mdif=args.mdif),
     )
     best_config_path = Path(prepared_args.out_dir) / "kbnn_best_config.json"
     best_payload = json.loads(best_config_path.read_text())
@@ -3200,7 +3215,7 @@ def command_sweep(args: argparse.Namespace) -> int:
     )
     update_training_export_commands(
         summary_path,
-        kbnn_export_commands(best_dir, args.mdif),
+        kbnn_export_commands(best_dir, dc_mdif=args.mdif),
     )
     print("reproduce best model:", flush=True)
     print(reproduction_command, flush=True)

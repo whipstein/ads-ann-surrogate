@@ -1348,6 +1348,9 @@ A normal `train` run writes:
 - `model.npz` and `metadata.json` with the trained RF model state and assumptions.
 - `dc_model.npz` and `dc_model.json` with the separate geometry-to-DC model
   and its extraction diagnostics.
+- `ads_export_template.mdif` with every fitted geometry block and frequency
+  row, ready to pass to `export-ads-mdif`. It contains only model parameter
+  `VAR`s; its S-parameter columns are clearly marked zero placeholders.
 - `predicted_verification.mdif` for held-out verification blocks.
 - `verification_metrics.csv` with per-block and per-S-parameter errors,
   including EVM.
@@ -2429,8 +2432,14 @@ Export any trained model family as a sampled ADS MDIF package:
 python3 surrogate.py --model dnn export-ads-mdif \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_ads_mdif \
-  --template-mdif ads_sweep_template.mdif
+  --template-mdif outputs/dnn_model/ads_export_template.mdif
 ```
+
+Every `train`, `sweep`, and `optimize` fit produces this template. The export
+command printed in the fitting report uses it automatically. You may also omit
+`--template-mdif` entirely when exporting from that model directory; the
+exporter discovers the generated template. A separate hand-written template is
+needed only when you want a different sampling grid.
 
 Export any trained model family as a direct Verilog-A n-port:
 
@@ -2508,6 +2517,298 @@ python3 surrogate.py --model dnn export-ads-ann \
 The ADS ANN export writes a portable package plus `train_ads_ann.py`; run that
 script with ADS Python on the ADS machine to produce the native `.inc`, `.c`,
 `.equation`, `.struc`, and `.scale` artifacts.
+
+### Native ADS ANN: Detailed ADS Integration
+
+This section describes `export-ads-ann`, not the sampled-MDIF or
+`export-ads-hb` paths. Native ADS ANN export is available for DNN and KBNN. It
+creates an ANN evaluator, but it does not automatically create an electrical
+N-port symbol. ADS still needs a wrapper that maps inputs, reconstructs complex
+S-parameters, and stamps port currents. Keysight documents SDD and FDD
+components as the electrical stimulus/response shells for an ANN equation.
+
+#### 1. Understand What Is Retrained
+
+The local model supplies the selected parameter names, frequency transform,
+S-parameter order, activation, and an initial architecture choice. The ADS-side
+script converts every positive-frequency MDIF row into one supervised ANN row:
+
+$$
+\mathbf{x}=
+\left[p_1,\ldots,p_d,\phi_1(f),\ldots,\phi_k(f)\right]
+$$
+
+$$
+\mathbf{y}=
+\left[
+\Re S_{11},\ldots,\Re S_{NN},
+\Im S_{11},\ldots,\Im S_{NN}
+\right].
+$$
+
+`train_ads_ann.py` then trains a new network through `keysight.ads.ann`. It does
+not load the weights in `model.npz`. The ADS ANN API uses one common neuron
+count for all hidden layers; a nonuniform local architecture is approximated
+unless `--ads-hidden-layers` and `--ads-neurons-per-layer` are specified.
+Local per-S-parameter/frequency weights, passivity enforcement, and reciprocity
+projection are not transferred automatically to this retrained network.
+
+Exact-zero-Hz rows are intentionally excluded. The native ADS ANN package is
+an RF evaluator and does not include the locally extracted distinct DC model.
+
+#### 2. Generate the Portable Package
+
+For a DNN:
+
+```bash
+python3 surrogate.py --model dnn export-ads-ann \
+  --mdif train_verify.mdif \
+  --model-dir outputs/dnn_model \
+  --out-dir outputs/dnn_ads_ann \
+  --ads-hidden-layers 3 \
+  --ads-neurons-per-layer 128 \
+  --ads-iterations 1000 \
+  --ads-output-format all
+```
+
+For the simplest KBNN component, request final fine S-parameters:
+
+```bash
+python3 surrogate.py --model kbnn export-ads-ann \
+  --mdif fine_train_verify.mdif \
+  --coarse-mdif coarse_train_verify.mdif \
+  --model-dir outputs/kbnn_model \
+  --out-dir outputs/kbnn_ads_ann \
+  --ads-ann-target fine \
+  --ads-iterations 1000 \
+  --ads-output-format all
+```
+
+The KBNN default, `--ads-ann-target native`, preserves a residual target. That
+form requires the ADS wrapper to evaluate the matching coarse model and add
+$\Delta\mathbf S$ at the same parameter/frequency point. Use `fine` unless that
+additional integration complexity is intentional.
+
+Copy the complete output directory to the ADS computer, for example:
+
+```text
+my_workspace_wrk/
+  models/
+    dnn_ads_ann/
+      ads_ann_manifest.json
+      ads_ann_training.csv
+      ads_ann_verification.csv
+      train_ads_ann.py
+      ADS_ANN_README.md
+```
+
+The package may live under `models/`; it does not need to be put in the ADS
+workspace `data/` directory.
+
+#### 3. Run the ADS ANN Extraction
+
+The Python interpreter and ANN module must come from the same ADS installation
+used for simulation. Keysight's ADS 2025 release notes state that the ANN Python
+API requires a Harmonic Balance license.
+
+From the package directory, use the ADS-bundled interpreter:
+
+Windows:
+
+```text
+"%HPEESOF_DIR%/tools/python/python.exe" train_ads_ann.py
+```
+
+Linux:
+
+```text
+"$HPEESOF_DIR/tools/python/bin/python3" train_ads_ann.py
+```
+
+With VS Code and ADS Python Utilities, configure the ADS interpreter, open
+`train_ads_ann.py`, and invoke the extension command
+`keysight-technologies.ael-debug.runPythonScript` (its visible label can vary by
+extension release). The script changes its working directory to the package
+directory, so generated files remain together.
+
+Expected output with `--ads-output-format all`:
+
+| File | Role |
+| --- | --- |
+| `<prefix>.equation` | Text ANN equations; recommended for the first transparent SDD/FDD integration. |
+| `<prefix>.inc` | Verilog-A-oriented ANN evaluator. Inspect it before use because the installed ADS release determines whether it is a complete module or a fragment. |
+| `<prefix>.struc`, `<prefix>.scale` | Native ANN structure and scaling used by ADS ANN simulation APIs; these are not `NetlistInclude` files. |
+| `<prefix>.c` | C-oriented model source for advanced compiled-model development. |
+| `ads_ann_training_fit.csv` | ADS ANN results on training rows. |
+| `ads_ann_verification_prediction.csv` | ADS ANN truth/prediction comparison for held-out rows. |
+
+Do not start schematic integration until the native verification CSV is
+acceptable. If it is already wrong there, change ADS ANN training settings;
+the wrapper is not the cause.
+
+#### 4. Read the Manifest as an Interface Contract
+
+Open `ads_ann_manifest.json`. The order in `input_columns`, `output_columns`,
+`parameter_names`, and `sparam_labels` is mandatory.
+
+Typical DNN inputs are:
+
+```text
+[W, L, freq_log10_hz]
+```
+
+or, for `log-linear`:
+
+```text
+[W, L, freq_log10_hz, freq_hz]
+```
+
+Map frequency features as:
+
+$$
+f_{\mathrm{linear}}=f_{\mathrm{ADS}}\quad\text{in Hz},
+\qquad
+f_{\log}=\log_{10}\!\left(\max(f_{\mathrm{ADS}},1\ \mathrm{Hz})\right).
+$$
+
+The training CSV stores parsed SI values. If the ADS instance parameter is
+entered as `W=500um`, map `W_model=W`, which ADS evaluates as `0.0005`. If the
+symbol intentionally exposes a unitless `W_um=500`, map
+`W_model=W_um*1e-6`. Passing the bare value `500` to an ANN trained on
+`0.0005` produces an extreme extrapolation.
+
+Output columns always place every real component before every imaginary
+component. Reconstruct each value explicitly:
+
+$$
+S_{ij}=S_{ij,\mathrm{real}}+jS_{ij,\mathrm{imag}}.
+$$
+
+Do not infer output ordering from the visual port layout.
+
+#### 5. Build the Electrical Wrapper Cell
+
+1. In the normal ADS library, create a cell such as `dnn_ann_nport` with a
+   schematic and symbol.
+2. Add one electrical pin per S-parameter port. Match the port numbering in
+   `sparam_labels`.
+3. Add one symbol/design parameter per `parameter_names` entry. These must be
+   instance parameters, not fixed global values.
+4. Use Component Search to place the matching N-port **Symbolically Defined
+   Device (SDD)**. Palette locations vary across ADS releases.
+5. Bring `<prefix>.equation` into the wrapper using the equation or netlist
+   inclusion mechanism supported by the installed release. Map the generated
+   ANN formal inputs to the manifest inputs in order. Rename ANN tokens before
+   using the SDD `_v1`, `_i1`, ... variables; an ANN `_v1` token is not
+   automatically electrical port 1.
+6. Reconstruct the complex S-matrix. For native residual KBNN, first calculate
+   $\mathbf S_{\mathrm{fine}}=\mathbf S_{\mathrm{coarse}}+\Delta\mathbf S$.
+7. Convert S to the wrapper's admittance matrix:
+
+   $$
+   \mathbf Y(f,\mathbf p)=
+   \frac{1}{Z_0}
+   \left(\mathbf I-\mathbf S(f,\mathbf p)\right)
+   \left(\mathbf I+\mathbf S(f,\mathbf p)\right)^{-1}.
+   $$
+
+8. Define each SDD current using the corresponding row:
+
+   $$
+   I_i=\sum_{j=1}^{N}Y_{ij}V_j.
+   $$
+
+   ADS defines positive SDD current into the device. Do not place physical
+   $Z_0$ shunt resistors on the ports; $Z_0$ is the wave reference in the
+   conversion.
+9. Generate/update the symbol. Expose only the N electrical pins and intended
+   geometry/process parameters.
+
+For a two-port, these explicit equations are convenient for checking the
+matrix implementation:
+
+$$
+D=(1+S_{11})(1+S_{22})-S_{12}S_{21},
+$$
+
+$$
+Y_{11}=\frac{(1-S_{11})(1+S_{22})+S_{12}S_{21}}{Z_0D},
+\quad
+Y_{12}=\frac{-2S_{12}}{Z_0D},
+$$
+
+$$
+Y_{21}=\frac{-2S_{21}}{Z_0D},
+\quad
+Y_{22}=\frac{(1-S_{22})(1+S_{11})+S_{21}S_{12}}{Z_0D}.
+$$
+
+If $D$ is close to zero, inspect the ANN S-matrix and mapping before adding any
+stabilizing conductance. A wrong input scale or swapped output can look like an
+S-to-Y singularity.
+
+#### 6. Instantiate the Cell More Than Once
+
+Keep the ANN equations and current stamp inside the hierarchical wrapper. Each
+symbol instance can then pass independent parameter expressions:
+
+```text
+XANN1 W=420um L=1.10mm
+XANN2 W=610um L=1.40mm
+```
+
+Top-level `VAR` values can drive those parameters, for example `W_A`, `L_A`,
+`W_B`, and `L_B`. The ANN coefficient files are shared, while every instance
+evaluates them with its own input values.
+
+#### 7. Validate in This Order
+
+1. Compare `ads_ann_verification_prediction.csv` with its truth columns.
+2. At one verification geometry, expose and plot every reconstructed ANN
+   $S_{ij}$ before S-to-Y conversion.
+3. Run an isolated ADS SP simulation and compare every port pair with the source
+   MDIF at the same point.
+4. Repeat at parameter corners, interior verification points, and both RF
+   frequency limits.
+5. Recheck reciprocity and the largest singular value; ADS retraining does not
+   inherit local structural enforcement.
+6. Instantiate two copies at different parameter values and confirm that the
+   responses differ.
+7. Only then place the wrapper in the larger circuit or optimizer.
+
+For HB, use `export-ads-hb` rather than assuming the SP-oriented ANN wrapper is
+complete. The dedicated HB export evaluates each spectral frequency, provides
+negative-frequency conjugation, and carries the separate DC network.
+
+#### Common Problems
+
+| Symptom | Likely first check |
+| --- | --- |
+| `keysight.ads.ann` import fails | Wrong Python interpreter, mismatched ADS installation, or missing required license. |
+| Native verification CSV is inaccurate | ADS ANN architecture, optimizer, iteration count, or tolerance. |
+| Native CSV is accurate but ADS SP is wrong | Manifest input order, SI scaling, frequency transform, S-port order, or real/imaginary reconstruction. |
+| Response is constant with frequency | The wrapper is not using the simulator frequency or mapped the wrong frequency feature. |
+| S12 and S21 appear swapped | `sparam_labels` and real-then-imaginary output ordering. |
+| Multiple instances give the same response | Geometry values were fixed globally instead of passed through cell instance parameters. |
+| DC is open or incorrect | Expected for native ANN export; use sampled MDIF, Verilog-A, or ADS HB export for the saved separate DC model. |
+| HB differs from SP | Use the purpose-built `export-ads-hb` package. |
+
+The generated `ADS_ANN_README.md` carries this same implementation checklist
+with the package's actual input/output names and output prefix.
+
+Keysight implementation references:
+
+- [Measurement-Based Artificial Neural Network Simulation Models for RF Power Amplifiers](https://www.keysight.com/us/en/assets/3124-1550/application-notes/Measurement-Based-Artificial-Neural-Network-Simulation-Models-for-RF-Power-Amplifiers.pdf)
+- [Adapting an ANN Model to an RF Simulation](https://www.youtube.com/watch?v=mWkHV1wfzFs)
+- [Using the ANN Model for Advanced Emulation](https://www.keysight.com/us/en/assets/3123-1787/how-to-videos/Using-the-ANN-model-for-Advanced-Emulation.html)
+
+Reference status: this repository documentation was checked in reference-only
+mode because the development machine did not contain a licensed ADS
+installation or its `doc/ann` tree. The API calls match the documented ADS 2026
+Update 2.1 paths already used by the generated script and the linked official
+Keysight material. Before production use, compare the emitted `.equation` and
+`.inc` contracts with the same ANN examples/reference pages in the installed
+ADS release.
 
 ### Choose the ADS Handoff
 
@@ -2861,6 +3162,8 @@ python3 surrogate.py --model dnn train \
 Outputs:
 
 - `model.npz` and `metadata.json`: trained DNN model
+- `ads_export_template.mdif`: all fitted parameter/frequency blocks for a
+  direct sampled-MDIF export; S values are zero placeholders
 - `predicted_verification.mdif`: model predictions at verification points
 - `verification_metrics.csv`: per-block and per-S-parameter errors, including EVM
 - `verification_summary.json`: global error, passivity summary, and plot paths
@@ -3189,15 +3492,18 @@ grid. Placeholder S-parameter columns are acceptable; their values are ignored.
 After training, export a parameterized S-parameter table that ADS can use
 directly through an MDIF-capable data-based n-port or data access component.
 
-The safest export is template driven: provide an MDIF containing the exact
-geometry `VAR`s and frequency grids you want available in ADS. Placeholder
-S-parameter values are accepted and ignored.
+The safest export is template driven. Training creates
+`dnn_model/ads_export_template.mdif` from all training and verification blocks,
+with only the actual model parameters retained as `VAR`s. Its zero placeholder
+S-parameter values are ignored by the exporter. If neither `--template-mdif`
+nor `--parameter-grid` is supplied, this model-directory template is selected
+automatically.
 
 ```bash
 python3 surrogate.py --model dnn export-ads-mdif \
   --model-dir dnn_model \
   --out-dir ads_export \
-  --template-mdif ads_sweep_template.mdif
+  --template-mdif dnn_model/ads_export_template.mdif
 ```
 
 You can also generate a rectangular parameter/frequency grid directly:
@@ -3471,7 +3777,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--out-mdif PATH</code></nobr> | <code>predict</code> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 | <nobr><code>--output-name NAME</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Output MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name dnn_ads.mdif</code></nobr> |
 | <nobr><code>--output-prefix NAME</code></nobr> | <code>export-ads-ann</code> | Prefix for native ADS ANN outputs such as `.inc`, `.c`, `.equation`, `.scale`, and `.struc`. Default: `dnn_ads_ann`. | <nobr><code>--output-prefix dnn_filter_ann</code></nobr> |
-| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. S-parameter values are ignored. Use this when you already know the ADS optimization grid. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. S-parameter values are ignored. Training generates <code>MODEL_DIR/ads_export_template.mdif</code> from all fitted blocks. | <nobr><code>--template-mdif dnn_model/ads_export_template.mdif</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
 
 ##### Data selection and loss weighting
@@ -3665,6 +3971,8 @@ python3 surrogate.py --model kbnn train \
 Outputs:
 
 - `model.npz` and `metadata.json`: trained fine KBNN/correction network
+- `ads_export_template.mdif`: all fine-data parameter/frequency blocks for a
+  direct sampled-MDIF export; S values are zero placeholders
 - `coarse_model/model.npz` and `coarse_model/metadata.json`: fitted frozen
   coarse S-domain DNN
 - `coarse_model/`: the coarse model's training history, verification metrics,
@@ -3939,15 +4247,18 @@ directly through an MDIF-capable data-based n-port or data access component.
 For residual and prior-input KBNNs, the frozen fitted coarse DNN is evaluated
 during export; ADS only needs the final exported fine-response MDIF.
 
-The safest export is template driven: provide an MDIF containing the exact
-geometry `VAR`s and frequency grids you want available in ADS. Placeholder
-fine S-parameter values are accepted and ignored.
+The safest export is template driven. Training creates
+`kbnn_model/ads_export_template.mdif` from all fine-data training and
+verification blocks; it never uses coarse-model blocks as the exported grid.
+The zero placeholder S-parameter values are ignored by the exporter. If neither
+`--template-mdif` nor `--parameter-grid` is supplied, this template is selected
+automatically.
 
 ```bash
 python3 surrogate.py --model kbnn export-ads-mdif \
   --model-dir kbnn_model \
   --out-dir ads_export \
-  --template-mdif ads_sweep_template.mdif
+  --template-mdif kbnn_model/ads_export_template.mdif
 ```
 
 You can also generate a rectangular parameter/frequency grid directly. The
@@ -4200,7 +4511,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--out-mdif PATH</code></nobr> | <code>predict</code> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 | <nobr><code>--output-name NAME</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Output MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name kbnn_ads.mdif</code></nobr> |
 | <nobr><code>--output-prefix NAME</code></nobr> | <code>export-ads-ann</code> | Prefix for native ADS ANN outputs such as `.inc`, `.c`, `.equation`, `.scale`, and `.struc`. Default: `kbnn_ads_ann`. | <nobr><code>--output-prefix kbnn_filter_ann</code></nobr> |
-| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact geometry and frequency blocks to evaluate for ADS. Fine S-parameter values are ignored. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional. MDIF containing the exact fine-data geometry and frequency blocks to evaluate for ADS. Fine S-parameter values are ignored. Training generates <code>MODEL_DIR/ads_export_template.mdif</code>. | <nobr><code>--template-mdif kbnn_model/ads_export_template.mdif</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Optional separate fine/target verification MDIF. When supplied, all blocks in `--mdif` are training blocks. | <nobr><code>--verification-mdif fine_verify.mdif</code></nobr> |
 
 ##### Data selection and loss weighting
@@ -4388,6 +4699,8 @@ Outputs:
 
 - `model.npz` and `metadata.json`: trained Neuro-TF model plus rational-stage,
   conditioning, reciprocity, and pre/post-contraction passivity diagnostics
+- `ads_export_template.mdif`: all fitted parameter/frequency blocks for a
+  direct sampled-MDIF export; S values are zero placeholders
 - `training_summary.md`: settings, metrics, plot links, and copyable
   self-contained Verilog-A and sampled ADS MDIF export commands
 - `predicted_verification.mdif`: model predictions at verification points
@@ -4600,13 +4913,15 @@ frequency blocks of a template MDIF or an explicit parameter/frequency grid:
 python3 surrogate.py --model neuro-tf export-ads-mdif \
   --model-dir neuro_tf_model \
   --out-dir neuro_tf_ads_export \
-  --template-mdif ads_sweep_template.mdif
+  --template-mdif neuro_tf_model/ads_export_template.mdif
 ```
 
 The command writes `surrogate_ads.mdif`, `ads_model_manifest.json`, and
 `ADS_README.md`. The template's S-parameter values are ignored; only its
-parameter blocks and frequency grids are used. Instead of `--template-mdif`,
-repeat `--parameter-grid` once for each model parameter and supply `--freqs`.
+parameter blocks and frequency grids are used. Omit `--template-mdif` to use
+`neuro_tf_model/ads_export_template.mdif` automatically. To request a different
+rectangular grid, repeat `--parameter-grid` once for each model parameter and
+supply `--freqs`.
 
 #### ADS Note
 
@@ -4631,7 +4946,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--out-dir PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Destination directory for the model, sweep, or export artifacts generated by the selected command. | <nobr><code>--out-dir neuro_tf_model</code></nobr> |
 | <nobr><code>--out-mdif PATH</code></nobr> | <code>predict</code> | Required. Output MDIF containing predicted S-parameters. | <nobr><code>--out-mdif predicted.mdif</code></nobr> |
 | <nobr><code>--output-name NAME</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Exported MDIF file name. Default: `surrogate_ads.mdif`. | <nobr><code>--output-name neuro_tf_ads.mdif</code></nobr> |
-| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | MDIF whose parameter/frequency blocks define the export sampling grid. Mutually exclusive in practice with the explicit-grid form. | <nobr><code>--template-mdif ads_sweep_template.mdif</code></nobr> |
+| <nobr><code>--template-mdif PATH</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | MDIF whose parameter/frequency blocks define the export sampling grid. Training generates <code>MODEL_DIR/ads_export_template.mdif</code>. Mutually exclusive in practice with the explicit-grid form. | <nobr><code>--template-mdif neuro_tf_model/ads_export_template.mdif</code></nobr> |
 | <nobr><code>--verification-mdif PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Optional. Separate MDIF containing verification blocks. When supplied, every block in `--mdif` is treated as training data and every block in this file is treated as verification data. | <nobr><code>--verification-mdif verify.mdif</code></nobr> |
 
 ##### Data selection and loss weighting
@@ -6241,7 +6556,7 @@ examples, although hyphenated keys are accepted too.
 | `--model MODEL optimize` | Run adaptive, grid, or random hyperparameter trials and promote the best completed model. `sweep` is an alias. | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --max-trials 24` |
 | `--model {dnn,kbnn} rerank-sweep` | Re-rank saved DNN/KBNN trial summaries without rerunning the trials. | `python3 surrogate.py --model dnn rerank-sweep --sweep-dir dnn_opt --selection-metric evm_pct --require-passive` |
 | `--model MODEL predict` | Evaluate a frozen model on the geometry and frequency blocks in another MDIF. | `python3 surrogate.py --model dnn predict --model-dir dnn_model --mdif request.mdif --out-mdif predicted.mdif` |
-| `--model MODEL export-ads-mdif` | Sample a frozen model into a parameterized ADS-ready MDIF. `export-ads` is an alias. | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_model --out-dir ads_mdif --template-mdif template.mdif` |
+| `--model MODEL export-ads-mdif` | Sample a frozen model into a parameterized ADS-ready MDIF. `export-ads` is an alias. | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_model --out-dir ads_mdif --template-mdif dnn_model/ads_export_template.mdif` |
 | `--model {dnn,kbnn} export-ads-ann` | Create a package that retrains/extracts a native ADS ANN model on a licensed ADS installation. | `python3 surrogate.py --model dnn export-ads-ann --mdif train_verify.mdif --model-dir dnn_model --out-dir ads_ann` |
 | `--model MODEL export-ads-hb` | Export a self-contained linear ADS SDD network intended for HB as well as small-signal use. | `python3 surrogate.py --model dnn export-ads-hb --model-dir dnn_model --out-dir ads_hb --module-name my_model --parameter-input-scales 1um` |
 | `--model MODEL export-veriloga` | Export the frozen model as a self-contained Verilog-A N-port. | `python3 surrogate.py --model dnn export-veriloga --model-dir dnn_model --out-dir veriloga --module-name my_model --parameter-input-scales 1um` |
@@ -6560,7 +6875,7 @@ all S-parameters.
 | `--parameter-grid NAME=SPEC` | All-model `export-ads-mdif` | Repeat once per model parameter; values are a comma list or `start:stop:count`. | `--parameter-grid W=0.4mm:0.8mm:9`  | `models.MODEL.commands.export-ads-mdif.parameter_grid` |
 | `--parameter-input-scales SCALE` | All-model HB/VA export | One positive ADS-side denominator applied to every parameter: `model_value=instance_value/scale`. Default: `1.0`. | `--parameter-input-scales 1um`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.parameter_input_scales` |
 | `--split-var NAME` | All-model `inspect-mdif` | Split variable summarized by inspection. Default: `dataset`. | `--split-var dataset`  | `models.MODEL.commands.inspect-mdif.split_var` |
-| `--template-mdif PATH` | All-model `export-ads-mdif` | Supplies exact parameter/frequency blocks; its S values are ignored. Alternative to an explicit grid. | `--template-mdif template.mdif`  | `models.MODEL.commands.export-ads-mdif.template_mdif` |
+| `--template-mdif PATH` | All-model `export-ads-mdif` | Supplies exact parameter/frequency blocks; its S values are ignored. Every fit generates `MODEL_DIR/ads_export_template.mdif`, which is auto-selected if both this option and `--parameter-grid` are omitted. Provide another file only for a different grid. | `--template-mdif dnn_model/ads_export_template.mdif`  | `models.MODEL.commands.export-ads-mdif.template_mdif` |
 | `--z0 FLOAT` | All-model HB/VA export | S reference impedance for conversion/stamping. Default: `50`. | `--z0 50`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.z0` |
 
 #### DNN export-only options
@@ -6644,7 +6959,7 @@ on the primary entry point:
 | Add points | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --existing-mdif train_verify.mdif --count 8 --out additions.csv --combined-out additions_training_geometries.csv` |
 | Next GP round | `python3 surrogate.py points suggest-additional --fit-dir dnn_refit --existing-points additions_training_geometries.csv --count 6 --out additions_round_2.csv` |
 | Refit | `python3 surrogate.py --model dnn train --mdif updated_train_verify.mdif --out-dir dnn_final --hidden-layers 128,128,64 --activation tanh --learning-rate 0.001` |
-| Export sampled MDIF | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_final --out-dir exports/mdif --template-mdif ads_template.mdif` |
+| Export sampled MDIF | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_final --out-dir exports/mdif --template-mdif dnn_final/ads_export_template.mdif` |
 | Export HB SDD | `python3 surrogate.py --model dnn export-ads-hb --model-dir dnn_final --out-dir exports/hb --module-name filter_hb --parameter-input-scales 1um` |
 | Export Verilog-A | `python3 surrogate.py --model dnn export-veriloga --model-dir dnn_final --out-dir exports/va --module-name filter_va --parameter-input-scales 1um` |
 

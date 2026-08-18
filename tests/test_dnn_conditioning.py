@@ -207,6 +207,16 @@ class DNNConditioningTests(unittest.TestCase):
                 (model_dir / "verification_summary.json").read_text()
             )
             metadata = json.loads((model_dir / "metadata.json").read_text())
+            export_template = read_mdif(model_dir / "ads_export_template.mdif")
+            self.assertEqual(len(export_template), len(blocks))
+            self.assertEqual(metadata["ads_export_template"]["block_count"], len(blocks))
+            for block in export_template:
+                self.assertEqual(set(block.params), {"x"})
+                for values in block.sparams.values():
+                    np.testing.assert_array_equal(
+                        values,
+                        np.zeros(values.shape, dtype=complex),
+                    )
             self.assertLess(float(summary["rmse_abs"]), 0.1)
             self.assertEqual(summary["passivity"]["violating_points"], 0)
             self.assertLessEqual(

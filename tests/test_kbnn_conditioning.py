@@ -12,6 +12,7 @@ from surrogate_common import (
     MDIFBlock,
     MLP,
     Standardizer,
+    read_mdif,
     write_ads_hb_mlp_package,
     write_mdif,
     write_veriloga_package,
@@ -317,6 +318,19 @@ class KBNNConditioningTests(unittest.TestCase):
                 self.assertEqual(kbnn.command_train(args), 0)
 
             metadata = json.loads((model_dir / "metadata.json").read_text())
+            export_template = read_mdif(model_dir / "ads_export_template.mdif")
+            self.assertEqual(len(export_template), len(fine_blocks))
+            self.assertEqual(
+                metadata["ads_export_template"]["block_count"],
+                len(fine_blocks),
+            )
+            for block in export_template:
+                self.assertEqual(set(block.params), {"x"})
+                for values in block.sparams.values():
+                    np.testing.assert_array_equal(
+                        values,
+                        np.zeros(values.shape, dtype=complex),
+                    )
             summary = json.loads(
                 (model_dir / "verification_summary.json").read_text()
             )

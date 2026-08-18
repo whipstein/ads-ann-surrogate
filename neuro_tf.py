@@ -764,11 +764,11 @@ def command_sweep(args: argparse.Namespace) -> int:
     if status == 0:
         update_training_export_commands(
             best_dir / "training_summary.md",
-            neurotf_export_commands(best_dir, args.mdif),
+            neurotf_export_commands(best_dir, dc_mdif=args.mdif),
         )
         update_training_export_commands(
             Path(args.out_dir) / "neurotf_sweep_summary.md",
-            neurotf_export_commands(best_dir, args.mdif),
+            neurotf_export_commands(best_dir, dc_mdif=args.mdif),
         )
     return status
 
@@ -776,6 +776,8 @@ def command_sweep(args: argparse.Namespace) -> int:
 def neurotf_export_commands(
     model_dir: Path,
     template_mdif: str | Path | None = None,
+    *,
+    dc_mdif: str | Path | None = None,
 ) -> list[tuple[str, str]]:
     """Build runnable direct-Verilog-A and sampled-MDIF Neuro-TF commands."""
 
@@ -783,6 +785,7 @@ def neurotf_export_commands(
         Path(__file__),
         model_dir,
         template_mdif,
+        dc_mdif=dc_mdif,
         include_veriloga=True,
         model_type="neuro-tf",
     )
@@ -1125,6 +1128,13 @@ def command_train(args: argparse.Namespace) -> int:
         **dc_metadata,
         "dc_model_history_rows": len(dc_history),
     }
+    template_path = out_dir / ADS_EXPORT_TEMPLATE_FILENAME
+    metadata["ads_export_template"] = write_ads_export_template(
+        template_path,
+        split_data.all_blocks,
+        parameter_names,
+        sparam_labels,
+    )
     model.save(
         out_dir,
         metadata=metadata,
@@ -1313,7 +1323,7 @@ def command_train(args: argparse.Namespace) -> int:
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
-    export_commands = neurotf_export_commands(out_dir, args.mdif)
+    export_commands = neurotf_export_commands(out_dir, dc_mdif=args.mdif)
     write_training_markdown(
         out_dir / "training_summary.md",
         model_kind="Neuro-TF",
@@ -1327,6 +1337,7 @@ def command_train(args: argparse.Namespace) -> int:
         print(json.dumps({
             "out_dir": str(out_dir),
             "training_summary": str(out_dir / "training_summary.md"),
+            "ads_export_template": str(template_path),
             "training_blocks": len(train_blocks),
             "verification_blocks": len(verify_blocks),
             "parameters": parameter_names,
@@ -1391,6 +1402,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         freqs_spec=args.freqs,
         parameter_names=model.parameter_names,
         sparam_labels=model.sparam_labels,
+        model_dir=model_dir,
     )
     pred_blocks = model.predict_blocks(blocks)
     write_mdif(out_dir / mdif_name, pred_blocks, model.sparam_labels)

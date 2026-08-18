@@ -31,6 +31,7 @@ from cli_options import (
     parse_args_with_options_json,
 )
 from surrogate_common import (  # noqa: E402
+    ADS_EXPORT_TEMPLATE_FILENAME,
     EPS,
     DEFAULT_DC_OPEN_RESISTANCE_OHM,
     DEFAULT_DC_OPEN_THRESHOLD_OHM,
@@ -106,6 +107,7 @@ from surrogate_common import (  # noqa: E402
     verification_metrics,
     write_training_verification_artifacts,
     write_ads_ann_package,
+    write_ads_export_template,
     write_ads_export_package,
     write_csv,
     write_history,
@@ -1026,6 +1028,8 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
 def dnn_export_commands(
     model_dir: Path,
     template_mdif: str | Path | None = None,
+    *,
+    dc_mdif: str | Path | None = None,
 ) -> list[tuple[str, str]]:
     """Build runnable export commands for a fitted DNN report."""
 
@@ -1033,6 +1037,7 @@ def dnn_export_commands(
         Path(__file__),
         model_dir,
         template_mdif,
+        dc_mdif=dc_mdif,
         include_veriloga=True,
         model_type="dnn",
     )
@@ -1071,6 +1076,14 @@ def command_train(args: argparse.Namespace) -> int:
     model, verify_blocks, parameter_names, labels, history, dc_history, metadata = train_model(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _, _, all_blocks = split_data(args)
+    template_path = out_dir / ADS_EXPORT_TEMPLATE_FILENAME
+    metadata["ads_export_template"] = write_ads_export_template(
+        template_path,
+        all_blocks,
+        parameter_names,
+        labels,
+    )
     model.save(out_dir, metadata=metadata)
     write_history(
         out_dir / "dc_training_history.csv",
@@ -1257,7 +1270,7 @@ def command_train(args: argparse.Namespace) -> int:
         (out_dir / "verification_summary.json").write_text(
             json.dumps(summary, indent=2)
         )
-    export_commands = dnn_export_commands(out_dir, args.mdif)
+    export_commands = dnn_export_commands(out_dir, dc_mdif=args.mdif)
     write_training_markdown(
         out_dir / "training_summary.md",
         model_kind="DNN",
@@ -1271,6 +1284,7 @@ def command_train(args: argparse.Namespace) -> int:
         print(json.dumps({
             "out_dir": str(out_dir),
             "training_summary": str(out_dir / "training_summary.md"),
+            "ads_export_template": str(template_path),
             "parameters": parameter_names,
             "sparameters": labels,
             "freq_transform": model.freq_transform,
@@ -1345,6 +1359,7 @@ def command_export_ads(args: argparse.Namespace) -> int:
         freqs_spec=args.freqs,
         parameter_names=model.parameter_names,
         sparam_labels=model.sparam_labels,
+        model_dir=model_dir,
     )
     pred_blocks = model.predict_blocks(blocks)
     write_mdif(out_dir / mdif_name, pred_blocks, model.sparam_labels)
@@ -2161,11 +2176,11 @@ def command_sweep(args: argparse.Namespace) -> int:
     if status == 0:
         update_training_export_commands(
             best_dir / "training_summary.md",
-            dnn_export_commands(best_dir, args.mdif),
+            dnn_export_commands(best_dir, dc_mdif=args.mdif),
         )
         update_training_export_commands(
             Path(args.out_dir) / "dnn_sweep_summary.md",
-            dnn_export_commands(best_dir, args.mdif),
+            dnn_export_commands(best_dir, dc_mdif=args.mdif),
         )
     return status
 
