@@ -168,6 +168,8 @@ def starter_options_payload() -> dict[str, object]:
                 "inspect-mdif": {"mdif": None},
                 "predict": {"mdif": None},
                 "export-ads-ann": {
+                    "dc_mdif": None,
+                    "include_dc": True,
                     "mdif": None,
                     "module_name": None,
                     "parameter_input_scales": 1.0,
@@ -911,6 +913,12 @@ _SKIP = object()
 def _coerce_default(action: argparse.Action, value: object) -> object:
     if value is None:
         return _SKIP
+    if isinstance(action, argparse.BooleanOptionalAction):
+        if not isinstance(value, bool):
+            raise OptionsJSONError(
+                f"{action.option_strings[0]} expects true or false in JSON"
+            )
+        return value
     if isinstance(action, argparse._StoreTrueAction):
         if not isinstance(value, bool):
             raise OptionsJSONError(

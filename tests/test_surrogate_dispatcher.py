@@ -410,6 +410,10 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertIn("ads_qt_runtime.py", (out_dir / "ADS_ANN_README.md").read_text())
             setup_source = (out_dir / "ADS_SDD_SETUP.md").read_text()
             self.assertIn("Preferred: Automatic NetlistInclude/SDD Flow", setup_source)
+            self.assertIn("## Manual Schematic Fallback", setup_source)
+            for step in range(1, 6):
+                self.assertIn(f"### {step}.", setup_source)
+                self.assertNotIn(f"\n## {step}.", setup_source)
             self.assertIn("Parameter Entry Mode", setup_source)
             self.assertIn("if (freq equals 0) then 0.0 else Y11 endif", setup_source)
             self.assertIn("`ann_in_1`", setup_source)
@@ -418,9 +422,23 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertEqual(manifest["sdd_setup_guide"], "ADS_SDD_SETUP.md")
             self.assertTrue(manifest["ads_netlist"]["enabled"])
             self.assertEqual(manifest["ads_netlist"]["nports"], 1)
+            self.assertEqual(
+                manifest["ads_netlist"]["parameter_ranges"]["W"],
+                {
+                    "model_min": 0.5e-3,
+                    "model_max": 0.5e-3,
+                    "instance_min": 0.5e-3,
+                    "instance_max": 0.5e-3,
+                },
+            )
             template_path = out_dir / manifest["ads_netlist"]["netlist_template_file"]
             self.assertTrue(template_path.is_file())
-            self.assertTrue((out_dir / "ADS_ANN_INSTANCE_TEMPLATE.txt").is_file())
+            instance_template_path = out_dir / "ADS_ANN_INSTANCE_TEMPLATE.txt"
+            self.assertTrue(instance_template_path.is_file())
+            instance_template = instance_template_path.read_text()
+            self.assertIn("W=ann_sweep_W", instance_template)
+            self.assertIn("sweep the exact", instance_template)
+            self.assertIn("W=W_A", instance_template)
             netlist_template = template_path.read_text()
             self.assertEqual(netlist_template.count(ADS_ANN_NETLIST_PLACEHOLDER), 1)
             self.assertIn("SDD:test_ann_sdd_core_rf", netlist_template)
@@ -484,6 +502,43 @@ class SurrogateDispatcherTests(unittest.TestCase):
         self.assertIn("I[4,17]=_v4", template)
         self.assertIn("if (freq equals 0) then 0.0 else", template)
         self.assertIn("native_ann_4port_stoy_y_3_3", template)
+
+    def test_ads_ann_netlist_uses_separate_geometry_dependent_exact_dc(self) -> None:
+        dc_model = {
+            "kind": "geometry_dependent_exact_dc_full_y_mlp",
+            "representation": "full_y_matrix",
+            "parameter_names": ["W"],
+            "sparam_labels": ["S11"],
+            "activation": "tanh",
+            "layer_sizes": [1, 1],
+            "weights": [np.asarray([[0.25]])],
+            "biases": [np.asarray([0.0])],
+            "x_mean": np.asarray([10.0]),
+            "x_std": np.asarray([2.0]),
+            "y_mean": np.asarray([0.02]),
+            "y_std": np.asarray([0.005]),
+        }
+        template, contract = ads_ann_netlist_template(
+            input_columns=["W", "freq_hz"],
+            output_columns=["fine_S11_real", "fine_S11_imag"],
+            parameter_names=["W"],
+            sparam_labels=["S11"],
+            module_name="native_ann_dc",
+            z0=50.0,
+            parameter_input_scales={"W": 1.0e-6},
+            parameter_model_defaults=[10.0],
+            dc_model=dc_model,
+        )
+
+        self.assertFalse(contract["rf_only"])
+        self.assertEqual(
+            contract["dc_behavior"],
+            "separate_geometry_dependent_exact_dc_model",
+        )
+        self.assertIn("SDD:native_ann_dc_core_rf", template)
+        self.assertIn("SDD:native_ann_dc_core_dc", template)
+        self.assertIn("if (freq equals 0) then native_ann_dc_dc_net_out0", template)
+        self.assertIn("else 0.0 endif", template)
 
     def test_ads_ann_netlist_rejects_residual_or_coarse_interface(self) -> None:
         with self.assertRaisesRegex(ValueError, "final fine"):

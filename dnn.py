@@ -1469,6 +1469,52 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             )
     else:
         labels = common_sparameter_labels(all_blocks)
+    export_dc_model: DCConductanceModel | None = None
+    dc_metadata: dict[str, object] = {"dc_mdif_action": "disabled"}
+    if args.include_dc:
+        if args.model_dir:
+            saved_model = DNN.load(Path(args.model_dir))
+            if saved_model.parameter_names != list(parameter_names):
+                raise ValueError(
+                    "The saved DNN parameter order does not match the ADS ANN training data"
+                )
+            if saved_model.sparam_labels != list(labels):
+                raise ValueError(
+                    "The saved DNN S-parameter order does not match the ADS ANN training data"
+                )
+            dc_args = argparse.Namespace(**vars(args))
+            if saved_model.dc_model is None and not dc_args.dc_mdif:
+                dc_args.dc_mdif = args.mdif
+            export_dc_model, dc_metadata = resolve_dnn_export_dc(
+                saved_model,
+                model_metadata,
+                dc_args,
+                float(args.z0),
+            )
+        else:
+            export_dc_model, dc_metadata = resolve_export_dc_conductance_model(
+                None,
+                {
+                    "split_var": args.split_var,
+                    "train_values": args.train_values,
+                    "verify_values": args.verify_values,
+                },
+                parameter_names,
+                labels,
+                dc_mdif=args.dc_mdif or args.mdif,
+                z0=float(args.z0),
+                port_paths=args.dc_port_paths,
+                open_threshold_ohm=args.dc_open_threshold,
+                open_resistance_ohm=args.dc_open_resistance,
+                activation=args.activation,
+                hidden_layers=parse_hidden_layers(args.hidden_layers),
+            )
+        if export_dc_model is None:
+            raise ValueError(
+                "ADS ANN DC export was requested, but no geometry-dependent exact-DC "
+                "model could be resolved. Supply exact-zero-Hz fitting data with "
+                "--dc-mdif/--mdif, or use --no-include-dc."
+            )
     train_blocks = positive_frequency_blocks(train_blocks, purpose="ADS ANN fitting")
     verify_blocks = (
         positive_frequency_blocks(verify_blocks, purpose="ADS ANN verification")
@@ -1537,6 +1583,8 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         parameter_names=parameter_names,
         sparam_labels=labels,
         target_description="Direct fine S-parameter response, stored as real columns followed by imaginary columns.",
+        dc_model=(export_dc_model.export_data() if export_dc_model is not None else None),
+        dc_metadata=dc_metadata,
         extra_manifest={
             "source_model_dir": args.model_dir,
             "source_mdif": args.mdif,
@@ -1558,7 +1606,12 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
             "The package records S-parameter weights in the manifest. ADS ANN's documented Python API does not expose direct per-output loss weights, so the included ADS training script does not apply those weights.",
             "Any source-model frequency weights are recorded in the manifest but are not applied because the documented ADS ANN API does not expose per-sample loss weights.",
             "The native ADS ANN output predicts fine S-parameter real/imaginary values directly.",
-            "Zero-Hz rows are excluded from ADS ANN fitting. Use the self-contained Verilog-A or sampled-MDIF export when the distinct saved DC resistance is required.",
+            (
+                "Zero-Hz rows are excluded from RF ANN fitting and are represented "
+                "only by the separate geometry-dependent DC branch."
+                if export_dc_model is not None
+                else "Zero-Hz rows are excluded from RF ANN fitting; this package was explicitly exported without a DC branch."
+            ),
         ],
     )
     print(json.dumps({
@@ -2678,7 +2731,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_ann.add_argument(
         "--parameter-input-scales",
         default="1.0",
-        help="One ADS-side input scale applied to every geometry parameter, such as 1.0 or 1um",
+        help=(
+            "One ADS-side denominator applied to every geometry parameter. Use "
+            "1.0 when MDIF values already carry engineering units (for example "
+            "500um); use 1um only for bare dimensionless micron counts."
+        ),
     )
     export_ann.add_argument(
         "--z0",
@@ -2686,6 +2743,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=50.0,
         help="S-parameter reference impedance used by the generated ANN SDD netlist",
     )
+    export_ann.add_argument(
+        "--include-dc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include the separate geometry-dependent exact-DC model in the "
+            "generated ANN netlist. Default: enabled. Use --no-include-dc for "
+            "an RF-only, open-at-DC package."
+        ),
+    )
+    add_dc_export_arguments(export_ann)
     export_ann.add_argument("--seed", type=int)
     export_ann.set_defaults(func=command_export_ads_ann)
 

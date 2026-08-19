@@ -43,6 +43,32 @@ def example_parser() -> argparse.ArgumentParser:
 
 
 class OptionsJSONTests(unittest.TestCase):
+    def test_boolean_optional_export_setting_preserves_json_false(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "dnn": {
+                            "commands": {
+                                "export-ads-ann": {
+                                    "include_dc": False,
+                                    "mdif": "training.mdif",
+                                    "out_dir": "ann_export",
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+            args = parse_args_with_options_json(
+                dnn.build_arg_parser(),
+                ["export-ads-ann", "--options-json", str(config)],
+                model="dnn",
+            )
+
+        self.assertIs(args.include_dc, False)
+
     def test_optimize_reuses_fit_compatible_train_settings_when_not_overridden(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.write_config(

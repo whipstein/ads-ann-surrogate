@@ -1694,8 +1694,9 @@ def ads_ann_netlist_template(
     z0: float,
     parameter_input_scales: dict[str, float],
     parameter_model_defaults: Sequence[float],
+    dc_model: dict[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
-    """Build an RF-only ADS ANN SDD subnetwork template.
+    """Build an ADS ANN SDD subnetwork with an optional distinct DC branch.
 
     ADS creates the fitted text formula only when ``train_ads_ann.py`` runs on
     the licensed machine.  This function emits the rest of the native ADS
@@ -1807,6 +1808,18 @@ def ads_ann_netlist_template(
         nports,
         float(z0),
     )
+    dc_matrix_names: list[str] | None = None
+    if dc_model is not None:
+        lines.append("")
+        lines.append("; Separate geometry-dependent exact-DC conductance model")
+        dc_matrix_names = _append_ads_hb_dc_conductance_model(
+            lines,
+            f"{module_id}_dc",
+            parameters,
+            labels,
+            parameter_features,
+            dc_model,
+        )
     lines.append("")
     _append_ads_hb_sdd(
         lines,
@@ -1814,6 +1827,7 @@ def ads_ann_netlist_template(
         [f"p{index}" for index in range(1, nports + 1)],
         y_names,
         "y",
+        dc_conductance_names=dc_matrix_names,
     )
     lines.extend([f"end {module_id}", ""])
     contract: dict[str, object] = {
@@ -1827,9 +1841,26 @@ def ads_ann_netlist_template(
         "parameter_scale_identifiers": scale_ids,
         "parameter_input_scales": dict(zip(parameters, scales)),
         "parameter_instance_defaults": dict(zip(parameters, instance_defaults)),
+        "parameter_value_relation": (
+            "model_value = ADS_instance_parameter / input_scale_parameter"
+        ),
+        "parameter_scaling_applies_to": [
+            "rf_ann_inputs",
+            *(["exact_dc_model_inputs"] if dc_model is not None else []),
+        ],
         "reference_impedance_ohm": float(z0),
-        "rf_only": True,
-        "dc_behavior": "open_at_exact_zero_hz",
+        "rf_only": dc_model is None,
+        "dc_behavior": (
+            "separate_geometry_dependent_exact_dc_model"
+            if dc_model is not None
+            else "open_at_exact_zero_hz"
+        ),
+        "dc_model_kind": (
+            str(dc_model.get("kind")) if dc_model is not None else None
+        ),
+        "dc_model_representation": (
+            str(dc_model.get("representation")) if dc_model is not None else None
+        ),
         "negative_frequency_behavior": "conjugate_of_positive_frequency_ann",
     }
     return "\n".join(lines), contract
@@ -2420,10 +2451,26 @@ def ads_ann_sdd_setup(
     input_rows: list[str] = []
     input_assignments: list[str] = []
     parameter_set = set(parameter_names)
+    raw_parameter_scales = settings.get("parameter_input_scales")
+    parameter_scales = (
+        {
+            str(name): float(value)
+            for name, value in raw_parameter_scales.items()
+        }
+        if isinstance(raw_parameter_scales, dict)
+        else {str(name): 1.0 for name in parameter_names}
+    )
     for index, column in enumerate(input_columns, start=1):
         if column in parameter_set:
-            expression = f"`{column}` (when the symbol parameter carries ADS units)"
-            assignment = column
+            scale = float(parameter_scales.get(str(column), 1.0))
+            if scale == 1.0:
+                assignment = column
+            else:
+                assignment = f"({column})/({veriloga_float(scale)})"
+            expression = (
+                f"`{assignment}`; model value = ADS instance value / "
+                f"`{scale:.12g}`"
+            )
         elif column == "freq_hz":
             expression = "`freq`"
             assignment = "freq"
@@ -2523,6 +2570,13 @@ matrix syntax; do not omit uninteresting transmission paths.
     parameters = ", ".join(f"`{name}`" for name in parameter_names) or "none"
     netlist = settings.get("netlist")
     if isinstance(netlist, dict) and bool(netlist.get("enabled")):
+        automatic_dc_text = (
+            "It includes a separate geometry-dependent exact-DC branch; the "
+            "native ANN remains bypassed at zero hertz."
+            if netlist.get("dc_behavior")
+            == "separate_geometry_dependent_exact_dc_model"
+            else "It is exactly open at zero hertz because no DC model was included."
+        )
         netlist_section = f"""## Preferred: Automatic NetlistInclude/SDD Flow
 
 Run `train_ads_ann.py` first. In addition to the native ANN files, it fills the
@@ -2531,6 +2585,14 @@ text formula and writes the complete `{netlist['netlist_file']}` RF subnetwork.
 The completed file already contains the input mapping, complex-S
 reconstruction, {nports}-port S-to-Y conversion, negative-frequency conjugation,
 and every SDD current/weight entry in this worksheet.
+
+At positive frequency, this is the same ANN-to-S-to-Y-to-current relationship
+described by the manual fallback. The simulator expression graphs are not
+textually identical: the automatic N-port model expands S-to-Y into scalar
+Gauss-Jordan equations and enforces negative-frequency conjugation, whereas the
+manual instructions below use ADS matrix operations for models with more than
+two ports. Those implementation details can produce different simulation times
+even when the positive-frequency S-parameters agree.
 
 Place one top-level `NetlistInclude` and set:
 
@@ -2544,7 +2606,15 @@ Load that definition once, then instantiate `{netlist['module_name']}` as many
 times as needed. `ADS_ANN_INSTANCE_TEMPLATE.txt` contains two native calls with
 the correct {nports}-node and parameter order. The include receives no geometry
 values; each subnetwork call receives its own values. The generated subnetwork
-is RF-only and exactly open at zero hertz.
+uses the native ANN only at nonzero frequency. {automatic_dc_text}
+
+For a parameter sweep, use the `X_SWEEP` call in that template. It binds each
+local model parameter to a distinctly named top-level variable such as
+`ann_sweep_W`. Sweep that exact right-hand-side variable. Sweeping `W` does not
+change an instance whose call says `W=W_A`, and setting `W` on the
+`NetlistInclude` does not pass it to any instance. Generate the ADS simulator
+netlist and confirm the `{netlist['module_name']}:X_SWEEP` line contains every
+expected `local_parameter=top_level_value` override.
 
 Do not point `NetlistInclude` directly at `{settings['output_prefix']}.equation`,
 `{settings['output_prefix']}.struc`, or `{settings['output_prefix']}.scale`.
@@ -2576,7 +2646,7 @@ S-parameter order is {labels}. The exposed geometry/process parameters are
 
 {netlist_section}
 
-## 1. Create the Wrapper
+### 1. Create the Wrapper
 
 1. Create a new schematic cell and give it `{nports}` single-ended RF pins.
 2. Place the `{nports}`-port **Symbolically Defined Device** from **Eqn-based
@@ -2588,7 +2658,7 @@ S-parameter order is {labels}. The exposed geometry/process parameters are
    `{settings['output_prefix']}_sdd.equation` into it, then add the input,
    complex-S, and S-to-Y equations described below.
 
-## 2. Map the ANN Evaluator
+### 2. Map the ANN Evaluator
 
 ADS ANN emits `_v1`, `_v2`, ... as generic ANN inputs. Those names are not SDD
 port voltages. The training script creates a renamed copy to prevent that
@@ -2619,14 +2689,14 @@ For this package, start the `Var/Eqn` mapping with:
 Every `coarse_*` name in that block is a required output of the separately
 implemented coarse model. It is not created by this ANN package.
 
-## 3. Convert S to Y
+### 3. Convert S to Y
 
 {conversion}
 
 `Z0={z0:g}` is the wave reference impedance. It is not a resistor to place on the
 wrapper pins. Do not add 50-ohm shunts inside the model.
 
-## 4. Enter These SDD Parameters
+### 4. Enter These SDD Parameters
 
 Double-click the SDD. Add the following entries one at a time. Every current
 entry is **Explicit**. Every `H[]` entry uses **Parameter Entry Mode =
@@ -2644,7 +2714,7 @@ be evaluated by a frequency-domain `H[]` weight. The zero-frequency guard makes
 this RF-only package open at exact DC; native ADS ANN training deliberately
 excluded DC rows.
 
-## 5. Top-Level SP Testbench
+### 5. Top-Level SP Testbench
 
 1. Generate the wrapper symbol and place one instance.
 2. Set every geometry/process parameter on that instance. ADS quantities such
@@ -2682,7 +2752,22 @@ def ads_ann_readme(
     if notes:
         notes = "\n\nNotes:\n\n" + notes + "\n"
     netlist = settings.get("netlist")
+    automatic_exact_dc = bool(
+        isinstance(netlist, dict)
+        and netlist.get("dc_behavior")
+        == "separate_geometry_dependent_exact_dc_model"
+    )
     if isinstance(netlist, dict) and bool(netlist.get("enabled")):
+        has_exact_dc = (
+            netlist.get("dc_behavior")
+            == "separate_geometry_dependent_exact_dc_model"
+        )
+        dc_summary = (
+            "At exact zero hertz it bypasses the RF ANN and stamps the separate "
+            "geometry-dependent DC model saved or extracted from the fitting data."
+            if has_exact_dc
+            else "No exact-DC model was supplied, so it is open at zero hertz."
+        )
         netlist_parameter_rows = "\n".join(
             f"| `{source}` | `{identifier}` | "
             f"`{float(netlist['parameter_instance_defaults'][source]):.12g}` | "
@@ -2702,8 +2787,7 @@ creates the ready-to-include `{netlist['netlist_file']}` subnetwork. It maps
 the ANN inputs, reconstructs every complex S-parameter, performs the complete
 {netlist['nports']}-port S-to-Y conversion, applies negative-frequency
 conjugation, and stamps the result with an explicit-current SDD. No DAC or
-manual SDD matrix entry is required. This generated subnetwork is RF-only and
-open at exact zero hertz."""
+manual SDD matrix entry is required. {dc_summary}"""
         netlist_usage = f"""## Step 3: Use the Generated NetlistInclude Model
 
 Successful training writes `{netlist['netlist_file']}`. Copy or keep the whole
@@ -2720,6 +2804,15 @@ The include loads the definition once. Instantiate `{netlist['module_name']}`
 with the ordered nodes `p1` through `p{netlist['nports']}` and the geometry
 parameters listed in `ADS_ANN_INSTANCE_TEMPLATE.txt`. Set geometry values on
 each subnetwork call, not on the `NetlistInclude`.
+
+For a one-instance sweep, copy the template's `X_SWEEP` call and define its
+`ann_sweep_*` right-hand-side variables in the top-level `VAR/Eqn` block. Point
+the ADS parameter-sweep controller at the exact `ann_sweep_*` name. For
+example, `W=ann_sweep_W` means that `ann_sweep_W` is swept; changing some other
+top-level `W` variable has no effect. After generating the simulator netlist,
+search for `{netlist['module_name']}:X_SWEEP` and verify that all assignments
+are present. A call containing only node names uses the fixed generated
+defaults for every geometry.
 
 | Training parameter | ADS instance parameter | Generated default | Input scale |
 | --- | --- | ---: | ---: |
@@ -2844,8 +2937,8 @@ script because the verified ADS ANN API does not expose those per-output and
 per-row weights here. Reciprocity and passivity enforcement from the local fit
 are not automatically transferred to the ADS-retrained network.
 
-Exact zero-Hz rows are excluded from ANN training. This package is an RF ANN
-handoff; it does not contain the separate DC network saved by the local fit.
+Exact zero-Hz rows are excluded from ANN training. They are used only by the
+separate DC extraction. The automatic netlist {"contains that geometry-dependent exact-DC branch" if automatic_exact_dc else "has no DC branch because no usable DC model was supplied"}; the RF ANN is never evaluated at zero hertz.
 
 ## Step 1: Prepare the ADS Machine
 
@@ -2947,9 +3040,7 @@ Before opening a schematic:
 Keysight documents SDD and FDD components as the electrical shell around a
 computed ANN response. For this linear, frequency-dependent S-parameter model,
 the generated native SDD subnetwork is the preferred first SP/AC/HB wrapper.
-It provides negative-frequency conjugation but intentionally has no DC branch.
-Use the repository's dedicated `export-ads-hb` model when the saved distinct DC
-network is also required.
+It provides negative-frequency conjugation. {"It also includes the separate saved/extracted exact-DC model." if automatic_exact_dc else "It is open at exact DC; re-export with a usable saved DC model or DC MDIF when DC is required."}
 
 {netlist_usage}
 
@@ -3128,8 +3219,8 @@ but the ANN generated files themselves are loaded only once by the wrapper.
 | Response is constant versus frequency | The wrapper is not feeding the analysis frequency, or `freq_log10_hz`/`freq_hz` is mapped incorrectly. |
 | Multiple instances produce the same response | Geometry inputs were defined globally inside the wrapper instead of being connected to instance parameters. |
 | Singular matrix during SP | Inspect `D = det(identity+S)`, port order, and ANN S values before changing the electrical stamp. |
-| DC is open or incorrect | Expected for this RF-only ANN package. Use sampled MDIF, `export-veriloga`, or `export-ads-hb` when the saved distinct DC model is required. |
-| HB differs from SP | Check fitted frequency range, negative-frequency conjugation, node order, and parameter scaling. The generated native-ANN `.net` is RF-only; use `export-ads-hb` when the saved exact-DC branch is required. |
+| DC is open or incorrect | Check `dc_model.included` and `ads_netlist.dc_behavior` in the manifest. DC must come from usable exact-zero-Hz fitting data or the saved DC model; it never comes from RF extrapolation. |
+| HB differs from SP | Check fitted frequency range, negative-frequency conjugation, node order, parameter binding, and parameter scaling. |
 
 ## Keysight Implementation References
 
@@ -3158,6 +3249,8 @@ def write_ads_ann_package(
     parameter_names: Sequence[str],
     sparam_labels: Sequence[str],
     target_description: str,
+    dc_model: dict[str, object] | None = None,
+    dc_metadata: dict[str, object] | None = None,
     extra_manifest: dict[str, object] | None = None,
     extra_notes: Sequence[str] | None = None,
 ) -> dict[str, object]:
@@ -3229,7 +3322,19 @@ def write_ads_ann_package(
                 z0=z0,
                 parameter_input_scales=parameter_scales,
                 parameter_model_defaults=parameter_defaults,
+                dc_model=dc_model,
             )
+            parameter_ranges: dict[str, dict[str, float]] = {}
+            for index, name in enumerate(parameter_names):
+                model_values = np.asarray(x_train, dtype=float)[:, index]
+                scale = float(parameter_scales[str(name)])
+                parameter_ranges[str(name)] = {
+                    "model_min": float(np.min(model_values)),
+                    "model_max": float(np.max(model_values)),
+                    "instance_min": float(np.min(model_values) * scale),
+                    "instance_max": float(np.max(model_values) * scale),
+                }
+            ads_netlist["parameter_ranges"] = parameter_ranges
         except ValueError as error:
             ads_netlist = {"enabled": False, "reason": str(error)}
     settings["netlist"] = ads_netlist
@@ -3243,6 +3348,16 @@ def write_ads_ann_package(
         "sdd_setup_guide": "ADS_SDD_SETUP.md",
         "sdd_mapped_equation": f"{settings['output_prefix']}_sdd.equation",
         "ads_netlist": ads_netlist,
+        "dc_model": {
+            "included": dc_model is not None,
+            "kind": str(dc_model.get("kind")) if dc_model is not None else None,
+            "representation": (
+                str(dc_model.get("representation"))
+                if dc_model is not None
+                else None
+            ),
+            "metadata": dict(dc_metadata or {}),
+        },
         "qt_runtime": {
             "application_policy": "reuse_existing_or_scoped_create",
             "platform_plugin_source": "active_ads_pyside6_runtime",
@@ -3301,12 +3416,25 @@ def write_ads_ann_package(
             netlist_template_text
         )
         (out_dir / str(ads_netlist["instance_template_file"])).write_text(
-            _ads_hb_instance_template(
+            _ads_ann_instance_template(
                 str(ads_netlist["module_name"]),
                 str(ads_netlist["netlist_file"]),
                 int(ads_netlist["nports"]),
                 [str(value) for value in ads_netlist["parameter_identifiers"]],
-                title="ADS ANN SDD",
+                [str(value) for value in parameter_names],
+                {
+                    str(name): float(value)
+                    for name, value in ads_netlist[
+                        "parameter_instance_defaults"
+                    ].items()
+                },
+                {
+                    str(name): {
+                        str(key): float(value)
+                        for key, value in values.items()
+                    }
+                    for name, values in ads_netlist["parameter_ranges"].items()
+                },
             )
         )
     (out_dir / qt_runtime_helper).write_text(ads_qt_runtime_helper_script())
@@ -6290,6 +6418,82 @@ def _ads_hb_instance_call(
             f"{identifier}={identifier}_{value_suffix}" for identifier in parameter_ids
         )
     return call
+
+
+def _ads_ann_instance_template(
+    module_name: str,
+    netlist_name: str,
+    nports: int,
+    parameter_ids: Sequence[str],
+    parameter_names: Sequence[str],
+    parameter_defaults: dict[str, float],
+    parameter_ranges: dict[str, dict[str, float]],
+) -> str:
+    """Return copyable ADS ANN calls with an unambiguous sweep binding."""
+
+    nodes = " ".join(f"x_sweep_p{idx}" for idx in range(1, nports + 1))
+    sweep_names = [f"ann_sweep_{identifier}" for identifier in parameter_ids]
+    sweep_call = f"{module_name}:X_SWEEP {nodes}"
+    if parameter_ids:
+        sweep_call += " " + " ".join(
+            f"{identifier}={sweep_name}"
+            for identifier, sweep_name in zip(parameter_ids, sweep_names)
+        )
+    call_a = _ads_hb_instance_call(module_name, "X1", nports, parameter_ids, "A")
+    call_b = _ads_hb_instance_call(module_name, "X2", nports, parameter_ids, "B")
+
+    variable_lines: list[str] = []
+    range_lines: list[str] = []
+    for source_name, identifier, sweep_name in zip(
+        parameter_names,
+        parameter_ids,
+        sweep_names,
+    ):
+        default = float(parameter_defaults[source_name])
+        limits = parameter_ranges[source_name]
+        variable_lines.append(f"; {sweep_name}={veriloga_float(default)}")
+        range_lines.append(
+            "; {source} -> instance parameter {identifier}; trained ADS-side "
+            "range [{minimum}, {maximum}]".format(
+                source=source_name,
+                identifier=identifier,
+                minimum=veriloga_float(float(limits["instance_min"])),
+                maximum=veriloga_float(float(limits["instance_max"])),
+            )
+        )
+    if not variable_lines:
+        variable_lines.append("; (no geometry/process variables)")
+        range_lines.append("; (no geometry/process parameters)")
+
+    return f"""; ADS ANN SDD instance-call template -- documentation only
+; Do not include this file unchanged. Copy the call you need into a separate
+; top-level ADS netlist fragment after {netlist_name}, then replace node labels.
+;
+; IMPORTANT PARAMETER-BINDING RULE
+; The left side of each assignment is the local subnetwork parameter. The right
+; side is the top-level value that must be varied. Setting a property on the
+; NetlistInclude does nothing, and sweeping a different variable leaves the ANN
+; at its generated default.
+;
+; Single-instance parameter-sweep example
+; Put these definitions in a top-level VAR/Eqn block, then sweep the exact
+; ann_sweep_* name on the right side of the instance call:
+{chr(10).join(variable_lines)}
+;
+; {sweep_call}
+;
+; Confirm the final ADS simulator netlist contains the call above, including
+; every parameter override. If it contains only the electrical nodes, ADS uses
+; the fixed defaults declared inside {netlist_name}.
+;
+; Training-to-instance parameter ranges
+{chr(10).join(range_lines)}
+;
+; Two-instance form for independently selected geometries
+; Values such as W_A and W_B must be separate top-level VAR expressions:
+; {call_a}
+; {call_b}
+"""
 
 
 def _ads_hb_instance_template(
