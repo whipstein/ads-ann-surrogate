@@ -27,12 +27,18 @@ OPTIONS_JSON_HELP = (
 UPDATE_OPTIONS_JSON_HELP = (
     "Save explicitly supplied CLI options into the exact model/workflow command "
     "section of --options-json after a successful command; combine with "
-    "--explain-options to capture settings without running the command."
+    "--explain-options to review settings before choosing whether to run the command."
 )
 EXPLAIN_OPTIONS_HELP = (
     "Show the effective options, their CLI/JSON/default sources, and conditional "
-    "input checks, then exit without running the command."
+    "input checks. When validation passes, interactively offer to run the command."
 )
+
+VALIDATION_COLORS = {
+    "ok": "\033[32m",
+    "missing": "\033[31m",
+}
+ANSI_RESET = "\033[0m"
 
 MODEL_NAMES = {"dnn", "kbnn", "neuro-tf"}
 MODEL_ALIASES = {"neuro_tf": "neuro-tf", "neurotf": "neuro-tf"}
@@ -256,6 +262,8 @@ def starter_options_payload() -> dict[str, object]:
         "workflows": {
             "audit": {
                 "common": {
+                    "bare_values": "auto",
+                    "color": "always",
                     "expect_reciprocal": True,
                     "geometry_json": None,
                     "mdif": None,
@@ -1481,17 +1489,41 @@ def _resolved_point_metrics_path(args: argparse.Namespace) -> Path | None:
     return candidates[0]
 
 
-def _print_point_suggestion_checks(args: argparse.Namespace) -> None:
+def _color_validation_text(text: str, *, ok: bool) -> str:
+    """Color an explain-options validation line unless NO_COLOR is set."""
+
+    if "NO_COLOR" in os.environ:
+        return text
+    color = VALIDATION_COLORS["ok" if ok else "missing"]
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def _print_validation_line(text: str, *, ok: bool) -> None:
+    print(_color_validation_text(text, ok=ok))
+
+
+def _print_point_suggestion_checks(args: argparse.Namespace) -> bool:
+    """Print additional-point preflight checks and return whether they pass."""
+
     print("\nAdditional-point input checks:")
+    checks_ok = True
     parameters = list(getattr(args, "parameter", None) or [])
     parameter_json = getattr(args, "parameter_json", None)
     existing_points = list(getattr(args, "existing_points", None) or [])
     if parameters:
-        print(f"  parameter domain: OK, {len(parameters)} --parameter value(s)")
+        _print_validation_line(
+            f"  parameter domain: OK, {len(parameters)} --parameter value(s)",
+            ok=True,
+        )
     elif parameter_json:
         path = Path(parameter_json)
         status = "found" if path.is_file() else "NOT FOUND"
-        print(f"  parameter domain: --parameter-json {path} ({status})")
+        found_parameter_json = path.is_file()
+        checks_ok = checks_ok and found_parameter_json
+        _print_validation_line(
+            f"  parameter domain: --parameter-json {path} ({status})",
+            ok=found_parameter_json,
+        )
     elif existing_points:
         found: list[Path] = []
         checked: list[Path] = []
@@ -1502,31 +1534,42 @@ def _print_point_suggestion_checks(args: argparse.Namespace) -> None:
                     found.append(candidate)
                     break
         if found:
-            print(
+            _print_validation_line(
                 "  parameter domain: OK, inferred companion JSON: "
-                + ", ".join(map(str, found))
+                + ", ".join(map(str, found)),
+                ok=True,
             )
         else:
-            print(
+            checks_ok = False
+            _print_validation_line(
                 "  parameter domain: MISSING; no companion JSON found (checked "
                 + ", ".join(map(str, checked))
-                + ")"
+                + ")",
+                ok=False,
             )
     else:
-        print(
+        checks_ok = False
+        _print_validation_line(
             "  parameter domain: MISSING; set --parameter, --parameter-json, or "
-            "--existing-points with its companion JSON"
+            "--existing-points with its companion JSON",
+            ok=False,
         )
 
     metrics_path = _resolved_point_metrics_path(args)
     metric = str(getattr(args, "metric", "evm_pct"))
     if metrics_path is None:
-        print(
+        checks_ok = False
+        _print_validation_line(
             "  verification metrics: MISSING; set --fit-dir or "
-            "--verification-metrics"
+            "--verification-metrics",
+            ok=False,
         )
     elif not metrics_path.is_file():
-        print(f"  verification metrics: NOT FOUND at {metrics_path}")
+        checks_ok = False
+        _print_validation_line(
+            f"  verification metrics: NOT FOUND at {metrics_path}",
+            ok=False,
+        )
     else:
         try:
             with metrics_path.open(newline="", encoding="utf-8-sig") as handle:
@@ -1534,7 +1577,11 @@ def _print_point_suggestion_checks(args: argparse.Namespace) -> None:
                 columns = list(reader.fieldnames or [])
                 rows = list(reader)
         except OSError as exc:
-            print(f"  verification metrics: could not read {metrics_path}: {exc}")
+            checks_ok = False
+            _print_validation_line(
+                f"  verification metrics: could not read {metrics_path}: {exc}",
+                ok=False,
+            )
         else:
             def usable_count(name: str) -> int:
                 count = 0
@@ -1560,9 +1607,11 @@ def _print_point_suggestion_checks(args: argparse.Namespace) -> None:
                     None,
                 )
                 status = f"auto -> {selected}" if selected else "auto found no known column"
+                metric_ok = selected is not None
             else:
                 if metric not in columns:
                     status = "COLUMN NOT FOUND"
+                    metric_ok = False
                 else:
                     usable = usable_count(metric)
                     status = (
@@ -1570,14 +1619,21 @@ def _print_point_suggestion_checks(args: argparse.Namespace) -> None:
                         if usable
                         else "COLUMN PRESENT BUT NO USABLE NUMERIC VALUES"
                     )
-            print(f"  verification metrics: {metrics_path} ({status}: {metric})")
+                    metric_ok = usable > 0
+            checks_ok = checks_ok and metric_ok
+            _print_validation_line(
+                f"  verification metrics: {metrics_path} ({status}: {metric})",
+                ok=metric_ok,
+            )
             if (
                 "point_generation_fallback" in metrics_path.parts
                 and not getattr(args, "allow_nonpassive", False)
             ):
-                print(
+                checks_ok = False
+                _print_validation_line(
                     "  passivity fallback: BLOCKED; add --allow-nonpassive to use "
-                    "these errors for point selection"
+                    "these errors for point selection",
+                    ok=False,
                 )
             if metric.startswith("weighted_"):
                 print(
@@ -1585,6 +1641,7 @@ def _print_point_suggestion_checks(args: argparse.Namespace) -> None:
                     "not geometry-row columns; use --metric evm_pct or --metric auto. "
                     "Per-row normalized_sparam_weight still applies S-parameter weights."
                 )
+    return checks_ok
 
 
 def print_effective_options(
@@ -1597,15 +1654,15 @@ def print_effective_options(
     command: str,
     json_sources: Mapping[str, str],
     required_actions: Mapping[int, bool],
-) -> None:
-    """Print the values a backend would receive without executing it."""
+) -> bool:
+    """Print effective backend values and return whether preflight checks pass."""
 
     route = (
         f"model={normalize_model_name(model)}"
         if model
         else f"workflow={workflow}"
     )
-    print("Effective command options (command was not executed)")
+    print("Effective command options")
     print(f"  route: {route}, command={normalize_command_name(command)}")
     options_path = getattr(args, "options_json", None)
     print(f"  options JSON: {options_path or '<none>'}")
@@ -1672,16 +1729,56 @@ def print_effective_options(
         rows.append((option, _display_value(value), source))
     width = max((len(row[0]) for row in rows), default=6)
     for option, value, source in rows:
-        print(f"  {option:<{width}} = {value}  [{source}]")
+        line = f"  {option:<{width}} = {value}  [{source}]"
+        if "MISSING REQUIRED" in source:
+            line = _color_validation_text(line, ok=False)
+        print(line)
     if missing:
-        print("\nRequired options still missing: " + ", ".join(missing))
+        _print_validation_line(
+            "\nRequired options: MISSING — " + ", ".join(missing),
+            ok=False,
+        )
     else:
-        print("\nRequired argparse options: complete")
+        _print_validation_line("\nRequired options: OK", ok=True)
+    checks_ok = not missing
     if (
         workflow == "points"
         and normalize_command_name(command) == "suggest-additional"
     ):
-        _print_point_suggestion_checks(args)
+        checks_ok = _print_point_suggestion_checks(args) and checks_ok
+    if checks_ok:
+        _print_validation_line("\nValidation result: OK", ok=True)
+    else:
+        _print_validation_line(
+            "\nValidation result: MISSING or invalid required input",
+            ok=False,
+        )
+    return checks_ok
+
+
+def _confirm_explained_command() -> bool:
+    """Ask an interactive user whether the validated command should execute."""
+
+    try:
+        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, OSError):
+        interactive = False
+    if not interactive:
+        print(
+            "\nValidation passed, but interactive confirmation is unavailable; "
+            "the command was not executed."
+        )
+        return False
+    try:
+        response = input("\nExecute this command with the options above? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nCommand was not executed.")
+        return False
+    if response.strip().lower() in {"y", "yes"}:
+        print("Executing command with the validated options...\n")
+        return True
+    print("Command was not executed.")
+    return False
 
 
 def _relax_parser_requirements_for_explanation(
@@ -1778,7 +1875,7 @@ def parse_args_with_options_json(
             selected_command or command or ""
         )
         if explain_requested:
-            print_effective_options(
+            validation_ok = print_effective_options(
                 parser,
                 args,
                 clean_args,
@@ -1788,6 +1885,8 @@ def parse_args_with_options_json(
                 json_sources=json_sources,
                 required_actions=required_actions,
             )
+            if validation_ok and _confirm_explained_command():
+                return args
             capture_status = (
                 finalize_options_json_update(args, 0)
                 if update_requested

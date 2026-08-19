@@ -159,6 +159,8 @@
   "workflows": {
     "audit": {
       "common": {
+        "bare_values": "auto",
+        "color": "always",
         "expect_reciprocal": true,
         "geometry_json": null,
         "mdif": null,

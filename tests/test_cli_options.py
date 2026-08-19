@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -849,7 +850,92 @@ class OptionsJSONTests(unittest.TestCase):
         self.assertIn("JSON: models.dnn.commands.train.mdif", report)
         self.assertIn("JSON: models.commands.fit.frequency_weights", report)
         self.assertIn("CLI (--epochs)", report)
-        self.assertIn("Required argparse options: complete", report)
+        self.assertIn("Required options: OK", report)
+        self.assertIn("Validation result: OK", report)
+
+    def test_explain_options_colors_ok_and_can_execute_without_reentry(self) -> None:
+        class InteractiveInput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        class InteractiveOutput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        stdout = InteractiveOutput()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("cli_options.sys.stdin", InteractiveInput()),
+            mock.patch("builtins.input", return_value="yes") as confirmation,
+            contextlib.redirect_stdout(stdout),
+        ):
+            args = parse_args_with_options_json(
+                example_parser(),
+                ["train", "--mdif", "data.mdif", "--explain-options"],
+                model="dnn",
+            )
+
+        report = stdout.getvalue()
+        self.assertEqual(args.mdif, "data.mdif")
+        self.assertIn("\033[32m\nRequired options: OK\033[0m", report)
+        self.assertIn("\033[32m\nValidation result: OK\033[0m", report)
+        self.assertIn("Executing command with the validated options", report)
+        confirmation.assert_called_once_with(
+            "\nExecute this command with the options above? [y/N] "
+        )
+
+    def test_explain_options_colors_missing_and_does_not_prompt(self) -> None:
+        class InteractiveInput(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("cli_options.sys.stdin", InteractiveInput()),
+            mock.patch("builtins.input") as confirmation,
+            contextlib.redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            parse_args_with_options_json(
+                example_parser(),
+                ["train", "--explain-options"],
+                model="dnn",
+            )
+
+        report = stdout.getvalue()
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertIn("\033[31m\nRequired options: MISSING", report)
+        self.assertIn("\033[31m\nValidation result: MISSING", report)
+        confirmation.assert_not_called()
+
+    def test_approved_explanation_executes_selected_workflow(self) -> None:
+        stdout = io.StringIO()
+        with (
+            mock.patch(
+                "cli_options._confirm_explained_command",
+                return_value=True,
+            ) as confirmation,
+            mock.patch(
+                "generate_points.command_generate",
+                return_value=0,
+            ) as command,
+            contextlib.redirect_stdout(stdout),
+        ):
+            status = generate_points.main(
+                [
+                    "generate",
+                    "--parameter",
+                    "W=1:2",
+                    "--count",
+                    "4",
+                    "--explain-options",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        confirmation.assert_called_once_with()
+        command.assert_called_once()
 
     def test_explain_additional_points_preflights_domain_and_metric(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

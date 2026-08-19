@@ -95,6 +95,36 @@ class DatasetAuditTests(unittest.TestCase):
                 "dataset audit: FAIL",
             )
 
+    def test_color_always_supports_captured_ads_console_output(self) -> None:
+        stream = io.StringIO()
+        with mock.patch.object(AUDIT.os, "environ", {"TERM": "dumb"}):
+            self.assertEqual(
+                AUDIT.format_audit_verdict_line(
+                    "WARNING",
+                    stream,
+                    color_mode="always",
+                ),
+                "\033[33mdataset audit: WARNING\033[0m",
+            )
+            reasons = [
+                {
+                    "severity": "ERROR",
+                    "code": "TEST_ERROR",
+                    "count": 1,
+                    "representative_messages": ["example"],
+                    "additional_message_count": 0,
+                    "affected_examples": [],
+                    "additional_location_count": 0,
+                    "recommendation": "fix it",
+                }
+            ]
+            AUDIT.print_verdict_reasons(
+                reasons,
+                stream=stream,
+                color_mode="always",
+            )
+        self.assertIn("\033[31m  - ERROR TEST_ERROR", stream.getvalue())
+
     def test_passive_consistent_dataset_passes_and_writes_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -306,6 +336,148 @@ class DatasetAuditTests(unittest.TestCase):
             self.assertEqual(verification["coverage_basis"], "geometry_generation_json")
             self.assertEqual(verification["verification_outside_observed_training"], "1")
             self.assertEqual(verification["verification_outside_coverage"], "0")
+
+    def test_unitless_mdif_values_auto_use_declared_geometry_units(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            geometry_csv = root / "geometries.csv"
+            mdif = root / "training.mdif"
+            verification_mdif = root / "verification.mdif"
+            out_dir = root / "audit"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=100um:500um",
+                            "--count",
+                            "6",
+                            "--verification-count",
+                            "1",
+                            "--lhs-candidates",
+                            "2",
+                            "--out",
+                            str(geometry_csv),
+                        ]
+                    ),
+                    0,
+                )
+            write_mdif(
+                mdif,
+                [
+                    passive_block(150.0, "train"),
+                    passive_block(250.0, "train"),
+                ],
+                LABELS,
+            )
+            write_mdif(
+                verification_mdif,
+                [passive_block(400.0, "verification")],
+                LABELS,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = AUDIT.main(
+                    [
+                        "--mdif",
+                        str(mdif),
+                        "--verification-mdif",
+                        str(verification_mdif),
+                        "--geometry-json",
+                        str(geometry_csv.with_suffix(".json")),
+                        "--out-dir",
+                        str(out_dir),
+                        "--color",
+                        "never",
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            summary = json.loads((out_dir / "dataset_audit.json").read_text())
+            self.assertEqual(summary["verdict"], "PASS")
+            self.assertNotIn(
+                "VERIFICATION_OUTSIDE_GEOMETRY_RANGE",
+                summary["issue_code_counts"],
+            )
+            decisions = [
+                row
+                for row in summary["parameter_unit_interpretation"]
+                if row["parameter"] == "W"
+            ]
+            self.assertEqual(len(decisions), 2)
+            self.assertEqual(
+                {row["selected_interpretation"] for row in decisions},
+                {"parameter-units"},
+            )
+            self.assertEqual({row["declared_unit"] for row in decisions}, {"um"})
+            self.assertEqual(
+                sum(int(row["parameter_units_inside_geometry"]) for row in decisions),
+                3,
+            )
+            self.assertEqual(
+                sum(int(row["base_units_inside_geometry"]) for row in decisions),
+                0,
+            )
+            self.assertIn("W -> parameter-units", stdout.getvalue())
+
+            with (out_dir / "dataset_parameter_coverage.csv").open(newline="") as stream:
+                coverage = list(csv.DictReader(stream))
+            verification = next(row for row in coverage if row["role"] == "verification")
+            self.assertAlmostEqual(
+                float(verification["maximum_base_units"]),
+                400.0e-6,
+            )
+            self.assertEqual(verification["verification_outside_coverage"], "0")
+
+    def test_unitless_mdif_values_auto_preserve_base_units_when_they_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            geometry_csv = root / "geometries.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=100um:500um",
+                            "--count",
+                            "4",
+                            "--verification-count",
+                            "1",
+                            "--lhs-candidates",
+                            "2",
+                            "--out",
+                            str(geometry_csv),
+                        ]
+                    ),
+                    0,
+                )
+            domain = AUDIT.resolve_geometry_domain(
+                [str(geometry_csv.with_suffix(".json"))],
+                [],
+            )
+            self.assertIsNotNone(domain)
+            record = AUDIT.AuditRecord(
+                record_id=1,
+                dataset_kind="fine",
+                role="verification",
+                source_path=root / "verification.mdif",
+                block=passive_block(400.0e-6, "verification"),
+                header=AUDIT.SourceHeader(),
+            )
+            decisions = AUDIT.resolve_record_parameter_values(
+                [record],
+                ["W"],
+                domain,
+                "auto",
+            )
+
+            self.assertEqual(decisions[0]["selected_interpretation"], "base-units")
+            vector = AUDIT.record_parameter_values(record, ["W"])
+            self.assertIsNotNone(vector)
+            assert vector is not None
+            self.assertAlmostEqual(float(vector[0]), 400.0e-6)
 
     def test_same_stem_geometry_json_is_inferred(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

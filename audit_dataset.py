@@ -16,7 +16,7 @@ import math
 import os
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -27,7 +27,11 @@ from cli_options import (
     finalize_options_json_update,
     parse_args_with_options_json,
 )
-from generate_points import parameter_specs_from_geometry_metadata
+from generate_points import (
+    UNIT_SCALES,
+    parameter_specs_from_geometry_metadata,
+    split_value_token,
+)
 from surrogate_common import (
     MDIFBlock,
     infer_nports,
@@ -57,6 +61,7 @@ class AuditRecord:
     source_path: Path
     block: MDIFBlock
     header: SourceHeader
+    resolved_parameter_values: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,30 +75,51 @@ AUDIT_VERDICT_COLORS = {
     "PASS": "\033[32m",
     "WARNING": "\033[33m",
     "FAIL": "\033[31m",
+    "ERROR": "\033[31m",
 }
 ANSI_RESET = "\033[0m"
+
+
+def terminal_color_enabled(
+    stream: object,
+    color_mode: str = "auto",
+) -> bool:
+    """Return whether ANSI status colors should be emitted to one stream."""
+
+    if "NO_COLOR" in os.environ or color_mode == "never":
+        return False
+    if color_mode == "always":
+        return True
+    return bool(
+        color_mode == "auto"
+        and hasattr(stream, "isatty")
+        and stream.isatty()  # type: ignore[attr-defined]
+        and os.environ.get("TERM", "").lower() != "dumb"
+    )
+
+
+def colorize_audit_text(
+    text: str,
+    severity: str,
+    stream: object,
+    color_mode: str = "auto",
+) -> str:
+    if not terminal_color_enabled(stream, color_mode):
+        return text
+    color = AUDIT_VERDICT_COLORS.get(severity)
+    return f"{color}{text}{ANSI_RESET}" if color else text
 
 
 def format_audit_verdict_line(
     verdict: str,
     stream: object | None = None,
+    color_mode: str = "auto",
 ) -> str:
-    """Return a colored verdict line for terminals and plain text otherwise."""
+    """Return the verdict line using the requested ANSI color policy."""
 
     line = f"dataset audit: {verdict}"
     output = sys.stdout if stream is None else stream
-    is_terminal = bool(
-        hasattr(output, "isatty")
-        and output.isatty()  # type: ignore[attr-defined]
-    )
-    if (
-        not is_terminal
-        or "NO_COLOR" in os.environ
-        or os.environ.get("TERM", "").lower() == "dumb"
-    ):
-        return line
-    color = AUDIT_VERDICT_COLORS.get(verdict)
-    return f"{color}{line}{ANSI_RESET}" if color else line
+    return colorize_audit_text(line, verdict, output, color_mode)
 
 
 def issue(
@@ -334,12 +360,181 @@ def load_dataset_records(
     return records, problems, starting_record_id
 
 
+def _parameter_token_parts(raw: object) -> tuple[float, str] | None:
+    text = str(raw).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    text = text.replace(",", "")
+    try:
+        value, unit = split_value_token(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value), unit
+
+
+def _domain_interpretation_score(
+    values: Sequence[float],
+    factor: float,
+    lower: float,
+    upper: float,
+) -> tuple[int, float]:
+    """Rank one bare-value interpretation by domain inclusion and distance."""
+
+    span = max(upper - lower, abs(lower), abs(upper), 1.0e-300)
+    inside = 0
+    outside_distance = 0.0
+    for raw_value in values:
+        value = raw_value * factor
+        if (
+            lower <= value <= upper
+            or math.isclose(value, lower, rel_tol=1.0e-10, abs_tol=1.0e-15)
+            or math.isclose(value, upper, rel_tol=1.0e-10, abs_tol=1.0e-15)
+        ):
+            inside += 1
+        elif value < lower:
+            outside_distance += (lower - value) / span
+        else:
+            outside_distance += (value - upper) / span
+    return inside, -outside_distance
+
+
+def resolve_record_parameter_values(
+    records: Sequence[AuditRecord],
+    parameter_names: Sequence[str],
+    geometry_domain: GeometryDomain | None,
+    bare_values: str,
+) -> list[dict[str, object]]:
+    """Resolve unitless MDIF parameters consistently for every source.
+
+    Explicit unit suffixes always win. In ``auto`` mode, unitless values are
+    evaluated both as SI/base-unit values and as values in the unit declared by
+    the geometry JSON. The interpretation that places the source's parameter
+    values inside or nearest the declared domain is selected consistently for
+    every block from that source.
+    """
+
+    if bare_values == "parameter-units" and geometry_domain is None:
+        raise ValueError(
+            "--bare-values parameter-units requires --geometry-json (or valid "
+            "same-stem geometry metadata) so declared parameter units are known"
+        )
+
+    decisions: list[dict[str, object]] = []
+    source_paths = list(dict.fromkeys(record.source_path for record in records))
+    for source_path in source_paths:
+        source_records = [
+            record for record in records if record.source_path == source_path
+        ]
+        for name in parameter_names:
+            key = normalize_name(name).lower()
+            domain_parameter = (
+                geometry_domain.parameters.get(key)
+                if geometry_domain is not None
+                else None
+            )
+            declared_unit = (
+                str(domain_parameter.get("unit") or "")
+                if domain_parameter is not None
+                else ""
+            )
+            unit_factor = UNIT_SCALES.get(declared_unit, 1.0)
+            parsed_rows: list[tuple[AuditRecord, tuple[float, str] | None]] = []
+            bare_numbers: list[float] = []
+            explicit_unit_count = 0
+            for record in source_records:
+                raw = normalized_mapping_value(record.block.params, name)
+                parsed = _parameter_token_parts(raw) if raw is not None else None
+                parsed_rows.append((record, parsed))
+                if parsed is None:
+                    continue
+                value, explicit_unit = parsed
+                if explicit_unit:
+                    explicit_unit_count += 1
+                else:
+                    bare_numbers.append(value)
+
+            base_score: tuple[int, float] | None = None
+            parameter_score: tuple[int, float] | None = None
+            if domain_parameter is not None and bare_numbers:
+                lower = float(domain_parameter["lower_base_units"])
+                upper = float(domain_parameter["upper_base_units"])
+                base_score = _domain_interpretation_score(
+                    bare_numbers,
+                    1.0,
+                    lower,
+                    upper,
+                )
+                parameter_score = _domain_interpretation_score(
+                    bare_numbers,
+                    unit_factor,
+                    lower,
+                    upper,
+                )
+
+            if not bare_numbers:
+                selected_mode = "explicit-units-only"
+            elif bare_values == "base-units":
+                selected_mode = "base-units"
+            elif bare_values == "parameter-units":
+                selected_mode = "parameter-units"
+            elif domain_parameter is None or not declared_unit:
+                selected_mode = "base-units"
+            elif parameter_score is not None and base_score is not None:
+                # A tie deliberately favors the declared parameter unit. This
+                # matches point generation and is the least surprising meaning
+                # for a unitless value accompanied by a unit-bearing domain.
+                selected_mode = (
+                    "parameter-units"
+                    if parameter_score >= base_score
+                    else "base-units"
+                )
+            else:
+                selected_mode = "base-units"
+
+            bare_factor = unit_factor if selected_mode == "parameter-units" else 1.0
+            for record, parsed in parsed_rows:
+                if parsed is None:
+                    record.resolved_parameter_values[key] = None
+                    continue
+                value, explicit_unit = parsed
+                factor = UNIT_SCALES[explicit_unit] if explicit_unit else bare_factor
+                record.resolved_parameter_values[key] = value * factor
+
+            decisions.append(
+                {
+                    "source_file": str(source_path),
+                    "parameter": name,
+                    "requested_bare_values": bare_values,
+                    "selected_interpretation": selected_mode,
+                    "declared_unit": declared_unit,
+                    "unitless_value_count": len(bare_numbers),
+                    "explicit_unit_value_count": explicit_unit_count,
+                    "base_units_inside_geometry": (
+                        base_score[0] if base_score is not None else None
+                    ),
+                    "parameter_units_inside_geometry": (
+                        parameter_score[0] if parameter_score is not None else None
+                    ),
+                }
+            )
+    return decisions
+
+
 def record_parameter_values(
     record: AuditRecord,
     parameter_names: Sequence[str],
 ) -> np.ndarray | None:
     values: list[float] = []
     for name in parameter_names:
+        key = normalize_name(name).lower()
+        if key in record.resolved_parameter_values:
+            resolved = record.resolved_parameter_values[key]
+            if resolved is None or not math.isfinite(resolved):
+                return None
+            values.append(float(resolved))
+            continue
         raw = normalized_mapping_value(record.block.params, name)
         if raw is None:
             return None
@@ -904,38 +1099,58 @@ def summarize_issue_reasons(
     return reasons
 
 
-def print_verdict_reasons(reasons: Sequence[dict[str, object]]) -> None:
+def print_verdict_reasons(
+    reasons: Sequence[dict[str, object]],
+    *,
+    stream: object | None = None,
+    color_mode: str = "auto",
+) -> None:
     """Print actionable issue details immediately below the CLI verdict."""
 
     if not reasons:
         return
-    print("verdict reasons:")
+    output = sys.stdout if stream is None else stream
+    print("verdict reasons:", file=output)
     for reason in reasons:
         count = int(reason["count"])
-        print(
+        heading = (
             f"  - {reason['severity']} {reason['code']} "
             f"({count} occurrence{'s' if count != 1 else ''})"
+        )
+        print(
+            colorize_audit_text(
+                heading,
+                str(reason["severity"]),
+                output,
+                color_mode,
+            ),
+            file=output,
         )
         messages = list(reason["representative_messages"])
         for index, message in enumerate(messages):
             label = "reason" if index == 0 else "additional detail"
-            print(f"    {label}: {message}")
+            print(f"    {label}: {message}", file=output)
         if int(reason["additional_message_count"]):
             print(
                 "    additional detail: "
                 f"{reason['additional_message_count']} more distinct message(s) in "
-                "dataset_issues.csv"
+                "dataset_issues.csv",
+                file=output,
             )
         locations = list(reason["affected_examples"])
         if locations:
-            print(f"    affected: {'; '.join(str(value) for value in locations)}")
+            print(
+                f"    affected: {'; '.join(str(value) for value in locations)}",
+                file=output,
+            )
         if int(reason["additional_location_count"]):
             print(
                 "    affected: "
                 f"{reason['additional_location_count']} more location(s) in "
-                "dataset_issues.csv"
+                "dataset_issues.csv",
+                file=output,
             )
-        print(f"    action: {reason['recommendation']}")
+        print(f"    action: {reason['recommendation']}", file=output)
 
 
 def audit_records(
@@ -1208,11 +1423,17 @@ def parameter_coverage(
             if outside_coverage:
                 if domain_parameter is not None:
                     code = "VERIFICATION_OUTSIDE_GEOMETRY_RANGE"
+                    observed_min = min(verification_values)
+                    observed_max = max(verification_values)
+                    declared_unit = str(domain_parameter.get("unit") or "base units")
                     message = (
                         f"{len(outside_coverage)} {kind} verification block(s) have "
                         f"{name} outside the declared geometry generation range "
                         f"[{coverage_min:.9g}, {coverage_max:.9g}] from "
-                        f"{coverage_sources}."
+                        f"{coverage_sources}; the interpreted verification range is "
+                        f"[{observed_min:.9g}, {observed_max:.9g}] in base units "
+                        f"(declared unit: {declared_unit}). Check --bare-values and "
+                        "dataset_parameter_coverage.csv."
                     )
                 else:
                     code = "VERIFICATION_OUTSIDE_TRAIN_RANGE"
@@ -1275,6 +1496,25 @@ def build_parser() -> argparse.ArgumentParser:
             "Generated geometry metadata JSON whose declared parameter bounds define "
             "coverage. Repeat for extended campaigns. When omitted, valid same-stem "
             "JSON files beside the supplied MDIFs are used automatically."
+        ),
+    )
+    parser.add_argument(
+        "--bare-values",
+        choices=("auto", "parameter-units", "base-units"),
+        default="auto",
+        help=(
+            "Interpret unitless MDIF parameter values as declared geometry units, "
+            "SI/base units, or choose per source and parameter against the geometry "
+            "JSON bounds. Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="always",
+        help=(
+            "Color the CLI verdict and reason headings: auto for terminals, always "
+            "for captured ADS/IDE consoles, or never. Default: always."
         ),
     )
     parser.add_argument("--out-dir", default="dataset_audit", help="Audit artifact directory. Default: dataset_audit.")
@@ -1394,6 +1634,12 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
                 "Geometry metadata does not declare the audited parameter(s): "
                 + ", ".join(missing_geometry_parameters)
             )
+    parameter_unit_interpretation = resolve_record_parameter_values(
+        records,
+        parameter_names,
+        geometry_domain,
+        args.bare_values,
+    )
     label_sets = Counter(
         tuple(sorted(record.block.sparams, key=sparam_sort_key)) for record in fine_records
     )
@@ -1592,6 +1838,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         "reference_impedance_ohm": z0_values,
         "frequency_grid_count": len(grid_rows),
         "coverage_domain": geometry_domain_summary,
+        "parameter_unit_interpretation": parameter_unit_interpretation,
         "issue_counts": dict(severity_counts),
         "issue_code_counts": dict(Counter(str(row["code"]) for row in problems)),
         "verdict_reasons": verdict_reasons,
@@ -1812,6 +2059,44 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
             "`--geometry-json geometries.json` to use the intended generated domain."
         )
 
+    markdown.extend(["", "## Parameter unit interpretation", ""])
+    markdown.append(
+        "Explicit MDIF unit suffixes are always converted directly. Unitless values "
+        "use the selected `--bare-values` policy; `auto` compares base-unit and "
+        "declared-parameter-unit interpretations against the geometry JSON for each "
+        "source and parameter."
+    )
+    markdown.append("")
+    markdown.extend(
+        markdown_table(
+            [
+                "Source",
+                "Parameter",
+                "Requested policy",
+                "Selected interpretation",
+                "Declared unit",
+                "Unitless values",
+                "Explicit-unit values",
+                "Inside as base units",
+                "Inside as parameter units",
+            ],
+            [
+                [
+                    Path(str(row["source_file"])).name,
+                    row["parameter"],
+                    row["requested_bare_values"],
+                    row["selected_interpretation"],
+                    row["declared_unit"] or "base units",
+                    row["unitless_value_count"],
+                    row["explicit_unit_value_count"],
+                    row["base_units_inside_geometry"],
+                    row["parameter_units_inside_geometry"],
+                ]
+                for row in parameter_unit_interpretation
+            ],
+        )
+    )
+
     markdown.extend(["", "## Parameter coverage", ""])
     markdown.extend(
         markdown_table(
@@ -1908,7 +2193,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     )
     markdown_path.write_text("\n".join(markdown))
 
-    print(format_audit_verdict_line(verdict))
+    print(format_audit_verdict_line(verdict, color_mode=args.color))
     print(
         "blocks: "
         f"fine train={role_counts.get(('fine', 'train'), 0)}, "
@@ -1933,6 +2218,20 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
             "coverage domain: observed training extrema; pass --geometry-json "
             "geometries.json to use declared generation bounds"
         )
+    unitless_decisions = [
+        row
+        for row in parameter_unit_interpretation
+        if int(row["unitless_value_count"]) > 0
+    ]
+    if unitless_decisions:
+        print(f"unitless parameter interpretation (--bare-values {args.bare_values}):")
+        for row in unitless_decisions:
+            declared = str(row["declared_unit"] or "base units")
+            print(
+                f"  {Path(str(row['source_file'])).name}: {row['parameter']} -> "
+                f"{row['selected_interpretation']} (declared {declared}, "
+                f"{row['unitless_value_count']} unitless value(s))"
+            )
     print(
         f"raw passivity: {len(violation_rows)} violating row(s) "
         f"(RF={len(rf_violation_rows)}, DC={len(dc_violation_rows)}), "
@@ -1943,7 +2242,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         f"issues: {severity_counts.get('ERROR', 0)} error(s), "
         f"{severity_counts.get('WARNING', 0)} warning(s)"
     )
-    print_verdict_reasons(verdict_reasons)
+    print_verdict_reasons(verdict_reasons, color_mode=args.color)
     print(f"report: {markdown_path}")
     exit_code = 1 if severity_counts["ERROR"] else 0
     if args.fail_on_warnings and severity_counts["WARNING"]:

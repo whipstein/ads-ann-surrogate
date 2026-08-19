@@ -218,7 +218,7 @@ are written relative to the current working directory whenever possible. Run
 from the project root if that is also where the recovered JSON will normally
 be used.
 
-After discovery, validate a command without running it:
+After discovery, validate a command and then choose whether to run it:
 
 ```bash
 python3 surrogate.py --options-json options.json --model dnn train \
@@ -332,6 +332,8 @@ as multiple `--parameter`, `--geometry-json`, or `--existing-points` options.
     },
     "audit": {
       "common": {
+        "bare_values": "auto",
+        "color": "always",
         "mdif": "data/train_verify.mdif",
         "verification_mdif": null,
         "geometry_json": ["geometries.json"],
@@ -368,7 +370,7 @@ python3 surrogate.py --options-json options.json --model dnn optimize \
 ### Inspect the Effective Options Before Running
 
 Add `--explain-options` (short alias: `--show-options`) to any selected command
-to see exactly what its backend would receive without running it:
+to see exactly what its backend would receive before deciding whether to run it:
 
 ```bash
 python3 surrogate.py --options-json options.json points suggest-additional \
@@ -377,7 +379,9 @@ python3 surrogate.py --options-json options.json points suggest-additional \
 
 The report lists every effective option after type conversion and precedence,
 labels its source as an explicit CLI flag, an exact JSON path, or the parser
-default, and identifies required options that are still missing. A configured
+default, and identifies required options that are still missing. Successful
+`OK` validation lines are green and missing or invalid lines are red. Set the
+standard `NO_COLOR` environment variable to suppress ANSI color. A configured
 `null` is reported as “JSON null ignored” so it cannot be mistaken for a value
 that reached the command. Audit data-input placeholders instead fall through
 to a populated common or unambiguous model fit value and report that fallback
@@ -404,9 +408,15 @@ For example, `selection_metric: weighted_evm_pct` is valid for model selection,
 but `points suggest-additional` needs a per-geometry row metric such as
 `metric: evm_pct` or `metric: auto`. The point selector still applies the saved
 `normalized_sparam_weight` column, so `evm_pct` respects the fit's S-parameter
-weights. `--explain-options` always exits without generating points, fitting a
-model, or writing model/workflow outputs. By itself it does not update the
-options JSON; combine it with `--update-options-json` to capture settings only.
+weights. When all required options and command-specific preflight checks pass,
+the command asks `Execute this command with the options above? [y/N]`. Answer
+`y` or `yes` to execute immediately using the displayed values; Enter, `n`, or
+any other response exits without executing. Missing or invalid inputs suppress
+the prompt. Non-interactive invocations also report the resolved configuration
+without executing. By itself `--explain-options` does not update the options
+JSON; combine it with `--update-options-json` to capture explicit settings. If
+you approve execution, the JSON update occurs after the command completes;
+otherwise it is captured immediately after the explanation.
 
 ### Build or Repair the JSON After Earlier Work
 
@@ -525,7 +535,8 @@ The update behavior is deliberately bounded:
 - options are written to the narrowest exact command section and are never
   automatically promoted to `models.commands` or another common scope;
 - when combined with `--explain-options`, explicit settings are saved after
-  parsing and preflight reporting without executing the selected command;
+  parsing if execution is declined, or after successful completion if the
+  prompted command is approved;
 - the file is replaced atomically after the command completes, including a
   completed audit whose data verdict is `FAIL`; parse errors and runtime
   failures do not modify it; and
@@ -976,6 +987,9 @@ The audit performs these checks:
 - compares verification parameter coverage with the declared geometry-generation
   range, falling back to observed training extrema only when no geometry JSON is
   supplied or inferred;
+- interprets unitless MDIF parameter values per source and parameter against the
+  declared geometry units, recording whether base units or parameter units were
+  selected;
 - ranks abrupt S-response changes between nearest training geometries; and
 - optionally checks reciprocity with `--expect-reciprocal`.
 
@@ -988,7 +1002,8 @@ recommended response. It also writes:
   section, recommended actions, an inset passivity plot, and the detailed
   findings;
 - `dataset_audit.json`: machine-readable verdict, issue counts, structured
-  `verdict_reasons` entries, and the selected coverage-domain source and bounds;
+  `verdict_reasons` entries, the selected coverage-domain source and bounds, and
+  per-source `parameter_unit_interpretation` decisions;
 - `dataset_passivity.csv`: every block/frequency singular-value calculation;
 - `dataset_blocks.csv`: passivity, grid, format, and geometry summary per block;
 - `dataset_issues.csv`: every error and warning with source block/frequency;
@@ -1005,11 +1020,22 @@ reported in the coverage CSV for diagnosis, but does not create a warning when
 it remains inside the declared range. Use `--fail-on-warnings` for CI-style
 strict checking.
 
-When standard output is an interactive terminal, the first status line is
-green for `PASS`, yellow for `WARNING`, and red for `FAIL`. Redirected output,
-captured logs, and Markdown/JSON artifacts remain plain text. Set the standard
-`NO_COLOR` environment variable, or use a terminal with `TERM=dumb`, to disable
-ANSI color explicitly.
+The CLI result is green for `PASS`, yellow for `WARNING`, and red for `FAIL`;
+individual warning/error reason headings use the same colors. The default
+`--color always` also works in captured ADS and IDE consoles. Use `--color auto`
+to emit colors only for an interactive terminal, or `--color never` when
+redirecting stdout to a text file. The standard `NO_COLOR` environment variable
+always disables ANSI color. Markdown, JSON, and CSV artifacts never contain
+ANSI escapes.
+
+Geometry JSON stores bounds in SI base units. MDIF parameter values with an
+explicit suffix such as `400um` are also converted directly to base units.
+Unitless values are ambiguous, so `--bare-values auto` evaluates both meanings
+for each source and parameter and selects the one consistent with the declared
+geometry range. Use `--bare-values parameter-units` when unitless `400` means
+`400um`, or `--bare-values base-units` when it means `400` SI units. The CLI,
+`dataset_audit.json`, and the **Parameter unit interpretation** report table show
+the selected interpretation.
 
 For example, a frequency-grid warning now identifies both the reason and what
 to inspect:
@@ -1035,6 +1061,7 @@ or a passivity-preserving formulation.
 
 | Option | Description | Example |
 | --- | --- | --- |
+| <nobr><code>--bare-values MODE</code></nobr> | Interpretation for unitless MDIF parameter values: <code>auto</code>, <code>parameter-units</code>, or <code>base-units</code>. Auto compares both interpretations against the geometry JSON independently for each source and parameter. Default: <code>auto</code>. | <nobr><code>--bare-values auto</code></nobr> |
 | <nobr><code>--coarse-mdif PATH</code></nobr> | Optional KBNN coarse training or combined MDIF. | <nobr><code>--coarse-mdif coarse_train_verify.mdif</code></nobr> |
 | <nobr><code>--coarse-verification-mdif PATH</code></nobr> | Optional separate coarse verification MDIF; requires <code>--coarse-mdif</code>. | <nobr><code>--coarse-verification-mdif coarse_verify.mdif</code></nobr> |
 | <nobr><code>--geometry-json PATH</code></nobr> | Geometry-generation metadata whose declared bounds define verification coverage. Repeat for extended campaigns. A valid same-stem JSON beside an MDIF is inferred when this option is omitted. | <nobr><code>--geometry-json geometries.json</code></nobr> |
@@ -1072,6 +1099,7 @@ or a passivity-preserving formulation.
 
 | Option | Description | Example |
 | --- | --- | --- |
+| <nobr><code>--color {auto,always,never}</code></nobr> | ANSI color policy for the CLI verdict and reason headings. Default: <code>always</code>; use <code>never</code> for redirected text. | <nobr><code>--color never</code></nobr> |
 | <nobr><code>--fail-on-warnings</code></nobr> | Return exit status 1 for warnings as well as errors. | <nobr><code>--fail-on-warnings</code></nobr> |
 | <nobr><code>--out-dir PATH</code></nobr> | Artifact directory. Default: <code>dataset_audit</code>. | <nobr><code>--out-dir outputs/data_audit</code></nobr> |
 
@@ -6946,10 +6974,10 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 
 | Option | Applies to | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- | --- |
-| `--explain-options`, `--show-options` | Every executable model/data workflow | Prints every effective value and its CLI, exact JSON, or parser-default source, performs additional-point input checks when applicable, and exits without executing. Combine with `--update-options-json` to capture explicit settings without running the command. It cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options`  | Not stored (CLI control) |
+| `--explain-options`, `--show-options` | Every executable model/data workflow | Prints every effective value and its CLI, exact JSON, or parser-default source, with green `OK` and red missing/invalid validation lines. Additional-point input checks run when applicable. If validation passes in an interactive terminal, answer the prompt with `y` or `yes` to execute immediately using those resolved values; decline to exit without execution. Missing inputs and non-interactive use do not execute. Combine with `--update-options-json` to capture explicit settings. It cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options`  | Not stored (CLI control) |
 | `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help`  | Not stored (CLI control) |
 | `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init` or `options discover`, which create the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model`  | Not stored (CLI control) |
-| `--update-options-json` | Every executable model/data workflow | Atomically saves explicitly supplied CLI options into the selected exact command section after completion, or immediately without execution when combined with `--explain-options`. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --explain-options --update-options-json`  | Not stored (CLI control) |
+| `--update-options-json` | Every executable model/data workflow | Atomically saves explicitly supplied CLI options into the selected exact command section after completion. With `--explain-options`, declining execution captures them immediately; approving execution saves them after the command completes. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --explain-options --update-options-json`  | Not stored (CLI control) |
 | `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help`  | Not stored (CLI control) |
 
 ### D.3 Options JSON creation and discovery
@@ -7091,8 +7119,10 @@ All options apply to `audit` and are alphabetized.
 
 | Option | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- |
+| `--bare-values MODE` | Interpretation for unitless MDIF parameters: `auto`, `parameter-units`, or `base-units`. Auto compares both interpretations with geometry JSON bounds independently per source and parameter. Default: `auto`. | `--bare-values auto` | `workflows.audit.common.bare_values` |
 | `--coarse-mdif PATH` | Optional KBNN coarse training/combined MDIF. | `--coarse-mdif coarse.mdif`  | `workflows.audit.common.coarse_mdif` |
 | `--coarse-verification-mdif PATH` | Optional separate coarse verification MDIF; requires `--coarse-mdif`. | `--coarse-verification-mdif coarse_verify.mdif`  | `workflows.audit.common.coarse_verification_mdif` |
+| `--color {auto,always,never}` | ANSI color policy for the CLI verdict and warning/error reason headings. Default: `always`; use `never` for redirected text. `NO_COLOR` always disables color. | `--color auto` | `workflows.audit.common.color` |
 | `--expect-reciprocal` | Makes reciprocity mismatch an audit error. Leave unset for intentionally nonreciprocal networks. | `--expect-reciprocal`  | `workflows.audit.common.expect_reciprocal` |
 | `--fail-on-warnings` | Returns nonzero status for warnings as well as errors. | `--fail-on-warnings`  | `workflows.audit.common.fail_on_warnings` |
 | `--frequency-abs-tolerance-hz FLOAT` | Absolute grid-comparison tolerance in hertz. Default: `1e-3`. | `--frequency-abs-tolerance-hz 1`  | `workflows.audit.common.frequency_abs_tolerance_hz` |
@@ -7343,7 +7373,7 @@ on the primary entry point:
 | Stage | Copyable command |
 | --- | --- |
 | Inspect resolved configuration | `python3 surrogate.py --options-json options.json points suggest-additional --explain-options` |
-| Capture a command without running | `python3 surrogate.py --options-json options.json points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --count 8 --metric auto --explain-options --update-options-json` |
+| Capture a command without running | `python3 surrogate.py --options-json options.json points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --count 8 --metric auto --explain-options --update-options-json` (decline the execution prompt) |
 | Generate | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 32 --verification-count 8 --out geometries.csv` |
 | Audit | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |
