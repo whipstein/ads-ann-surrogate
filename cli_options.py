@@ -167,7 +167,12 @@ def starter_options_payload() -> dict[str, object]:
                 },
                 "inspect-mdif": {"mdif": None},
                 "predict": {"mdif": None},
-                "export-ads-ann": {"mdif": None},
+                "export-ads-ann": {
+                    "mdif": None,
+                    "module_name": None,
+                    "parameter_input_scales": 1.0,
+                    "z0": 50.0,
+                },
             },
             "dnn": {
                 "commands": {

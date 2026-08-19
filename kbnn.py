@@ -2487,6 +2487,13 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         "training_stop_tolerance": args.ads_training_stop_tolerance,
         "output_format": ads_ann_output_format_enum(args.ads_output_format),
         "output_prefix": normalize_name(args.output_prefix) or "kbnn_ads_ann",
+        "netlist_module_name": args.module_name
+        or f"{normalize_name(args.output_prefix) or 'kbnn_ads_ann'}_sdd",
+        "parameter_input_scales": parse_parameter_scale_spec(
+            parameter_names,
+            args.parameter_input_scales,
+        ),
+        "z0": float(args.z0),
     }
 
     notes = [
@@ -2560,6 +2567,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         "input_columns": manifest["input_columns"],
         "output_columns": manifest["output_columns"],
         "ads_ann": manifest["ads_ann"],
+        "ads_netlist": manifest["ads_netlist"],
         "mode": mode,
         "ads_ann_target": target,
     }, indent=2))
@@ -3767,7 +3775,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["log", "linear", "log-linear"],
     )
     export_ann.add_argument("--mode", choices=["plain", "residual", "prior-input"])
-    export_ann.add_argument("--include-coarse-input", action="store_true", default=None)
+    export_ann.add_argument(
+        "--include-coarse-input",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Include coarse S values as ADS ANN inputs. Use "
+            "--no-include-coarse-input with --ads-ann-target fine for a "
+            "self-contained generated SDD netlist."
+        ),
+    )
     export_ann.add_argument(
         "--ads-ann-target",
         choices=["native", "fine"],
@@ -3800,6 +3817,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
     )
     export_ann.add_argument("--output-prefix", default="kbnn_ads_ann")
+    export_ann.add_argument(
+        "--module-name",
+        help="Generated ADS ANN SDD subnetwork name. Defaults to <output-prefix>_sdd",
+    )
+    export_ann.add_argument(
+        "--parameter-input-scales",
+        default="1.0",
+        help="One ADS-side input scale applied to every geometry parameter, such as 1.0 or 1um",
+    )
+    export_ann.add_argument(
+        "--z0",
+        type=float,
+        default=50.0,
+        help="S-parameter reference impedance used by the generated ANN SDD netlist",
+    )
     export_ann.add_argument("--seed", type=int)
     export_ann.set_defaults(func=command_export_ads_ann)
 

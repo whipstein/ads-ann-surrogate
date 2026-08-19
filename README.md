@@ -2517,15 +2517,19 @@ python3 surrogate.py --model dnn export-ads-ann \
 The ADS ANN export writes a portable package with `train_ads_ann.py` and the
 scoped `ads_qt_runtime.py` bootstrap; run the trainer with ADS Python on the ADS
 machine to produce the native `.inc`, `.c`, `.equation`, `.struc`, and `.scale`
-artifacts.
+artifacts. When the output format includes text equations, the same training
+run also creates a complete RF-only ADS SDD `.net` subnetwork for
+`NetlistInclude`; no ANN coefficients or N-port SDD entries are entered by
+hand.
 
 ### Native ADS ANN: Detailed ADS Integration
 
 This section describes `export-ads-ann`, not the sampled-MDIF or
 `export-ads-hb` paths. Native ADS ANN export is available for DNN and KBNN. It
-creates an ANN evaluator, but it does not automatically create an electrical
-N-port symbol. ADS still needs a wrapper that maps inputs, reconstructs complex
-S-parameters, and stamps port currents. Keysight documents SDD and FDD
+creates an ANN evaluator and, for final-fine S-parameter targets, automatically
+packages it inside a native ADS SDD subnetwork. A graphical adapter symbol is
+optional; the complete electrical model can be loaded with `NetlistInclude`
+and instantiated with native subnetwork calls. Keysight documents SDD and FDD
 components as the electrical stimulus/response shells for an ANN equation.
 
 #### 1. Understand What Is Retrained
@@ -2569,6 +2573,9 @@ python3 surrogate.py --model dnn export-ads-ann \
   --mdif train_verify.mdif \
   --model-dir outputs/dnn_model \
   --out-dir outputs/dnn_ads_ann \
+  --module-name my_dnn_ann_4port \
+  --parameter-input-scales 1um \
+  --z0 50 \
   --ads-hidden-layers 2 \
   --ads-neurons-per-layer 20 \
   --ads-iterations 1000 \
@@ -2584,6 +2591,10 @@ python3 surrogate.py --model kbnn export-ads-ann \
   --model-dir outputs/kbnn_model \
   --out-dir outputs/kbnn_ads_ann \
   --ads-ann-target fine \
+  --no-include-coarse-input \
+  --module-name my_kbnn_ann_4port \
+  --parameter-input-scales 1um \
+  --z0 50 \
   --ads-iterations 1000 \
   --ads-output-format all
 ```
@@ -2606,6 +2617,8 @@ my_workspace_wrk/
       ads_qt_runtime.py
       ADS_ANN_README.md
       ADS_SDD_SETUP.md
+      my_dnn_ann_4port.net.in
+      ADS_ANN_INSTANCE_TEMPLATE.txt
 ```
 
 The package may live under `models/`; it does not need to be put in the ADS
@@ -2709,6 +2722,9 @@ Expected output with `--ads-output-format all`:
 | --- | --- |
 | `<prefix>.equation` | Native ANN text equations. Its `_vN` identifiers are ANN inputs, not electrical SDD port voltages. |
 | `<prefix>_sdd.equation` | Created by `train_ads_ann.py`; the ANN inputs and outputs are safely renamed to `ann_in_N` and `ann_out_N` for use in an SDD wrapper. |
+| `<module>.net` | Created automatically by `train_ads_ann.py`; complete RF-only native ADS subnetwork containing the ANN evaluator, N-port S-to-Y conversion, negative-frequency conjugation, and SDD stamp. Point `NetlistInclude` here. |
+| `<module>.net.in` | Pre-generated wrapper template filled by `train_ads_ann.py`; do not include this incomplete template. |
+| `ADS_ANN_INSTANCE_TEMPLATE.txt` | Two copyable native ADS calls with the exact node and geometry-parameter order. |
 | `<prefix>.inc` | Verilog-A-oriented ANN evaluator. Inspect it before use because the installed ADS release determines whether it is a complete module or a fragment. |
 | `<prefix>.struc`, `<prefix>.scale` | Native ANN structure and scaling used by ADS ANN simulation APIs; these are not `NetlistInclude` files. |
 | `<prefix>.c` | C-oriented model source for advanced compiled-model development. |
@@ -2760,13 +2776,53 @@ $$
 
 Do not infer output ordering from the visual port layout.
 
-#### 5. Build the Electrical Wrapper Cell
+#### 5. Use the Automatic NetlistInclude/SDD Model
 
-There is no `NetlistInclude` in this route. `<prefix>.equation` is an ANN text
-formula, not a complete ADS subcircuit. Do not include `.equation`, `.struc`,
-or `.scale` with `NetlistInclude`. The training script writes
-`<prefix>_sdd.equation`, with the generated ANN `_vN` inputs renamed to
-`ann_in_N` and `yN` outputs renamed to `ann_out_N`.
+`<prefix>.equation` by itself remains an evaluator fragment and must not be
+used as a `NetlistInclude`. Instead, `train_ads_ann.py` inserts the renamed
+equation into `<module>.net.in` and writes the complete `<module>.net` model.
+That final file already contains every N-port conversion and SDD equation.
+
+On the top-level ADS simulation schematic, place one `NetlistInclude`:
+
+```text
+IncludePath="./models/dnn_ads_ann"
+IncludeFiles[1]="my_dnn_ann_4port.net"
+UsePreprocessor=yes
+```
+
+Load the definition once. Instantiate the module separately using the calls in
+`ADS_ANN_INSTANCE_TEMPLATE.txt`, for example:
+
+```text
+my_dnn_ann_4port:X1 x1_p1 x1_p2 x1_p3 x1_p4 W=W_A L=L_A Gap=Gap_A
+my_dnn_ann_4port:X2 x2_p1 x2_p2 x2_p3 x2_p4 W=W_B L=L_B Gap=Gap_B
+```
+
+The include receives no geometry values. Each subnetwork call receives its own
+physical ADS-side parameters. The generated input scale implements
+`model_value=instance_value/input_scale`; with
+`--parameter-input-scales 1um`, pass `W=10um`, not `W=10` and not a manually
+pre-divided value.
+
+For visible schematic placement, create or generate one N-pin adapter symbol
+whose netlist line is the same module call. This is the only remaining
+schematic-specific step; the ANN, S-to-Y, and SDD implementation are already
+inside the included definition.
+
+The automatic native-ANN subnetwork is RF-only: its SDD weights are exactly
+zero at zero hertz. It evaluates positive spectral frequency magnitude and
+uses the complex conjugate at negative frequency for HB real-wave symmetry.
+Use `export-ads-hb` when the repository's separate extracted DC network must
+also be included.
+
+#### 6. Manual Wrapper Fallback
+
+If the automatic netlist is disabled in `ads_ann_manifest.json`—for example,
+because KBNN exports residual outputs or requires external `coarse_*`
+inputs—regenerate with `--ads-ann-target fine` and without
+`--include-coarse-input`. The following manual construction remains available
+for specialized integrations.
 
 Create the wrapper as follows:
 
@@ -2897,7 +2953,7 @@ DC bias sources, or a second copy of the generated ANN equations. This native
 ANN package is RF-only; use the repository's separate exported DC/HB model when
 those behaviors are required.
 
-#### 6. Instantiate the Cell More Than Once
+#### 7. Instantiate the Manual Cell More Than Once
 
 Keep the ANN equations and current stamp inside the hierarchical wrapper. Each
 symbol instance can then pass independent parameter expressions:
@@ -2911,7 +2967,7 @@ Top-level `VAR` values can drive those parameters, for example `W_A`, `L_A`,
 `W_B`, and `L_B`. The ANN coefficient files are shared, while every instance
 evaluates them with its own input values.
 
-#### 7. Validate in This Order
+#### 8. Validate in This Order
 
 1. Compare `ads_ann_verification_prediction.csv` with its truth columns.
 2. At one verification geometry, expose and plot every reconstructed ANN
@@ -3689,6 +3745,9 @@ python3 surrogate.py --model dnn export-ads-ann \
   --mdif train_verify.mdif \
   --model-dir dnn_sweep/best_model \
   --out-dir dnn_ads_ann \
+  --module-name my_dnn_ann \
+  --parameter-input-scales 1um \
+  --z0 50 \
   --ads-iterations 1000 \
   --ads-output-format all
 ```
@@ -3699,6 +3758,8 @@ The export writes `ads_ann_training.csv`, optional
 ADS Python interpreter on a licensed ADS machine. The Qt helper is invoked
 automatically before `keysight.ads.ann` is imported. This path retrains the
 network in ADS ANN; it does not import the local NumPy `model.npz` weights.
+When text equations are requested, the training run also writes a complete
+`my_dnn_ann.net` RF SDD subnetwork and `ADS_ANN_INSTANCE_TEMPLATE.txt`.
 
 ADS reference used:
 
@@ -3732,22 +3793,18 @@ Portable workflow:
 4. On the ADS machine, run `train_ads_ann.py` with ADS Python to generate the
    native ADS ANN files.
 
-Schematic use:
+ADS use:
 
-1. Create a small ADS wrapper cell. For Verilog-A, include/call the generated
-   `.inc` file. For an SDD or equation-based wrapper, use the generated
-   `.equation` file as the ANN equation source/reference.
-2. Feed the wrapper inputs from the `input_columns` in `ads_ann_manifest.json`.
-   For example, `freq_log10_hz` means the wrapper must pass
-   $\log_{10}(f_{\mathrm{Hz}})$.
-3. Interpret `output_columns` as the final fine S-parameters, with all real
-   columns followed by the matching imaginary columns.
-4. Convert the final complex S-matrix to a circuit relation before driving the
-   schematic pins. For reference impedance $Z_0$, use
-   $\mathbf Y=(\mathbf I-\mathbf S)(\mathbf I+\mathbf S)^{-1}/Z_0$, then
-   $\mathbf I_{\mathrm{port}}=\mathbf Y\mathbf V_{\mathrm{port}}$.
-5. Validate the wrapper in an S-parameter or AC simulation before circuit
-   optimization.
+1. Run `train_ads_ann.py`; confirm native verification before circuit use.
+2. Place one top-level `NetlistInclude` that loads the generated `.net`, not
+   the raw `.equation`, `.struc`, or `.scale` artifacts.
+3. Copy an instance call from `ADS_ANN_INSTANCE_TEMPLATE.txt`; set its ordered
+   electrical nodes and geometry values independently for every instance.
+4. The generated subnetwork maps the manifest inputs, reconstructs complex S,
+   performs the complete N-port S-to-Y conversion, and stamps the SDD. It is
+   RF-only and open at exact zero hertz.
+5. Validate all S-parameters in an isolated SP testbench before circuit
+   optimization or HB use.
 
 #### ADS Harmonic-Balance Passive Network Export
 
@@ -4007,18 +4064,18 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | <code>export-ads-ann</code> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
 | <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. Default: `20`, matching Keysight's in-memory extraction example. | <nobr><code>--ads-neurons-per-layer 20</code></nobr> |
 | <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
-| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
+| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` and `equation` also enable the automatic NetlistInclude/SDD package. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
 | <nobr><code>--dc-open-threshold FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | A selected branch conductance below the reciprocal of this resistance is treated as open. Default: `1e12` ohm. | <nobr><code>--dc-open-threshold 1e12</code></nobr> |
 | <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted DC resistor paths. If omitted, both components of every ordered complex DC $S_{ij}$ value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
-| <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
+| <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. ADS ANN defaults to `<output-prefix>_sdd`; other exporters derive it from the model directory. | <nobr><code>--module-name my_dnn_4port</code></nobr> |
 | <nobr><code>--no-fold-scalers</code></nobr> | <code>export-veriloga</code> | Debug option. Keep input/output standardization as explicit Verilog-A arithmetic instead of folding it into the first and final neural layers. Leaving this unset is faster. | <nobr><code>--no-fold-scalers</code></nobr> |
 | <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used for every geometry/process parameter: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
-| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance. Direct-Y DNNs use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used for every geometry/process parameter: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance. Direct-Y DNNs use the saved training `--target-z0` metadata instead. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
 
@@ -4704,7 +4761,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--freq-transform {log,linear,log-linear}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Frequency input transform. `log` uses $\log_{10}(f_{\mathrm{Hz}})$, `linear` uses raw Hz, and `log-linear` supplies both columns. Train default: `log`. | <nobr><code>--freq-transform log-linear</code></nobr> |
 | <nobr><code>--freq-transforms LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated frequency transforms to try. `--freq-transform` accepts one train-compatible value; `--freq-transform-options` remains an alias. Default: `log,linear,log-linear`. | <nobr><code>--freq-transforms log,linear,log-linear</code></nobr> |
 | <nobr><code>--hidden-layers LIST</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | Comma-separated hidden-layer sizes for one model. Sweeps also accept semicolon-separated candidate layouts. Train default: `64,64`; sweep default: `32;64;64,64`. `--hidden-layer-layouts` and `--hidden-layer-options` remain aliases. | <nobr><code>--hidden-layers 64,64</code></nobr> |
-| <nobr><code>--include-coarse-input</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | In `residual` mode, append coarse real/imaginary S-parameters to the NN input vector. This can improve accuracy if the correction depends strongly on the coarse response. Forced on for `prior-input` and off for `plain`. | <nobr><code>--include-coarse-input</code></nobr> |
+| <nobr><code>--include-coarse-input</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | In `residual` mode, append coarse real/imaginary S-parameters to the NN input vector. ADS ANN export also accepts `--no-include-coarse-input`, which is required with a final-fine target when a self-contained native SDD netlist must override stored metadata. Forced on for `prior-input` and off for `plain`. | <nobr><code>--no-include-coarse-input</code></nobr> |
 | <nobr><code>--include-coarse-inputs LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated boolean candidates for `--include-coarse-input`. Supplying the singular flag selects only `true`; `--include-coarse-input-options` remains an alias. Default: `false,true`. | <nobr><code>--include-coarse-inputs false,true</code></nobr> |
 | <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam step size. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
 | <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
@@ -4758,7 +4815,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--ads-network-training-type {standard,adjoint,classification}</code></nobr> | <code>export-ads-ann</code> | ADS ANN training type. Use `standard` for normal S-parameter regression. Default: `standard`. | <nobr><code>--ads-network-training-type standard</code></nobr> |
 | <nobr><code>--ads-neurons-per-layer INT</code></nobr> | <code>export-ads-ann</code> | Override ADS `AnnSetup.num_neurons_per_layer`. Default: `20`, matching Keysight's in-memory extraction example. | <nobr><code>--ads-neurons-per-layer 20</code></nobr> |
 | <nobr><code>--ads-optimizer {quasi-newton,bayesian-regularization}</code></nobr> | <code>export-ads-ann</code> | ADS ANN modeler optimizer. `bayesian-regularization` can improve generalization at additional training cost. Default: `quasi-newton`. | <nobr><code>--ads-optimizer bayesian-regularization</code></nobr> |
-| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` requests every documented output. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
+| <nobr><code>--ads-output-format {all,verilog-a,c-code,equation,struct-scale}</code></nobr> | <code>export-ads-ann</code> | ADS ANN native artifact format. `all` and `equation` also enable the automatic NetlistInclude/SDD package. Default: `all`. | <nobr><code>--ads-output-format all</code></nobr> |
 | <nobr><code>--ads-training-stop-tolerance FLOAT</code></nobr> | <code>export-ads-ann</code> | ADS ANN RMSE stop tolerance. Use `0` to rely on the iteration limit. Default: `0.0`. | <nobr><code>--ads-training-stop-tolerance 0</code></nobr> |
 | <nobr><code>--allow-coarse-hooks</code></nobr> | <code>export-veriloga</code> | Explicitly allow the legacy non-self-contained residual/prior-input export when `--coarse-model-dir` is omitted. The generated coarse values default to zero and are intended only for fixed-point diagnostics or hand-written equations. | <nobr><code>--allow-coarse-hooks</code></nobr> |
 | <nobr><code>--dc-open-resistance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Finite resistance used to represent an open fine-data DC branch. Default: `1e19` ohm. | <nobr><code>--dc-open-resistance 1e19</code></nobr> |
@@ -4766,10 +4823,10 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--dc-port-paths SPEC</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-mdif</code>, <code>export-ads</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional comma-separated restricted fine-data DC resistor paths. If omitted, both components of every ordered complex fine-data DC $S_{ij}$ value are fitted directly. | <nobr><code>--dc-port-paths 1-2,3-4</code></nobr> |
 | <nobr><code>--freqs SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Frequency grid used with `--parameter-grid`. `SPEC` can be a comma list or `start:stop:count`. | <nobr><code>--freqs 1GHz:20GHz:401</code></nobr> |
 | <nobr><code>--frequency-expression EXPR</code></nobr> | <code>export-veriloga</code> | Verilog-A expression for simulator frequency in Hz. Default: `$freq`. Change this only if your ADS Verilog-A release requires a different frequency expression. | <nobr><code>--frequency-expression '$freq'</code></nobr> |
-| <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. If omitted, the exporter derives one from the model directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
+| <nobr><code>--module-name NAME</code></nobr> | <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Optional ADS subnetwork or Verilog-A module name. ADS ANN defaults to `<output-prefix>_sdd`; other exporters derive it from the model directory. | <nobr><code>--module-name my_kbnn_4port</code></nobr> |
 | <nobr><code>--parameter-grid NAME=SPEC</code></nobr> | <code>export-ads-mdif</code>, <code>export-ads</code> | Optional repeatable grid definition. `SPEC` can be a comma list or `start:stop:count`. Repeat once for every model parameter when not using `--template-mdif`. | <nobr><code>--parameter-grid W=0.40mm:0.80mm:9</code></nobr> |
-| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used before both fine and coarse networks: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
-| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
+| <nobr><code>--parameter-input-scales SCALE</code></nobr> | <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | Common positive ADS-side unit scale used before both fine and coarse networks: $p_{\mathrm{model}}=p_{\mathrm{instance}}/s_{\mathrm{input}}$. Default: `1.0`. | <nobr><code>--parameter-input-scales 1um</code></nobr> |
+| <nobr><code>--z0 FLOAT</code></nobr> | <code>export-ads-ann</code>, <code>export-ads-hb</code>, <code>export-veriloga</code> | S-parameter reference impedance used by the exported wave or admittance relation. Default: `50.0`. | <nobr><code>--z0 50</code></nobr> |
 
 ---
 
@@ -6987,7 +7044,7 @@ The fine fit must receive exactly one reusable coarse source for `residual` or
 | `--coarse-worst-plots INT` | KBNN fit with `--coarse-mdif` | Coarse verification plot count; defaults to fine `--worst-plots`. | `--coarse-worst-plots 3`  | `models.kbnn.commands.fit.coarse_worst_plots` |
 | `--freq-transform NAME` | KBNN `train`; single-value optimize form | Fine-network transform: `log`, `linear`, or `log-linear`. Default: `log`. | `--freq-transform log`  | `models.kbnn.commands.fit.freq_transform` |
 | `--freq-transforms LIST` | KBNN optimize | Fine transform candidates; aliases include `--freq-transform-options` and single-value `--freq-transform`. Default: `log,linear,log-linear`. | `--freq-transforms log,log-linear`  | `models.kbnn.commands.optimize.freq_transforms` |
-| `--include-coarse-input` | KBNN `train`, optimize, ADS ANN export | Adds coarse S as fine-network inputs; for optimize this is the single true candidate. | `--include-coarse-input`  | `models.kbnn.commands.fit.include_coarse_input`<br>`models.kbnn.commands.export-ads-ann.include_coarse_input` |
+| `--include-coarse-input` | KBNN `train`, optimize, ADS ANN export | Adds coarse S as fine-network inputs; for optimize this is the single true candidate. ADS ANN export additionally accepts `--no-include-coarse-input` for a self-contained final-fine netlist. | `--no-include-coarse-input`  | `models.kbnn.commands.fit.include_coarse_input`<br>`models.kbnn.commands.export-ads-ann.include_coarse_input` |
 | `--include-coarse-inputs LIST` | KBNN optimize | Boolean candidate list; alias: `--include-coarse-input-options`. Default: `false,true`. | `--include-coarse-inputs false,true`  | `models.kbnn.commands.optimize.include_coarse_inputs` |
 | `--mode {plain,residual,prior-input,adaptive,grid,random}` | KBNN `train`/optimize | Fine formulation for the first three values; train accepts only those and defaults to `residual`. In optimize, `adaptive`, `grid`, and `random` are legacy search-mode values; prefer `--search-mode` for clarity. | `--mode residual`  | `models.kbnn.commands.fit.mode` |
 | `--modes LIST` | KBNN optimize | Comma-separated formulation candidates; alias: `--mode-options`. Default: `residual,prior-input`. | `--modes residual,prior-input`  | `models.kbnn.commands.optimize.modes` |
@@ -7021,15 +7078,15 @@ all S-parameters.
 | `--frequency-expression EXPR` | All-model `export-veriloga` | Simulator frequency expression in hertz. Default: `$freq`. | `--frequency-expression '$freq'`  | `models.MODEL.commands.export-veriloga.frequency_expression` |
 | `--mdif PATH` | All-model `inspect-mdif`, `predict` | Input MDIF to inspect or whose parameter/frequency blocks should be predicted. | `--mdif request.mdif`  | `models.MODEL.commands.{inspect-mdif,predict}.mdif` |
 | `--model-dir PATH` | All-model predict/export | Directory containing `model.npz` and `metadata.json`. | `--model-dir dnn_model`  | `models.MODEL.commands.{predict,export-ads-mdif,export-ads-ann,export-ads-hb,export-veriloga}.model_dir` |
-| `--module-name NAME` | All-model HB/VA export | ADS subnetwork or Verilog-A module name; otherwise derived from the model directory. | `--module-name filter_model`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.module_name` |
+| `--module-name NAME` | DNN/KBNN ADS ANN and all-model HB/VA export | ADS subnetwork or Verilog-A module name; ADS ANN defaults to `<output-prefix>_sdd`, while other exports derive it from the model directory. | `--module-name filter_model`  | `models.MODEL.commands.{export-ads-ann,export-ads-hb,export-veriloga}.module_name` |
 | `--out-dir PATH` | All-model export | Required package destination. | `--out-dir exports/filter`  | `models.MODEL.commands.export.out_dir` |
 | `--out-mdif PATH` | All-model `predict` | Required predicted MDIF path. | `--out-mdif predicted.mdif`  | `models.MODEL.commands.predict.out_mdif` |
 | `--output-name NAME` | All-model `export-ads-mdif` | Exported MDIF filename. Default: `surrogate_ads.mdif`. | `--output-name filter.mdif`  | `models.MODEL.commands.export-ads-mdif.output_name` |
 | `--parameter-grid NAME=SPEC` | All-model `export-ads-mdif` | Repeat once per model parameter; values are a comma list or `start:stop:count`. | `--parameter-grid W=0.4mm:0.8mm:9`  | `models.MODEL.commands.export-ads-mdif.parameter_grid` |
-| `--parameter-input-scales SCALE` | All-model HB/VA export | One positive ADS-side denominator applied to every parameter: `model_value=instance_value/scale`. Default: `1.0`. | `--parameter-input-scales 1um`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.parameter_input_scales` |
+| `--parameter-input-scales SCALE` | DNN/KBNN ADS ANN and all-model HB/VA export | One positive ADS-side denominator applied to every parameter: `model_value=instance_value/scale`. Default: `1.0`. | `--parameter-input-scales 1um`  | `models.MODEL.commands.{export-ads-ann,export-ads-hb,export-veriloga}.parameter_input_scales` |
 | `--split-var NAME` | All-model `inspect-mdif` | Split variable summarized by inspection. Default: `dataset`. | `--split-var dataset`  | `models.MODEL.commands.inspect-mdif.split_var` |
 | `--template-mdif PATH` | All-model `export-ads-mdif` | Supplies exact parameter/frequency blocks; its S values are ignored. Every fit generates `MODEL_DIR/ads_export_template.mdif`, which is auto-selected if both this option and `--parameter-grid` are omitted. Provide another file only for a different grid. | `--template-mdif dnn_model/ads_export_template.mdif`  | `models.MODEL.commands.export-ads-mdif.template_mdif` |
-| `--z0 FLOAT` | All-model HB/VA export | S reference impedance for conversion/stamping. Default: `50`. | `--z0 50`  | `models.MODEL.commands.{export-ads-hb,export-veriloga}.z0` |
+| `--z0 FLOAT` | DNN/KBNN ADS ANN and all-model HB/VA export | S reference impedance for conversion/stamping. Default: `50`. | `--z0 50`  | `models.MODEL.commands.{export-ads-ann,export-ads-hb,export-veriloga}.z0` |
 
 #### DNN export-only options
 
@@ -7060,19 +7117,21 @@ training tables from MDIF rather than importing local weights.
 | `--ads-network-training-type {standard,adjoint,classification}` | DNN/KBNN ADS ANN | ADS network training type. Default: `standard`. | `--ads-network-training-type standard`  | `models.MODEL.commands.export-ads-ann.ads_network_training_type` |
 | `--ads-neurons-per-layer INT` | DNN/KBNN ADS ANN | Overrides ADS neurons per hidden layer; default `20`. | `--ads-neurons-per-layer 20`  | `models.MODEL.commands.export-ads-ann.ads_neurons_per_layer` |
 | `--ads-optimizer {quasi-newton,bayesian-regularization}` | DNN/KBNN ADS ANN | ADS modeler optimizer. Default: `quasi-newton`. | `--ads-optimizer quasi-newton`  | `models.MODEL.commands.export-ads-ann.ads_optimizer` |
-| `--ads-output-format {all,verilog-a,c-code,equation,struct-scale}` | DNN/KBNN ADS ANN | Native artifact type requested from ADS. Default: `all`. | `--ads-output-format all`  | `models.MODEL.commands.export-ads-ann.ads_output_format` |
+| `--ads-output-format {all,verilog-a,c-code,equation,struct-scale}` | DNN/KBNN ADS ANN | Native artifact type requested from ADS. `all` and `equation` also enable the automatic NetlistInclude/SDD model. Default: `all`. | `--ads-output-format all`  | `models.MODEL.commands.export-ads-ann.ads_output_format` |
 | `--ads-training-stop-tolerance FLOAT` | DNN/KBNN ADS ANN | ADS RMSE stop tolerance. Default: `0`. | `--ads-training-stop-tolerance 0`  | `models.MODEL.commands.export-ads-ann.ads_training_stop_tolerance` |
 | `--coarse-mdif PATH` | KBNN ADS ANN only | Optional coarse/prior MDIF used to prepare native KBNN targets. | `--coarse-mdif coarse.mdif`  | `models.MODEL.commands.export-ads-ann.coarse_mdif` |
 | `--coarse-verification-mdif PATH` | KBNN ADS ANN only | Optional separate coarse verification MDIF. | `--coarse-verification-mdif coarse_verify.mdif`  | `models.MODEL.commands.export-ads-ann.coarse_verification_mdif` |
 | `--freq-transform NAME` | DNN/KBNN ADS ANN | Frequency-transform override; otherwise model metadata is used. | `--freq-transform log`  | `models.MODEL.commands.export-ads-ann.freq_transform` |
 | `--hidden-layers LAYOUT` | DNN/KBNN ADS ANN | Architecture metadata override. | `--hidden-layers 128,128,64`  | `models.MODEL.commands.export-ads-ann.hidden_layers` |
 | `--holdout-fraction FLOAT` | DNN/KBNN ADS ANN | Random verification fraction if labels are absent. Default: `0.2`. | `--holdout-fraction 0.2`  | `models.MODEL.commands.export-ads-ann.holdout_fraction` |
-| `--include-coarse-input` | KBNN ADS ANN only | Includes coarse S among network inputs. | `--include-coarse-input`  | `models.MODEL.commands.export-ads-ann.include_coarse_input` |
+| `--include-coarse-input`, `--no-include-coarse-input` | KBNN ADS ANN only | Enables or disables coarse S among ANN inputs. Disable it with `--ads-ann-target fine` for the automatic self-contained NetlistInclude/SDD package. | `--no-include-coarse-input`  | `models.MODEL.commands.export-ads-ann.include_coarse_input` |
 | `--mdif PATH` | DNN/KBNN ADS ANN | Required direct/fine MDIF. | `--mdif train_verify.mdif`  | `models.MODEL.commands.export-ads-ann.mdif` |
 | `--mode {plain,residual,prior-input}` | KBNN ADS ANN only | KBNN target formulation override. | `--mode residual`  | `models.MODEL.commands.export-ads-ann.mode` |
 | `--model-dir PATH` | DNN/KBNN ADS ANN | Optional local model or `best_model` directory used for labels and compatible export metadata. Local hidden sizes are recorded but not inherited by ADS ANN. | `--model-dir dnn_opt/best_model`  | `models.MODEL.commands.export-ads-ann.model_dir` |
+| `--module-name NAME` | DNN/KBNN ADS ANN | Name of the generated native ADS ANN SDD subnetwork. Defaults to `<output-prefix>_sdd`. | `--module-name filter_ann_4port`  | `models.MODEL.commands.export-ads-ann.module_name` |
 | `--out-dir PATH` | DNN/KBNN ADS ANN | Required package directory. | `--out-dir ads_ann`  | `models.MODEL.commands.export-ads-ann.out_dir` |
 | `--output-prefix NAME` | DNN/KBNN ADS ANN | Generated ADS artifact prefix. Defaults: `dnn_ads_ann` or `kbnn_ads_ann`. | `--output-prefix filter_ann`  | `models.MODEL.commands.export-ads-ann.output_prefix` |
+| `--parameter-input-scales SCALE` | DNN/KBNN ADS ANN | One positive ADS-side scale applied to every geometry parameter in the generated netlist: `model_value=instance_value/scale`. Default: `1.0`. | `--parameter-input-scales 1um`  | `models.MODEL.commands.export-ads-ann.parameter_input_scales` |
 | `--parameter-names LIST` | DNN/KBNN ADS ANN | Geometry/process inputs; inferred when omitted. | `--parameter-names W,L,H`  | `models.MODEL.commands.export-ads-ann.parameter_names` |
 | `--seed INT` | DNN/KBNN ADS ANN | Optional data-preparation seed. | `--seed 1234`  | `models.MODEL.commands.export-ads-ann.seed` |
 | `--sparam-weights SPEC` | DNN/KBNN ADS ANN | Records intended output priorities in the manifest; defaults to model metadata. | `--sparam-weights 'diag=1;offdiag=0.2'`  | `models.MODEL.commands.export-ads-ann.sparam_weights` |
@@ -7080,6 +7139,7 @@ training tables from MDIF rather than importing local weights.
 | `--train-values LIST` | DNN/KBNN ADS ANN | Training-label override. | `--train-values train`  | `models.MODEL.commands.export-ads-ann.train_values` |
 | `--verification-mdif PATH` | DNN/KBNN ADS ANN | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif`  | `models.MODEL.commands.export-ads-ann.verification_mdif` |
 | `--verify-values LIST` | DNN/KBNN ADS ANN | Verification-label override. | `--verify-values verification`  | `models.MODEL.commands.export-ads-ann.verify_values` |
+| `--z0 FLOAT` | DNN/KBNN ADS ANN | S-parameter reference impedance used by the generated S-to-Y/SDD netlist. Default: `50`. | `--z0 50`  | `models.MODEL.commands.export-ads-ann.z0` |
 
 ### D.15 ADS HB solver-report options
 

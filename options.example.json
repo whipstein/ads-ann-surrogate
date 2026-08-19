@@ -31,7 +31,10 @@
         "mdif": null
       },
       "export-ads-ann": {
-        "mdif": null
+        "mdif": null,
+        "module_name": null,
+        "parameter_input_scales": 1.0,
+        "z0": 50.0
       }
     },
     "dnn": {

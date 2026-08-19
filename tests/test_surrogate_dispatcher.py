@@ -13,8 +13,10 @@ import numpy as np
 
 import surrogate
 from surrogate_common import (
+    ADS_ANN_NETLIST_PLACEHOLDER,
     ADS_EXPORT_TEMPLATE_FILENAME,
     MDIFBlock,
+    ads_ann_netlist_template,
     ads_qt_runtime_helper_script,
     ads_ann_parameter_count,
     build_ads_export_blocks,
@@ -402,17 +404,110 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertIn("except MemoryError as error", training_source)
             self.assertIn("dense_quasi_newton_state_estimate_gib", training_source)
             self.assertIn("write_sdd_equation_copy", training_source)
+            self.assertIn("write_sdd_netlist", training_source)
             self.assertIn("ann_in_", training_source)
             self.assertIn("ann_out_", training_source)
             self.assertIn("ads_qt_runtime.py", (out_dir / "ADS_ANN_README.md").read_text())
             setup_source = (out_dir / "ADS_SDD_SETUP.md").read_text()
-            self.assertIn("Do Not Use NetlistInclude", setup_source)
+            self.assertIn("Preferred: Automatic NetlistInclude/SDD Flow", setup_source)
             self.assertIn("Parameter Entry Mode", setup_source)
             self.assertIn("if (freq equals 0) then 0.0 else Y11 endif", setup_source)
             self.assertIn("`ann_in_1`", setup_source)
             self.assertIn("ann_in_1=W", setup_source)
             self.assertIn("S11=complex(ann_out_1,ann_out_2)", setup_source)
             self.assertEqual(manifest["sdd_setup_guide"], "ADS_SDD_SETUP.md")
+            self.assertTrue(manifest["ads_netlist"]["enabled"])
+            self.assertEqual(manifest["ads_netlist"]["nports"], 1)
+            template_path = out_dir / manifest["ads_netlist"]["netlist_template_file"]
+            self.assertTrue(template_path.is_file())
+            self.assertTrue((out_dir / "ADS_ANN_INSTANCE_TEMPLATE.txt").is_file())
+            netlist_template = template_path.read_text()
+            self.assertEqual(netlist_template.count(ADS_ANN_NETLIST_PLACEHOLDER), 1)
+            self.assertIn("SDD:test_ann_sdd_core_rf", netlist_template)
+
+            # Exercise the generated post-training finalizer without importing
+            # Qt or the licensed ADS ANN module.
+            (out_dir / "test_ann.equation").write_text(
+                "hidden_1=tanh(_v1)\ny1=hidden_1\ny2=0.0\n"
+            )
+            fake_pandas = types.ModuleType("pandas")
+            fake_runtime = types.ModuleType("ads_qt_runtime")
+            fake_runtime.create_or_reuse_qapplication = lambda: None
+            fake_runtime.qt_runtime_diagnostics = lambda _runtime: {}
+            generated_namespace = {
+                "__file__": str(out_dir / "train_ads_ann.py"),
+                "__name__": "generated_ads_ann_training",
+            }
+            with mock.patch.dict(
+                sys.modules,
+                {"pandas": fake_pandas, "ads_qt_runtime": fake_runtime},
+            ):
+                exec(training_source, generated_namespace)
+            mapped_equation = generated_namespace["write_sdd_equation_copy"](
+                manifest
+            )
+            completed_netlist = generated_namespace["write_sdd_netlist"](
+                manifest,
+                mapped_equation,
+            )
+            self.assertEqual(completed_netlist, "test_ann_sdd.net")
+            completed_source = (out_dir / completed_netlist).read_text()
+            self.assertNotIn(ADS_ANN_NETLIST_PLACEHOLDER, completed_source)
+            self.assertIn("hidden_1=tanh(ann_in_1)", completed_source)
+            self.assertIn("ann_out_1=hidden_1", completed_source)
+
+    def test_ads_ann_netlist_template_generates_complete_four_port_sdd(self) -> None:
+        labels = [f"S{row}{column}" for row in range(1, 5) for column in range(1, 5)]
+        outputs = [
+            *[f"fine_{label}_real" for label in labels],
+            *[f"fine_{label}_imag" for label in labels],
+        ]
+        template, contract = ads_ann_netlist_template(
+            input_columns=["W", "freq_log10_hz"],
+            output_columns=outputs,
+            parameter_names=["W"],
+            sparam_labels=labels,
+            module_name="native_ann_4port",
+            z0=50.0,
+            parameter_input_scales={"W": 1.0e-6},
+            parameter_model_defaults=[10.0],
+        )
+
+        self.assertEqual(contract["nports"], 4)
+        self.assertEqual(contract["module_name"], "native_ann_4port")
+        self.assertEqual(template.count(ADS_ANN_NETLIST_PLACEHOLDER), 1)
+        self.assertIn("define native_ann_4port (p1 p2 p3 p4)", template)
+        self.assertIn("ann_in_1=(W)/(W_input_scale)", template)
+        self.assertIn("ann_in_2=log10(max(abs(freq),1.0))", template)
+        self.assertIn("native_ann_4port_rf_s44=complex(ann_out_16,ann_out_32)", template)
+        self.assertIn("SDD:native_ann_4port_core_rf p1 0 p2 0 p3 0 p4 0", template)
+        self.assertIn("I[4,17]=_v4", template)
+        self.assertIn("if (freq equals 0) then 0.0 else", template)
+        self.assertIn("native_ann_4port_stoy_y_3_3", template)
+
+    def test_ads_ann_netlist_rejects_residual_or_coarse_interface(self) -> None:
+        with self.assertRaisesRegex(ValueError, "final fine"):
+            ads_ann_netlist_template(
+                input_columns=["W", "freq_hz"],
+                output_columns=["delta_S11_real", "delta_S11_imag"],
+                parameter_names=["W"],
+                sparam_labels=["S11"],
+                module_name="residual_ann",
+                z0=50.0,
+                parameter_input_scales={"W": 1.0},
+                parameter_model_defaults=[1.0],
+            )
+        with self.assertRaisesRegex(ValueError, "external coarse"):
+            ads_ann_netlist_template(
+                input_columns=["W", "freq_hz", "coarse_S11_real"],
+                output_columns=["fine_S11_real", "fine_S11_imag"],
+                parameter_names=["W"],
+                sparam_labels=["S11"],
+                module_name="coarse_input_ann",
+                z0=50.0,
+                parameter_input_scales={"W": 1.0},
+                parameter_model_defaults=[1.0],
+            )
 
     def test_ads_qt_runtime_helper_restores_platform_plugin_environment(self) -> None:
         helper_globals = load_generated_ads_qt_runtime("ads_qt_runtime_test")

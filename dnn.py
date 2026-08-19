@@ -1513,6 +1513,13 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         "training_stop_tolerance": args.ads_training_stop_tolerance,
         "output_format": ads_ann_output_format_enum(args.ads_output_format),
         "output_prefix": normalize_name(args.output_prefix) or "dnn_ads_ann",
+        "netlist_module_name": args.module_name
+        or f"{normalize_name(args.output_prefix) or 'dnn_ads_ann'}_sdd",
+        "parameter_input_scales": parse_parameter_scale_spec(
+            parameter_names,
+            args.parameter_input_scales,
+        ),
+        "z0": float(args.z0),
     }
     input_columns = [*parameter_names, *frequency_feature_columns(args.freq_transform)]
     output_columns = sparameter_real_imag_columns(labels, prefix="fine")
@@ -1563,6 +1570,7 @@ def command_export_ads_ann(args: argparse.Namespace) -> int:
         "input_columns": manifest["input_columns"],
         "output_columns": manifest["output_columns"],
         "ads_ann": manifest["ads_ann"],
+        "ads_netlist": manifest["ads_netlist"],
     }, indent=2))
     return 0
 
@@ -2663,6 +2671,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
     )
     export_ann.add_argument("--output-prefix", default="dnn_ads_ann")
+    export_ann.add_argument(
+        "--module-name",
+        help="Generated ADS ANN SDD subnetwork name. Defaults to <output-prefix>_sdd",
+    )
+    export_ann.add_argument(
+        "--parameter-input-scales",
+        default="1.0",
+        help="One ADS-side input scale applied to every geometry parameter, such as 1.0 or 1um",
+    )
+    export_ann.add_argument(
+        "--z0",
+        type=float,
+        default=50.0,
+        help="S-parameter reference impedance used by the generated ANN SDD netlist",
+    )
     export_ann.add_argument("--seed", type=int)
     export_ann.set_defaults(func=command_export_ads_ann)
 
