@@ -592,25 +592,115 @@ def coverage_tick_label(parameter: ParameterSpec, coordinate: float) -> str:
     return f"{displayed:.4g}"
 
 
-def coverage_split_group(value: object) -> str:
-    token = normalize_key(value)
-    if token in {"verification", "verify", "validation", "test"}:
+TRAIN_DATASET_TOKENS = {"train", "training"}
+VERIFICATION_DATASET_TOKENS = {
+    "verification",
+    "verify",
+    "validation",
+    "test",
+}
+LEGACY_TRAIN_DATASET_TOKENS = {
+    "targeted",
+    "additional",
+    "added",
+    "new",
+    "acquisition",
+}
+
+
+def canonical_dataset_label(value: object, *, default: str | None = None) -> str:
+    """Return the only two dataset labels accepted by geometry workflows.
+
+    ``targeted`` and the other acquisition-origin labels were emitted by older
+    suggest-additional versions.  They describe provenance, not a holdout
+    split, so they are migrated to ``train``.  Newness remains represented by
+    ``point_origin=additional`` and ``method``.
+    """
+
+    token = normalize_key(value) if str(value or "").strip() else ""
+    if not token and default is not None:
+        token = normalize_key(default)
+    if token in TRAIN_DATASET_TOKENS or token in LEGACY_TRAIN_DATASET_TOKENS:
+        return "train"
+    if token in VERIFICATION_DATASET_TOKENS:
         return "verification"
-    return "training"
+    raise ValueError(
+        f"Unrecognized geometry dataset value {value!r}; expected train or "
+        "verification"
+    )
+
+
+def coverage_split_group(value: object) -> str:
+    return (
+        "verification"
+        if canonical_dataset_label(value) == "verification"
+        else "training"
+    )
 
 
 def geometry_file_split_group(path: Path) -> str | None:
-    """Infer a split only from an unambiguous split-file suffix."""
+    """Infer a geometry-file role from train/verification words in its name.
 
-    stem = path.stem.lower()
-    suffix_groups = {
-        "training": ("_train", "_training"),
-        "verification": ("_verification", "_verify", "_validation", "_test"),
+    Generated split files use the explicit ``_training`` and
+    ``_verification`` suffixes. Legacy ``train``/``verify`` spellings remain
+    accepted as final suffixes. Complete ``training`` or ``verification``
+    words are recognized anywhere, so a file such as
+    ``round_2_training_geometries.csv`` cannot be mistaken for a combined
+    inventory.
+    """
+
+    ordered_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", path.stem.lower())
+        if token
+    ]
+    tokens = set(ordered_tokens)
+    final_token = ordered_tokens[-1] if ordered_tokens else ""
+    has_training = "training" in tokens or final_token == "train"
+    has_verification = "verification" in tokens or final_token in {
+        "verify",
+        "validation",
+        "test",
     }
-    for group, suffixes in suffix_groups.items():
-        if any(stem.endswith(suffix) for suffix in suffixes):
-            return group
+    if has_training and has_verification:
+        raise ValueError(
+            f"Geometry filename {path.name!r} contains both training and "
+            "verification role words"
+        )
+    if has_training:
+        return "training"
+    if has_verification:
+        return "verification"
     return None
+
+
+def require_combined_geometry_path(path: Path, option_name: str) -> None:
+    """Reject a split-looking path for an output that contains both roles."""
+
+    role = geometry_file_split_group(path)
+    if role is not None:
+        raise ValueError(
+            f"{option_name} is a combined geometry output, but {path.name!r} "
+            f"is named like a {role} split. Use a basename without train, "
+            "training, verify, verification, validation, or test; the command "
+            "writes explicit _training.csv and _verification.csv views."
+        )
+
+
+def combined_geometry_stem(path: Path) -> str:
+    """Remove split-role words when deriving a new combined output name."""
+
+    tokens = [
+        token
+        for token in re.split(r"[^A-Za-z0-9]+", path.stem)
+        if token
+    ]
+    filtered = [
+        token
+        for token in tokens
+        if token.lower() not in {"train", "training", "verification", "verify"}
+    ]
+    return "_".join(filtered) or "geometries"
 
 
 def coverage_point_group(
@@ -1007,12 +1097,29 @@ def write_geometry_metadata(
     decimal_places: int | None = None,
     bare_values: str = "parameter-units",
 ) -> Path:
+    validate_geometry_output_rows(
+        geometry_path,
+        rows,
+        parameters,
+        split_var,
+        bare_values=bare_values,
+    )
     split_counts: dict[str, int] = {}
+    split_geometry_keys: dict[str, set[tuple[int, ...]]] = {
+        "train": set(),
+        "verification": set(),
+    }
     inferred_split = geometry_file_split_group(geometry_path)
     for row in rows:
-        split_value = str(row.get(split_var, "") or inferred_split or "").strip()
-        if split_value:
+        raw_split_value = row.get(split_var, "")
+        if not str(raw_split_value or "").strip() and inferred_split is not None:
+            raw_split_value = "train" if inferred_split == "training" else "verification"
+        if str(raw_split_value or "").strip():
+            split_value = canonical_dataset_label(raw_split_value)
             split_counts[split_value] = split_counts.get(split_value, 0) + 1
+            point = row_unit_point(row, parameters, bare_values=bare_values)
+            assert point is not None
+            split_geometry_keys[split_value].add(geometry_point_key(point))
 
     metadata: dict[str, object] = {
         "schema_version": 1,
@@ -1022,6 +1129,21 @@ def write_geometry_metadata(
         "point_count": len(rows),
         "split_variable": split_var,
         "split_counts": split_counts,
+        "geometry_integrity": {
+            "unique_point_count": len(
+                split_geometry_keys["train"]
+                | split_geometry_keys["verification"]
+            ),
+            "training_point_count": len(split_geometry_keys["train"]),
+            "verification_point_count": len(
+                split_geometry_keys["verification"]
+            ),
+            "training_verification_overlap_count": len(
+                split_geometry_keys["train"]
+                & split_geometry_keys["verification"]
+            ),
+            "duplicates_present": False,
+        },
         "parameters": [parameter_range_metadata(parameter) for parameter in parameters],
     }
     if decimal_places is not None:
@@ -1208,7 +1330,9 @@ def generated_point_rows(
 
 
 def split_output_path(path: Path, split_name: str) -> Path:
-    return path.with_name(f"{path.stem}_{safe_method_name(split_name)}{path.suffix or '.csv'}")
+    canonical_name = canonical_dataset_label(split_name)
+    suffix = "training" if canonical_name == "train" else "verification"
+    return path.with_name(f"{path.stem}_{suffix}{path.suffix or '.csv'}")
 
 
 def write_points_csv(
@@ -1231,6 +1355,14 @@ def write_points_csv(
         include_normalized,
         decimal_places,
     )
+    require_combined_geometry_path(path, "--out")
+    validate_geometry_output_rows(
+        path,
+        rows,
+        parameters,
+        split_var,
+        bare_values="parameter-units",
+    )
     write_rows_csv(path, rows, fields)
     metadata_path = write_geometry_metadata(
         path,
@@ -1247,6 +1379,13 @@ def write_points_csv(
         for split_value in split_values:
             split_rows = [row for row in rows if row.get(split_var) == split_value]
             split_path = split_output_path(path, split_value)
+            validate_geometry_output_rows(
+                split_path,
+                split_rows,
+                parameters,
+                split_var,
+                bare_values="parameter-units",
+            )
             write_rows_csv(split_path, split_rows, fields)
             split_plot_path = write_parameter_coverage_png(
                 split_path,
@@ -1340,7 +1479,9 @@ def write_range_extension_csv(
     bare_values: str,
     write_split_files: bool,
     decimal_places: int | None = None,
+    input_cleanup: dict[str, int] | None = None,
 ) -> list[Path]:
+    require_combined_geometry_path(path, "--out")
     rows = [dict(row) for row in existing_rows]
     train_count = len(unit_points) - verification_count
     for offset, point in enumerate(unit_points):
@@ -1368,9 +1509,10 @@ def write_range_extension_csv(
     )
     split_counts: dict[str, int] = {}
     for point_index, row in enumerate(rows, start=1):
-        split_value = str(lookup_row_value(row, split_var) or "train").strip() or "train"
-        if split_value.lower() in {"train", "verification"}:
-            split_value = split_value.lower()
+        split_value = canonical_dataset_label(
+            lookup_row_value(row, split_var),
+            default="train",
+        )
         row[split_var] = split_value
         split_counts[split_value] = split_counts.get(split_value, 0) + 1
         split_sequence = split_counts[split_value]
@@ -1400,6 +1542,13 @@ def write_range_extension_csv(
         canonical_fields.extend(normalized_fields)
     canonical_fields.extend(parameter.name for parameter in plan.overall_parameters)
     fields = list(dict.fromkeys([*canonical_fields, *existing_fields]))
+    validate_geometry_output_rows(
+        path,
+        rows,
+        plan.overall_parameters,
+        split_var,
+        bare_values=bare_values,
+    )
     write_rows_csv(path, rows, fields)
     extension_metadata: dict[str, object] = {
         "range_extension": {
@@ -1416,7 +1565,8 @@ def write_range_extension_csv(
                 parameter_range_metadata(parameter)
                 for parameter in plan.sampling_parameters
             ],
-        }
+        },
+        "input_geometry_cleanup": dict(input_cleanup or {}),
     }
     metadata_path = write_geometry_metadata(
         path,
@@ -1436,6 +1586,13 @@ def write_range_extension_csv(
                 row for row in rows if str(row.get(split_var, "")) == split_value
             ]
             split_path = split_output_path(path, split_value)
+            validate_geometry_output_rows(
+                split_path,
+                split_rows,
+                plan.overall_parameters,
+                split_var,
+                bare_values=bare_values,
+            )
             write_rows_csv(split_path, split_rows, fields)
             split_plot_path = write_parameter_coverage_png(
                 split_path,
@@ -1498,6 +1655,130 @@ def row_unit_point(
             return None
         point.append(unit_value)
     return point
+
+
+def geometry_point_key(point: Sequence[float]) -> tuple[int, ...]:
+    """Stable identity for a geometry in normalized parameter coordinates."""
+
+    return tuple(int(round(float(value) * 1.0e10)) for value in point)
+
+
+def validate_geometry_output_rows(
+    path: Path,
+    rows: Sequence[dict[str, object]],
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    *,
+    bare_values: str,
+) -> None:
+    """Validate role naming and prohibit every duplicate output geometry."""
+
+    filename_role = geometry_file_split_group(path)
+    seen: dict[tuple[int, ...], tuple[str, int]] = {}
+    for row_number, row in enumerate(rows, start=2):
+        raw_dataset = lookup_row_value(row, split_var)
+        try:
+            dataset = canonical_dataset_label(raw_dataset)
+        except ValueError as exc:
+            raise ValueError(f"{path} row {row_number}: {exc}") from exc
+        row[split_var] = dataset
+        if filename_role is not None and coverage_split_group(dataset) != filename_role:
+            raise ValueError(
+                f"Geometry file {path.name!r} is named as {filename_role}, but "
+                f"row {row_number} is labeled {dataset!r}"
+            )
+        point = row_unit_point(row, parameters, bare_values=bare_values)
+        if point is None or not in_unit_cube(point):
+            raise ValueError(
+                f"Could not validate every parameter in {path} row {row_number}"
+            )
+        key = geometry_point_key(point)
+        prior = seen.get(key)
+        if prior is not None:
+            prior_dataset, prior_row = prior
+            relation = (
+                "across training and verification"
+                if prior_dataset != dataset
+                else f"within {dataset}"
+            )
+            raise ValueError(
+                f"Duplicate geometry {relation} in {path}: rows {prior_row} "
+                f"and {row_number}. Increase --decimal-places or correct the "
+                "input geometry inventory."
+            )
+        seen[key] = (dataset, row_number)
+
+
+def clean_existing_geometry_rows(
+    path: Path,
+    rows: Sequence[dict[str, object]],
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    *,
+    bare_values: str,
+) -> tuple[list[dict[str, object]], dict[str, int]]:
+    """Normalize a legacy inventory and remove train/verification leakage.
+
+    If a geometry was ever assigned to training, it cannot remain an
+    independent verification point.  Training therefore wins a cross-split
+    conflict.  This is deliberately conservative: it prevents an already
+    trained-on response from inflating verification quality.
+    """
+
+    filename_role = geometry_file_split_group(path)
+    default_dataset = (
+        "train"
+        if filename_role == "training"
+        else "verification" if filename_role == "verification" else None
+    )
+    cleaned: list[dict[str, object]] = []
+    seen: dict[tuple[int, ...], int] = {}
+    stats = {
+        "legacy_dataset_rows_normalized": 0,
+        "same_split_duplicates_removed": 0,
+        "cross_split_duplicates_removed": 0,
+        "filename_role_mismatches": 0,
+    }
+    for row_number, source_row in enumerate(rows, start=2):
+        row = dict(source_row)
+        raw_dataset = lookup_row_value(row, split_var)
+        if not str(raw_dataset or "").strip() and default_dataset is None:
+            raise ValueError(
+                f"Combined geometry file {path} row {row_number} has no "
+                f"{split_var!r} value. Combined files must explicitly identify "
+                "every row as train or verification."
+            )
+        try:
+            dataset = canonical_dataset_label(raw_dataset, default=default_dataset)
+        except ValueError as exc:
+            raise ValueError(f"{path} row {row_number}: {exc}") from exc
+        if normalize_key(raw_dataset) in LEGACY_TRAIN_DATASET_TOKENS:
+            stats["legacy_dataset_rows_normalized"] += 1
+        if filename_role is not None and coverage_split_group(dataset) != filename_role:
+            # Older versions emitted mixed cumulative inventories with
+            # "training" in the filename. Accept them as migration inputs, but
+            # never reproduce that mismatch in a new output.
+            stats["filename_role_mismatches"] += 1
+        row[split_var] = dataset
+        point = row_unit_point(row, parameters, bare_values=bare_values)
+        if point is None or not in_unit_cube(point):
+            raise ValueError(
+                f"Could not validate every parameter in {path} row {row_number}"
+            )
+        key = geometry_point_key(point)
+        prior_index = seen.get(key)
+        if prior_index is None:
+            seen[key] = len(cleaned)
+            cleaned.append(row)
+            continue
+        prior_dataset = str(cleaned[prior_index][split_var])
+        if prior_dataset == dataset:
+            stats["same_split_duplicates_removed"] += 1
+            continue
+        stats["cross_split_duplicates_removed"] += 1
+        if dataset == "train":
+            cleaned[prior_index] = row
+    return cleaned, stats
 
 
 def resolve_bare_values_for_rows(
@@ -1643,13 +1924,13 @@ def load_existing_points(
     return dedupe_points(points)
 
 
-def existing_csv_dataset_counts(
+def existing_csv_dataset_assignments(
     csv_paths: Sequence[str],
     parameters: Sequence[ParameterSpec],
     split_var: str,
     bare_values: str,
-) -> dict[str, int]:
-    """Count unique training/verification geometries across separate or combined CSVs."""
+) -> dict[tuple[int, ...], str]:
+    """Resolve one leakage-safe dataset assignment per existing geometry."""
 
     assignments: dict[tuple[int, ...], str] = {}
     for raw_path in csv_paths:
@@ -1660,20 +1941,38 @@ def existing_csv_dataset_counts(
             parameters,
             bare_values,
         )
-        inferred_dataset = geometry_file_split_group(path) or "train"
+        rows, _cleanup = clean_existing_geometry_rows(
+            path,
+            rows,
+            parameters,
+            split_var,
+            bare_values=source_mode,
+        )
         for row in rows:
             point = row_unit_point(row, parameters, bare_values=source_mode)
             if point is None or not in_unit_cube(point):
                 continue
-            key = tuple(int(round(value * 1.0e10)) for value in point)
-            group = coverage_split_group(
-                lookup_row_value(row, split_var) or inferred_dataset
-            )
-            # When the same geometry appears in independent train and
-            # verification inventories, preserve held-out status regardless of
-            # CLI source order.
-            if assignments.get(key) != "verification" or group == "verification":
+            key = geometry_point_key(point)
+            group = coverage_split_group(lookup_row_value(row, split_var))
+            # Any geometry exposed to training cannot be counted as an
+            # independent verification geometry.
+            if assignments.get(key) != "training" or group == "training":
                 assignments[key] = group
+    return assignments
+
+
+def existing_csv_dataset_counts(
+    csv_paths: Sequence[str],
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    bare_values: str,
+) -> dict[str, int]:
+    assignments = existing_csv_dataset_assignments(
+        csv_paths,
+        parameters,
+        split_var,
+        bare_values,
+    )
     return {
         "training": sum(group == "training" for group in assignments.values()),
         "verification": sum(
@@ -1996,7 +2295,9 @@ def write_error_regions_csv(
 
 
 def analysis_output_path(out_path: Path) -> Path:
-    return out_path.with_name(f"{out_path.stem}_fit_error_regions{out_path.suffix or '.csv'}")
+    return out_path.with_name(
+        f"{out_path.stem}_verification_error_regions{out_path.suffix or '.csv'}"
+    )
 
 
 def candidate_focus(
@@ -2395,6 +2696,7 @@ def write_suggested_points_csv(
             if target_datasets is not None
             else target_dataset
         )
+        point_dataset = canonical_dataset_label(point_dataset)
         row: dict[str, object] = {
             "point_index": idx,
             split_var: point_dataset,
@@ -2447,6 +2749,14 @@ def write_suggested_points_csv(
         for parameter, value in zip(parameters, rounded_values):
             row[parameter.name] = format_value(value, parameter.unit, decimal_places)
         rows.append(row)
+    require_combined_geometry_path(path, "--out")
+    validate_geometry_output_rows(
+        path,
+        rows,
+        parameters,
+        split_var,
+        bare_values="parameter-units",
+    )
     write_rows_csv(path, rows, fields)
     return write_geometry_metadata(
         path,
@@ -2465,10 +2775,10 @@ def write_suggested_points_csv(
     )
 
 
-def accumulated_training_geometry_path(path: Path) -> Path:
-    """Return the default cumulative geometry CSV beside a new-point CSV."""
+def accumulated_geometry_path(path: Path) -> Path:
+    """Return the combined cumulative geometry CSV beside a new-point CSV."""
 
-    return path.with_name(f"{path.stem}_training_geometries.csv")
+    return path.with_name(f"{path.stem}_all_geometries.csv")
 
 
 def write_dataset_split_geometry_views(
@@ -2504,6 +2814,13 @@ def write_dataset_split_geometry_views(
             == group
         ]
         split_path = split_output_path(source_path, suffix)
+        validate_geometry_output_rows(
+            split_path,
+            split_rows,
+            parameters,
+            split_var,
+            bare_values=bare_values,
+        )
         write_rows_csv(split_path, split_rows, fields)
         plot_path = write_parameter_coverage_png(
             split_path,
@@ -2516,7 +2833,7 @@ def write_dataset_split_geometry_views(
     return written
 
 
-def write_accumulated_training_geometries(
+def write_accumulated_geometries(
     path: Path,
     parameters: Sequence[ParameterSpec],
     split_var: str,
@@ -2531,6 +2848,8 @@ def write_accumulated_training_geometries(
     metadata_extra: dict[str, object] | None = None,
 ) -> Path:
     """Write a deduplicated union suitable for the next GP acquisition round."""
+
+    require_combined_geometry_path(path, "--combined-out")
 
     fields = [
         "point_index",
@@ -2550,6 +2869,11 @@ def write_accumulated_training_geometries(
     records: list[tuple[list[float], str, str, str, str, object]] = []
     seen: dict[tuple[int, ...], int] = {}
     duplicate_count = 0
+    same_split_duplicate_count = 0
+    cross_split_duplicate_count = 0
+    legacy_dataset_rows_normalized = 0
+    filename_role_mismatch_count = 0
+    cross_split_conflicts: list[dict[str, object]] = []
 
     def append_point(
         point: Sequence[float],
@@ -2560,6 +2884,13 @@ def write_accumulated_training_geometries(
         source_index: object,
     ) -> None:
         nonlocal duplicate_count
+        nonlocal same_split_duplicate_count
+        nonlocal cross_split_duplicate_count
+        nonlocal legacy_dataset_rows_normalized
+        raw_dataset = dataset
+        dataset = canonical_dataset_label(dataset, default="train")
+        if normalize_key(raw_dataset) in LEGACY_TRAIN_DATASET_TOKENS:
+            legacy_dataset_rows_normalized += 1
         if len(point) != len(parameters) or not in_unit_cube(point):
             coordinates = ", ".join(
                 f"{parameter.name}:u={float(coordinate):.6g} "
@@ -2583,31 +2914,60 @@ def write_accumulated_training_geometries(
             unit_coordinate_for_value(value, parameter)
             for parameter, value in zip(parameters, rounded_values)
         ]
-        key = tuple(int(round(value * 1.0e10)) for value in rounded_point)
+        key = geometry_point_key(rounded_point)
         if key in seen:
             duplicate_count += 1
             existing_index = seen[key]
             existing_record = records[existing_index]
             existing_dataset = existing_record[1]
-            new_dataset = str(dataset or "train")
-            if (
-                coverage_split_group(existing_dataset) != "verification"
-                and coverage_split_group(new_dataset) == "verification"
-            ):
+            new_dataset = str(dataset)
+            if str(point_origin or "").lower() == "additional":
+                raise ValueError(
+                    "A newly suggested geometry becomes a duplicate after "
+                    f"rounding: {source} row {source_index} matches "
+                    f"{existing_record[4]} row {existing_record[5]}. Increase "
+                    "--decimal-places or --min-distance."
+                )
+            if existing_dataset == new_dataset:
+                same_split_duplicate_count += 1
+            else:
+                cross_split_duplicate_count += 1
+                cross_split_conflicts.append(
+                    {
+                        "geometry": {
+                            parameter.name: format_value(
+                                value,
+                                parameter.unit,
+                                decimal_places,
+                            )
+                            for parameter, value in zip(parameters, rounded_values)
+                        },
+                        "first_dataset": existing_dataset,
+                        "first_source": existing_record[4],
+                        "first_source_point_index": existing_record[5],
+                        "conflicting_dataset": new_dataset,
+                        "conflicting_source": source,
+                        "conflicting_source_point_index": source_index,
+                        "retained_dataset": "train",
+                    }
+                )
+            # A response used for training is no longer an independent
+            # verification response. Training therefore wins every conflict.
+            if existing_dataset == "verification" and new_dataset == "train":
                 records[existing_index] = (
-                    existing_record[0],
-                    new_dataset,
-                    existing_record[2],
-                    existing_record[3],
-                    existing_record[4],
-                    existing_record[5],
+                    rounded_values,
+                    "train",
+                    str(point_origin or "existing"),
+                    str(source_method or "existing"),
+                    source,
+                    source_index,
                 )
             return
         seen[key] = len(records)
         records.append(
             (
                 rounded_values,
-                str(dataset or "train"),
+                str(dataset),
                 str(point_origin or "existing"),
                 str(source_method or "existing"),
                 source,
@@ -2618,7 +2978,12 @@ def write_accumulated_training_geometries(
     for raw_path in existing_csv_paths:
         source_path = Path(raw_path)
         _, source_rows = read_csv_table(source_path)
-        inferred_source_dataset = geometry_file_split_group(source_path) or "train"
+        source_filename_role = geometry_file_split_group(source_path)
+        default_source_dataset = (
+            "train"
+            if source_filename_role == "training"
+            else "verification" if source_filename_role == "verification" else None
+        )
         source_mode = resolve_bare_values_for_rows(
             source_rows,
             parameters,
@@ -2631,9 +2996,25 @@ def write_accumulated_training_geometries(
                     f"Could not read every parameter from {source_path} row "
                     f"{row_number} while building the cumulative geometry CSV"
                 )
+            raw_dataset = lookup_row_value(row, split_var)
+            if not str(raw_dataset or "").strip() and default_source_dataset is None:
+                raise ValueError(
+                    f"Combined geometry file {source_path} row {row_number} has "
+                    f"no {split_var!r} value. Combined files must explicitly "
+                    "identify every row as train or verification."
+                )
+            dataset = canonical_dataset_label(
+                raw_dataset,
+                default=default_source_dataset,
+            )
+            if (
+                source_filename_role is not None
+                and coverage_split_group(dataset) != source_filename_role
+            ):
+                filename_role_mismatch_count += 1
             append_point(
                 point,
-                lookup_row_value(row, split_var) or inferred_source_dataset,
+                raw_dataset or default_source_dataset,
                 "existing",
                 lookup_row_value(row, "method") or "existing",
                 str(lookup_row_value(row, "geometry_source") or source_path),
@@ -2707,13 +3088,42 @@ def write_accumulated_training_geometries(
             )
         rows.append(row)
 
+    validate_geometry_output_rows(
+        path,
+        rows,
+        parameters,
+        split_var,
+        bare_values=bare_values,
+    )
     write_rows_csv(path, rows, fields)
+    if legacy_dataset_rows_normalized:
+        print(
+            "warning: normalized "
+            f"{legacy_dataset_rows_normalized} legacy targeted/additional "
+            "dataset label(s) to train in the cumulative geometry inventory",
+            file=sys.stderr,
+        )
+    if cross_split_duplicate_count:
+        print(
+            "warning: removed "
+            f"{cross_split_duplicate_count} geometry duplicate(s) shared by "
+            "training and verification; retained each as training to prevent "
+            "verification leakage",
+            file=sys.stderr,
+        )
+    if filename_role_mismatch_count:
+        print(
+            "warning: migrated "
+            f"{filename_role_mismatch_count} row(s) from legacy mixed geometry "
+            "files whose names indicated a single split",
+            file=sys.stderr,
+        )
     return write_geometry_metadata(
         path,
         parameters,
         rows,
         split_var,
-        generation_kind="accumulated_training_geometries",
+        generation_kind="accumulated_geometries",
         method=method,
         decimal_places=decimal_places,
         bare_values=bare_values,
@@ -2721,6 +3131,12 @@ def write_accumulated_training_geometries(
             "additional_points_file": str(additional_path),
             "existing_geometry_files": list(existing_csv_paths),
             "deduplicated_input_rows": duplicate_count,
+            "same_split_duplicates_removed": same_split_duplicate_count,
+            "cross_split_duplicates_removed": cross_split_duplicate_count,
+            "cross_split_conflict_resolution": "training_wins",
+            "cross_split_conflicts": cross_split_conflicts,
+            "legacy_dataset_rows_normalized": legacy_dataset_rows_normalized,
+            "legacy_filename_role_mismatches": filename_role_mismatch_count,
             "next_gp_existing_points": str(path),
             **(metadata_extra or {}),
         },
@@ -2875,7 +3291,10 @@ def build_generate_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--write-split-files",
         action="store_true",
-        help="Also write *_train.csv and *_verification.csv files beside the combined CSV.",
+        help=(
+            "Also write *_training.csv and *_verification.csv files beside "
+            "the combined CSV."
+        ),
     )
     add_options_json_argument(parser, recursive=False)
     return parser
@@ -3053,7 +3472,11 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-dataset",
         default="train",
-        help="Dataset label assigned to primary suggested points. Default: train.",
+        help=(
+            "Dataset assigned to primary suggested points: train or "
+            "verification. Legacy targeted/additional values are migrated to "
+            "train. Default: train."
+        ),
     )
     parser.add_argument(
         "--verification-policy",
@@ -3094,19 +3517,25 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         default="targeted_additional_points.csv",
         help=(
             "New-points-only CSV path. A same-stem JSON/coverage plot and a "
-            "cumulative training-geometry CSV/JSON are also written."
+            "combined cumulative all-geometries CSV/JSON plus strict split "
+            "views are also written."
         ),
     )
     parser.add_argument(
         "--combined-out",
         help=(
             "Cumulative CSV containing existing and newly suggested geometries for "
-            "the next GP round. Default: <out>_training_geometries.csv."
+            "the next GP round. Its basename must not contain a training or "
+            "verification role word. Default: <out>_all_geometries.csv."
         ),
     )
     parser.add_argument(
         "--analysis-out",
-        help="Ranked current-fit error-region CSV path. Default: <out>_fit_error_regions.csv.",
+        help=(
+            "Ranked verification-error-region CSV path. Its basename must "
+            "contain verification. Default: "
+            "<out>_verification_error_regions.csv."
+        ),
     )
     add_options_json_argument(parser, recursive=False)
     return parser
@@ -3205,6 +3634,7 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     validate_parameter_decimal_places(parser, parameters, args.decimal_places)
 
     extension_plan: RangeExtensionPlan | None = None
+    extension_cleanup_stats: dict[str, int] | None = None
     existing_fields: list[str] = []
     existing_rows: list[dict[str, object]] = []
     if extending:
@@ -3216,6 +3646,32 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 args.decimal_places,
             )
             existing_fields, existing_rows = read_csv_table(Path(args.existing_points))
+            existing_rows, cleanup_stats = clean_existing_geometry_rows(
+                Path(args.existing_points),
+                existing_rows,
+                extension_plan.original_parameters,
+                args.split_var,
+                bare_values=args.bare_values,
+            )
+            extension_cleanup_stats = cleanup_stats
+            if cleanup_stats["legacy_dataset_rows_normalized"]:
+                print(
+                    "warning: normalized "
+                    f"{cleanup_stats['legacy_dataset_rows_normalized']} legacy "
+                    "targeted/additional dataset label(s) to train",
+                    file=sys.stderr,
+                )
+            removed_duplicates = (
+                cleanup_stats["same_split_duplicates_removed"]
+                + cleanup_stats["cross_split_duplicates_removed"]
+            )
+            if removed_duplicates:
+                print(
+                    "warning: removed "
+                    f"{removed_duplicates} duplicate existing geometries before "
+                    "range extension; training retained every cross-split conflict",
+                    file=sys.stderr,
+                )
             validate_existing_parameter_rows(
                 existing_rows,
                 extension_plan.original_parameters,
@@ -3309,7 +3765,8 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     elif extending:
         existing_path = Path(args.existing_points)
         base_out_path = existing_path.with_name(
-            f"{existing_path.stem}_extended{existing_path.suffix or '.csv'}"
+            f"{combined_geometry_stem(existing_path)}_extended"
+            f"{existing_path.suffix or '.csv'}"
         )
     else:
         base_out_path = Path("generated_points.csv")
@@ -3345,6 +3802,7 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                     decimal_places=args.decimal_places,
                     bare_values=args.bare_values,
                     write_split_files=args.write_split_files,
+                    input_cleanup=extension_cleanup_stats,
                 )
             )
         else:
@@ -3722,6 +4180,10 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
 def command_suggest_additional(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.count <= 0:
         parser.error("--count must be positive")
+    try:
+        canonical_dataset_label(args.target_dataset)
+    except ValueError as exc:
+        parser.error(f"--target-dataset: {exc}")
     if args.candidate_factor <= 0:
         parser.error("--candidate-factor must be positive")
     if args.candidate_count is not None and args.candidate_count <= 0:
@@ -3773,35 +4235,92 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     )
     mdif_observed_points: list[tuple[list[float], str, str, object]] = []
     for raw_path in args.existing_mdif:
-        for source_index, point in enumerate(
-            load_existing_points(
-                [],
-                [raw_path],
-                parameters,
-                bare_values=args.bare_values,
-            ),
-            start=1,
-        ):
+        mdif_path = Path(raw_path)
+        mdif_rows = read_mdif_parameter_rows(mdif_path)
+        source_mode = resolve_bare_values_for_rows(
+            mdif_rows,
+            parameters,
+            args.bare_values,
+        )
+        try:
+            filename_role = geometry_file_split_group(mdif_path)
+        except ValueError:
+            # MDIF names such as train_verify.mdif commonly describe a
+            # combined file; row-level split variables remain authoritative.
+            filename_role = None
+        default_dataset = (
+            "train"
+            if filename_role != "verification"
+            else "verification"
+        )
+        for source_index, row in enumerate(mdif_rows, start=1):
+            point = row_unit_point(row, parameters, bare_values=source_mode)
+            if point is None or not in_unit_cube(point):
+                continue
+            try:
+                dataset = canonical_dataset_label(
+                    lookup_row_value(row, args.split_var),
+                    default=default_dataset,
+                )
+            except ValueError as exc:
+                parser.error(f"{mdif_path} block {source_index}: {exc}")
             mdif_observed_points.append(
-                (point, "existing", str(raw_path), source_index)
+                (clamp_unit_point(point), dataset, str(raw_path), source_index)
             )
     existing_points = [region.unit_point for region in regions]
     existing_points.extend(csv_existing_points)
     existing_points.extend(point for point, _, _, _ in mdif_observed_points)
     existing_points = dedupe_points(existing_points)
 
-    existing_dataset_counts = existing_csv_dataset_counts(
-        args.existing_points,
-        parameters,
-        args.split_var,
-        args.bare_values,
+    try:
+        existing_dataset_assignments = existing_csv_dataset_assignments(
+            args.existing_points,
+            parameters,
+            args.split_var,
+            args.bare_values,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    for point, dataset, _source, _source_index in mdif_observed_points:
+        key = geometry_point_key(point)
+        group = coverage_split_group(dataset)
+        if existing_dataset_assignments.get(key) != "training" or group == "training":
+            existing_dataset_assignments[key] = group
+    training_geometry_keys = {
+        key
+        for key, group in existing_dataset_assignments.items()
+        if group == "training"
+    }
+    existing_verification_geometry_keys = {
+        key
+        for key, group in existing_dataset_assignments.items()
+        if group == "verification"
+    }
+    metrics_geometry_keys = {
+        geometry_point_key(region.unit_point) for region in regions
+    }
+    leaked_metrics_geometry_keys = metrics_geometry_keys & training_geometry_keys
+    verification_inventory_keys = (
+        existing_verification_geometry_keys | metrics_geometry_keys
+    ) - training_geometry_keys
+    existing_dataset_counts = {
+        "training": len(training_geometry_keys),
+        "verification": len(existing_verification_geometry_keys),
+    }
+    verification_metrics_geometry_count = len(
+        metrics_geometry_keys - training_geometry_keys
     )
-    verification_metrics_geometry_count = len(regions)
-    existing_verification_geometry_count = existing_dataset_counts["verification"]
-    effective_verification_count = max(
-        existing_verification_geometry_count,
-        verification_metrics_geometry_count,
-    )
+    existing_verification_geometry_count = len(existing_verification_geometry_keys)
+    effective_verification_count = len(verification_inventory_keys)
+    if leaked_metrics_geometry_keys:
+        print(
+            "warning: "
+            f"{len(leaked_metrics_geometry_keys)} verification-metrics "
+            "geometry/ies also occur in training; they remain useful GP error "
+            "observations but are excluded from the independent verification "
+            "inventory",
+            file=sys.stderr,
+        )
     primary_is_training = (
         coverage_split_group(args.target_dataset) == "training"
     )
@@ -3828,8 +4347,11 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         verification_metrics_geometry_count
     )
     preliminary_verification_plan["verification_count_basis"] = (
-        "maximum of existing verification geometry inventory and distinct "
-        "verification-metrics geometries"
+        "deduplicated union of existing verification geometry inventory and "
+        "verification-metrics geometries, excluding every training geometry"
+    )
+    preliminary_verification_plan["training_verification_overlap_count"] = len(
+        leaked_metrics_geometry_keys
     )
     planned_total_count = args.count + int(
         preliminary_verification_plan["additional_verification_count"]
@@ -3910,8 +4432,11 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             verification_metrics_geometry_count
         )
         verification_plan["verification_count_basis"] = (
-            "maximum of existing verification geometry inventory and distinct "
-            "verification-metrics geometries"
+            "deduplicated union of existing verification geometry inventory and "
+            "verification-metrics geometries, excluding every training geometry"
+        )
+        verification_plan["training_verification_overlap_count"] = len(
+            leaked_metrics_geometry_keys
         )
         if not automatic_verification_enabled:
             verification_plan["reason"] = (
@@ -4016,11 +4541,54 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             file=sys.stderr,
         )
 
+    occupied_output_keys = {
+        geometry_point_key(point) for point in existing_points
+    }
+    selected_output_keys: dict[tuple[int, ...], tuple[int, str]] = {}
+    for suggestion_index, (suggestion, raw_dataset) in enumerate(
+        zip(suggestions, target_datasets),
+        start=1,
+    ):
+        rounded_values = [
+            round_parameter_value(
+                map_unit_point(unit_value, parameter),
+                parameter,
+                args.decimal_places,
+            )
+            for parameter, unit_value in zip(parameters, suggestion.unit_point)
+        ]
+        rounded_point = [
+            unit_coordinate_for_value(value, parameter)
+            for parameter, value in zip(parameters, rounded_values)
+        ]
+        key = geometry_point_key(rounded_point)
+        dataset = canonical_dataset_label(raw_dataset)
+        if key in occupied_output_keys:
+            parser.error(
+                f"Suggested point {suggestion_index} becomes identical to an "
+                "existing geometry after output rounding. Increase "
+                "--decimal-places or --min-distance."
+            )
+        prior = selected_output_keys.get(key)
+        if prior is not None:
+            prior_index, prior_dataset = prior
+            relation = (
+                "across training and verification"
+                if prior_dataset != dataset
+                else f"within {dataset}"
+            )
+            parser.error(
+                f"Suggested points {prior_index} and {suggestion_index} become "
+                f"duplicates {relation} after output rounding. Increase "
+                "--decimal-places or --min-distance."
+            )
+        selected_output_keys[key] = (suggestion_index, dataset)
+
     out_path = Path(args.out)
     combined_path = (
         Path(args.combined_out)
         if args.combined_out
-        else accumulated_training_geometry_path(out_path)
+        else accumulated_geometry_path(out_path)
     )
     analysis_path = (
         Path(args.analysis_out)
@@ -4037,13 +4605,65 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error(
             "--combined-out must produce a different companion JSON from --out"
         )
-    if automatic_verification_suggestions:
-        acquisition_metadata["rfpro_split_files"] = {
-            "training": str(split_output_path(out_path, "train")),
-            "verification": str(split_output_path(out_path, "verification")),
-            "companion_json": str(geometry_metadata_path(out_path)),
-            "separate_split_json_files": False,
-        }
+    try:
+        require_combined_geometry_path(out_path, "--out")
+        require_combined_geometry_path(combined_path, "--combined-out")
+        if geometry_file_split_group(analysis_path) != "verification":
+            raise ValueError(
+                f"--analysis-out contains verification information only, so "
+                f"{analysis_path.name!r} must include the word verification"
+            )
+    except ValueError as exc:
+        parser.error(str(exc))
+    normalized_target_dataset = canonical_dataset_label(args.target_dataset)
+    if normalized_target_dataset != normalize_key(args.target_dataset):
+        print(
+            f"warning: normalized legacy --target-dataset {args.target_dataset!r} "
+            f"to {normalized_target_dataset!r}; use point_origin=additional to "
+            "identify the new batch",
+            file=sys.stderr,
+        )
+    batch_dataset_labels = {
+        canonical_dataset_label(value) for value in target_datasets
+    }
+    acquisition_metadata["split_files"] = {
+        **(
+            {"training": str(split_output_path(out_path, "train"))}
+            if "train" in batch_dataset_labels
+            else {}
+        ),
+        **(
+            {"verification": str(split_output_path(out_path, "verification"))}
+            if "verification" in batch_dataset_labels
+            else {}
+        ),
+        "companion_json": str(geometry_metadata_path(out_path)),
+        "separate_split_json_files": False,
+    }
+    cumulative_dataset_labels = set(batch_dataset_labels)
+    if training_geometry_keys:
+        cumulative_dataset_labels.add("train")
+    if verification_inventory_keys:
+        cumulative_dataset_labels.add("verification")
+    acquisition_metadata["cumulative_split_files"] = {
+        **(
+            {"training": str(split_output_path(combined_path, "train"))}
+            if "train" in cumulative_dataset_labels
+            else {}
+        ),
+        **(
+            {
+                "verification": str(
+                    split_output_path(combined_path, "verification")
+                )
+            }
+            if "verification" in cumulative_dataset_labels
+            else {}
+        ),
+        "combined": str(combined_path),
+        "companion_json": str(geometry_metadata_path(combined_path)),
+        "separate_split_json_files": False,
+    }
     acquisition_metadata["parameter_coverage_context"] = {
         "source": str(combined_path),
         "includes_existing_points": True,
@@ -4070,10 +4690,6 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         if args.acquisition == "error-distance"
         else f"{args.acquisition}-{candidate_method}"
     )
-    csv_existing_keys = {
-        tuple(int(round(value * 1.0e10)) for value in point)
-        for point in csv_existing_points
-    }
     observed_points: list[tuple[Sequence[float], str, str, object]] = [
         (
             region.unit_point,
@@ -4082,14 +4698,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             region.source_index,
         )
         for region in regions
-        if tuple(
-            int(round(value * 1.0e10)) for value in region.unit_point
-        )
-        not in csv_existing_keys
     ]
     observed_points.extend(mdif_observed_points)
     try:
-        combined_metadata_path = write_accumulated_training_geometries(
+        combined_metadata_path = write_accumulated_geometries(
             combined_path,
             parameters,
             args.split_var,
@@ -4114,6 +4726,13 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     except ValueError as exc:
         parser.error(str(exc))
     _, coverage_context_rows = read_csv_table(combined_path)
+    cumulative_training_count = sum(
+        canonical_dataset_label(lookup_row_value(row, args.split_var)) == "train"
+        for row in coverage_context_rows
+    )
+    cumulative_verification_count = (
+        len(coverage_context_rows) - cumulative_training_count
+    )
     write_parameter_coverage_png(
         out_path,
         parameters,
@@ -4121,15 +4740,20 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         args.split_var,
         bare_values=args.bare_values,
     )
-    split_view_paths: list[Path] = []
-    if automatic_verification_suggestions:
-        split_view_paths = write_dataset_split_geometry_views(
-            out_path,
-            parameters,
-            args.split_var,
-            bare_values=args.bare_values,
-            coverage_rows=coverage_context_rows,
-        )
+    split_view_paths = write_dataset_split_geometry_views(
+        out_path,
+        parameters,
+        args.split_var,
+        bare_values=args.bare_values,
+        coverage_rows=coverage_context_rows,
+    )
+    cumulative_split_view_paths = write_dataset_split_geometry_views(
+        combined_path,
+        parameters,
+        args.split_var,
+        bare_values=args.bare_values,
+        coverage_rows=coverage_context_rows,
+    )
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(
         f"considered {len(existing_points)} existing point(s) and "
@@ -4187,6 +4811,15 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     print(f"wrote {combined_path}")
     print(f"wrote {combined_metadata_path}")
     print(f"wrote {geometry_coverage_plot_path(combined_path)}")
+    for split_view_path in cumulative_split_view_paths:
+        print(f"wrote {split_view_path}")
+    print(
+        "geometry integrity: "
+        f"{len(coverage_context_rows)} unique combined point(s) = "
+        f"{cumulative_training_count} training + "
+        f"{cumulative_verification_count} verification; "
+        "training/verification overlap: 0"
+    )
     print(
         "next GP round: --existing-points "
         f"{shlex.quote(str(combined_path))}"

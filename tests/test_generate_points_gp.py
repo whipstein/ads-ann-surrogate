@@ -12,6 +12,39 @@ import generate_points as POINTS
 
 
 class GaussianAdaptivePointTests(unittest.TestCase):
+    def assert_geometry_splits_are_disjoint(
+        self,
+        combined_path: Path,
+        parameter_names: list[str],
+    ) -> None:
+        training_path = POINTS.split_output_path(combined_path, "train")
+        verification_path = POINTS.split_output_path(combined_path, "verification")
+        with combined_path.open(newline="") as stream:
+            combined_rows = list(csv.DictReader(stream))
+        with training_path.open(newline="") as stream:
+            training_rows = list(csv.DictReader(stream))
+        with verification_path.open(newline="") as stream:
+            verification_rows = list(csv.DictReader(stream))
+
+        self.assertTrue(all(row["dataset"] == "train" for row in training_rows))
+        self.assertTrue(
+            all(row["dataset"] == "verification" for row in verification_rows)
+        )
+        training_keys = {
+            tuple(row[name] for name in parameter_names) for row in training_rows
+        }
+        verification_keys = {
+            tuple(row[name] for name in parameter_names) for row in verification_rows
+        }
+        combined_keys = {
+            tuple(row[name] for name in parameter_names) for row in combined_rows
+        }
+        self.assertFalse(training_keys & verification_keys)
+        self.assertEqual(len(training_keys), len(training_rows))
+        self.assertEqual(len(verification_keys), len(verification_rows))
+        self.assertEqual(combined_keys, training_keys | verification_keys)
+        self.assertEqual(len(combined_keys), len(combined_rows))
+
     def test_gp_ucb_is_the_default_acquisition(self) -> None:
         parser = POINTS.build_suggest_parser()
         args = parser.parse_args(["--count", "2"])
@@ -132,14 +165,14 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 sum(row["dataset"] == "verification" for row in rows),
                 8,
             )
-            training_queue = root / "round_3_train.csv"
+            training_queue = root / "round_3_training.csv"
             verification_queue = root / "round_3_verification.csv"
             self.assertTrue(training_queue.is_file())
             self.assertTrue(verification_queue.is_file())
             self.assertFalse(training_queue.with_suffix(".json").exists())
             self.assertFalse(verification_queue.with_suffix(".json").exists())
             self.assertTrue(
-                (root / "round_3_train_parameter_coverage.png").is_file()
+                (root / "round_3_training_parameter_coverage.png").is_file()
             )
             self.assertTrue(
                 (root / "round_3_verification_parameter_coverage.png").is_file()
@@ -158,7 +191,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertIn((249, 115, 22), combined_colors)
             self.assertIn((22, 163, 74), combined_colors)
             with Image.open(
-                root / "round_3_train_parameter_coverage.png"
+                root / "round_3_training_parameter_coverage.png"
             ) as image:
                 training_colors = {
                     color
@@ -217,11 +250,11 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     0,
                 )
 
-            train_points = root / "geometries_train.csv"
+            train_points = root / "geometries_training.csv"
             verification_points = root / "geometries_verification.csv"
             coverage_plot = root / "geometries_parameter_coverage.png"
             train_coverage_plot = (
-                root / "geometries_train_parameter_coverage.png"
+                root / "geometries_training_parameter_coverage.png"
             )
             verification_coverage_plot = (
                 root / "geometries_verification_parameter_coverage.png"
@@ -263,6 +296,16 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(
                 metadata["parameter_coverage_plot"],
                 coverage_plot.name,
+            )
+            self.assertEqual(
+                metadata["geometry_integrity"],
+                {
+                    "unique_point_count": 8,
+                    "training_point_count": 6,
+                    "verification_point_count": 2,
+                    "training_verification_overlap_count": 0,
+                    "duplicates_present": False,
+                },
             )
             parser = POINTS.build_suggest_parser()
             args = parser.parse_args(
@@ -320,11 +363,325 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 ),
                 "training",
             )
-            self.assertIsNone(
+            self.assertEqual(
                 POINTS.geometry_file_split_group(
                     Path(temp_dir) / "gp_round_training_geometries.csv"
-                )
+                ),
+                "training",
             )
+
+    def test_combined_geometry_outputs_reject_split_role_words(self) -> None:
+        with self.assertRaisesRegex(ValueError, "combined geometry output"):
+            POINTS.require_combined_geometry_path(
+                Path("round_training_geometries.csv"),
+                "--combined-out",
+            )
+        with self.assertRaisesRegex(ValueError, "combined geometry output"):
+            POINTS.require_combined_geometry_path(
+                Path("round_verification_geometries.csv"),
+                "--combined-out",
+            )
+        POINTS.require_combined_geometry_path(
+            Path("round_all_geometries.csv"),
+            "--combined-out",
+        )
+
+    def test_output_rounding_cannot_duplicate_training_and_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "geometries.csv"
+            with self.assertRaisesRegex(
+                ValueError,
+                "across training and verification",
+            ):
+                POINTS.write_points_csv(
+                    output,
+                    "maximin-lhs",
+                    [[0.1], [0.2]],
+                    [POINTS.parse_parameter_spec("W=0:1")],
+                    verification_count=1,
+                    split_var="dataset",
+                    include_normalized=False,
+                    write_split_files=True,
+                    decimal_places=0,
+                )
+            self.assertFalse(output.exists())
+
+    def test_range_extension_preserves_disjoint_combined_and_split_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            initial = root / "initial.csv"
+            extended = root / "extended.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--parameter",
+                            "L=0:1",
+                            "--count",
+                            "8",
+                            "--verification-count",
+                            "2",
+                            "--lhs-candidates",
+                            "3",
+                            "--write-split-files",
+                            "--out",
+                            str(initial),
+                        ]
+                    ),
+                    0,
+                )
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--parameter",
+                            "L=0:1",
+                            "--existing-points",
+                            str(initial),
+                            "--extend-range",
+                            "W=0:1.2",
+                            "--count",
+                            "4",
+                            "--verification-count",
+                            "1",
+                            "--lhs-candidates",
+                            "3",
+                            "--write-split-files",
+                            "--out",
+                            str(extended),
+                        ]
+                    ),
+                    0,
+                )
+            self.assert_geometry_splits_are_disjoint(extended, ["W", "L"])
+            metadata = json.loads(extended.with_suffix(".json").read_text())
+            self.assertEqual(
+                metadata["input_geometry_cleanup"][
+                    "cross_split_duplicates_removed"
+                ],
+                0,
+            )
+
+    def test_repeated_gp_rounds_keep_combined_and_split_outputs_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            initial = root / "initial.csv"
+            metrics = root / "verification_metrics.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--parameter",
+                            "L=0:1",
+                            "--count",
+                            "18",
+                            "--verification-count",
+                            "6",
+                            "--lhs-candidates",
+                            "4",
+                            "--write-split-files",
+                            "--out",
+                            str(initial),
+                        ]
+                    ),
+                    0,
+                )
+            self.assert_geometry_splits_are_disjoint(initial, ["W", "L"])
+
+            with initial.open(newline="") as stream:
+                verification_rows = [
+                    row
+                    for row in csv.DictReader(stream)
+                    if row["dataset"] == "verification"
+                ]
+            with metrics.open("w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["source_index", "sparam", "evm_pct", "W", "L"],
+                )
+                writer.writeheader()
+                for index, row in enumerate(verification_rows, start=1):
+                    writer.writerow(
+                        {
+                            "source_index": index,
+                            "sparam": "S21",
+                            "evm_pct": 0.1 + 0.1 * index,
+                            "W": row["W"],
+                            "L": row["L"],
+                        }
+                    )
+
+            round_one = root / "round_one.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            "--count",
+                            "2",
+                            "--verification-metrics",
+                            str(metrics),
+                            "--existing-points",
+                            str(initial),
+                            "--candidate-count",
+                            "64",
+                            "--lhs-candidates",
+                            "4",
+                            "--out",
+                            str(round_one),
+                        ]
+                    ),
+                    0,
+                )
+            round_one_all = root / "round_one_all_geometries.csv"
+            self.assert_geometry_splits_are_disjoint(round_one_all, ["W", "L"])
+            self.assertTrue((root / "round_one_training.csv").is_file())
+            self.assertFalse((root / "round_one_verification.csv").exists())
+
+            round_two = root / "round_two.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            "--count",
+                            "2",
+                            "--verification-metrics",
+                            str(metrics),
+                            "--existing-points",
+                            str(round_one_all),
+                            "--candidate-count",
+                            "96",
+                            "--lhs-candidates",
+                            "4",
+                            "--out",
+                            str(round_two),
+                        ]
+                    ),
+                    0,
+                )
+            round_two_all = root / "round_two_all_geometries.csv"
+            self.assert_geometry_splits_are_disjoint(round_two, ["W", "L"])
+            self.assert_geometry_splits_are_disjoint(round_two_all, ["W", "L"])
+            with round_two.open(newline="") as stream:
+                round_two_rows = list(csv.DictReader(stream))
+            self.assertEqual(
+                {row["dataset"] for row in round_two_rows},
+                {"train", "verification"},
+            )
+
+    def test_legacy_targeted_and_cross_split_duplicates_are_migrated_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            seed = root / "seed.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--parameter",
+                            "L=0:1",
+                            "--count",
+                            "4",
+                            "--lhs-candidates",
+                            "3",
+                            "--out",
+                            str(seed),
+                        ]
+                    ),
+                    0,
+                )
+            legacy = root / "legacy_training_geometries.csv"
+            legacy.write_text(
+                "point_index,dataset,W,L\n"
+                "1,train,0.1,0.1\n"
+                "2,verification,0.1,0.1\n"
+                "3,targeted,0.3,0.3\n"
+                "4,verification,0.7,0.7\n",
+                encoding="utf-8",
+            )
+            legacy.with_suffix(".json").write_text(
+                seed.with_suffix(".json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            metrics = root / "verification_metrics.csv"
+            metrics.write_text(
+                "source_index,sparam,evm_pct,W,L\n"
+                "1,S21,0.5,0.7,0.7\n"
+                "2,S21,0.7,0.8,0.8\n",
+                encoding="utf-8",
+            )
+            output = root / "migrated.csv"
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            "--count",
+                            "1",
+                            "--verification-policy",
+                            "off",
+                            "--verification-metrics",
+                            str(metrics),
+                            "--existing-points",
+                            str(legacy),
+                            "--candidate-count",
+                            "32",
+                            "--lhs-candidates",
+                            "3",
+                            "--out",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
+            cumulative = root / "migrated_all_geometries.csv"
+            self.assert_geometry_splits_are_disjoint(cumulative, ["W", "L"])
+            with cumulative.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual({row["dataset"] for row in rows}, {"train", "verification"})
+            self.assertNotIn("targeted", {row["dataset"] for row in rows})
+            metadata = json.loads(cumulative.with_suffix(".json").read_text())
+            self.assertEqual(metadata["cross_split_duplicates_removed"], 1)
+            self.assertEqual(metadata["legacy_dataset_rows_normalized"], 1)
+            self.assertEqual(metadata["cross_split_conflict_resolution"], "training_wins")
+            self.assertEqual(len(metadata["cross_split_conflicts"]), 1)
+            self.assertIn("retained each as training", stderr.getvalue())
+
+    def test_cross_split_duplicate_resolution_is_independent_of_input_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            training = root / "points_training.csv"
+            verification = root / "points_verification.csv"
+            training.write_text("W,L\n0.25,0.75\n", encoding="utf-8")
+            verification.write_text("W,L\n0.25,0.75\n", encoding="utf-8")
+            parameters = [
+                POINTS.parse_parameter_spec("W=0:1"),
+                POINTS.parse_parameter_spec("L=0:1"),
+            ]
+            for paths in (
+                [str(training), str(verification)],
+                [str(verification), str(training)],
+            ):
+                assignments = POINTS.existing_csv_dataset_assignments(
+                    paths,
+                    parameters,
+                    "dataset",
+                    "parameter-units",
+                )
+                self.assertEqual(list(assignments.values()), ["training"])
 
     def test_suggest_infers_parameters_from_existing_points_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -408,6 +765,12 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             )
             self.assertEqual(metadata["parameters"][0]["range"]["unit"], "mm")
             self.assertEqual(metadata["parameters"][1]["scale"], "log")
+            self.assertEqual(
+                metadata["automatic_verification"][
+                    "training_verification_overlap_count"
+                ],
+                6,
+            )
             self.assertTrue(
                 (root / "additional_parameter_coverage.png").is_file()
             )
@@ -431,9 +794,9 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertIn((22, 163, 74), additional_plot_colors)
             self.assertIn((37, 99, 235), additional_plot_colors)
             self.assertIn((249, 115, 22), additional_plot_colors)
-            combined = root / "additional_training_geometries.csv"
+            combined = root / "additional_all_geometries.csv"
             combined_json = combined.with_suffix(".json")
-            combined_plot = root / "additional_training_geometries_parameter_coverage.png"
+            combined_plot = root / "additional_all_geometries_parameter_coverage.png"
             self.assertTrue(combined.is_file())
             self.assertTrue(combined_json.is_file())
             self.assertTrue(combined_plot.is_file())
@@ -488,10 +851,16 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             combined_metadata = json.loads(combined_json.read_text())
             self.assertEqual(
                 combined_metadata["generation_kind"],
-                "accumulated_training_geometries",
+                "accumulated_geometries",
             )
             self.assertEqual(combined_metadata["point_count"], 11)
             self.assertEqual(combined_metadata["new_point_count"], 3)
+            self.assertEqual(
+                combined_metadata["geometry_integrity"][
+                    "training_verification_overlap_count"
+                ],
+                0,
+            )
             self.assertEqual(
                 combined_metadata["split_counts"],
                 {"train": 9, "verification": 2},
@@ -534,7 +903,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     ),
                     0,
                 )
-            round_two_combined = root / "additional_round_two_training_geometries.csv"
+            round_two_combined = root / "additional_round_two_all_geometries.csv"
             with round_two_combined.open(newline="") as stream:
                 round_two_rows = list(csv.DictReader(stream))
             self.assertEqual(
@@ -891,6 +1260,8 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                             "3",
                             "--acquisition",
                             "error-distance",
+                            "--target-dataset",
+                            "targeted",
                             "--out",
                             str(output),
                         ]
@@ -906,6 +1277,7 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertTrue(
                 all(row["acquisition_method"] == "error-distance" for row in rows)
             )
+            self.assertTrue(all(row["dataset"] == "train" for row in rows))
             self.assertTrue(all(row["predicted_error"] == "" for row in rows))
 
     def test_sweep_root_resolves_promoted_best_model_metrics(self) -> None:

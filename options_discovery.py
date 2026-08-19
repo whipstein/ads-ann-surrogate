@@ -515,6 +515,7 @@ def recover_geometry_metadata(
 
     if generation_kind not in {
         "targeted_additional",
+        "accumulated_geometries",
         "accumulated_training_geometries",
     }:
         return

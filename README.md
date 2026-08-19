@@ -326,7 +326,7 @@ as multiple `--parameter`, `--geometry-json`, or `--existing-points` options.
           "acquisition": "gp-ucb",
           "metric": "auto",
           "out": "additional_points.csv",
-          "combined_out": "additional_training_geometries.csv"
+          "combined_out": "additional_all_geometries.csv"
         }
       }
     },
@@ -537,7 +537,7 @@ The update behavior is deliberately bounded:
 | Geometry parameter names and ranges | `workflows.points.commands.generate.parameter` | Use an array of `NAME=LOW:HIGH[:linear|log]` strings. This is the JSON equivalent of repeating `--parameter`. |
 | Initial training/verification point counts | `workflows.points.commands.generate.count` and `verification_count` | The generated CSV contains the split labels. |
 | Geometry CSV location | `workflows.points.commands.generate.out` | A same-stem geometry JSON is generated automatically; `geometries.csv` creates `geometries.json`. |
-| GP update inputs and output | `workflows.points.commands.suggest-additional` | Put `fit_dir`, `existing_points`, `count`, `out`, and optional `combined_out` here. The companion geometry JSON supplies the saved parameter ranges automatically; after each round, point `existing_points` at the latest cumulative training-geometries CSV. |
+| GP update inputs and output | `workflows.points.commands.suggest-additional` | Put `fit_dir`, `existing_points`, `count`, `out`, and optional `combined_out` here. The companion geometry JSON supplies the saved parameter ranges automatically; after each round, point `existing_points` at the latest combined cumulative all-geometries CSV. |
 | Training or combined MDIF | `models.commands.fit.mdif` | Put it here when all model families use the same dataset. A model-specific value, such as `models.kbnn.commands.fit.mdif`, overrides it. |
 | Separate verification MDIF | `models.commands.fit.verification_mdif` | Leave `null` when training and verification blocks are combined in `mdif`. |
 | Fitted parameter names | `models.commands.fit.parameter_names` | Usually optional because numeric MDIF `VAR` values are inferred. This selects variables; it does not define their fitting ranges. |
@@ -800,7 +800,7 @@ Each generated CSV contains `point_index`, `dataset`, `split_sequence`,
 `train_sequence`, `verification_sequence`, `method`, and one column per
 parameter. Add `--include-normalized` when you also want the underlying
 unit-cube coordinates. Add `--write-split-files` to also write separate
-`*_train.csv` and `*_verification.csv` files for tools that consume the two
+`*_training.csv` and `*_verification.csv` files for tools that consume the two
 simulation queues independently. Use `--decimal-places N` to round generated
 parameter values to at most `N` decimal places in each parameter's declared
 unit; normalized coordinates are recalculated from those rounded values. During
@@ -833,7 +833,7 @@ contains only the orange verification group. Range extensions plot the
 complete original-plus-appended set and apply the same combined/split
 behavior. Targeted additional-point CSVs receive their own JSON and coverage
 matrix. They also
-produce a deduplicated `<out>_training_geometries.csv`, same-stem JSON, and
+produce a deduplicated `<out>_all_geometries.csv`, same-stem JSON, and
 coverage matrix containing the prior occupied inputs plus the new batch. The
 latest cumulative CSV/JSON pair becomes the geometry input for the next GP
 round.
@@ -1594,7 +1594,7 @@ python3 surrogate.py points suggest-additional \
 Then simulate the returned rows, append their results only to the training
 MDIF, refit the same provisional model, and run the command again against the
 new `verification_metrics.csv`. The command also writes
-`outputs/error_distance_round_1_training_geometries.csv` and its companion
+`outputs/error_distance_round_1_all_geometries.csv` and its companion
 JSON; pass that cumulative CSV as the single `--existing-points` input in the
 next round so no previous geometry can be selected again.
 
@@ -1644,8 +1644,8 @@ python3 surrogate.py points suggest-additional \
   --decimal-places 4 \
   --include-normalized \
   --target-dataset train \
-  --analysis-out outputs/gp_round_1_error_regions.csv \
-  --combined-out outputs/gp_round_1_training_geometries.csv \
+  --analysis-out outputs/gp_round_1_verification_error_regions.csv \
+  --combined-out outputs/gp_round_1_all_geometries.csv \
   --out outputs/gp_round_1_points.csv
 ```
 
@@ -1655,7 +1655,7 @@ The important inputs are:
 | --- | --- |
 | `--fit-dir` | Current fit/model directory or optimize/sweep root. A successful sweep root resolves `best_model/` automatically. If every completed model failed only the passivity criteria, add `--allow-nonpassive` to use its retained acquisition-only error observations. |
 | `--existing-points` | CSV of already simulated geometries that must not be suggested again. Its same-stem JSON is loaded automatically as the parameter domain. Repeat for multiple CSVs. `--existing-mdif` can be used together with it. |
-| `--combined-out` | Optional cumulative geometry CSV path. It contains the deduplicated union of existing CSV/MDIF points and the new suggestions. Default: `<out>_training_geometries.csv`. Its same-stem JSON and coverage PNG are written automatically. |
+| `--combined-out` | Optional combined cumulative geometry CSV path. It contains the deduplicated union of existing CSV/MDIF points and the new suggestions. Its name must not contain a training or verification role word. Default: `<out>_all_geometries.csv`. Its same-stem JSON, coverage PNG, and strict `_training.csv`/`_verification.csv` views are written automatically. |
 | `--parameter-json` | Explicit geometry metadata source when no original point CSV is supplied, such as an MDIF-only workflow. It is normally unnecessary. |
 | `--parameter` | Optional backward-compatible domain override. Repeat it for every parameter only when intentionally bypassing the generated JSON. |
 | `--count` | Number of new expensive geometries to return, not candidate-pool size. Start with roughly one or two points per dimension. |
@@ -1670,12 +1670,12 @@ the acquisition diagnostics:
 - `outputs/gp_round_1_points.csv`: the eight new geometries to simulate;
 - `outputs/gp_round_1_points.json`: parameter ranges and GP/acquisition
   metadata; and
-- `outputs/gp_round_1_training_geometries.csv`: all existing and newly
+- `outputs/gp_round_1_all_geometries.csv`: all existing and newly
   suggested geometries, deduplicated and ready to use as the next round's
   single `--existing-points` input;
-- `outputs/gp_round_1_training_geometries.json`: the companion parameter-domain
+- `outputs/gp_round_1_all_geometries.json`: the companion parameter-domain
   and provenance metadata for that cumulative CSV;
-- `outputs/gp_round_1_error_regions.csv`: current verification geometries
+- `outputs/gp_round_1_verification_error_regions.csv`: current verification geometries
   ranked by the error used to fit the GP.
 
 Both geometry CSVs also receive same-stem parameter-coverage PNGs. Although the
@@ -1692,35 +1692,108 @@ independent of `--target-dataset`.
 The title identifies whether the underlying geometry inventory is combined,
 training-only, or verification-only. Its dataset summary and legend include
 only groups actually present instead of displaying empty categories. Explicit
-`dataset` values take precedence. If an RFPro-oriented split CSV omits that
-column, the plotter and cumulative-geometry writer recognize unambiguous
-`_train`, `_training`, `_verification`, `_verify`, `_validation`, and `_test`
-filename suffixes. Files without an explicit split or a recognized split-file
-suffix default to training.
+`dataset` values take precedence. Legacy `_train`, `_verify`, `_validation`,
+and `_test` names remain accepted as inputs, but new files use the complete
+`_training` and `_verification` suffixes.
+
+#### Geometry File Roles and Split Integrity
+
+Geometry CSV naming is strict and deliberately matches file content:
+
+| Filename form | Required contents |
+| --- | --- |
+| `<name>.csv` or `<name>_all_geometries.csv` | Combined, unsplit container; every row explicitly says `dataset=train` or `dataset=verification`. A particular batch may contain only one role when no point of the other role was requested. |
+| `<name>_training.csv` | Training rows only. |
+| `<name>_verification.csv` | Verification rows only. |
+
+`--out` and `--combined-out` are combined outputs and therefore reject names
+containing a complete training or verification role word. Every
+`suggest-additional` run derives its split CSVs from the same deduplicated
+combined inventory. The split sets are checked for internal duplicates and
+for any train/verification intersection before they are written. Output
+rounding is checked too; if `--decimal-places` would collapse two selected
+geometries, the command stops and asks for greater precision rather than
+silently losing or leaking a point.
+
+Only `train` and `verification` are written to the `dataset` column. Older
+`targeted`, `additional`, `added`, `new`, and `acquisition` dataset values are
+migrated to `train`; the separate `point_origin=additional` and `method`
+columns preserve acquisition provenance. A legacy mixed cumulative file with
+`training` in its name can be read for migration, but the source file is never
+rewritten and every newly produced file follows the strict naming contract.
+
+If the same geometry is found in both datasets, training wins: a response that
+has been used for fitting cannot remain an independent verification response.
+The duplicate is written once as training, a warning is printed, and the
+cumulative JSON records `cross_split_duplicates_removed`, the
+`training_wins` resolution, and a source/geometry entry in
+`cross_split_conflicts`. Such overlapping verification-metrics geometries can
+still guide GP acquisition, but they are excluded from the independent
+verification count used by the automatic growth policy. Every geometry JSON
+also contains a `geometry_integrity` object with unique training and
+verification counts, a cross-split overlap count, and an explicit duplicate
+flag. `suggest-additional` prints the same zero-overlap integrity summary at
+the end of a successful run.
+
+For the first run after upgrading, an older mixed file can remain the input,
+but give the new combined output a role-neutral name:
+
+```bash
+python3 surrogate.py points suggest-additional \
+  --existing-points outputs/gp_round_2_training_geometries.csv \
+  --fit-dir outputs/current_fit \
+  --count 8 \
+  --combined-out outputs/gp_round_3_all_geometries.csv \
+  --out outputs/gp_round_3_points.csv
+```
+
+The old file is read only as a migration source. The new all-geometries CSV,
+its `_training.csv` and `_verification.csv` views, and its JSON duplicate audit
+become the authoritative inputs for later rounds. Update the corresponding
+`combined_out` and `existing_points` values in `options.json` if they still use
+the former `*_training_geometries.csv` convention. Likewise, rename an
+explicit `analysis_out` to include `verification`, because that report contains
+verification error regions only.
+
+If earlier geometry queues have already been simulated and merged into an
+MDIF, audit that MDIF before refitting:
+
+```bash
+python3 surrogate.py audit \
+  --mdif updated_train_verify.mdif \
+  --geometry-json outputs/gp_round_3_all_geometries.json \
+  --out-dir outputs/round_3_audit
+```
+
+`TRAIN_VERIFICATION_OVERLAP` is an audit error, and
+`dataset_duplicates.csv` identifies the source files and one-based blocks for
+every matching geometry so contaminated verification blocks can be removed or
+regenerated.
 
 When automatic verification growth adds both datasets in one GP command, the
 main new-points CSV remains the auditable combined result and receives the one
-companion JSON. The command also writes RFPro-ready `<out>_train.csv` and
+companion JSON. The command also writes RFPro-ready `<out>_training.csv` and
 `<out>_verification.csv` queues and a correctly scoped coverage PNG beside
 each, without duplicate split JSON files. The training plot contains existing
 training plus newly added training points; the verification plot contains
 existing verification plus newly added verification points. Current-round
 additions remain green, while the retained dataset labels control blue/orange
-rendering after they become existing inputs in the next round.
+rendering after they become existing inputs in the next round. Every
+`suggest-additional` invocation writes each nonempty split view for both the
+current batch and the cumulative all-geometries inventory; a training-only
+batch therefore has a `_training.csv` view but no empty `_verification.csv`.
 
-The cumulative CSV preserves dataset labels from existing CSV rows and assigns
-new rows according to `--target-dataset`; it does not silently move verification
-geometries into training. Points supplied only through `--existing-mdif` are
-recorded with the neutral `existing` label for occupancy tracking.
+The cumulative CSV preserves canonical dataset labels from existing CSV and
+MDIF rows and assigns primary new rows according to `--target-dataset`.
 
 The new-point CSV includes `predicted_error`, `gp_log_uncertainty`,
 `gp_upper_confidence_error`, `distance_to_existing`, and
 `acquisition_score`. The original `geometries.csv` and every MDIF remain
-unchanged; accumulation is written to the new training-geometries CSV.
+unchanged; accumulation is written to the new combined all-geometries CSV.
 
 The selector first looks for `geometries.json` beside
 `--existing-points geometries.csv`. If a split file such as
-`geometries_train.csv` is supplied, it also finds the single combined
+`geometries_training.csv` is supplied, it also finds the single combined
 `geometries.json`; split generation intentionally does not create duplicate
 JSON files. Use `--parameter-json PATH` only when the CSV/JSON names no longer
 match or when occupied points are supplied only through `--existing-mdif`.
@@ -1730,7 +1803,7 @@ is repeatable and the cumulative plot preserves their roles:
 
 ```bash
 python3 surrogate.py --options-json options.json points suggest-additional \
-  --existing-points geometries_train.csv \
+  --existing-points geometries_training.csv \
   --existing-points geometries_verification.csv \
   --fit-dir outputs/current_fit \
   --count 8 \
@@ -1738,9 +1811,9 @@ python3 surrogate.py --options-json options.json points suggest-additional \
   --out gp_round_2.csv
 ```
 
-If duplicate coordinates appear in separate inputs, verification status wins
-regardless of input order so a held-out point is not silently reclassified as
-training in the cumulative inventory or the automatic policy count.
+If duplicate coordinates appear in separate inputs, training status wins
+regardless of input order because the point is no longer a valid independent
+holdout. The cumulative JSON records the conflict for auditability.
 
 #### After Simulating the First GP Batch
 
@@ -1752,7 +1825,7 @@ Run the following sequence:
 4. Produce a new `verification_metrics.csv` from verification data not used as
    training data.
 5. Run a second GP command using the new fit and the first round's cumulative
-   training-geometries CSV as the occupied set.
+   combined all-geometries CSV as the occupied set.
 
 For example:
 
@@ -1760,7 +1833,7 @@ For example:
 python3 surrogate.py points suggest-additional \
   --count 6 \
   --fit-dir outputs/dnn_gp_round_1_refit \
-  --existing-points outputs/gp_round_1_training_geometries.csv \
+  --existing-points outputs/gp_round_1_all_geometries.csv \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
   --candidate-count 1400 \
@@ -1771,8 +1844,8 @@ python3 surrogate.py points suggest-additional \
   --min-distance 0.05 \
   --seed 1235 \
   --target-dataset train \
-  --analysis-out outputs/gp_round_2_error_regions.csv \
-  --combined-out outputs/gp_round_2_training_geometries.csv \
+  --analysis-out outputs/gp_round_2_verification_error_regions.csv \
+  --combined-out outputs/gp_round_2_all_geometries.csv \
   --out outputs/gp_round_2_points.csv
 ```
 
@@ -1997,7 +2070,7 @@ python3 surrogate.py points suggest-additional \
   --decimal-places 4 \
   --include-normalized \
   --target-dataset train \
-  --analysis-out outputs/gp_round_1_error_regions.csv \
+  --analysis-out outputs/gp_round_1_verification_error_regions.csv \
   --out outputs/gp_round_1_points.csv
 ```
 
@@ -2008,7 +2081,7 @@ automatically uses `normalized_sparam_weight` when it is present, so an
 Global summary fields such as `weighted_evm_pct` are not per-geometry input
 columns. The requested CSV contains only the ten new geometries; it does not
 append or rewrite the original MDIF. The separately generated
-`gp_round_1_points_training_geometries.csv` contains the cumulative occupied
+`gp_round_1_points_all_geometries.csv` contains the cumulative occupied
 geometry set for the next acquisition round.
 
 #### GP Additions From KBNN and Neuro-TF Optimize Runs
@@ -2096,7 +2169,7 @@ metrics. Pass the cumulative CSV from round 1 as the single
 python3 surrogate.py points suggest-additional \
   --count 6 \
   --fit-dir outputs/dnn_gp_round_1_refit \
-  --existing-points outputs/gp_round_1_training_geometries.csv \
+  --existing-points outputs/gp_round_1_all_geometries.csv \
   --existing-mdif train_verify_plus_round_1.mdif \
   --acquisition gp-ucb \
   --candidate-method maximin-lhs \
@@ -2108,8 +2181,8 @@ python3 surrogate.py points suggest-additional \
   --min-distance 0.05 \
   --seed 1235 \
   --target-dataset train \
-  --analysis-out outputs/gp_round_2_error_regions.csv \
-  --combined-out outputs/gp_round_2_training_geometries.csv \
+  --analysis-out outputs/gp_round_2_verification_error_regions.csv \
+  --combined-out outputs/gp_round_2_all_geometries.csv \
   --out outputs/gp_round_2_points.csv
 ```
 
@@ -2186,7 +2259,7 @@ outputs:
   geometries, `predicted_error`, `gp_log_uncertainty`,
   `gp_upper_confidence_error`, `distance_to_existing`, and the final
   `acquisition_score`.
-- The same-stem `*_fit_error_regions.csv`, or the explicit `--analysis-out`,
+- The same-stem `*_verification_error_regions.csv`, or the explicit `--analysis-out`,
   ranks the measured verification geometries used to fit the GP. Use it to
   confirm that the expected bad regions and parameter values were parsed.
 - The same-stem JSON records the normalized parameter ranges, selected Matérn
@@ -2351,17 +2424,17 @@ unambiguous.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked fit-error-region CSV. Default: <code>&lt;out&gt;_fit_error_regions.csv</code>. | <nobr><code>--analysis-out error_regions.csv</code></nobr> |
-| <nobr><code>--combined-out PATH</code></nobr> | <code>suggest-additional</code> | Deduplicated cumulative geometry CSV containing prior CSV/MDIF points and the new suggestions. Its same-stem JSON and coverage PNG are also written. Default: <code>&lt;out&gt;_training_geometries.csv</code>. | <nobr><code>--combined-out gp_round_1_training_geometries.csv</code></nobr> |
+| <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked verification-error-region CSV. Because it contains verification information only, its basename must contain <code>verification</code>. Default: <code>&lt;out&gt;_verification_error_regions.csv</code>. | <nobr><code>--analysis-out verification_error_regions.csv</code></nobr> |
+| <nobr><code>--combined-out PATH</code></nobr> | <code>suggest-additional</code> | Deduplicated combined cumulative geometry CSV containing prior CSV/MDIF points and the new suggestions. Its basename cannot contain a training or verification role word. Same-stem JSON/coverage PNG and strict split CSV/PNGs are also written. Default: <code>&lt;out&gt;_all_geometries.csv</code>. | <nobr><code>--combined-out gp_round_1_all_geometries.csv</code></nobr> |
 | <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of primary points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. For a GP-UCB training suggestion, automatically triggered verification points are additional to this count and are reported explicitly. | <nobr><code>--count 80</code></nobr> |
 | <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
-| <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. After the first acquisition, use the latest <code>*_training_geometries.csv</code> cumulative output. The option remains repeatable for compatibility and multiple independent sources. | <nobr><code>--existing-points gp_round_1_training_geometries.csv</code></nobr> |
+| <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. After the first acquisition, use the latest <code>*_all_geometries.csv</code> combined cumulative output. The option remains repeatable for compatibility and multiple independent sources. | <nobr><code>--existing-points gp_round_1_all_geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
 | <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Primary output CSV path with same-stem JSON and coverage PNG. For <code>suggest-additional</code>, this file contains only the new points to simulate; the cumulative history is written separately through <code>--combined-out</code>. | <nobr><code>--out gp_round_1_points.csv</code></nobr> |
 | <nobr><code>--split-var NAME</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | CSV column used for dataset labels. Default: <code>dataset</code>. | <nobr><code>--split-var dataset</code></nobr> |
-| <nobr><code>--target-dataset NAME</code></nobr> | <code>suggest-additional</code> | Dataset label assigned to primary suggested points. Default: <code>train</code>; automatic verification additions are labeled <code>verification</code> independently. | <nobr><code>--target-dataset train</code></nobr> |
+| <nobr><code>--target-dataset {train,verification}</code></nobr> | <code>suggest-additional</code> | Canonical dataset assigned to primary suggested points. Default: <code>train</code>; automatic verification additions are labeled <code>verification</code> independently. Legacy acquisition labels are migrated to <code>train</code> and retained only through provenance columns. | <nobr><code>--target-dataset train</code></nobr> |
 | <nobr><code>--verification-count INT</code></nobr> | <code>generate</code> | Number of new tail points labeled verification; must be smaller than <code>--count</code>. Default: <code>0</code>, or the original split ratio during a range extension. | <nobr><code>--verification-count 16</code></nobr> |
-| <nobr><code>--write-split-files</code></nobr> | <code>generate</code> | Also writes separate <code>*_train.csv</code> and, when applicable, <code>*_verification.csv</code> files. The combined geometry keeps the one companion JSON; each split CSV receives a correctly scoped coverage PNG without a duplicate JSON. | <nobr><code>--write-split-files</code></nobr> |
+| <nobr><code>--write-split-files</code></nobr> | <code>generate</code> | Also writes separate <code>*_training.csv</code> and, when applicable, <code>*_verification.csv</code> files. The combined geometry keeps the one companion JSON; each split CSV receives a correctly scoped coverage PNG without a duplicate JSON. | <nobr><code>--write-split-files</code></nobr> |
 
 ### Existing Input and Targeted Selection
 
@@ -2398,7 +2471,7 @@ For each adaptive round:
 5. Request another small point batch only while held-out performance continues
    to improve meaningfully.
 
-Each round writes `<out>_training_geometries.csv` with a same-stem JSON. This
+Each round writes `<out>_all_geometries.csv` with a same-stem JSON. This
 cumulative pair carries the union of prior and new geometries plus the parameter
 names, ranges, units, and linear/log scaling. Pass only the latest cumulative
 CSV as `--existing-points` in the next round; its JSON is inferred automatically.
@@ -6694,7 +6767,7 @@ The suggested-point CSV contains:
 
 The companion JSON records the kernel, target transform, observation count,
 chosen length scale, selection mode, nugget, exploration weight, and log
-marginal likelihood. The companion `*_fit_error_regions.csv` ranks the source
+marginal likelihood. The companion `*_verification_error_regions.csv` ranks the source
 error geometries used by both acquisition modes.
 
 When passivity criteria reject every completed optimize trial, the sweep
@@ -6893,7 +6966,7 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | `--skip INT` | Generate, suggest | Skips leading Sobol or Halton sequence points. Default: `0`. | `--skip 32`  | `workflows.points.commands.{generate,suggest-additional}.skip` |
 | `--split-var NAME` | Generate, suggest | CSV column used for dataset labels. Default: `dataset`. | `--split-var dataset`  | `workflows.points.commands.{generate,suggest-additional}.split_var` |
 | `--verification-count INT` | Generate | Number of new tail points labeled verification. Default: `0`; range extension preserves the original split ratio when omitted. | `--verification-count 8`  | `workflows.points.commands.generate.verification_count` |
-| `--write-split-files` | Generate | Also writes separate `_train.csv` and `_verification.csv` files. JSON remains combined; the combined and each split CSV receive coverage PNGs containing only their applicable dataset groups. | `--write-split-files`  | `workflows.points.commands.generate.write_split_files` |
+| `--write-split-files` | Generate | Also writes separate `_training.csv` and `_verification.csv` files. JSON remains combined; the combined and each split CSV receive coverage PNGs containing only their applicable dataset groups. | `--write-split-files`  | `workflows.points.commands.generate.write_split_files` |
 
 ### D.6 Adaptive additional-point options
 
@@ -6904,13 +6977,13 @@ options in D.5 also apply where marked.
 | --- | --- | --- | --- |
 | `--acquisition {gp-ucb,error-distance}` | Selection method. Default: `gp-ucb`; `error-distance` is the legacy non-GP selector. | `--acquisition gp-ucb`  | `workflows.points.commands.suggest-additional.acquisition` |
 | `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive`  | `workflows.points.commands.suggest-additional.allow_nonpassive` |
-| `--analysis-out PATH` | Ranked current-fit error-region CSV. Default: `<out>_fit_error_regions.csv`. | `--analysis-out additions_regions.csv`  | `workflows.points.commands.suggest-additional.analysis_out` |
+| `--analysis-out PATH` | Ranked verification-error-region CSV. Its basename must contain `verification`. Default: `<out>_verification_error_regions.csv`. | `--analysis-out additions_verification_regions.csv`  | `workflows.points.commands.suggest-additional.analysis_out` |
 | `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, planned total * candidate-factor)`, where planned total includes triggered automatic verification points. | `--candidate-count 4000`  | `workflows.points.commands.suggest-additional.candidate_count` |
 | `--candidate-factor INT` | Candidate multiplier when `--candidate-count` is omitted. Default: `200`. | `--candidate-factor 300`  | `workflows.points.commands.suggest-additional.candidate_factor` |
 | `--candidate-method NAME` | Candidate generator: `maximin-lhs`, `minimax-lhs`, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--candidate-method sobol`  | `workflows.points.commands.suggest-additional.candidate_method` |
-| `--combined-out PATH` | Cumulative existing-plus-new geometry CSV for the next GP round; a same-stem JSON and coverage PNG are also written. Default: `<out>_training_geometries.csv`. | `--combined-out additions_training_geometries.csv`  | `workflows.points.commands.suggest-additional.combined_out` |
+| `--combined-out PATH` | Combined cumulative existing-plus-new geometry CSV for the next GP round. Its basename cannot contain a training or verification role word; same-stem JSON/coverage PNG and strict split views are also written. Default: `<out>_all_geometries.csv`. | `--combined-out additions_all_geometries.csv`  | `workflows.points.commands.suggest-additional.combined_out` |
 | `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. | `--existing-mdif train_verify.mdif`  | `workflows.points.commands.suggest-additional.existing_mdif` |
-| `--existing-points PATH` | CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. In later rounds, use the latest cumulative `*_training_geometries.csv`; repeat only for independent sources. | `--existing-points gp_round_1_training_geometries.csv`  | `workflows.points.commands.suggest-additional.existing_points` |
+| `--existing-points PATH` | CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. In later rounds, use the latest combined cumulative `*_all_geometries.csv`; repeat only for independent sources. | `--existing-points gp_round_1_all_geometries.csv`  | `workflows.points.commands.suggest-additional.existing_points` |
 | `--exploration-weight FLOAT` | GP-UCB uncertainty multiplier; larger values explore more. Default: `2.0`. | `--exploration-weight 2.5`  | `workflows.points.commands.suggest-additional.exploration_weight` |
 | `--fit-dir PATH` | Fit/model directory or optimize/sweep root. A sweep root resolves `best_model/verification_metrics.csv`, or `point_generation_fallback/verification_metrics.csv` with `--allow-nonpassive`. | `--fit-dir dnn_opt`  | `workflows.points.commands.suggest-additional.fit_dir` |
 | `--focus-power FLOAT` | Exponent on measured verification-error scores for legacy error-distance selection. Default: `1.0`. | `--focus-power 1.5`  | `workflows.points.commands.suggest-additional.focus_power` |
@@ -6923,7 +6996,7 @@ options in D.5 also apply where marked.
 | `--novelty-power FLOAT` | Exponent on candidate distance/diversity. Default: `1.0`. | `--novelty-power 2`  | `workflows.points.commands.suggest-additional.novelty_power` |
 | `--out PATH` | New-points-only simulation CSV; a same-stem JSON and PNG are also written, in addition to the cumulative output. Default: `targeted_additional_points.csv`. | `--out additions.csv`  | `workflows.points.commands.suggest-additional.out` |
 | `--parameter-json PATH` | Explicit geometry metadata JSON. Normally inferred beside `--existing-points`. | `--parameter-json geometries.json`  | `workflows.points.commands.suggest-additional.parameter_json` |
-| `--target-dataset NAME` | Dataset label written on primary suggested points. Default: `train`; automatic verification additions remain `verification`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
+| `--target-dataset {train,verification}` | Canonical dataset written on primary suggested points. Default: `train`; automatic verification additions remain `verification`. Legacy acquisition labels are migrated to `train`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
 | `--verification-batch INT` | Automatic acquisition-verification points per crossed training milestone. Default: `max(2, ceil(2*d/3))`. | `--verification-batch 4`  | `workflows.points.commands.suggest-additional.verification_batch` |
 | `--verification-interval INT` | Positive training growth between automatic verification milestones. Default: `2*d`. | `--verification-interval 12`  | `workflows.points.commands.suggest-additional.verification_interval` |
 | `--verification-max-add INT` | Per-command cap on automatic verification catch-up. Default: `max(d+2, 6)`. | `--verification-max-add 8`  | `workflows.points.commands.suggest-additional.verification_max_add` |
@@ -7206,8 +7279,8 @@ on the primary entry point:
 | Generate | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 32 --verification-count 8 --out geometries.csv` |
 | Audit | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |
-| Add points | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --existing-mdif train_verify.mdif --count 8 --out additions.csv --combined-out additions_training_geometries.csv` |
-| Next GP round | `python3 surrogate.py points suggest-additional --fit-dir dnn_refit --existing-points additions_training_geometries.csv --count 6 --out additions_round_2.csv` |
+| Add points | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --existing-mdif train_verify.mdif --count 8 --out additions.csv --combined-out additions_all_geometries.csv` |
+| Next GP round | `python3 surrogate.py points suggest-additional --fit-dir dnn_refit --existing-points additions_all_geometries.csv --count 6 --out additions_round_2.csv` |
 | Refit | `python3 surrogate.py --model dnn train --mdif updated_train_verify.mdif --out-dir dnn_final --hidden-layers 128,128,64 --activation tanh --learning-rate 0.001` |
 | Export sampled MDIF | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_final --out-dir exports/mdif --template-mdif dnn_final/ads_export_template.mdif` |
 | Export HB SDD | `python3 surrogate.py --model dnn export-ads-hb --model-dir dnn_final --out-dir exports/hb --module-name filter_hb --parameter-input-scales 1um` |
