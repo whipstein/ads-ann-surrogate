@@ -333,6 +333,7 @@ as multiple `--parameter`, `--geometry-json`, or `--existing-points` options.
     "audit": {
       "common": {
         "mdif": "data/train_verify.mdif",
+        "verification_mdif": null,
         "geometry_json": ["geometries.json"],
         "parameter_names": "W,L,H",
         "expect_reciprocal": true,
@@ -378,7 +379,9 @@ The report lists every effective option after type conversion and precedence,
 labels its source as an explicit CLI flag, an exact JSON path, or the parser
 default, and identifies required options that are still missing. A configured
 `null` is reported as “JSON null ignored” so it cannot be mistaken for a value
-that reached the command. For
+that reached the command. Audit data-input placeholders instead fall through
+to a populated common or unambiguous model fit value and report that fallback
+source explicitly. For
 `points suggest-additional`, it also performs two read-only preflight checks:
 
 - it shows whether the parameter domain comes from repeatable `--parameter`
@@ -542,7 +545,7 @@ The update behavior is deliberately bounded:
 | Separate verification MDIF | `models.commands.fit.verification_mdif` | Leave `null` when training and verification blocks are combined in `mdif`. |
 | Fitted parameter names | `models.commands.fit.parameter_names` | Usually optional because numeric MDIF `VAR` values are inferred. This selects variables; it does not define their fitting ranges. |
 | KBNN coarse data | `models.kbnn.commands.fit.coarse_mdif` | KBNN-only, so it belongs below the KBNN model node. |
-| Audit data and declared geometry domain | `workflows.audit.common.mdif` and `geometry_json` | `geometry_json` may be an array when the range was extended in multiple campaigns. |
+| Audit data and declared geometry domain | `workflows.audit.common.mdif`, `verification_mdif`, and `geometry_json` | When the audit MDIF values are omitted or `null`, audit reuses populated `models.commands.fit.mdif` and `verification_mdif` values. Non-null audit values override that fallback. `geometry_json` may be an array when the range was extended in multiple campaigns. |
 | Training and optimization outputs | `models.MODEL.commands.train.out_dir` and `models.MODEL.commands.optimize.out_dir` | Keep these model-specific to avoid DNN, KBNN, and Neuro-TF writing into the same directory. |
 | Export input, output, and module settings | `models.MODEL.commands.EXACT_EXPORT_COMMAND` | Replace both placeholders, for example with `models.dnn.commands.export-veriloga`; exact scope avoids applying unsupported options to other exporters. |
 
@@ -804,8 +807,21 @@ unit-cube coordinates. Add `--write-split-files` to also write separate
 simulation queues independently. Use `--decimal-places N` to round generated
 parameter values to at most `N` decimal places in each parameter's declared
 unit; normalized coordinates are recalculated from those rounded values. During
-a range extension, this applies to the newly appended points while the original
-CSV rows remain unchanged.
+a range extension, this applies to the newly appended points. Surviving
+original row values remain unchanged, while repeated original rows that occupy
+the same target-digit key are removed.
+
+The requested decimal places also define geometry identity. For example, with
+`--decimal-places 3`, `1.2344um` and `1.23449um` both occupy the `1.234um`
+location and cannot appear as separate points. Initial and range-extension
+generation retain the unique results from the requested design and draw
+deterministic replacement candidates until the requested count is full.
+`suggest-additional` removes candidate locations already occupied by any
+existing CSV, MDIF, or verification-metrics point, and collapses the remaining
+candidate pool on the same declared-unit digit grid before scoring it. If the
+selected precision and ranges cannot provide enough unique locations, the
+command stops before writing the geometry CSV and reports the grid capacity or
+the number of unique points it could find.
 
 Every geometry CSV also gets an automatic same-stem JSON file. For example,
 `geometries.csv` produces `geometries.json`. The JSON records the generation
@@ -1712,8 +1728,9 @@ containing a complete training or verification role word. Every
 combined inventory. The split sets are checked for internal duplicates and
 for any train/verification intersection before they are written. Output
 rounding is checked too; if `--decimal-places` would collapse two selected
-geometries, the command stops and asks for greater precision rather than
-silently losing or leaking a point.
+geometries, initial generation draws replacements and acquisition excludes the
+duplicate locations before scoring. Final validation still stops before a file
+can be written if any internal or cross-split duplicate survives.
 
 Only `train` and `verification` are written to the `dataset` column. Older
 `targeted`, `additional`, `added`, `new`, and `acquisition` dataset values are
@@ -1734,6 +1751,47 @@ also contains a `geometry_integrity` object with unique training and
 verification counts, a cross-split overlap count, and an explicit duplicate
 flag. `suggest-additional` prints the same zero-overlap integrity summary at
 the end of a successful run.
+
+#### Recovering an Existing Set with Duplicate Points
+
+Do not change the coordinates on a row that has already been simulated: its
+S-parameter response belongs to the original geometry. Instead, use the same
+target digits that will be used by RFPro, retain one row for each unique
+declared-unit digit key, and generate replacements for the deficit:
+
+$$
+N_{\text{replacement}} = N_{\text{intended}} - N_{\text{unique at target digits}}.
+$$
+
+If the geometry has not been simulated, rerun the original `points generate`
+command with this version and the same seed. It automatically replaces any
+rounded collisions and returns the full requested count. If it has been
+simulated and verification metrics are available, let the cumulative GP flow
+remove the repeated inventory rows and request the deficit as a new batch:
+
+```bash
+python3 surrogate.py points suggest-additional \
+  --existing-points outputs/current_all_geometries.csv \
+  --fit-dir outputs/current_fit \
+  --count N_REPLACEMENT \
+  --verification-policy off \
+  --decimal-places 4 \
+  --out outputs/duplicate_replacements.csv
+```
+
+The replacement points are selected only from unoccupied target-digit keys and
+the resulting `duplicate_replacements_all_geometries.csv` is the cleaned,
+complete inventory for the next round. When duplicate geometries have already
+been simulated, compare their S-parameter responses before discarding copies.
+Materially different responses at the same target-digit geometry indicate a
+simulation or data-association problem and should be investigated rather than
+averaged. If a duplicate crosses the train/verification split, retain it as
+training because it is no longer an independent verification sample.
+To preserve the original split sizes exactly, calculate training and
+verification deficits separately. Run the command above first with
+`--target-dataset train --verification-policy off`, then run a second suggestion
+against its cumulative output with `--target-dataset verification` for the
+verification deficit.
 
 For the first run after upgrading, an older mixed file can remain the input,
 but give the new combined output a role-neutral name:
@@ -2427,7 +2485,7 @@ unambiguous.
 | <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked verification-error-region CSV. Because it contains verification information only, its basename must contain <code>verification</code>. Default: <code>&lt;out&gt;_verification_error_regions.csv</code>. | <nobr><code>--analysis-out verification_error_regions.csv</code></nobr> |
 | <nobr><code>--combined-out PATH</code></nobr> | <code>suggest-additional</code> | Deduplicated combined cumulative geometry CSV containing prior CSV/MDIF points and the new suggestions. Its basename cannot contain a training or verification role word. Same-stem JSON/coverage PNG and strict split CSV/PNGs are also written. Default: <code>&lt;out&gt;_all_geometries.csv</code>. | <nobr><code>--combined-out gp_round_1_all_geometries.csv</code></nobr> |
 | <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of primary points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. For a GP-UCB training suggestion, automatically triggered verification points are additional to this count and are reported explicitly. | <nobr><code>--count 80</code></nobr> |
-| <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated parameter values to this many decimal places in their declared units. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
+| <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated values and defines duplicate identity at this many decimal places in each declared unit. Generation refills rounded collisions; acquisition excludes occupied/collapsed candidates. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. After the first acquisition, use the latest <code>*_all_geometries.csv</code> combined cumulative output. The option remains repeatable for compatibility and multiple independent sources. | <nobr><code>--existing-points gp_round_1_all_geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
 | <nobr><code>--out PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Primary output CSV path with same-stem JSON and coverage PNG. For <code>suggest-additional</code>, this file contains only the new points to simulate; the cumulative history is written separately through <code>--combined-out</code>. | <nobr><code>--out gp_round_1_points.csv</code></nobr> |
@@ -6931,13 +6989,23 @@ row overrides an earlier row when both define the same option:
 
 Workflow commands use the root layers followed by the selected
 `workflows.WORKFLOW` common and command layers, then the explicit command line.
+The audit workflow additionally treats populated data-input values in
+`models.commands.fit` as fallbacks. This lets one `mdif`, `verification_mdif`,
+`parameter_names`, and split-label configuration drive fitting and auditing
+without duplication. A populated `workflows.audit.common` or
+`workflows.audit.commands.audit` value overrides the fallback. Audit also uses
+a model-specific fit value when every populated model scope agrees on that
+value (including the common case where only one model has been configured). If
+different model scopes name different datasets, place the intended selection
+under `workflows.audit` or pass it explicitly rather than having audit guess.
 The `fit` group means `train` and `optimize`; `export` means every `export-*`
 command; and `all` applies to every command in that scope.
 
 Keys may use `frequency_weights`, `frequency-weights`, or
 `--frequency-weights`. Scalars retain normal parser typing, JSON booleans set
 flag options, arrays set repeatable/multi-value options, and `null` leaves the
-built-in default unchanged. Delete a key or set it to `null` to omit it; an
+built-in default unchanged. For audit data inputs, `null` permits the documented
+model-fit fallback instead. Delete a key or set it to `null` to omit it; an
 empty string is an explicit value and is not treated as omission. A JSON value
 can satisfy a normally required option such as `mdif` or `out_dir`, although
 keeping run-specific paths on the CLI is usually clearer. The selected command
@@ -6952,7 +7020,7 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | --- | --- | --- | --- | --- |
 | `--bare-values MODE` | Generate, suggest | Interprets unitless values read from existing CSV, MDIF, or metrics. Generate accepts `parameter-units` and `base-units` and defaults to parameter units. Suggest additionally accepts and defaults to `auto`, selecting parameter or SI base units independently for the metrics file and each geometry/MDIF source according to the saved geometry domain. | `--bare-values auto`  | `workflows.points.commands.{generate,suggest-additional}.bare_values` |
 | `--count INT` | Generate, suggest | Number of primary new points. Required for suggestions and ordinary generation; a range extension can infer a density-based recommendation when omitted. GP-UCB may append separately reported automatic verification points beyond this primary count. | `--count 12`  | `workflows.points.commands.{generate,suggest-additional}.count` |
-| `--decimal-places INT` | Generate, suggest | Rounds newly generated values in their declared units; allowed range is 0 through 15. | `--decimal-places 4`  | `workflows.points.commands.{generate,suggest-additional}.decimal_places` |
+| `--decimal-places INT` | Generate, suggest | Rounds values and defines duplicate identity in each declared unit; generation refills rounded collisions and acquisition excludes occupied/collapsed candidates. Allowed range is 0 through 15. | `--decimal-places 4`  | `workflows.points.commands.{generate,suggest-additional}.decimal_places` |
 | `--existing-points PATH` | Generate | Original CSV retained and appended when `--extend-range` is used. | `--existing-points geometries.csv`  | `workflows.points.commands.generate.existing_points` |
 | `--extend-range NAME=LOW:HIGH` | Generate | Extends exactly one existing parameter on one side and samples only the added slab. Requires `--existing-points`. | `--extend-range W=0.4mm:1.0mm`  | `workflows.points.commands.generate.extend_range` |
 | `--include-normalized` | Generate, suggest | Adds `u_NAME` unit-cube coordinate columns. | `--include-normalized`  | `workflows.points.commands.{generate,suggest-additional}.include_normalized` |
@@ -7031,7 +7099,7 @@ All options apply to `audit` and are alphabetized.
 | `--frequency-rel-tolerance FLOAT` | Relative frequency-grid tolerance. Default: `1e-10`. | `--frequency-rel-tolerance 1e-9`  | `workflows.audit.common.frequency_rel_tolerance` |
 | `--geometry-json PATH` | Repeatable generation metadata whose declared bounds define coverage; same-stem files are inferred when possible. | `--geometry-json geometries.json`  | `workflows.audit.common.geometry_json` |
 | `--holdout-fraction FLOAT` | Random holdout used only when no recognized train labels exist. Default: `0.2`. | `--holdout-fraction 0.25`  | `workflows.audit.common.holdout_fraction` |
-| `--mdif PATH` | Required fine/direct training or combined MDIF. | `--mdif train_verify.mdif`  | `workflows.audit.common.mdif` |
+| `--mdif PATH` | Required fine/direct training or combined MDIF. When this audit value is omitted or `null`, a populated common or unambiguous model-specific fit `mdif` is reused. | `--mdif train_verify.mdif`  | `workflows.audit.common.mdif` |
 | `--neighbor-min-relative-jump FLOAT` | Minimum relative response RMSE eligible for a neighbor warning. Default: `0.05`. | `--neighbor-min-relative-jump 0.1`  | `workflows.audit.common.neighbor_min_relative_jump` |
 | `--neighbor-outlier-factor FLOAT` | Warning multiplier above the median nearest-neighbor jump. Default: `5`. | `--neighbor-outlier-factor 8`  | `workflows.audit.common.neighbor_outlier_factor` |
 | `--out-dir PATH` | Report directory. Default: `dataset_audit`. | `--out-dir outputs/audit`  | `workflows.audit.common.out_dir` |
@@ -7045,7 +7113,7 @@ All options apply to `audit` and are alphabetized.
 | `--seed INT` | Random-holdout seed. Default: `1234`. | `--seed 42`  | `workflows.audit.common.seed` |
 | `--split-var NAME` | Split `VAR` name. Default: `dataset`. | `--split-var dataset`  | `workflows.audit.common.split_var` |
 | `--train-values LIST` | Comma-separated training labels. Default: `train,training`. | `--train-values train`  | `workflows.audit.common.train_values` |
-| `--verification-mdif PATH` | Optional separate fine/direct verification MDIF. | `--verification-mdif verify.mdif`  | `workflows.audit.common.verification_mdif` |
+| `--verification-mdif PATH` | Optional separate fine/direct verification MDIF. When this audit value is omitted or `null`, the corresponding common or unambiguous model-specific fit value is reused. | `--verification-mdif verify.mdif`  | `workflows.audit.common.verification_mdif` |
 | `--verify-values LIST` | Comma-separated verification labels. Default: `verify,verification,test,validation`. | `--verify-values verification`  | `workflows.audit.common.verify_values` |
 
 ### D.8 Shared model fitting options

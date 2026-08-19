@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -405,6 +406,144 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     decimal_places=0,
                 )
             self.assertFalse(output.exists())
+
+    def test_duplicate_identity_uses_declared_unit_target_digits(self) -> None:
+        parameter = POINTS.parse_parameter_spec("W=0um:10um")
+        rows = [
+            {"dataset": "train", "W": "1.2344um"},
+            {"dataset": "train", "W": "1.23449um"},
+        ]
+        with self.assertRaisesRegex(ValueError, "within train"):
+            POINTS.validate_geometry_output_rows(
+                Path("geometries.csv"),
+                rows,
+                [parameter],
+                "dataset",
+                bare_values="parameter-units",
+                decimal_places=3,
+            )
+
+    def test_generation_refills_points_collapsed_by_target_digits(self) -> None:
+        parameter = POINTS.parse_parameter_spec("W=0:1")
+        generated_batches = [
+            [[0.1], [0.2]],
+            [[0.6], [0.7]],
+        ]
+        with mock.patch.object(
+            POINTS,
+            "generate_unit_points",
+            side_effect=generated_batches,
+        ) as generate:
+            points = POINTS.generate_unique_output_points(
+                "maximin-lhs",
+                count=2,
+                sampling_parameters=[parameter],
+                output_parameters=[parameter],
+                decimal_places=0,
+                seed=7,
+                lhs_candidates=3,
+                scramble=True,
+                skip=0,
+            )
+        self.assertEqual(generate.call_count, 2)
+        keys = {
+            POINTS.geometry_output_key_from_unit_point(point, [parameter], 0)
+            for point in points
+        }
+        self.assertEqual(keys, {("0",), ("1",)})
+
+    def test_generation_rejects_count_above_target_digit_capacity(self) -> None:
+        parameter = POINTS.parse_parameter_spec("W=0:1")
+        with self.assertRaisesRegex(ValueError, "only 2 unique point"):
+            POINTS.generate_unique_output_points(
+                "maximin-lhs",
+                count=3,
+                sampling_parameters=[parameter],
+                output_parameters=[parameter],
+                decimal_places=0,
+                seed=7,
+                lhs_candidates=3,
+                scramble=True,
+                skip=0,
+            )
+
+    def test_candidate_filter_excludes_target_digit_duplicates(self) -> None:
+        parameter = POINTS.parse_parameter_spec("W=0um:10um")
+        existing = POINTS.geometry_output_key_from_values(
+            [1.2344e-6],
+            [parameter],
+            3,
+        )
+        candidates = POINTS.filter_unique_output_candidates(
+            [[0.123449], [0.123451], [0.8], [0.80001]],
+            [parameter],
+            3,
+            excluded_keys={existing},
+        )
+        keys = [
+            POINTS.geometry_output_key_from_unit_point(point, [parameter], 3)
+            for point in candidates
+        ]
+        self.assertEqual(keys, [("1.235um",), ("8um",)])
+
+    def test_range_extension_refills_target_digit_boundary_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            initial = root / "initial.csv"
+            extended = root / "extended.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--count",
+                            "2",
+                            "--decimal-places",
+                            "0",
+                            "--lhs-candidates",
+                            "2",
+                            "--out",
+                            str(initial),
+                        ]
+                    ),
+                    0,
+                )
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--existing-points",
+                            str(initial),
+                            "--extend-range",
+                            "W=0:2",
+                            "--count",
+                            "1",
+                            "--verification-count",
+                            "0",
+                            "--method",
+                            "halton",
+                            "--skip",
+                            "1",
+                            "--decimal-places",
+                            "0",
+                            "--out",
+                            str(extended),
+                        ]
+                    ),
+                    0,
+                )
+            with extended.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            keys = [row["W"] for row in rows]
+            self.assertEqual(len(keys), 3)
+            self.assertEqual(set(keys), {"0", "1", "2"})
 
     def test_range_extension_preserves_disjoint_combined_and_split_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

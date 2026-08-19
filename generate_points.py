@@ -1103,9 +1103,10 @@ def write_geometry_metadata(
         parameters,
         split_var,
         bare_values=bare_values,
+        decimal_places=decimal_places,
     )
     split_counts: dict[str, int] = {}
-    split_geometry_keys: dict[str, set[tuple[int, ...]]] = {
+    split_geometry_keys: dict[str, set[tuple[str, ...]]] = {
         "train": set(),
         "verification": set(),
     }
@@ -1117,9 +1118,14 @@ def write_geometry_metadata(
         if str(raw_split_value or "").strip():
             split_value = canonical_dataset_label(raw_split_value)
             split_counts[split_value] = split_counts.get(split_value, 0) + 1
-            point = row_unit_point(row, parameters, bare_values=bare_values)
-            assert point is not None
-            split_geometry_keys[split_value].add(geometry_point_key(point))
+            key = geometry_output_key_from_row(
+                row,
+                parameters,
+                decimal_places,
+                bare_values=bare_values,
+            )
+            assert key is not None
+            split_geometry_keys[split_value].add(key)
 
     metadata: dict[str, object] = {
         "schema_version": 1,
@@ -1362,6 +1368,7 @@ def write_points_csv(
         parameters,
         split_var,
         bare_values="parameter-units",
+        decimal_places=decimal_places,
     )
     write_rows_csv(path, rows, fields)
     metadata_path = write_geometry_metadata(
@@ -1385,6 +1392,7 @@ def write_points_csv(
                 parameters,
                 split_var,
                 bare_values="parameter-units",
+                decimal_places=decimal_places,
             )
             write_rows_csv(split_path, split_rows, fields)
             split_plot_path = write_parameter_coverage_png(
@@ -1548,6 +1556,7 @@ def write_range_extension_csv(
         plan.overall_parameters,
         split_var,
         bare_values=bare_values,
+        decimal_places=decimal_places,
     )
     write_rows_csv(path, rows, fields)
     extension_metadata: dict[str, object] = {
@@ -1592,6 +1601,7 @@ def write_range_extension_csv(
                 plan.overall_parameters,
                 split_var,
                 bare_values=bare_values,
+                decimal_places=decimal_places,
             )
             write_rows_csv(split_path, split_rows, fields)
             split_plot_path = write_parameter_coverage_png(
@@ -1641,13 +1651,12 @@ def row_unit_point(
     parameters: Sequence[ParameterSpec],
     bare_values: str,
 ) -> list[float] | None:
+    values = row_parameter_values(row, parameters, bare_values=bare_values)
+    if values is None:
+        return None
     point: list[float] = []
-    for parameter in parameters:
-        raw = lookup_row_value(row, parameter.name)
-        if raw is None or str(raw).strip() == "":
-            return None
+    for parameter, value in zip(parameters, values):
         try:
-            value = parse_observed_value(raw, parameter, bare_values=bare_values)
             unit_value = unit_coordinate_for_value(value, parameter)
         except (ValueError, OverflowError):
             return None
@@ -1657,10 +1666,271 @@ def row_unit_point(
     return point
 
 
-def geometry_point_key(point: Sequence[float]) -> tuple[int, ...]:
-    """Stable identity for a geometry in normalized parameter coordinates."""
+def row_parameter_values(
+    row: dict[str, object],
+    parameters: Sequence[ParameterSpec],
+    *,
+    bare_values: str,
+) -> list[float] | None:
+    """Read one row into base-unit parameter values without normalizing it."""
 
-    return tuple(int(round(float(value) * 1.0e10)) for value in point)
+    values: list[float] = []
+    for parameter in parameters:
+        raw = lookup_row_value(row, parameter.name)
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            value = parse_observed_value(raw, parameter, bare_values=bare_values)
+        except (ValueError, OverflowError):
+            return None
+        if not math.isfinite(value):
+            return None
+        values.append(value)
+    return values
+
+
+def geometry_output_key_from_values(
+    values: Sequence[float],
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+) -> tuple[str, ...]:
+    """Return the identity of the parameter values as they appear in a CSV.
+
+    Geometry duplication is an output concern: values that resolve to the same
+    declared-unit digits are the same simulation point even when their original
+    floating-point or normalized coordinates differ.  Building the key from the
+    canonical formatted values keeps generation, validation, and accumulation
+    on exactly the same decimal grid.
+    """
+
+    if len(values) != len(parameters):
+        raise ValueError("A geometry key requires one value per parameter")
+    return tuple(
+        format_value(
+            round_parameter_value(float(value), parameter, decimal_places),
+            parameter.unit,
+            decimal_places,
+        )
+        for parameter, value in zip(parameters, values)
+    )
+
+
+def geometry_output_key_from_unit_point(
+    point: Sequence[float],
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+) -> tuple[str, ...]:
+    """Return the emitted-value identity for a normalized geometry point."""
+
+    if len(point) != len(parameters):
+        raise ValueError("A geometry key requires one coordinate per parameter")
+    values = [
+        map_unit_point(float(coordinate), parameter)
+        for parameter, coordinate in zip(parameters, point)
+    ]
+    return geometry_output_key_from_values(values, parameters, decimal_places)
+
+
+def geometry_output_key_from_row(
+    row: dict[str, object],
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+    *,
+    bare_values: str,
+) -> tuple[str, ...] | None:
+    """Return the target-digit identity of a parsed geometry CSV row."""
+
+    values = row_parameter_values(row, parameters, bare_values=bare_values)
+    if values is None:
+        return None
+    return geometry_output_key_from_values(values, parameters, decimal_places)
+
+
+def round_unit_point_for_output(
+    point: Sequence[float],
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+) -> list[float]:
+    """Move a normalized point onto the exact grid used by the output CSV."""
+
+    if decimal_places is None:
+        return [float(value) for value in point]
+    values = [
+        round_parameter_value(
+            map_unit_point(float(coordinate), parameter),
+            parameter,
+            decimal_places,
+        )
+        for parameter, coordinate in zip(parameters, point)
+    ]
+    return [
+        unit_coordinate_for_value(value, parameter)
+        for parameter, value in zip(parameters, values)
+    ]
+
+
+def canonicalize_sampled_point(
+    point: Sequence[float],
+    sampling_parameters: Sequence[ParameterSpec],
+    output_parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+) -> tuple[list[float], tuple[str, ...]]:
+    """Round a sampled point and return its final output-space identity."""
+
+    if len(sampling_parameters) != len(output_parameters):
+        raise ValueError("Sampling and output parameter domains must align")
+    if any(
+        sampling.name != output.name or sampling.unit != output.unit
+        for sampling, output in zip(sampling_parameters, output_parameters)
+    ):
+        raise ValueError(
+            "Sampling and output parameters must have matching names and units"
+        )
+    values = [
+        round_parameter_value(
+            map_unit_point(float(coordinate), sampling_parameter),
+            sampling_parameter,
+            decimal_places,
+        )
+        for sampling_parameter, coordinate in zip(sampling_parameters, point)
+    ]
+    rounded_point = (
+        [float(value) for value in point]
+        if decimal_places is None
+        else [
+            unit_coordinate_for_value(value, sampling_parameter)
+            for sampling_parameter, value in zip(sampling_parameters, values)
+        ]
+    )
+    key = geometry_output_key_from_values(
+        values,
+        output_parameters,
+        decimal_places,
+    )
+    return rounded_point, key
+
+
+def target_grid_capacity(
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+) -> int | None:
+    """Return the finite point capacity of a requested decimal grid."""
+
+    if decimal_places is None:
+        return None
+    capacity = 1
+    for parameter in parameters:
+        first, last, _ = parameter_decimal_grid(parameter, decimal_places)
+        capacity *= max(0, last - first + 1)
+    return capacity
+
+
+def generate_unique_output_points(
+    method: str,
+    *,
+    count: int,
+    sampling_parameters: Sequence[ParameterSpec],
+    output_parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+    seed: int,
+    lhs_candidates: int,
+    scramble: bool,
+    skip: int,
+    excluded_keys: set[tuple[str, ...]] | None = None,
+) -> list[list[float]]:
+    """Generate exactly ``count`` points unique at the requested output digits.
+
+    The first design is unchanged when it is already unique.  If rounding
+    collapses points, deterministic follow-up batches fill only the missing
+    slots.  A finite-grid or retry failure is reported before any CSV is
+    written.
+    """
+
+    capacity = target_grid_capacity(sampling_parameters, decimal_places)
+    occupied = set(excluded_keys or ())
+    if capacity is not None and count > capacity:
+        raise ValueError(
+            f"--decimal-places {decimal_places} provides only {capacity} unique "
+            f"point(s) in the sampling range, fewer than --count {count}; "
+            "increase --decimal-places or reduce --count"
+        )
+
+    selected: list[list[float]] = []
+    next_skip = skip
+    max_attempts = 32
+    for attempt in range(max_attempts):
+        remaining = count - len(selected)
+        if remaining <= 0:
+            return selected
+        batch_count = (
+            count
+            if attempt == 0
+            else max(remaining, min(count, max(8, 2 * len(sampling_parameters))))
+        )
+        batch = generate_unit_points(
+            method,
+            count=batch_count,
+            dimensions=len(sampling_parameters),
+            seed=seed + attempt * 1009,
+            lhs_candidates=lhs_candidates,
+            scramble=scramble,
+            skip=next_skip,
+        )
+        next_skip += batch_count
+        for point in batch:
+            rounded_point, key = canonicalize_sampled_point(
+                point,
+                sampling_parameters,
+                output_parameters,
+                decimal_places,
+            )
+            if key in occupied:
+                continue
+            occupied.add(key)
+            selected.append(rounded_point)
+            if len(selected) == count:
+                return selected
+
+    available = len(selected)
+    precision = (
+        "the default output precision"
+        if decimal_places is None
+        else f"--decimal-places {decimal_places}"
+    )
+    raise ValueError(
+        f"Could generate only {available} of {count} unique point(s) using "
+        f"{precision} after excluding existing geometries. Increase "
+        "--decimal-places, increase the parameter range, or reduce --count."
+    )
+
+
+def filter_unique_output_candidates(
+    candidate_points: Sequence[Sequence[float]],
+    parameters: Sequence[ParameterSpec],
+    decimal_places: int | None,
+    *,
+    excluded_keys: set[tuple[str, ...]],
+) -> list[list[float]]:
+    """Collapse an acquisition pool onto unique, unoccupied output points."""
+
+    seen = set(excluded_keys)
+    unique: list[list[float]] = []
+    for point in candidate_points:
+        rounded_point = round_unit_point_for_output(
+            point,
+            parameters,
+            decimal_places,
+        )
+        key = geometry_output_key_from_unit_point(
+            rounded_point,
+            parameters,
+            decimal_places,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(rounded_point)
+    return unique
 
 
 def validate_geometry_output_rows(
@@ -1670,11 +1940,12 @@ def validate_geometry_output_rows(
     split_var: str,
     *,
     bare_values: str,
+    decimal_places: int | None = None,
 ) -> None:
     """Validate role naming and prohibit every duplicate output geometry."""
 
     filename_role = geometry_file_split_group(path)
-    seen: dict[tuple[int, ...], tuple[str, int]] = {}
+    seen: dict[tuple[str, ...], tuple[str, int]] = {}
     for row_number, row in enumerate(rows, start=2):
         raw_dataset = lookup_row_value(row, split_var)
         try:
@@ -1692,7 +1963,13 @@ def validate_geometry_output_rows(
             raise ValueError(
                 f"Could not validate every parameter in {path} row {row_number}"
             )
-        key = geometry_point_key(point)
+        key = geometry_output_key_from_row(
+            row,
+            parameters,
+            decimal_places,
+            bare_values=bare_values,
+        )
+        assert key is not None
         prior = seen.get(key)
         if prior is not None:
             prior_dataset, prior_row = prior
@@ -1716,6 +1993,7 @@ def clean_existing_geometry_rows(
     split_var: str,
     *,
     bare_values: str,
+    decimal_places: int | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, int]]:
     """Normalize a legacy inventory and remove train/verification leakage.
 
@@ -1732,7 +2010,7 @@ def clean_existing_geometry_rows(
         else "verification" if filename_role == "verification" else None
     )
     cleaned: list[dict[str, object]] = []
-    seen: dict[tuple[int, ...], int] = {}
+    seen: dict[tuple[str, ...], int] = {}
     stats = {
         "legacy_dataset_rows_normalized": 0,
         "same_split_duplicates_removed": 0,
@@ -1765,7 +2043,13 @@ def clean_existing_geometry_rows(
             raise ValueError(
                 f"Could not validate every parameter in {path} row {row_number}"
             )
-        key = geometry_point_key(point)
+        key = geometry_output_key_from_row(
+            row,
+            parameters,
+            decimal_places,
+            bare_values=bare_values,
+        )
+        assert key is not None
         prior_index = seen.get(key)
         if prior_index is None:
             seen[key] = len(cleaned)
@@ -1929,10 +2213,11 @@ def existing_csv_dataset_assignments(
     parameters: Sequence[ParameterSpec],
     split_var: str,
     bare_values: str,
-) -> dict[tuple[int, ...], str]:
+    decimal_places: int | None = None,
+) -> dict[tuple[str, ...], str]:
     """Resolve one leakage-safe dataset assignment per existing geometry."""
 
-    assignments: dict[tuple[int, ...], str] = {}
+    assignments: dict[tuple[str, ...], str] = {}
     for raw_path in csv_paths:
         path = Path(raw_path)
         rows = read_csv_rows(path)
@@ -1947,12 +2232,19 @@ def existing_csv_dataset_assignments(
             parameters,
             split_var,
             bare_values=source_mode,
+            decimal_places=decimal_places,
         )
         for row in rows:
             point = row_unit_point(row, parameters, bare_values=source_mode)
             if point is None or not in_unit_cube(point):
                 continue
-            key = geometry_point_key(point)
+            key = geometry_output_key_from_row(
+                row,
+                parameters,
+                decimal_places,
+                bare_values=source_mode,
+            )
+            assert key is not None
             group = coverage_split_group(lookup_row_value(row, split_var))
             # Any geometry exposed to training cannot be counted as an
             # independent verification geometry.
@@ -1966,12 +2258,14 @@ def existing_csv_dataset_counts(
     parameters: Sequence[ParameterSpec],
     split_var: str,
     bare_values: str,
+    decimal_places: int | None = None,
 ) -> dict[str, int]:
     assignments = existing_csv_dataset_assignments(
         csv_paths,
         parameters,
         split_var,
         bare_values,
+        decimal_places,
     )
     return {
         "training": sum(group == "training" for group in assignments.values()),
@@ -2756,6 +3050,7 @@ def write_suggested_points_csv(
         parameters,
         split_var,
         bare_values="parameter-units",
+        decimal_places=decimal_places,
     )
     write_rows_csv(path, rows, fields)
     return write_geometry_metadata(
@@ -2787,6 +3082,7 @@ def write_dataset_split_geometry_views(
     split_var: str,
     *,
     bare_values: str = "parameter-units",
+    decimal_places: int | None = None,
     coverage_rows: Sequence[dict[str, object]] | None = None,
 ) -> list[Path]:
     """Write RFPro queues with coverage plots placed in full prior context."""
@@ -2820,6 +3116,7 @@ def write_dataset_split_geometry_views(
             parameters,
             split_var,
             bare_values=bare_values,
+            decimal_places=decimal_places,
         )
         write_rows_csv(split_path, split_rows, fields)
         plot_path = write_parameter_coverage_png(
@@ -2867,7 +3164,7 @@ def write_accumulated_geometries(
     fields.extend(parameter.name for parameter in parameters)
 
     records: list[tuple[list[float], str, str, str, str, object]] = []
-    seen: dict[tuple[int, ...], int] = {}
+    seen: dict[tuple[str, ...], int] = {}
     duplicate_count = 0
     same_split_duplicate_count = 0
     cross_split_duplicate_count = 0
@@ -2910,11 +3207,11 @@ def write_accumulated_geometries(
             )
             for parameter, coordinate in zip(parameters, point)
         ]
-        rounded_point = [
-            unit_coordinate_for_value(value, parameter)
-            for parameter, value in zip(parameters, rounded_values)
-        ]
-        key = geometry_point_key(rounded_point)
+        key = geometry_output_key_from_values(
+            rounded_values,
+            parameters,
+            decimal_places,
+        )
         if key in seen:
             duplicate_count += 1
             existing_index = seen[key]
@@ -3094,6 +3391,7 @@ def write_accumulated_geometries(
         parameters,
         split_var,
         bare_values=bare_values,
+        decimal_places=decimal_places,
     )
     write_rows_csv(path, rows, fields)
     if legacy_dataset_rows_normalized:
@@ -3652,6 +3950,7 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 extension_plan.original_parameters,
                 args.split_var,
                 bare_values=args.bare_values,
+                decimal_places=args.decimal_places,
             )
             extension_cleanup_stats = cleanup_stats
             if cleanup_stats["legacy_dataset_rows_normalized"]:
@@ -3770,19 +4069,43 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         )
     else:
         base_out_path = Path("generated_points.csv")
+    sampling_parameters = (
+        extension_plan.sampling_parameters
+        if extension_plan is not None
+        else parameters
+    )
+    output_parameters = (
+        extension_plan.overall_parameters
+        if extension_plan is not None
+        else parameters
+    )
+    excluded_output_keys: set[tuple[str, ...]] = set()
+    if extension_plan is not None:
+        for row in existing_rows:
+            key = geometry_output_key_from_row(
+                row,
+                output_parameters,
+                args.decimal_places,
+                bare_values=args.bare_values,
+            )
+            if key is not None:
+                excluded_output_keys.add(key)
     written_paths: list[Path] = []
     for offset, method in enumerate(methods):
         try:
-            unit_points = generate_unit_points(
+            unit_points = generate_unique_output_points(
                 method,
                 count=count,
-                dimensions=len(parameters),
+                sampling_parameters=sampling_parameters,
+                output_parameters=output_parameters,
+                decimal_places=args.decimal_places,
                 seed=args.seed + offset,
                 lhs_candidates=args.lhs_candidates,
                 scramble=not args.no_scramble,
                 skip=args.skip,
+                excluded_keys=excluded_output_keys,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
@@ -4278,11 +4601,16 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             parameters,
             args.split_var,
             args.bare_values,
+            args.decimal_places,
         )
     except ValueError as exc:
         parser.error(str(exc))
     for point, dataset, _source, _source_index in mdif_observed_points:
-        key = geometry_point_key(point)
+        key = geometry_output_key_from_unit_point(
+            point,
+            parameters,
+            args.decimal_places,
+        )
         group = coverage_split_group(dataset)
         if existing_dataset_assignments.get(key) != "training" or group == "training":
             existing_dataset_assignments[key] = group
@@ -4297,7 +4625,12 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         if group == "verification"
     }
     metrics_geometry_keys = {
-        geometry_point_key(region.unit_point) for region in regions
+        geometry_output_key_from_unit_point(
+            region.unit_point,
+            parameters,
+            args.decimal_places,
+        )
+        for region in regions
     }
     leaked_metrics_geometry_keys = metrics_geometry_keys & training_geometry_keys
     verification_inventory_keys = (
@@ -4379,7 +4712,34 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    occupied_output_keys = {
+        geometry_output_key_from_unit_point(
+            point,
+            parameters,
+            args.decimal_places,
+        )
+        for point in existing_points
+    }
+    raw_candidate_count = len(candidates)
+    candidates = filter_unique_output_candidates(
+        candidates,
+        parameters,
+        args.decimal_places,
+        excluded_keys=occupied_output_keys,
+    )
+    if not candidates:
+        parser.error(
+            "No unoccupied candidate remains at the requested output digits. "
+            "Increase --decimal-places, increase --candidate-count, or expand "
+            "the parameter range."
+        )
+
     acquisition_metadata: dict[str, object] = {}
+    acquisition_metadata["candidate_output_grid"] = {
+        "requested_candidate_count": raw_candidate_count,
+        "unique_unoccupied_candidate_count": len(candidates),
+        "decimal_places": args.decimal_places,
+    }
     acquisition_metadata["verification_metrics_source"] = str(metrics_path)
     acquisition_metadata["bare_values_mode"] = args.bare_values
     acquisition_metadata["bare_values_interpretation"] = effective_bare_values
@@ -4541,27 +4901,16 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             file=sys.stderr,
         )
 
-    occupied_output_keys = {
-        geometry_point_key(point) for point in existing_points
-    }
-    selected_output_keys: dict[tuple[int, ...], tuple[int, str]] = {}
+    selected_output_keys: dict[tuple[str, ...], tuple[int, str]] = {}
     for suggestion_index, (suggestion, raw_dataset) in enumerate(
         zip(suggestions, target_datasets),
         start=1,
     ):
-        rounded_values = [
-            round_parameter_value(
-                map_unit_point(unit_value, parameter),
-                parameter,
-                args.decimal_places,
-            )
-            for parameter, unit_value in zip(parameters, suggestion.unit_point)
-        ]
-        rounded_point = [
-            unit_coordinate_for_value(value, parameter)
-            for parameter, value in zip(parameters, rounded_values)
-        ]
-        key = geometry_point_key(rounded_point)
+        key = geometry_output_key_from_unit_point(
+            suggestion.unit_point,
+            parameters,
+            args.decimal_places,
+        )
         dataset = canonical_dataset_label(raw_dataset)
         if key in occupied_output_keys:
             parser.error(
@@ -4745,6 +5094,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parameters,
         args.split_var,
         bare_values=args.bare_values,
+        decimal_places=args.decimal_places,
         coverage_rows=coverage_context_rows,
     )
     cumulative_split_view_paths = write_dataset_split_geometry_views(
@@ -4752,6 +5102,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parameters,
         args.split_var,
         bare_values=args.bare_values,
+        decimal_places=args.decimal_places,
         coverage_rows=coverage_context_rows,
     )
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")

@@ -43,6 +43,143 @@ def example_parser() -> argparse.ArgumentParser:
 
 
 class OptionsJSONTests(unittest.TestCase):
+    def test_audit_reuses_common_fit_mdif_inputs_from_options_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "commands": {
+                            "fit": {
+                                "mdif": "data/training.mdif",
+                                "verification_mdif": "data/verification.mdif",
+                            }
+                        }
+                    },
+                    "workflows": {
+                        "audit": {
+                            "common": {
+                                "mdif": None,
+                                "verification_mdif": None,
+                            }
+                        }
+                    },
+                },
+            )
+            args = parse_args_with_options_json(
+                audit_dataset.build_parser(),
+                ["--options-json", str(config)],
+                workflow="audit",
+                command="audit",
+            )
+            defaults, sources = load_options_json_resolution(
+                config,
+                workflow="audit",
+                command="audit",
+            )
+
+        self.assertEqual(args.mdif, "data/training.mdif")
+        self.assertEqual(args.verification_mdif, "data/verification.mdif")
+        self.assertEqual(defaults["mdif"], "data/training.mdif")
+        self.assertEqual(defaults["verification_mdif"], "data/verification.mdif")
+        self.assertIn("models.commands.fit.mdif", sources["mdif"])
+        self.assertIn(
+            "models.commands.fit.verification_mdif",
+            sources["verification_mdif"],
+        )
+
+    def test_audit_specific_mdif_inputs_override_common_fit_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "commands": {
+                            "fit": {
+                                "mdif": "data/model_train.mdif",
+                                "verification_mdif": "data/model_verify.mdif",
+                            }
+                        }
+                    },
+                    "workflows": {
+                        "audit": {
+                            "common": {
+                                "mdif": "data/audit_train.mdif",
+                                "verification_mdif": "data/audit_verify.mdif",
+                            }
+                        }
+                    },
+                },
+            )
+            args = parse_args_with_options_json(
+                audit_dataset.build_parser(),
+                ["--options-json", str(config)],
+                workflow="audit",
+                command="audit",
+            )
+
+        self.assertEqual(args.mdif, "data/audit_train.mdif")
+        self.assertEqual(args.verification_mdif, "data/audit_verify.mdif")
+
+    def test_audit_reuses_unambiguous_model_specific_fit_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "dnn": {
+                            "commands": {
+                                "fit": {
+                                    "mdif": "data/dnn_train.mdif",
+                                    "verification_mdif": "data/dnn_verify.mdif",
+                                }
+                            }
+                        }
+                    },
+                    "workflows": {"audit": {"common": {"mdif": None}}},
+                },
+            )
+            args = parse_args_with_options_json(
+                audit_dataset.build_parser(),
+                ["--options-json", str(config)],
+                workflow="audit",
+                command="audit",
+            )
+
+        self.assertEqual(args.mdif, "data/dnn_train.mdif")
+        self.assertEqual(args.verification_mdif, "data/dnn_verify.mdif")
+
+    def test_audit_does_not_guess_between_conflicting_model_fit_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self.write_config(
+                Path(temp_dir),
+                {
+                    "models": {
+                        "dnn": {
+                            "commands": {
+                                "fit": {"mdif": "data/dnn_train.mdif"}
+                            }
+                        },
+                        "kbnn": {
+                            "commands": {
+                                "fit": {"mdif": "data/kbnn_train.mdif"}
+                            }
+                        },
+                    },
+                    "workflows": {"audit": {"common": {"mdif": None}}},
+                },
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                parse_args_with_options_json(
+                    audit_dataset.build_parser(),
+                    ["--options-json", str(config)],
+                    workflow="audit",
+                    command="audit",
+                )
+
+        self.assertIn("--mdif", stderr.getvalue())
+
     def test_boolean_optional_export_setting_preserves_json_false(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.write_config(

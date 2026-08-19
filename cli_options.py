@@ -128,6 +128,17 @@ FIT_SHARED_OPTION_KEYS = {
     "worst_plots",
 }
 
+AUDIT_FIT_INPUT_KEYS = {
+    "coarse_mdif",
+    "coarse_verification_mdif",
+    "mdif",
+    "parameter_names",
+    "split_var",
+    "train_values",
+    "verification_mdif",
+    "verify_values",
+}
+
 
 def fit_shared_option_keys(model: str | None = None) -> set[str]:
     keys = set(FIT_SHARED_OPTION_KEYS)
@@ -251,6 +262,7 @@ def starter_options_payload() -> dict[str, object]:
                     "out_dir": None,
                     "parameter_names": None,
                     "passivity_tolerance": 1e-6,
+                    "verification_mdif": None,
                 }
             },
             "points": {
@@ -526,6 +538,26 @@ def _fit_sibling_defaults(
     }
 
 
+def _audit_fit_input_defaults(
+    commands: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    """Reuse common model-fitting data inputs as audit-only fallbacks."""
+
+    for raw_name, raw_options in commands.items():
+        if normalize_command_name(raw_name) != "fit":
+            continue
+        options = _mapping(raw_options, f"{context}.{raw_name}")
+        return {
+            str(key): value
+            for key, value in options.items()
+            if str(key).strip().lstrip("-").replace("-", "_")
+            in AUDIT_FIT_INPUT_KEYS
+            and value is not None
+        }
+    return {}
+
+
 def _record_locations(
     target: dict[str, str],
     source: Mapping[str, object],
@@ -574,6 +606,71 @@ def _fit_sibling_locations(
             in fit_shared_option_keys(model)
         }
     return {}
+
+
+def _audit_fit_input_locations(
+    commands: Mapping[str, object],
+    context: str,
+) -> dict[str, str]:
+    """Return source labels for audit inputs inherited from model fitting."""
+
+    for raw_name, raw_options in commands.items():
+        if normalize_command_name(raw_name) != "fit":
+            continue
+        options = _mapping(raw_options, f"options JSON {context}.{raw_name}")
+        return {
+            str(key): f"{context}.{raw_name}.{key} (audit data fallback)"
+            for key, value in options.items()
+            if str(key).strip().lstrip("-").replace("-", "_")
+            in AUDIT_FIT_INPUT_KEYS
+            and value is not None
+        }
+    return {}
+
+
+def _audit_unambiguous_model_fit_inputs(
+    models: Mapping[str, object],
+    inherited: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, str]]:
+    """Recover audit inputs from one unambiguous model-specific fit scope."""
+
+    candidates: dict[str, list[tuple[object, str]]] = {}
+    for raw_model, raw_node in models.items():
+        if raw_model in NODE_HEADINGS:
+            continue
+        model_node = _mapping(raw_node, f"options JSON models.{raw_model}")
+        commands = _mapping(
+            model_node.get("commands"),
+            f"options JSON models.{raw_model}.commands",
+        )
+        values = _audit_fit_input_defaults(
+            commands,
+            f"options JSON models.{raw_model}.commands",
+        )
+        for key, value in values.items():
+            candidates.setdefault(key, []).append(
+                (
+                    value,
+                    f"models.{raw_model}.commands.fit.{key} "
+                    "(unambiguous audit data fallback)",
+                )
+            )
+
+    defaults: dict[str, object] = {}
+    locations: dict[str, str] = {}
+    for key, values in candidates.items():
+        if key in inherited:
+            continue
+        distinct: dict[str, tuple[object, str]] = {}
+        for value, location in values:
+            identity = json.dumps(value, sort_keys=True, default=str)
+            distinct.setdefault(identity, (value, location))
+        if len(distinct) != 1:
+            continue
+        value, location = next(iter(distinct.values()))
+        defaults[key] = value
+        locations[key] = location
+    return defaults, locations
 
 
 def _node_locations(
@@ -681,6 +778,27 @@ def load_options_json_resolution(
     if canonical_command not in COMMAND_NAMES:
         raise OptionsJSONError(f"Unknown selected command {command!r}")
 
+    audit_fit_defaults: dict[str, object] = {}
+    audit_fit_locations: dict[str, str] = {}
+    if (
+        workflow is not None
+        and normalize_workflow_name(workflow) == "audit"
+        and canonical_command == "audit"
+    ):
+        audit_fit_defaults = _audit_fit_input_defaults(
+            model_container_commands,
+            "options JSON models.commands",
+        )
+        audit_fit_locations = _audit_fit_input_locations(
+            model_container_commands,
+            "models.commands",
+        )
+        model_fit_defaults, model_fit_locations = (
+            _audit_unambiguous_model_fit_inputs(models, audit_fit_defaults)
+        )
+        _merge_options(audit_fit_defaults, model_fit_defaults)
+        audit_fit_locations.update(model_fit_locations)
+
     defaults = {
         str(key): value
         for key, value in root.items()
@@ -696,6 +814,7 @@ def load_options_json_resolution(
         defaults,
         _command_defaults(commands, canonical_command, "options JSON commands"),
     )
+    _merge_options(defaults, audit_fit_defaults)
 
     selected_scope: dict[str, object] | None = None
     scope_context = ""
@@ -771,6 +890,14 @@ def load_options_json_resolution(
                 f"{scope_context}.commands",
             ),
         )
+    audit_fallback_restored: set[str] = set()
+    for key, value in audit_fit_defaults.items():
+        # The starter file contains null audit placeholders. They carry no
+        # audit-specific value, so retain a populated model-fit fallback. A
+        # non-null audit value still wins.
+        if defaults.get(key) is None:
+            defaults[key] = value
+            audit_fallback_restored.add(key)
     locations: dict[str, str] = {}
     _record_locations(
         locations,
@@ -791,6 +918,7 @@ def load_options_json_resolution(
     locations.update(
         _command_locations(commands, canonical_command, "commands")
     )
+    locations.update(audit_fit_locations)
     if model is not None:
         for heading in ("generic", "common"):
             if heading in models:
@@ -840,6 +968,9 @@ def load_options_json_resolution(
                 f"{scope_context.removeprefix('options JSON ')}.commands",
             )
         )
+    for key in audit_fallback_restored:
+        if key in audit_fit_locations:
+            locations[key] = audit_fit_locations[key]
     return defaults, locations
 
 
