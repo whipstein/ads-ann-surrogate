@@ -1912,6 +1912,7 @@ import argparse
 from pathlib import Path
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -2037,6 +2038,32 @@ def allocation_error(stage, summary, error):
     )
 
 
+def write_sdd_equation_copy(manifest):
+    # Rename ADS ANN evaluator tokens so they cannot collide with SDD ports.
+    settings = manifest["ads_ann"]
+    source = PACKAGE_DIR / f"{settings['output_prefix']}.equation"
+    if not source.exists():
+        return None
+    equation = source.read_text()
+    input_columns = list(manifest["input_columns"])
+    output_columns = list(manifest["output_columns"])
+    for index in range(len(input_columns), 0, -1):
+        equation = re.sub(
+            rf"(?<![A-Za-z0-9_])_v{index}(?![A-Za-z0-9_])",
+            f"ann_in_{index}",
+            equation,
+        )
+    for index in range(len(output_columns), 0, -1):
+        equation = re.sub(
+            rf"(?<![A-Za-z0-9_])y{index}(?![A-Za-z0-9_])",
+            f"ann_out_{index}",
+            equation,
+        )
+    destination = PACKAGE_DIR / f"{settings['output_prefix']}_sdd.equation"
+    destination.write_text(equation)
+    return destination.name
+
+
 def main():
     args = parse_args()
     manifest = json.loads((PACKAGE_DIR / "ads_ann_manifest.json").read_text())
@@ -2137,11 +2164,13 @@ def main():
         result_df.to_csv(PACKAGE_DIR / "ads_ann_verification_prediction.csv", index=False)
 
     expected = [f"{settings['output_prefix']}{suffix}" for suffix in settings["expected_output_suffixes"]]
+    mapped_sdd_equation = write_sdd_equation_copy(manifest)
     print(json.dumps({
         "package_dir": str(PACKAGE_DIR),
         "input_columns": input_columns,
         "output_columns": output_columns,
         "expected_native_outputs": expected,
+        "mapped_sdd_equation": mapped_sdd_equation,
         "preflight": summary,
         "qt_runtime": qt_runtime,
     }, indent=2))
@@ -2157,10 +2186,227 @@ if __name__ == "__main__":
 """
 
 
+def ads_ann_sdd_setup(
+    input_columns: Sequence[str],
+    output_columns: Sequence[str],
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
+    settings: dict[str, object],
+) -> str:
+    """Return a package-specific ADS SDD schematic worksheet."""
+
+    nports = infer_complete_sparameter_ports(sparam_labels)
+    input_rows: list[str] = []
+    input_assignments: list[str] = []
+    parameter_set = set(parameter_names)
+    for index, column in enumerate(input_columns, start=1):
+        if column in parameter_set:
+            expression = f"`{column}` (when the symbol parameter carries ADS units)"
+            assignment = column
+        elif column == "freq_hz":
+            expression = "`freq`"
+            assignment = "freq"
+        elif column == "freq_log10_hz":
+            expression = "`log10(max(abs(freq),1.0))`"
+            assignment = "log10(max(abs(freq),1.0))"
+        elif column.startswith("coarse_"):
+            expression = "the identically named coarse-model value at this geometry and `freq`"
+            assignment = column
+        else:
+            expression = "an explicit wrapper expression with the same numeric units as the CSV"
+            assignment = column
+        input_rows.append(
+            f"| {index} | `_v{index}` | `ann_in_{index}` | `{column}` | {expression} |"
+        )
+        input_assignments.append(f"ann_in_{index}={assignment}")
+
+    output_rows = [
+        f"| {index} | `y{index}` | `ann_out_{index}` | `{column}` |"
+        for index, column in enumerate(output_columns, start=1)
+    ]
+    output_positions = {name: index for index, name in enumerate(output_columns, start=1)}
+    reconstruction_lines: list[str] = []
+    residual_outputs = False
+    for label in sparam_labels:
+        real_name = next(
+            (name for name in output_columns if name.endswith(f"{label}_real")),
+            None,
+        )
+        imag_name = next(
+            (name for name in output_columns if name.endswith(f"{label}_imag")),
+            None,
+        )
+        if real_name is None or imag_name is None:
+            continue
+        destination = f"delta_{label}" if real_name.startswith("delta_") else label
+        residual_outputs = residual_outputs or destination.startswith("delta_")
+        reconstruction_lines.append(
+            f"{destination}=complex(ann_out_{output_positions[real_name]},"
+            f"ann_out_{output_positions[imag_name]})"
+        )
+    if residual_outputs:
+        reconstruction_lines.extend(
+            f"{label}=coarse_{label}+delta_{label}" for label in sparam_labels
+        )
+
+    sdd_rows: list[str] = []
+    weight = 2
+    for row in range(1, nports + 1):
+        sdd_rows.append(
+            f"| Baseline for port {row} | Explicit | `{row}` | `0` | `0.0` |"
+        )
+        for column in range(1, nports + 1):
+            sdd_rows.append(
+                f"| Current term for `Y{row}{column}` | Explicit | `{row}` | `{weight}` | `_v{column}` |"
+            )
+            sdd_rows.append(
+                f"| Weight `H[{weight}]` | Weighting | — | `{weight}` | "
+                f"`if (freq equals 0) then 0.0 else Y{row}{column} endif` |"
+            )
+            weight += 1
+
+    if nports == 1:
+        conversion = """
+For this one-port package, enter this scalar equation in the wrapper's
+`Var/Eqn` block after reconstructing `S11`:
+
+```text
+Z0=50
+Y11=(1-S11)/(Z0*(1+S11))
+```
+"""
+    elif nports == 2:
+        conversion = """
+For this two-port package, enter these scalar equations in the wrapper's
+`Var/Eqn` block after reconstructing `S11`, `S12`, `S21`, and `S22`:
+
+```text
+Z0=50
+D=(1+S11)*(1+S22)-S12*S21
+Y11=((1-S11)*(1+S22)+S12*S21)/(Z0*D)
+Y12=(-2*S12)/(Z0*D)
+Y21=(-2*S21)/(Z0*D)
+Y22=((1-S22)*(1+S11)+S21*S12)/(Z0*D)
+```
+"""
+    else:
+        conversion = f"""
+This is a {nports}-port package. Form the complete matrix in the manifest's
+`sparam_labels` order, then calculate
+`Y=(identity-S)*inverse(identity+S)/50`. Expose the resulting scalar elements
+as `Y11` through `Y{nports}{nports}`. Use the installed ADS equation editor's
+matrix syntax; do not omit uninteresting transmission paths.
+"""
+
+    labels = ", ".join(f"`{label}`" for label in sparam_labels)
+    parameters = ", ".join(f"`{name}`" for name in parameter_names) or "none"
+    return f"""# ADS SDD Setup Worksheet
+
+This worksheet gives the schematic values for this exact native ADS ANN
+package. It is an RF N-port wrapper with `{nports}` electrical ports. The
+S-parameter order is {labels}. The exposed geometry/process parameters are
+{parameters}.
+
+## Do Not Use NetlistInclude for the ANN Equation File
+
+`{settings['output_prefix']}.equation` is an ADS ANN text formula, not a
+complete ADS subcircuit. Do not point a `NetlistInclude` component at the
+`.equation`, `.struc`, or `.scale` file. After training,
+`train_ads_ann.py` creates `{settings['output_prefix']}_sdd.equation`, in which
+the ANN's `_vN` and `yN` tokens are renamed. Copy those equations into a
+schematic `Var/Eqn` block in the wrapper cell. A `NetlistInclude` is needed only
+when using a separately generated, syntactically complete ADS netlist.
+
+## 1. Create the Wrapper
+
+1. Create a new schematic cell and give it `{nports}` single-ended RF pins.
+2. Place the `{nports}`-port **Symbolically Defined Device** from **Eqn-based
+   Nonlinear**. Connect each SDD `+` terminal to the matching wrapper pin and
+   each `-` terminal to ground. Port 1 must remain port 1 throughout the cell.
+3. Add the parameters listed above as cell parameters, so every symbol instance
+   may supply different values.
+4. Place a `Var/Eqn` block. Paste the contents of
+   `{settings['output_prefix']}_sdd.equation` into it, then add the input,
+   complex-S, and S-to-Y equations described below.
+
+## 2. Map the ANN Evaluator
+
+ADS ANN emits `_v1`, `_v2`, ... as generic ANN inputs. Those names are not SDD
+port voltages. The training script creates a renamed copy to prevent that
+collision.
+
+| Position | Native ANN input | Name in renamed equation | CSV/manifest input | Wrapper value |
+| ---: | --- | --- | --- | --- |
+{chr(10).join(input_rows)}
+
+| Position | Native ANN output | Name in renamed equation | Meaning |
+| ---: | --- | --- | --- |
+{chr(10).join(output_rows)}
+
+Define `ann_in_N` in the `Var/Eqn` block exactly as shown. Reconstruct every
+complex S-parameter from its mapped real and imaginary outputs. All real
+outputs precede all imaginary outputs; follow the table, not visual position.
+For native residual KBNN output, add each complex `delta_Sij` to the matching
+coarse `Sij` before the S-to-Y conversion. Export KBNN with
+`--ads-ann-target fine` if a self-contained fine-response wrapper is required.
+
+For this package, start the `Var/Eqn` mapping with:
+
+```text
+{chr(10).join(input_assignments)}
+{chr(10).join(reconstruction_lines)}
+```
+
+Every `coarse_*` name in that block is a required output of the separately
+implemented coarse model. It is not created by this ANN package.
+
+## 3. Convert S to Y
+
+{conversion}
+
+`Z0=50` is the wave reference impedance. It is not a resistor to place on the
+wrapper pins. Do not add 50-ohm shunts inside the model.
+
+## 4. Enter These SDD Parameters
+
+Double-click the SDD. Add the following entries one at a time. Every current
+entry is **Explicit**. Every `H[]` entry uses **Parameter Entry Mode =
+Weighting**. Custom weights begin at 2 because ADS reserves weight 0 for unity
+and weight 1 for `j*omega`.
+
+| Purpose | Parameter Entry Mode | Port | Weight | Formula |
+| --- | --- | ---: | ---: | --- |
+{chr(10).join(sdd_rows)}
+
+Do not populate `C[]`; this model uses no controlling currents. Do not replace
+the weighting entries with one weight-0 formula such as
+`Y11*_v1+Y12*_v2`. The ANN admittance depends on frequency, so each `Yij` must
+be evaluated by a frequency-domain `H[]` weight. The zero-frequency guard makes
+this RF-only package open at exact DC; native ADS ANN training deliberately
+excluded DC rows.
+
+## 5. Top-Level SP Testbench
+
+1. Generate the wrapper symbol and place one instance.
+2. Set every geometry/process parameter on that instance. ADS quantities such
+   as `500um` already evaluate to SI (`0.0005`); a unitless `500` must be scaled
+   explicitly before it reaches `ann_in_N`.
+3. Place one `Term` per RF pin. Number them consecutively from 1 through
+   `{nports}` and use `Z=50 Ohm`.
+4. Add an SP controller over only the fitted RF range. There is no additional
+   termination, bias source, `NetlistInclude`, controlling current, or hidden
+   SDD parameter to set for the isolated RF check.
+5. Compare all `{nports * nports}` S-parameters with the source MDIF at the same
+   geometry before putting the cell into a larger circuit.
+"""
+
+
 def ads_ann_readme(
     model_kind: str,
     input_columns: Sequence[str],
     output_columns: Sequence[str],
+    parameter_names: Sequence[str],
+    sparam_labels: Sequence[str],
     settings: dict[str, object],
     training_rows: int,
     verification_rows: int,
@@ -2191,6 +2437,8 @@ that can parse the MDIF data, then copy the whole folder to the ADS machine.
 - `train_ads_ann.py`: ADS Python script that trains and extracts the native ANN
 - `ads_qt_runtime.py`: scoped ADS/PySide6 QApplication and platform-plugin helper
 - `ADS_ANN_README.md`: this usage note
+- `ADS_SDD_SETUP.md`: package-specific SDD values, evaluator mapping, and
+  schematic checklist
 
 ## ADS Reference Used
 
@@ -2330,8 +2578,10 @@ ANN native verbose mode. The script prints each native phase, resets stale
 process-local ANN setup state, and translates `MemoryError` allocation failures
 into a message containing the failing phase and requested architecture. For the
 selected output format, ADS ANN is expected to write {expected_files}. The
-script also writes `ads_ann_training_fit.csv` and, when verification data
-exists, `ads_ann_verification_prediction.csv`.
+script also writes `ads_ann_training_fit.csv`, the renamed
+`{settings["output_prefix"]}_sdd.equation` when native text equations were
+requested, and, when verification data exists,
+`ads_ann_verification_prediction.csv`.
 
 Before opening a schematic:
 
@@ -2348,7 +2598,8 @@ Before opening a schematic:
 
 | Artifact | Intended role | Schematic guidance |
 | --- | --- | --- |
-| `{settings["output_prefix"]}.equation` | Transparent text equations | Recommended first integration path. Copy or include the equations in an SDD/FDD wrapper and explicitly rename/map every generated input and output token. |
+| `{settings["output_prefix"]}.equation` | Native transparent text equations | Source artifact. Do not connect its `_vN` names directly to SDD ports. |
+| `{settings["output_prefix"]}_sdd.equation` | SDD-safe text equations | Generated by `train_ads_ann.py`; ANN inputs are `ann_in_N` and outputs are `ann_out_N`. Copy these equations into a wrapper `Var/Eqn` block. |
 | `{settings["output_prefix"]}.inc` | Verilog-A-oriented ANN output | Use only inside a Verilog-A wrapper/view. Inspect the file first: the installed ADS release determines whether it is a complete module or an evaluator fragment. It is not automatically an ADS `NetlistInclude` subnetwork. |
 | `{settings["output_prefix"]}.struc` and `.scale` | Saved native ANN structure and scaling | Used by `simulate_inmemory()` and future ADS ANN evaluation. Do not place these files in a `NetlistInclude` block. |
 | `{settings["output_prefix"]}.c` | C-oriented model source | Advanced compiled-model route; not the recommended first schematic implementation. |
@@ -2372,10 +2623,11 @@ separate DC branch.
    matching number of ports. ADS menu/palette placement differs by release;
    search for **Symbolically Defined Device** rather than relying on a palette
    location.
-5. Bring the generated `.equation` formulas into this cell using the equation
-   or netlist-include mechanism supported by the installed ADS release. Keep the
-   generated coefficients unchanged. Rename only the evaluator's formal input
-   and output tokens, using the ordered manifest mapping below.
+5. Place a `Var/Eqn` block and copy in the generated
+   `{settings["output_prefix"]}_sdd.equation` formulas. Do **not** point a
+   `NetlistInclude` at `.equation`, `.struc`, or `.scale`: none is a complete
+   ADS subcircuit. The training script already renamed only the evaluator's
+   formal input and output tokens; keep every coefficient unchanged.
 6. Add wrapper equations that form complex `Sij` values, convert S to Y, and
    define SDD port currents. Then generate/update the symbol and expose only the
    electrical pins and geometry/process parameters.
@@ -2429,7 +2681,7 @@ All real columns precede all imaginary columns. Reconstruct each complex value
 as, for example:
 
 ```text
-S11 = fine_S11_real + j*fine_S11_imag
+S11 = complex(fine_S11_real,fine_S11_imag)
 ```
 
 For a native residual KBNN, first calculate:
@@ -2445,12 +2697,35 @@ Y = (identity - S) * inverse(identity + S) / Z0
 Iport = Y * Vport
 ```
 
-Then define each SDD port current using the corresponding row, for example:
+The intended frequency-domain result is:
 
 ```text
 I1 = Y11*_v1 + Y12*_v2 + ... + Y1N*_vN
 I2 = Y21*_v1 + Y22*_v2 + ... + Y2N*_vN
 ```
+
+Do **not** put that sum into one weight-0 formula. The admittance is frequency
+dependent, so each `Yij` is a separate custom frequency weight. For every port
+`i`, first add `I[i,0]=0.0`. For every `(i,j)`, add an **Explicit** entry with
+Port `i`, a unique Weight `w>=2`, and Formula `_vj`; then add a **Weighting**
+entry `H[w]=if (freq equals 0) then 0.0 else Yij endif`. For a two-port, enter:
+
+| Mode | Port | Weight | Formula |
+| --- | ---: | ---: | --- |
+| Explicit | 1 | 0 | `0.0` |
+| Explicit | 1 | 2 | `_v1` |
+| Weighting | — | 2 | `if (freq equals 0) then 0.0 else Y11 endif` |
+| Explicit | 1 | 3 | `_v2` |
+| Weighting | — | 3 | `if (freq equals 0) then 0.0 else Y12 endif` |
+| Explicit | 2 | 0 | `0.0` |
+| Explicit | 2 | 4 | `_v1` |
+| Weighting | — | 4 | `if (freq equals 0) then 0.0 else Y21 endif` |
+| Explicit | 2 | 5 | `_v2` |
+| Weighting | — | 5 | `if (freq equals 0) then 0.0 else Y22 endif` |
+
+Leave `C[]` empty; this model uses no controlling currents. The generated
+`ADS_SDD_SETUP.md` contains the complete field table for this package's actual
+port count.
 
 Use the SDD sign convention consistently: positive current flows into the
 device. Do not add 50-ohm shunt resistors at the wrapper pins; `Z0` is the wave
@@ -2579,6 +2854,8 @@ def write_ads_ann_package(
         "training_csv": training_csv,
         "verification_csv": verification_csv,
         "qt_runtime_helper": qt_runtime_helper,
+        "sdd_setup_guide": "ADS_SDD_SETUP.md",
+        "sdd_mapped_equation": f"{settings['output_prefix']}_sdd.equation",
         "qt_runtime": {
             "application_policy": "reuse_existing_or_scoped_create",
             "platform_plugin_source": "active_ads_pyside6_runtime",
@@ -2634,11 +2911,22 @@ def write_ads_ann_package(
     (out_dir / "ads_ann_manifest.json").write_text(json.dumps(manifest, indent=2))
     (out_dir / qt_runtime_helper).write_text(ads_qt_runtime_helper_script())
     (out_dir / "train_ads_ann.py").write_text(ads_ann_training_script())
+    (out_dir / "ADS_SDD_SETUP.md").write_text(
+        ads_ann_sdd_setup(
+            input_columns=input_columns,
+            output_columns=output_columns,
+            parameter_names=parameter_names,
+            sparam_labels=sparam_labels,
+            settings=settings,
+        )
+    )
     (out_dir / "ADS_ANN_README.md").write_text(
         ads_ann_readme(
             model_kind=model_kind,
             input_columns=input_columns,
             output_columns=output_columns,
+            parameter_names=parameter_names,
+            sparam_labels=sparam_labels,
             settings=settings,
             training_rows=int(x_train.shape[0]),
             verification_rows=int(x_verify.shape[0]) if x_verify is not None else 0,

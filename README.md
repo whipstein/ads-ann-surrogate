@@ -2605,6 +2605,7 @@ my_workspace_wrk/
       train_ads_ann.py
       ads_qt_runtime.py
       ADS_ANN_README.md
+      ADS_SDD_SETUP.md
 ```
 
 The package may live under `models/`; it does not need to be put in the ADS
@@ -2706,12 +2707,14 @@ Expected output with `--ads-output-format all`:
 
 | File | Role |
 | --- | --- |
-| `<prefix>.equation` | Text ANN equations; recommended for the first transparent SDD/FDD integration. |
+| `<prefix>.equation` | Native ANN text equations. Its `_vN` identifiers are ANN inputs, not electrical SDD port voltages. |
+| `<prefix>_sdd.equation` | Created by `train_ads_ann.py`; the ANN inputs and outputs are safely renamed to `ann_in_N` and `ann_out_N` for use in an SDD wrapper. |
 | `<prefix>.inc` | Verilog-A-oriented ANN evaluator. Inspect it before use because the installed ADS release determines whether it is a complete module or a fragment. |
 | `<prefix>.struc`, `<prefix>.scale` | Native ANN structure and scaling used by ADS ANN simulation APIs; these are not `NetlistInclude` files. |
 | `<prefix>.c` | C-oriented model source for advanced compiled-model development. |
 | `ads_ann_training_fit.csv` | ADS ANN results on training rows. |
 | `ads_ann_verification_prediction.csv` | ADS ANN truth/prediction comparison for held-out rows. |
+| `ADS_SDD_SETUP.md` | Package-specific ANN input/output mapping, exact SDD field values for every modeled port, and an isolated SP testbench checklist. |
 
 Do not start schematic integration until the native verification CSV is
 acceptable. If it is already wrong there, change ADS ANN training settings;
@@ -2759,22 +2762,50 @@ Do not infer output ordering from the visual port layout.
 
 #### 5. Build the Electrical Wrapper Cell
 
+There is no `NetlistInclude` in this route. `<prefix>.equation` is an ANN text
+formula, not a complete ADS subcircuit. Do not include `.equation`, `.struc`,
+or `.scale` with `NetlistInclude`. The training script writes
+`<prefix>_sdd.equation`, with the generated ANN `_vN` inputs renamed to
+`ann_in_N` and `yN` outputs renamed to `ann_out_N`.
+
+Create the wrapper as follows:
+
 1. In the normal ADS library, create a cell such as `dnn_ann_nport` with a
    schematic and symbol.
-2. Add one electrical pin per S-parameter port. Match the port numbering in
-   `sparam_labels`.
-3. Add one symbol/design parameter per `parameter_names` entry. These must be
-   instance parameters, not fixed global values.
-4. Use Component Search to place the matching N-port **Symbolically Defined
-   Device (SDD)**. Palette locations vary across ADS releases.
-5. Bring `<prefix>.equation` into the wrapper using the equation or netlist
-   inclusion mechanism supported by the installed release. Map the generated
-   ANN formal inputs to the manifest inputs in order. Rename ANN tokens before
-   using the SDD `_v1`, `_i1`, ... variables; an ANN `_v1` token is not
-   automatically electrical port 1.
-6. Reconstruct the complex S-matrix. For native residual KBNN, first calculate
+2. Add one single-ended electrical pin per S-parameter port. Match the port
+   numbering in `sparam_labels`.
+3. Add one cell parameter per `parameter_names` entry. These are the values set
+   independently on every wrapper instance.
+4. Place a `Var/Eqn` block. Copy the contents of
+   `<prefix>_sdd.equation` into it. Define `ann_in_1`, `ann_in_2`, and so on
+   from `input_columns` in manifest order. For example, if the order is
+   `[W, L, freq_log10_hz]`, use:
+
+   ```text
+   ann_in_1=W
+   ann_in_2=L
+   ann_in_3=log10(max(abs(freq),1.0))
+   ```
+
+   `W=500um` is already the numeric SI value `0.0005` in ADS. If the exposed
+   parameter is deliberately unitless, such as `W_um=500`, use
+   `ann_in_1=W_um*1e-6` instead.
+5. In the same `Var/Eqn` block, map each `ann_out_N` to the corresponding
+   `output_columns[N-1]` entry and reconstruct complex S. For example:
+
+   ```text
+   S11=complex(ann_out_1,ann_out_5)
+   S12=complex(ann_out_2,ann_out_6)
+   S21=complex(ann_out_3,ann_out_7)
+   S22=complex(ann_out_4,ann_out_8)
+   ```
+
+   That example assumes the exact output order
+   `[S11_real,S12_real,S21_real,S22_real,S11_imag,S12_imag,S21_imag,S22_imag]`.
+   Use the manifest rather than assuming those positions. For native residual
+   KBNN, first calculate
    $\mathbf S_{\mathrm{fine}}=\mathbf S_{\mathrm{coarse}}+\Delta\mathbf S$.
-7. Convert S to the wrapper's admittance matrix:
+6. Convert S to the wrapper's admittance matrix:
 
    $$
    \mathbf Y(f,\mathbf p)=
@@ -2783,17 +2814,51 @@ Do not infer output ordering from the visual port layout.
    \left(\mathbf I+\mathbf S(f,\mathbf p)\right)^{-1}.
    $$
 
-8. Define each SDD current using the corresponding row:
+7. Use Component Search to place the matching N-port **Symbolically Defined
+   Device (SDD)** from **Eqn-based Nonlinear**. Connect each SDD `+` terminal
+   to the correspondingly numbered wrapper pin and each `-` terminal to
+   ground. Do not place 50-ohm resistors inside the wrapper.
+8. Double-click the SDD and add the current and weighting entries described
+   below. Do not enter one frequency-independent current formula. The desired
+   frequency-domain result is:
 
    $$
    I_i=\sum_{j=1}^{N}Y_{ij}V_j.
    $$
 
-   ADS defines positive SDD current into the device. Do not place physical
-   $Z_0$ shunt resistors on the ports; $Z_0$ is the wave reference in the
-   conversion.
+   ADS implements that response by applying each frequency-dependent
+   $Y_{ij}(f)$ as a custom SDD weight. ADS defines positive SDD current into the
+   device. $Z_0$ is the wave reference in the conversion, not a physical
+   termination.
 9. Generate/update the symbol. Expose only the N electrical pins and intended
    geometry/process parameters.
+
+For a two-port, these are the exact SDD component values:
+
+| Purpose | Parameter Entry Mode | Port | Weight | Formula |
+| --- | --- | ---: | ---: | --- |
+| Port 1 baseline | Explicit | 1 | 0 | `0.0` |
+| $Y_{11}V_1$ term | Explicit | 1 | 2 | `_v1` |
+| $Y_{11}$ weight | Weighting | — | 2 | `if (freq equals 0) then 0.0 else Y11 endif` |
+| $Y_{12}V_2$ term | Explicit | 1 | 3 | `_v2` |
+| $Y_{12}$ weight | Weighting | — | 3 | `if (freq equals 0) then 0.0 else Y12 endif` |
+| Port 2 baseline | Explicit | 2 | 0 | `0.0` |
+| $Y_{21}V_1$ term | Explicit | 2 | 4 | `_v1` |
+| $Y_{21}$ weight | Weighting | — | 4 | `if (freq equals 0) then 0.0 else Y21 endif` |
+| $Y_{22}V_2$ term | Explicit | 2 | 5 | `_v2` |
+| $Y_{22}$ weight | Weighting | — | 5 | `if (freq equals 0) then 0.0 else Y22 endif` |
+
+For each `I[]` row, choose **Parameter Entry Mode = Explicit**, then enter the
+Port, Weight, and Formula exactly as listed. For each `H[]` row, add another
+entry, choose **Parameter Entry Mode = Weighting**, enter the listed Weight,
+and enter the formula; the Port field is not used. Leave every `C[]` controlling
+current empty. Weight 0 is unity and weight 1 is the built-in $j\omega$, so
+custom weights start at 2. The exact-zero guard keeps this RF-only ANN branch
+open at DC because DC was excluded from native ANN training.
+
+For more than two ports, use one baseline `I[i,0]=0.0` for every port, then one
+pair `I[i,w]=_vj` and `H[w]=Yij` for every matrix element, with a unique
+`w>=2`. The exported `ADS_SDD_SETUP.md` prints that full table automatically.
 
 For a two-port, these explicit equations are convenient for checking the
 matrix implementation:
@@ -2817,6 +2882,20 @@ $$
 If $D$ is close to zero, inspect the ANN S-matrix and mapping before adding any
 stabilizing conductance. A wrong input scale or swapped output can look like an
 S-to-Y singularity.
+
+For the first isolated SP testbench, the remaining manual setup is only:
+
+- one wrapper instance with every geometry/process parameter set;
+- one `Term` per wrapper pin, numbered consecutively from 1 through N and set
+  to `Z=50 Ohm`;
+- an SP controller whose sweep stays inside the fitted positive-frequency
+  range; and
+- ground on every SDD negative terminal inside the wrapper.
+
+Do not add a `NetlistInclude`, 50-ohm shunts, controlling-current references,
+DC bias sources, or a second copy of the generated ANN equations. This native
+ANN package is RF-only; use the repository's separate exported DC/HB model when
+those behaviors are required.
 
 #### 6. Instantiate the Cell More Than Once
 

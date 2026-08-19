@@ -401,7 +401,18 @@ class SurrogateDispatcherTests(unittest.TestCase):
             self.assertIn("ann.reset()", training_source)
             self.assertIn("except MemoryError as error", training_source)
             self.assertIn("dense_quasi_newton_state_estimate_gib", training_source)
+            self.assertIn("write_sdd_equation_copy", training_source)
+            self.assertIn("ann_in_", training_source)
+            self.assertIn("ann_out_", training_source)
             self.assertIn("ads_qt_runtime.py", (out_dir / "ADS_ANN_README.md").read_text())
+            setup_source = (out_dir / "ADS_SDD_SETUP.md").read_text()
+            self.assertIn("Do Not Use NetlistInclude", setup_source)
+            self.assertIn("Parameter Entry Mode", setup_source)
+            self.assertIn("if (freq equals 0) then 0.0 else Y11 endif", setup_source)
+            self.assertIn("`ann_in_1`", setup_source)
+            self.assertIn("ann_in_1=W", setup_source)
+            self.assertIn("S11=complex(ann_out_1,ann_out_2)", setup_source)
+            self.assertEqual(manifest["sdd_setup_guide"], "ADS_SDD_SETUP.md")
 
     def test_ads_qt_runtime_helper_restores_platform_plugin_environment(self) -> None:
         helper_globals = load_generated_ads_qt_runtime("ads_qt_runtime_test")
