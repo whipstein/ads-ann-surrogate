@@ -378,7 +378,6 @@ class OptionsJSONTests(unittest.TestCase):
                             or (not action.option_strings and action.nargs == "+")
                         )
                     ]
-                    self.assertTrue(required, command)
                     for action in required:
                         self.assertIn(
                             action.dest,

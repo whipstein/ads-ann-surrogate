@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Generate and adapt geometry/process points for surrogate-model extraction.
 
-The default method is a maximin Latin hypercube because finite EM sample sets
-usually benefit from stratification plus good point separation. Sobol is also
-available when SciPy is installed. After a fit, GP-UCB acquisition can use a
-Matérn-5/2 posterior over geometry-level model error to select the next EM
-batch while retaining the original error-distance selector as an alternative.
+The default initial method is a maximin Latin hypercube because finite EM
+sample sets usually benefit from stratification plus good point separation.
+Sobol is also available when SciPy is installed. After a fit, the default
+hybrid acquisition combines predicted-error exploitation, Gaussian-process
+uncertainty, and maximin coverage while retaining GP-UCB and the original
+error-distance selector as explicit alternatives.
 """
 
 from __future__ import annotations
@@ -99,6 +100,7 @@ class SuggestedPoint:
     predicted_error: float | None = None
     gp_log_uncertainty: float | None = None
     gp_upper_confidence_error: float | None = None
+    selection_component: str = ""
 
 
 @dataclass
@@ -106,11 +108,50 @@ class GaussianProcessModel:
     observation_points: list[list[float]]
     log_error_mean: float
     log_error_scale: float
-    length_scale: float
+    length_scales: list[float]
     noise_variance: float
     cholesky: list[list[float]]
     alpha: list[float]
     log_marginal_likelihood: float
+    normalized_targets: list[float]
+    length_scale_selection: str = "isotropic"
+
+    @property
+    def length_scale(self) -> float:
+        """Geometric-mean length scale retained for backward compatibility."""
+
+        if not self.length_scales:
+            return 1.0
+        return math.exp(
+            sum(math.log(max(value, 1e-300)) for value in self.length_scales)
+            / len(self.length_scales)
+        )
+
+
+@dataclass(frozen=True)
+class PointCountRecommendation:
+    recommended_count: int
+    dimensions: int
+    current_error_rms: float
+    current_error_median: float
+    current_error_p90: float
+    current_error_max: float
+    target_error: float | None
+    target_ratio: float | None
+    previous_error_rms: list[float]
+    latest_improvement_fraction: float | None
+    existing_training_count: int
+    verification_observation_count: int
+    stage: str
+    rationale: list[str]
+
+
+@dataclass(frozen=True)
+class HybridAllocation:
+    exploitation: int
+    uncertainty: int
+    coverage: int
+    regime: str
 
 
 def split_value_token(token: object) -> tuple[float, str]:
@@ -2286,8 +2327,11 @@ def automatic_verification_plan(
     batch: int | None = None,
     max_add: int | None = None,
 ) -> dict[str, object]:
-    """Plan milestone-based acquisition-verification growth for GP-UCB."""
+    """Plan milestone-based acquisition-verification growth for adaptive GP use."""
 
+    # Preserve the intentionally lean adaptive-campaign seed. The error GP can
+    # start sparse; hybrid uncertainty/coverage roles and this milestone policy
+    # grow its verification observations over later rounds.
     initial_training = max(4 * dimensions, 12)
     initial_verification = max(dimensions + 2, 6)
     effective_interval = interval if interval is not None else max(2 * dimensions, 1)
@@ -2314,11 +2358,13 @@ def automatic_verification_plan(
     needed = max(0, target_verification - verification_observation_count)
     added = (
         min(needed, effective_max_add)
-        if enabled and completed_milestones > 0
+        if enabled and projected_training >= initial_training
         else 0
     )
     next_trigger = (
-        initial_training + (completed_milestones + 1) * effective_interval
+        initial_training
+        if projected_training < initial_training
+        else initial_training + (completed_milestones + 1) * effective_interval
     )
     return {
         "enabled": bool(enabled),
@@ -2555,6 +2601,220 @@ def load_error_regions(
     raise ValueError("\n".join(details))
 
 
+def _linear_quantile(values: Sequence[float], fraction: float) -> float:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    position = min(max(float(fraction), 0.0), 1.0) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def error_region_summary(regions: Sequence[ErrorRegion]) -> dict[str, float]:
+    scores = [max(float(region.score), 0.0) for region in regions]
+    if not scores:
+        return {"rms": 0.0, "median": 0.0, "p90": 0.0, "max": 0.0}
+    return {
+        "rms": math.sqrt(sum(value * value for value in scores) / len(scores)),
+        "median": _linear_quantile(scores, 0.5),
+        "p90": _linear_quantile(scores, 0.9),
+        "max": max(scores),
+    }
+
+
+def recommend_additional_point_count(
+    *,
+    dimensions: int,
+    regions: Sequence[ErrorRegion],
+    existing_training_count: int,
+    target_error: float | None,
+    previous_error_rms: Sequence[float] = (),
+) -> PointCountRecommendation:
+    """Recommend a dimension-scaled primary batch from accuracy and progress."""
+
+    if dimensions <= 0:
+        raise ValueError("Point-count recommendation requires at least one dimension")
+    summary = error_region_summary(regions)
+    current_error = summary["rms"]
+    target_ratio = (
+        current_error / target_error
+        if target_error is not None and target_error > 0.0
+        else None
+    )
+    history = [
+        float(value)
+        for value in previous_error_rms
+        if math.isfinite(float(value)) and float(value) >= 0.0
+    ]
+    latest_improvement = None
+    if history and history[-1] > 0.0:
+        latest_improvement = (history[-1] - current_error) / history[-1]
+
+    minimum = max(dimensions, 4)
+    moderate = max(2 * dimensions, minimum)
+    aggressive = max(3 * dimensions, moderate)
+    rationale: list[str] = []
+
+    if target_ratio is not None and target_ratio <= 1.0:
+        count = 0
+        stage = "target-met"
+        rationale.append(
+            f"current RMS error {current_error:.6g} meets target {target_error:.6g}"
+        )
+    elif target_ratio is not None and target_ratio >= 4.0:
+        count = aggressive
+        stage = "far-from-target"
+        rationale.append(
+            f"current RMS error is {target_ratio:.3g}x the requested target"
+        )
+    elif target_ratio is not None and target_ratio >= 2.0:
+        count = moderate
+        stage = "above-target"
+        rationale.append(
+            f"current RMS error is {target_ratio:.3g}x the requested target"
+        )
+    elif target_ratio is not None:
+        count = max(minimum, int(math.ceil(1.5 * dimensions)))
+        stage = "near-target"
+        rationale.append(
+            f"current RMS error is {target_ratio:.3g}x the requested target"
+        )
+    else:
+        count = moderate
+        stage = "coverage-guided"
+        rationale.append(
+            "no --target-error was supplied, so the recommendation uses geometry "
+            "and error-observation density"
+        )
+
+    lean_training = max(4 * dimensions, 12)
+    if count and existing_training_count < lean_training:
+        count = max(count, moderate)
+        rationale.append(
+            f"training inventory {existing_training_count} is below the lean "
+            f"{lean_training}-point dimension-scaled anchor"
+        )
+
+    observation_target = max(3 * dimensions, 12)
+    if count and len(regions) < observation_target:
+        count = max(count, moderate)
+        rationale.append(
+            f"only {len(regions)} GP error observations are available; "
+            f"approximately {observation_target} are preferred for {dimensions}D"
+        )
+
+    if count and latest_improvement is not None:
+        if latest_improvement < -0.02:
+            count = minimum
+            stage = "regressed"
+            rationale.append(
+                f"RMS error regressed by {-100.0 * latest_improvement:.1f}% in the "
+                "latest recorded round; use a diagnostic-sized batch"
+            )
+        elif latest_improvement < 0.05:
+            count = min(max(count, moderate), moderate)
+            stage = "plateau"
+            rationale.append(
+                f"latest RMS improvement was only {100.0 * latest_improvement:.1f}%; "
+                "a larger blind batch is unlikely to be point-efficient"
+            )
+        elif latest_improvement >= 0.20:
+            count = max(minimum, min(count, moderate))
+            stage = "improving"
+            rationale.append(
+                f"latest RMS improvement was {100.0 * latest_improvement:.1f}%; "
+                "continue with a moderate batch and remeasure"
+            )
+
+    count = min(max(count, 0), aggressive)
+    return PointCountRecommendation(
+        recommended_count=count,
+        dimensions=dimensions,
+        current_error_rms=current_error,
+        current_error_median=summary["median"],
+        current_error_p90=summary["p90"],
+        current_error_max=summary["max"],
+        target_error=target_error,
+        target_ratio=target_ratio,
+        previous_error_rms=history,
+        latest_improvement_fraction=latest_improvement,
+        existing_training_count=existing_training_count,
+        verification_observation_count=len(regions),
+        stage=stage,
+        rationale=rationale,
+    )
+
+
+def hybrid_component_allocation(
+    count: int,
+    *,
+    dimensions: int,
+    observation_count: int,
+    target_ratio: float | None,
+    latest_improvement_fraction: float | None,
+) -> HybridAllocation:
+    """Allocate a hybrid batch across exploitation, uncertainty, and coverage."""
+
+    if count <= 0:
+        return HybridAllocation(0, 0, 0, "empty")
+    observation_target = max(3 * dimensions, 12)
+    if observation_count < observation_target:
+        fractions = (0.35, 0.35, 0.30)
+        regime = "sparse-error-observations"
+    elif latest_improvement_fraction is not None and latest_improvement_fraction < 0.05:
+        fractions = (0.40, 0.25, 0.35)
+        regime = "plateau"
+    elif target_ratio is not None and target_ratio >= 2.0:
+        fractions = (0.60, 0.20, 0.20)
+        regime = "far-from-target"
+    elif target_ratio is not None and target_ratio < 1.5:
+        fractions = (0.45, 0.25, 0.30)
+        regime = "near-target"
+    else:
+        fractions = (0.50, 0.25, 0.25)
+        regime = "balanced"
+
+    raw = [count * fraction for fraction in fractions]
+    allocated = [int(math.floor(value)) for value in raw]
+    if count >= 3:
+        allocated = [max(1, value) for value in allocated]
+    while sum(allocated) > count:
+        index = max(range(3), key=lambda idx: allocated[idx] - raw[idx])
+        if allocated[index] <= (1 if count >= 3 else 0):
+            break
+        allocated[index] -= 1
+    while sum(allocated) < count:
+        index = max(range(3), key=lambda idx: raw[idx] - allocated[idx])
+        allocated[index] += 1
+    return HybridAllocation(
+        exploitation=allocated[0],
+        uncertainty=allocated[1],
+        coverage=allocated[2],
+        regime=regime,
+    )
+
+
+def adaptive_exploration_weight(
+    recommendation: PointCountRecommendation,
+) -> float:
+    """Return a conservative-to-exploitative GP schedule for the current round."""
+
+    preferred_observations = max(3 * recommendation.dimensions, 12)
+    if recommendation.verification_observation_count < preferred_observations:
+        return 2.5
+    if recommendation.stage in {"plateau", "regressed", "near-target"}:
+        return 0.75
+    if recommendation.stage in {"far-from-target", "above-target", "improving"}:
+        return 1.0
+    return 1.5
+
+
 def error_region_fields(parameters: Sequence[ParameterSpec]) -> list[str]:
     return [
         "rank",
@@ -2622,11 +2882,21 @@ def candidate_focus(
 def _matern52_kernel(
     lhs: Sequence[float],
     rhs: Sequence[float],
-    length_scale: float,
+    length_scale: float | Sequence[float],
 ) -> float:
+    if isinstance(length_scale, (int, float)):
+        scales = [float(length_scale)] * len(lhs)
+    else:
+        scales = [float(value) for value in length_scale]
+        if len(scales) != len(lhs):
+            raise ValueError(
+                f"Expected {len(lhs)} GP length scales, received {len(scales)}"
+            )
+    if any(not math.isfinite(value) or value <= 0.0 for value in scales):
+        raise ValueError("Every GP length scale must be positive and finite")
     distance2 = sum(
-        ((float(a) - float(b)) / length_scale) ** 2
-        for a, b in zip(lhs, rhs)
+        ((float(a) - float(b)) / scale) ** 2
+        for a, b, scale in zip(lhs, rhs, scales)
     )
     if distance2 <= 0.0:
         return 1.0
@@ -2697,7 +2967,7 @@ def _unique_gp_observations(
 def _factor_gp_candidate(
     points: Sequence[Sequence[float]],
     normalized_targets: Sequence[float],
-    length_scale: float,
+    length_scale: float | Sequence[float],
     noise_variance: float,
 ) -> tuple[list[list[float]], list[float], float]:
     covariance = [
@@ -2739,9 +3009,10 @@ def _factor_gp_candidate(
 
 def fit_error_gaussian_process(
     regions: Sequence[ErrorRegion],
-    length_scale: float | None,
+    length_scale: float | Sequence[float] | None,
     noise_variance: float,
     error_floor: float,
+    ard_mode: str = "auto",
 ) -> GaussianProcessModel:
     points, log_errors = _unique_gp_observations(regions, error_floor)
     if len(points) < 2:
@@ -2759,31 +3030,121 @@ def fit_error_gaussian_process(
     normalized_targets = [
         (value - log_error_mean) / log_error_scale for value in log_errors
     ]
-    candidates = (
-        [float(length_scale)]
-        if length_scale is not None
-        else [0.08, 0.12, 0.18, 0.27, 0.4, 0.6, 0.9, 1.35]
+    dimensions = len(points[0])
+    scale_grid = [0.08, 0.12, 0.18, 0.27, 0.4, 0.6, 0.9, 1.35]
+    explicit_scales: list[float] | None = None
+    if length_scale is not None:
+        if isinstance(length_scale, (int, float)):
+            explicit_scales = [float(length_scale)] * dimensions
+        else:
+            explicit_scales = [float(value) for value in length_scale]
+            if len(explicit_scales) != dimensions:
+                raise ValueError(
+                    f"--gp-length-scale supplied {len(explicit_scales)} values "
+                    f"for a {dimensions}-dimensional geometry"
+                )
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in explicit_scales
+        ):
+            raise ValueError("Every --gp-length-scale value must be positive")
+
+    isotropic_candidates = (
+        [explicit_scales[0]]
+        if explicit_scales is not None and len(set(explicit_scales)) == 1
+        else ([] if explicit_scales is not None else scale_grid)
     )
-    best: tuple[list[list[float]], list[float], float, float] | None = None
-    for candidate in candidates:
+    best: tuple[list[list[float]], list[float], float, list[float]] | None = None
+    if explicit_scales is not None and len(set(explicit_scales)) > 1:
         factor, alpha, likelihood = _factor_gp_candidate(
             points,
             normalized_targets,
-            candidate,
+            explicit_scales,
+            noise_variance,
+        )
+        best = (factor, alpha, likelihood, explicit_scales)
+    for candidate in isotropic_candidates:
+        candidate_scales = [float(candidate)] * dimensions
+        factor, alpha, likelihood = _factor_gp_candidate(
+            points,
+            normalized_targets,
+            candidate_scales,
             noise_variance,
         )
         if best is None or likelihood > best[2]:
-            best = (factor, alpha, likelihood, candidate)
+            best = (factor, alpha, likelihood, candidate_scales)
     assert best is not None
+
+    use_ard = (
+        explicit_scales is None
+        and ard_mode in {"auto", "on"}
+        and (
+            ard_mode == "on"
+            or len(points) >= max(3 * dimensions, 12)
+        )
+    )
+    selection = "user" if explicit_scales is not None else "isotropic-likelihood"
+    if use_ard:
+        # Coordinate-wise marginal-likelihood refinement avoids an exponential
+        # Cartesian search. A weak log-scale shrinkage penalty prevents sparse
+        # error observations from forcing unrelated dimensions to opposite
+        # extremes of the search grid.
+        scales = list(best[3])
+        base_scale = math.exp(sum(math.log(value) for value in scales) / dimensions)
+        penalty_weight = 0.15
+
+        def selection_score(likelihood: float, values: Sequence[float]) -> float:
+            shrinkage = sum(
+                math.log(value / base_scale) ** 2 for value in values
+            )
+            return likelihood - penalty_weight * shrinkage
+
+        current_score = selection_score(best[2], scales)
+        for dimension in range(dimensions):
+            dimension_best = best
+            dimension_score = current_score
+            local_grid = sorted(
+                {
+                    *scale_grid,
+                    max(0.05, min(2.0, base_scale * 0.5)),
+                    max(0.05, min(2.0, base_scale * 1.5)),
+                    max(0.05, min(2.0, base_scale * 2.0)),
+                }
+            )
+            for candidate in local_grid:
+                trial_scales = list(scales)
+                trial_scales[dimension] = candidate
+                factor, alpha, likelihood = _factor_gp_candidate(
+                    points,
+                    normalized_targets,
+                    trial_scales,
+                    noise_variance,
+                )
+                score = selection_score(likelihood, trial_scales)
+                if score > dimension_score + 1e-12:
+                    dimension_best = (
+                        factor,
+                        alpha,
+                        likelihood,
+                        trial_scales,
+                    )
+                    dimension_score = score
+            best = dimension_best
+            scales = list(best[3])
+            current_score = dimension_score
+        selection = "ard-coordinate-likelihood"
+
     return GaussianProcessModel(
         observation_points=points,
         log_error_mean=log_error_mean,
         log_error_scale=log_error_scale,
-        length_scale=best[3],
+        length_scales=list(best[3]),
         noise_variance=noise_variance,
         cholesky=best[0],
         alpha=best[1],
         log_marginal_likelihood=best[2],
+        normalized_targets=normalized_targets,
+        length_scale_selection=selection,
     )
 
 
@@ -2792,7 +3153,7 @@ def predict_error_gaussian_process(
     point: Sequence[float],
 ) -> tuple[float, float]:
     covariance = [
-        _matern52_kernel(point, observed, model.length_scale)
+        _matern52_kernel(point, observed, model.length_scales)
         for observed in model.observation_points
     ]
     normalized_mean = sum(
@@ -2808,6 +3169,40 @@ def predict_error_gaussian_process(
     )
     std_log_error = model.log_error_scale * math.sqrt(normalized_variance)
     return mean_log_error, std_log_error
+
+
+def condition_gp_on_fantasy_mean(
+    model: GaussianProcessModel,
+    point: Sequence[float],
+) -> GaussianProcessModel:
+    """Condition on the current posterior mean to reduce batch uncertainty."""
+
+    mean_log_error, _ = predict_error_gaussian_process(model, point)
+    normalized_target = (
+        (mean_log_error - model.log_error_mean) / model.log_error_scale
+        if model.log_error_scale > 0.0
+        else 0.0
+    )
+    observation_points = [*model.observation_points, list(point)]
+    normalized_targets = [*model.normalized_targets, normalized_target]
+    factor, alpha, likelihood = _factor_gp_candidate(
+        observation_points,
+        normalized_targets,
+        model.length_scales,
+        model.noise_variance,
+    )
+    return GaussianProcessModel(
+        observation_points=observation_points,
+        log_error_mean=model.log_error_mean,
+        log_error_scale=model.log_error_scale,
+        length_scales=list(model.length_scales),
+        noise_variance=model.noise_variance,
+        cholesky=factor,
+        alpha=alpha,
+        log_marginal_likelihood=likelihood,
+        normalized_targets=normalized_targets,
+        length_scale_selection=model.length_scale_selection,
+    )
 
 
 def _nearest_error_region(
@@ -2830,36 +3225,39 @@ def select_gp_ucb_points(
     exploration_weight: float,
     novelty_power: float,
     min_distance: float,
-    length_scale: float | None,
+    length_scale: float | Sequence[float] | None,
     noise_variance: float,
     error_floor: float,
+    ard_mode: str = "auto",
 ) -> tuple[list[SuggestedPoint], GaussianProcessModel]:
     model = fit_error_gaussian_process(
         regions,
         length_scale=length_scale,
         noise_variance=noise_variance,
         error_floor=error_floor,
+        ard_mode=ard_mode,
     )
+    working_model = model
     selected: list[SuggestedPoint] = []
     occupied = [list(point) for point in existing_points]
     diag = max(
         math.sqrt(len(candidate_points[0])) if candidate_points else 1.0,
         1e-12,
     )
-    unused: list[tuple[list[float], float, float, float]] = []
-    for raw_point in candidate_points:
-        point = list(raw_point)
-        mean_log_error, std_log_error = predict_error_gaussian_process(model, point)
-        predicted_error = math.exp(min(700.0, mean_log_error))
-        upper_error = math.exp(
-            min(700.0, mean_log_error + exploration_weight * std_log_error)
-        )
-        unused.append((point, predicted_error, std_log_error, upper_error))
+    unused = [list(point) for point in candidate_points]
 
     while len(selected) < count and unused:
         best_idx: int | None = None
         best_point: SuggestedPoint | None = None
-        for idx, (point, predicted_error, std_log_error, upper_error) in enumerate(unused):
+        for idx, point in enumerate(unused):
+            mean_log_error, std_log_error = predict_error_gaussian_process(
+                working_model,
+                point,
+            )
+            predicted_error = math.exp(min(700.0, mean_log_error))
+            upper_error = math.exp(
+                min(700.0, mean_log_error + exploration_weight * std_log_error)
+            )
             distance_existing = nearest_distance(point, occupied)
             if distance_existing < min_distance:
                 continue
@@ -2876,6 +3274,7 @@ def select_gp_ucb_points(
                 predicted_error=predicted_error,
                 gp_log_uncertainty=std_log_error,
                 gp_upper_confidence_error=upper_error,
+                selection_component="gp-ucb",
             )
             if best_point is None or candidate.acquisition_score > best_point.acquisition_score:
                 best_idx = idx
@@ -2885,7 +3284,163 @@ def select_gp_ucb_points(
         selected.append(best_point)
         occupied.append(best_point.unit_point)
         unused.pop(best_idx)
+        working_model = condition_gp_on_fantasy_mean(
+            working_model,
+            best_point.unit_point,
+        )
     return selected, model
+
+
+def _hybrid_component_schedule(allocation: HybridAllocation) -> list[str]:
+    targets = {
+        "exploitation": allocation.exploitation,
+        "uncertainty": allocation.uncertainty,
+        "coverage": allocation.coverage,
+    }
+    total = sum(targets.values())
+    selected = {name: 0 for name in targets}
+    schedule: list[str] = []
+    order = ("exploitation", "uncertainty", "coverage")
+    for step in range(total):
+        available = [name for name in order if selected[name] < targets[name]]
+        component = max(
+            available,
+            key=lambda name: (
+                targets[name] * (step + 1) / max(total, 1) - selected[name],
+                -order.index(name),
+            ),
+        )
+        schedule.append(component)
+        selected[component] += 1
+    return schedule
+
+
+def select_hybrid_points(
+    candidate_points: Sequence[Sequence[float]],
+    regions: Sequence[ErrorRegion],
+    existing_points: Sequence[Sequence[float]],
+    count: int,
+    allocation: HybridAllocation,
+    exploration_weight: float,
+    novelty_power: float,
+    min_distance: float,
+    length_scale: float | Sequence[float] | None,
+    noise_variance: float,
+    error_floor: float,
+    ard_mode: str = "auto",
+) -> tuple[list[SuggestedPoint], GaussianProcessModel, dict[str, object]]:
+    """Select an adaptive mixture of error, uncertainty, and coverage points."""
+
+    model = fit_error_gaussian_process(
+        regions,
+        length_scale=length_scale,
+        noise_variance=noise_variance,
+        error_floor=error_floor,
+        ard_mode=ard_mode,
+    )
+    working_model = model
+    selected: list[SuggestedPoint] = []
+    occupied = [list(point) for point in existing_points]
+    unused = [list(point) for point in candidate_points]
+    diag = max(
+        math.sqrt(len(candidate_points[0])) if candidate_points else 1.0,
+        1e-12,
+    )
+    schedule = _hybrid_component_schedule(allocation)
+
+    initial_predictions: list[float] = []
+    initial_uncertainties: list[float] = []
+    for point in unused:
+        mean_log_error, std_log_error = predict_error_gaussian_process(model, point)
+        initial_predictions.append(math.exp(min(700.0, mean_log_error)))
+        initial_uncertainties.append(std_log_error)
+
+    for component in schedule:
+        best_idx: int | None = None
+        best_point: SuggestedPoint | None = None
+        for idx, point in enumerate(unused):
+            distance_existing = nearest_distance(point, occupied)
+            if distance_existing < min_distance:
+                continue
+            novelty = min(1.0, distance_existing / diag)
+            mean_log_error, std_log_error = predict_error_gaussian_process(
+                working_model,
+                point,
+            )
+            predicted_error = math.exp(min(700.0, mean_log_error))
+            upper_error = math.exp(
+                min(700.0, mean_log_error + exploration_weight * std_log_error)
+            )
+            if component == "exploitation":
+                component_novelty = min(novelty_power, 0.5)
+                score = predicted_error * (
+                    max(novelty, 1e-12) ** component_novelty
+                )
+            elif component == "uncertainty":
+                component_novelty = max(0.5, min(novelty_power, 1.5))
+                score = std_log_error * (
+                    max(novelty, 1e-12) ** component_novelty
+                )
+            else:
+                score = novelty
+            region, region_distance = _nearest_error_region(point, regions)
+            candidate = SuggestedPoint(
+                unit_point=point,
+                acquisition_score=score,
+                distance_to_existing=distance_existing,
+                nearest_error_source_index=(region.source_index if region else ""),
+                nearest_error_score=(region.score if region else 0.0),
+                nearest_error_distance=region_distance,
+                predicted_error=predicted_error,
+                gp_log_uncertainty=std_log_error,
+                gp_upper_confidence_error=upper_error,
+                selection_component=component,
+            )
+            if best_point is None or candidate.acquisition_score > best_point.acquisition_score:
+                best_idx = idx
+                best_point = candidate
+        if best_idx is None or best_point is None:
+            break
+        selected.append(best_point)
+        occupied.append(best_point.unit_point)
+        unused.pop(best_idx)
+        working_model = condition_gp_on_fantasy_mean(
+            working_model,
+            best_point.unit_point,
+        )
+
+    prediction_median = _linear_quantile(initial_predictions, 0.5)
+    prediction_p10 = _linear_quantile(initial_predictions, 0.1)
+    prediction_p90 = _linear_quantile(initial_predictions, 0.9)
+    prediction_spread_ratio = (
+        prediction_p90 / prediction_p10
+        if prediction_p10 > 0.0
+        else None
+    )
+    diagnostics: dict[str, object] = {
+        "allocation": {
+            "exploitation": allocation.exploitation,
+            "uncertainty": allocation.uncertainty,
+            "coverage": allocation.coverage,
+            "regime": allocation.regime,
+        },
+        "selected_components": {
+            name: sum(item.selection_component == name for item in selected)
+            for name in ("exploitation", "uncertainty", "coverage")
+        },
+        "candidate_prediction": {
+            "median": prediction_median,
+            "p10": prediction_p10,
+            "p90": prediction_p90,
+            "p90_to_p10_ratio": prediction_spread_ratio,
+            "median_log_uncertainty": _linear_quantile(
+                initial_uncertainties,
+                0.5,
+            ),
+        },
+        "batch_posterior_update": "kriging-believer-posterior-mean",
+    }
+    return selected, model, diagnostics
 
 
 def select_targeted_points(
@@ -2927,6 +3482,7 @@ def select_targeted_points(
                 nearest_error_source_index=source_index,
                 nearest_error_score=source_score,
                 nearest_error_distance=region_distance,
+                selection_component="error-distance",
             )
             if best_point is None or candidate.acquisition_score > best_point.acquisition_score:
                 best_idx = idx
@@ -2965,6 +3521,7 @@ def write_suggested_points_csv(
         "point_origin",
         "method",
         "acquisition_method",
+        "selection_component",
         "analysis_metric",
         "fit_error_score",
         "nearest_error_source_index",
@@ -2998,6 +3555,7 @@ def write_suggested_points_csv(
             "point_origin": "additional",
             "method": method_name,
             "acquisition_method": acquisition_method,
+            "selection_component": suggestion.selection_component,
             "analysis_metric": metric_name,
             "fit_error_score": f"{suggestion.nearest_error_score:.12g}",
             "nearest_error_source_index": suggestion.nearest_error_source_index,
@@ -3462,6 +4020,47 @@ VALID_METHODS = {
 }
 
 
+def parse_auto_point_count(value: object) -> int | str:
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("count must be a positive integer or 'auto'") from exc
+    if count <= 0:
+        raise argparse.ArgumentTypeError("count must be positive")
+    return count
+
+
+def parse_gp_length_scale(value: object) -> float | list[float]:
+    text = str(value).strip()
+    try:
+        values = [float(part.strip()) for part in text.split(",") if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "GP length scale must be a positive number or comma-separated list"
+        ) from exc
+    if not values or any(not math.isfinite(item) or item <= 0.0 for item in values):
+        raise argparse.ArgumentTypeError("every GP length scale must be positive")
+    return values[0] if len(values) == 1 else values
+
+
+def parse_auto_nonnegative_float(value: object) -> float | str:
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    try:
+        number = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be a non-negative number or 'auto'"
+        ) from exc
+    if not math.isfinite(number) or number < 0.0:
+        raise argparse.ArgumentTypeError("value must be non-negative and finite")
+    return number
+
+
 def add_parameter_arguments(
     parser: argparse.ArgumentParser,
     *,
@@ -3622,11 +4221,12 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--count",
-        type=int,
-        required=True,
+        type=parse_auto_point_count,
+        default="auto",
         help=(
-            "Number of primary additional points to suggest. Automatic GP-UCB "
-            "verification points are appended beyond this count when triggered."
+            "Number of primary additional points, or auto for a dimension-, "
+            "accuracy-, and progress-scaled recommendation. Default: auto. "
+            "Automatic verification points are appended beyond this count when triggered."
         ),
     )
     parser.add_argument(
@@ -3671,6 +4271,24 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         help="Column in verification_metrics.csv used to target errors. Use 'auto' to pick a known metric.",
     )
     parser.add_argument(
+        "--target-error",
+        type=float,
+        help=(
+            "Desired RMS geometry-level value of --metric. With --count auto, "
+            "the current-to-target ratio scales the recommended primary batch."
+        ),
+    )
+    parser.add_argument(
+        "--previous-verification-metrics",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Prior-round verification_metrics.csv used to measure improvement. "
+            "Repeat in oldest-to-newest order."
+        ),
+    )
+    parser.add_argument(
         "--candidate-method",
         default="maximin-lhs",
         choices=sorted(VALID_METHODS),
@@ -3681,30 +4299,43 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--acquisition",
-        choices=["error-distance", "gp-ucb"],
-        default="gp-ucb",
+        choices=["error-distance", "gp-ucb", "hybrid"],
+        default="hybrid",
         help=(
-            "Candidate scoring method. gp-ucb fits a Matérn-5/2 Gaussian process "
-            "to log geometry-level error; error-distance retains the original "
-            "radial error-focus and novelty selector without fitting a GP. "
-            "Default: gp-ucb."
+            "Candidate scoring method. hybrid divides a dimension-scaled batch "
+            "among exploitation, GP uncertainty, and maximin coverage and updates "
+            "posterior uncertainty after each selection. gp-ucb retains one-score "
+            "UCB acquisition; error-distance uses measured error hotspots. "
+            "Default: hybrid."
         ),
     )
     parser.add_argument(
         "--exploration-weight",
-        type=float,
-        default=2.0,
+        type=parse_auto_nonnegative_float,
+        default="auto",
         help=(
-            "GP-UCB standard-deviation multiplier. Larger values explore uncertain "
-            "regions more strongly. Default: 2.0."
+            "GP-UCB standard-deviation multiplier, or auto to reduce exploration "
+            "as error observations mature and accuracy approaches its target. "
+            "Default: auto."
         ),
     )
     parser.add_argument(
         "--gp-length-scale",
-        type=float,
+        type=parse_gp_length_scale,
         help=(
-            "Optional Matérn-5/2 length scale in normalized geometry space. If "
-            "omitted, select it by log marginal likelihood."
+            "Optional Matérn-5/2 length scale in normalized geometry space. "
+            "Supply one value for isotropic behavior or one comma-separated value "
+            "per parameter. If omitted, likelihood fitting and --gp-ard apply."
+        ),
+    )
+    parser.add_argument(
+        "--gp-ard",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Per-dimension GP length-scale fitting: auto enables it at roughly "
+            "3*d error observations, on forces it, and off retains one isotropic "
+            "scale. Default: auto."
         ),
     )
     parser.add_argument(
@@ -3783,7 +4414,7 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         help=(
             "Automatically add acquisition-verification points as cumulative "
             "training count crosses dimension-based milestones. Applies to "
-            "GP-UCB training batches. Default: auto."
+            "hybrid and GP-UCB training batches. Default: auto."
         ),
     )
     parser.add_argument(
@@ -4501,8 +5132,6 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
 
 
 def command_suggest_additional(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    if args.count <= 0:
-        parser.error("--count must be positive")
     try:
         canonical_dataset_label(args.target_dataset)
     except ValueError as exc:
@@ -4519,10 +5148,12 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error("--novelty-power must be non-negative")
     if args.min_distance < 0.0:
         parser.error("--min-distance must be non-negative")
-    if args.exploration_weight < 0.0:
+    if args.exploration_weight != "auto" and args.exploration_weight < 0.0:
         parser.error("--exploration-weight must be non-negative")
-    if args.gp_length_scale is not None and args.gp_length_scale <= 0.0:
-        parser.error("--gp-length-scale must be positive")
+    if args.target_error is not None and (
+        not math.isfinite(args.target_error) or args.target_error <= 0.0
+    ):
+        parser.error("--target-error must be positive and finite")
     if args.gp_noise_variance < 0.0:
         parser.error("--gp-noise-variance must be non-negative")
     if args.gp_error_floor <= 0.0:
@@ -4538,6 +5169,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     validate_shared_sampling_args(parser, args)
     parameters = resolve_suggest_parameters(parser, args)
     validate_parameter_decimal_places(parser, parameters, args.decimal_places)
+    if isinstance(args.gp_length_scale, list) and len(args.gp_length_scale) not in {
+        1,
+        len(parameters),
+    }:
+        parser.error(
+            "--gp-length-scale must contain one value or exactly one value per "
+            f"parameter ({len(parameters)})"
+        )
 
     metrics_path = verification_metrics_path(args, parser)
     try:
@@ -4657,8 +5296,81 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     primary_is_training = (
         coverage_split_group(args.target_dataset) == "training"
     )
+
+    previous_error_rms: list[float] = []
+    for raw_history_path in args.previous_verification_metrics:
+        history_path = Path(raw_history_path)
+        try:
+            history_regions, _, _ = load_error_regions(
+                history_path,
+                parameters,
+                metric_name=metric_name,
+                bare_values=args.bare_values,
+            )
+        except ValueError as exc:
+            parser.error(f"--previous-verification-metrics {history_path}: {exc}")
+        previous_error_rms.append(error_region_summary(history_regions)["rms"])
+
+    recommendation = recommend_additional_point_count(
+        dimensions=len(parameters),
+        regions=regions,
+        existing_training_count=existing_dataset_counts["training"],
+        target_error=args.target_error,
+        previous_error_rms=previous_error_rms,
+    )
+    count_is_automatic = args.count == "auto"
+    primary_count = (
+        recommendation.recommended_count
+        if count_is_automatic
+        else int(args.count)
+    )
+    exploration_is_automatic = args.exploration_weight == "auto"
+    effective_exploration_weight = (
+        adaptive_exploration_weight(recommendation)
+        if exploration_is_automatic
+        else float(args.exploration_weight)
+    )
+    print(
+        "point recommendation: "
+        f"{recommendation.recommended_count} primary "
+        f"{canonical_dataset_label(args.target_dataset)} point(s) for "
+        f"{len(parameters)}D; current {metric_name} RMS "
+        f"{recommendation.current_error_rms:.6g}, p90 "
+        f"{recommendation.current_error_p90:.6g}, max "
+        f"{recommendation.current_error_max:.6g}; stage "
+        f"{recommendation.stage}"
+    )
+    if args.target_error is not None:
+        print(
+            f"accuracy target: {args.target_error:.6g}; current/target "
+            f"{recommendation.target_ratio:.6g}x"
+        )
+    if recommendation.latest_improvement_fraction is not None:
+        print(
+            "latest recorded RMS improvement: "
+            f"{100.0 * recommendation.latest_improvement_fraction:.2f}%"
+        )
+    for reason in recommendation.rationale:
+        print(f"  recommendation basis: {reason}")
+    print(
+        "exploration weight: "
+        f"{effective_exploration_weight:.6g}"
+        + (" (auto)" if exploration_is_automatic else " (explicit)")
+    )
+    if not count_is_automatic and primary_count != recommendation.recommended_count:
+        print(
+            f"explicit --count {primary_count} overrides the recommended "
+            f"{recommendation.recommended_count}"
+        )
+    if count_is_automatic and primary_count == 0:
+        print(
+            "no additional points were generated because the requested accuracy "
+            "target is met"
+        )
+        return 0
+
     automatic_verification_enabled = (
-        args.acquisition == "gp-ucb"
+        args.acquisition in {"gp-ucb", "hybrid"}
         and args.verification_policy == "auto"
         and primary_is_training
     )
@@ -4666,7 +5378,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         dimensions=len(parameters),
         existing_training_count=existing_dataset_counts["training"],
         verification_observation_count=effective_verification_count,
-        requested_training_count=args.count if primary_is_training else 0,
+        requested_training_count=primary_count if primary_is_training else 0,
         enabled=automatic_verification_enabled,
         interval=args.verification_interval,
         batch=args.verification_batch,
@@ -4686,7 +5398,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     preliminary_verification_plan["training_verification_overlap_count"] = len(
         leaked_metrics_geometry_keys
     )
-    planned_total_count = args.count + int(
+    planned_total_count = primary_count + int(
         preliminary_verification_plan["additional_verification_count"]
     )
     candidate_count = args.candidate_count or max(
@@ -4746,6 +5458,32 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     acquisition_metadata["verification_metrics_bare_values_interpretation"] = (
         effective_bare_values
     )
+    acquisition_metadata["point_count_recommendation"] = {
+        "requested_count": args.count,
+        "count_mode": "auto" if count_is_automatic else "explicit",
+        "recommended_primary_count": recommendation.recommended_count,
+        "resolved_primary_count": primary_count,
+        "dimensions": recommendation.dimensions,
+        "current_error_rms": recommendation.current_error_rms,
+        "current_error_median": recommendation.current_error_median,
+        "current_error_p90": recommendation.current_error_p90,
+        "current_error_max": recommendation.current_error_max,
+        "target_error": recommendation.target_error,
+        "target_ratio": recommendation.target_ratio,
+        "previous_error_rms": recommendation.previous_error_rms,
+        "previous_verification_metrics": list(
+            args.previous_verification_metrics
+        ),
+        "latest_improvement_fraction": (
+            recommendation.latest_improvement_fraction
+        ),
+        "existing_training_count": recommendation.existing_training_count,
+        "verification_observation_count": (
+            recommendation.verification_observation_count
+        ),
+        "stage": recommendation.stage,
+        "rationale": recommendation.rationale,
+    }
     if getattr(args, "nonpassive_source", None):
         acquisition_metadata["nonpassive_point_generation_source"] = (
             args.nonpassive_source
@@ -4756,20 +5494,47 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     target_datasets: list[str]
     automatic_verification_suggestions: list[SuggestedPoint] = []
-    if args.acquisition == "gp-ucb":
+    hybrid_diagnostics: dict[str, object] = {}
+    if args.acquisition in {"gp-ucb", "hybrid"}:
         try:
-            suggestions, gp_model = select_gp_ucb_points(
-                candidates,
-                regions,
-                existing_points,
-                count=args.count,
-                exploration_weight=args.exploration_weight,
-                novelty_power=args.novelty_power,
-                min_distance=args.min_distance,
-                length_scale=args.gp_length_scale,
-                noise_variance=args.gp_noise_variance,
-                error_floor=args.gp_error_floor,
-            )
+            if args.acquisition == "hybrid":
+                hybrid_allocation = hybrid_component_allocation(
+                    primary_count,
+                    dimensions=len(parameters),
+                    observation_count=len(regions),
+                    target_ratio=recommendation.target_ratio,
+                    latest_improvement_fraction=(
+                        recommendation.latest_improvement_fraction
+                    ),
+                )
+                suggestions, gp_model, hybrid_diagnostics = select_hybrid_points(
+                    candidates,
+                    regions,
+                    existing_points,
+                    count=primary_count,
+                    allocation=hybrid_allocation,
+                    exploration_weight=effective_exploration_weight,
+                    novelty_power=args.novelty_power,
+                    min_distance=args.min_distance,
+                    length_scale=args.gp_length_scale,
+                    noise_variance=args.gp_noise_variance,
+                    error_floor=args.gp_error_floor,
+                    ard_mode=args.gp_ard,
+                )
+            else:
+                suggestions, gp_model = select_gp_ucb_points(
+                    candidates,
+                    regions,
+                    existing_points,
+                    count=primary_count,
+                    exploration_weight=effective_exploration_weight,
+                    novelty_power=args.novelty_power,
+                    min_distance=args.min_distance,
+                    length_scale=args.gp_length_scale,
+                    noise_variance=args.gp_noise_variance,
+                    error_floor=args.gp_error_floor,
+                    ard_mode=args.gp_ard,
+                )
         except ValueError as exc:
             parser.error(str(exc))
         verification_plan = automatic_verification_plan(
@@ -4819,14 +5584,17 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                         regions,
                         verification_existing_points,
                         count=automatic_verification_count,
-                        exploration_weight=max(args.exploration_weight, 3.0),
+                        exploration_weight=max(effective_exploration_weight, 3.0),
                         novelty_power=max(args.novelty_power, 2.0),
                         min_distance=max(args.min_distance, 1.0e-9),
                         length_scale=args.gp_length_scale,
                         noise_variance=args.gp_noise_variance,
                         error_floor=args.gp_error_floor,
+                        ard_mode=args.gp_ard,
                     )
                 )
+                for suggestion in automatic_verification_suggestions:
+                    suggestion.selection_component = "verification-uncertainty"
             except ValueError as exc:
                 parser.error(str(exc))
             if len(automatic_verification_suggestions) < automatic_verification_count:
@@ -4841,7 +5609,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             automatic_verification_suggestions
         )
         verification_plan["selection_exploration_weight"] = max(
-            args.exploration_weight,
+            effective_exploration_weight,
             3.0,
         )
         verification_plan["selection_novelty_power"] = max(
@@ -4850,22 +5618,37 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
         acquisition_metadata["automatic_verification"] = verification_plan
         acquisition_metadata["gp"] = {
-            "kernel": "matern52_isotropic",
+            "kernel": (
+                "matern52_ard"
+                if len(set(round(value, 12) for value in gp_model.length_scales)) > 1
+                else "matern52_isotropic"
+            ),
             "target_transform": "natural_log_error",
             "observation_count": len(gp_model.observation_points),
             "length_scale": gp_model.length_scale,
-            "length_scale_selection": (
-                "user" if args.gp_length_scale is not None else "log_marginal_likelihood"
-            ),
+            "length_scales": gp_model.length_scales,
+            "length_scale_by_parameter": {
+                parameter.name: scale
+                for parameter, scale in zip(parameters, gp_model.length_scales)
+            },
+            "length_scale_selection": gp_model.length_scale_selection,
+            "ard_mode": args.gp_ard,
             "noise_variance": gp_model.noise_variance,
-            "exploration_weight": args.exploration_weight,
+            "exploration_weight": effective_exploration_weight,
+            "exploration_weight_requested": args.exploration_weight,
+            "exploration_weight_selection": (
+                "auto" if exploration_is_automatic else "user"
+            ),
             "log_marginal_likelihood": gp_model.log_marginal_likelihood,
+            "batch_posterior_update": "kriging-believer-posterior-mean",
         }
-        if len(gp_model.observation_points) < len(parameters) + 1:
+        if hybrid_diagnostics:
+            acquisition_metadata["hybrid"] = hybrid_diagnostics
+        if len(gp_model.observation_points) < max(3 * len(parameters), 12):
             print(
-                "warning: GP-UCB has fewer distinct error observations than "
-                "dimensions + 1; selections will emphasize posterior uncertainty "
-                "until more simulated error observations are available",
+                "warning: the adaptive GP has fewer distinct error observations "
+                "than the preferred max(3*d, 12); the hybrid allocation reserves "
+                "extra uncertainty and coverage points until observations grow",
                 file=sys.stderr,
             )
         target_datasets = [args.target_dataset] * len(suggestions)
@@ -4878,7 +5661,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             candidates,
             regions,
             existing_points,
-            count=args.count,
+            count=primary_count,
             focus_radius=args.focus_radius,
             focus_power=args.focus_power,
             novelty_power=args.novelty_power,
@@ -4888,15 +5671,15 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         acquisition_metadata["automatic_verification"] = {
             **preliminary_verification_plan,
             "enabled": False,
-            "reason": "automatic verification applies only to GP-UCB training batches",
+            "reason": "automatic verification applies only to hybrid or GP-UCB training batches",
             "selected_additional_verification_count": 0,
         }
     primary_suggestion_count = len(suggestions) - len(
         automatic_verification_suggestions
     )
-    if primary_suggestion_count < args.count:
+    if primary_suggestion_count < primary_count:
         print(
-            f"warning: selected {primary_suggestion_count} of {args.count} requested points; "
+            f"warning: selected {primary_suggestion_count} of {primary_count} requested points; "
             "increase --candidate-count or lower --min-distance",
             file=sys.stderr,
         )
@@ -5123,13 +5906,26 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     if getattr(args, "parameter_metadata_source", None):
         print(f"parameter domain: {args.parameter_metadata_source}")
-    if args.acquisition == "gp-ucb":
+    if args.acquisition in {"gp-ucb", "hybrid"}:
+        scale_text = ", ".join(
+            f"{parameter.name}={scale:.4g}"
+            for parameter, scale in zip(parameters, gp_model.length_scales)
+        )
         print(
             "GP observations: "
             f"{len(gp_model.observation_points)}, "
-            f"Matérn-5/2 length scale: {gp_model.length_scale:.6g}, "
-            f"exploration weight: {args.exploration_weight:.6g}"
+            f"Matérn-5/2 length scales: {scale_text}, "
+            f"exploration weight: {effective_exploration_weight:.6g}"
         )
+        if args.acquisition == "hybrid":
+            allocation = hybrid_diagnostics.get("allocation", {})
+            print(
+                "hybrid batch: "
+                f"{allocation.get('exploitation', 0)} exploitation + "
+                f"{allocation.get('uncertainty', 0)} uncertainty + "
+                f"{allocation.get('coverage', 0)} coverage "
+                f"({allocation.get('regime', 'unknown')})"
+            )
         verification_plan = acquisition_metadata["automatic_verification"]
         assert isinstance(verification_plan, dict)
         added_verification = int(

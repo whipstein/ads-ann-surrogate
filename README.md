@@ -322,9 +322,11 @@ as multiple `--parameter`, `--geometry-json`, or `--existing-points` options.
         "suggest-additional": {
           "fit_dir": "outputs/dnn_optimize/best_model",
           "existing_points": ["geometries.csv"],
-          "count": 8,
-          "acquisition": "gp-ucb",
+          "count": "auto",
+          "acquisition": "hybrid",
           "metric": "auto",
+          "target_error": 1.0,
+          "exploration_weight": "auto",
           "out": "additional_points.csv",
           "combined_out": "additional_all_geometries.csv"
         }
@@ -483,8 +485,8 @@ saved back into the file supplied by `--options-json`:
 python3 surrogate.py --options-json options.json points generate \
   --parameter W=0.40mm:0.80mm \
   --parameter L=1.00mm:1.60mm \
-  --count 32 \
-  --verification-count 8 \
+  --count 66 \
+  --verification-count 18 \
   --out geometries.csv \
   --update-options-json
 ```
@@ -677,11 +679,10 @@ python3 surrogate.py points generate \
   --out geometries.csv
 ```
 
-### How Many Points for the Default GP-UCB Workflow
+### How Many Points for the Default Hybrid GP Workflow
 
-The default adaptive workflow can begin substantially below a one-shot design
-because it refits the surrogate and acquires new points in multiple rounds. For
-a lean initial campaign, use
+The default adaptive workflow deliberately starts lean because the surrogate
+is refit after each round. Use
 
 $$
 n_{\mathrm{train}}=\max(4d,12),\qquad
@@ -689,38 +690,39 @@ n_{\mathrm{acq}}=\max(d+2,6),
 $$
 
 where $d$ is the number of geometry parameters and $n_{\mathrm{acq}}$ is the
-fixed verification set used to construct geometry-level GP error observations.
-Then request roughly $d$ to $2d$ new training points per GP-UCB round:
+acquisition-verification set used to construct geometry-level GP error
+observations. These are not final independent audit points.
 
-| Geometry parameters | Initial training | Acquisition verification | Initial `--count` | GP-UCB points per round |
-| ---: | ---: | ---: | ---: | ---: |
-| 2 | 12 | 6 | 18 | 2-4 |
-| 3 | 12 | 6 | 18 | 3-6 |
-| 4 | 16 | 6 | 22 | 4-8 |
-| 5 | 20 | 7 | 27 | 5-10 |
-| 6 | 24 | 8 | 32 | 6-12 |
-| 7 | 28 | 9 | 37 | 7-14 |
-| 8 | 32 | 10 | 42 | 8-16 |
+| Geometry parameters | Initial training | Acquisition verification | Initial `generate --count` | Near target | Above target | Far from target |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 12 | 6 | 18 | 4 | 4 | 6 |
+| 3 | 12 | 6 | 18 | 5 | 6 | 9 |
+| 4 | 16 | 6 | 22 | 6 | 8 | 12 |
+| 5 | 20 | 7 | 27 | 8 | 10 | 15 |
+| 6 | 24 | 8 | 32 | 9 | 12 | 18 |
+| 7 | 28 | 9 | 37 | 11 | 14 | 21 |
+| 8 | 32 | 10 | 42 | 12 | 16 | 24 |
 
-These are intentionally lean starting counts, not one-shot coverage
-guarantees. Use the low end of the GP batch range for expensive simulations and
-the high end when the posterior remains uncertain in several separated
-regions. The acquisition-verification points influence GP selection, so they
-are not an unbiased final test set; reserve a separate final audit set that is
-never supplied to `suggest-additional`.
+`suggest-additional --count auto` calculates the round column from the current
+RMS geometry error and `--target-error`: target met returns zero, within
+$2\times$ uses roughly $1.5d$, $2\times$ to $4\times$ uses $2d$, and at
+least $4\times$ uses $3d$. Sparse training or error observations raise the
+minimum to $2d$. A latest-round improvement below 5% caps the recommendation
+at $2d$ and labels a plateau; a regression reduces it to a diagnostic batch so
+the workflow does not spend a large simulation budget on a likely fitting or
+data problem. Supply prior metrics in oldest-to-newest order with repeatable
+`--previous-verification-metrics` options.
 
 ### Automatic Acquisition-Verification Growth
 
-The acquisition-verification column above is a **lean initial count**, not a
-fixed count for an entire adaptive campaign. In six dimensions, eight points
-is the $d+2$ starting set: it is enough to begin GP-UCB, but it gives the GP
-only eight locations at which to observe the current surrogate's
-geometry-level error. Additional training points improve the surrogate without
-increasing that error-observation count.
+The acquisition-verification column above is a starting error-observation
+target, not a fixed count for the entire campaign. Additional training points
+improve the RF surrogate without automatically increasing the number of
+locations at which its geometry-level error has been measured.
 
-`points suggest-additional --acquisition gp-ucb` therefore grows the
-acquisition-verification set automatically during training acquisitions. The
-default milestone policy is:
+`points suggest-additional` therefore grows the acquisition-verification set
+automatically for the default hybrid method and for explicit GP-UCB training
+acquisitions. The default milestone policy is:
 
 $$
 n_{\mathrm{train},0}=\max(4d,12),\qquad
@@ -741,13 +743,11 @@ without creating an unexpectedly unbounded simulation batch. The requested
 triggered verification points are additional rows and are reported before the
 output paths.
 
-For six dimensions, the initial anchor is 24 training and 8 verification
-points. The first verification-growth milestone is 36 projected training
-points and raises the target to 12 verification points. The second milestone
-is 48 training points and raises the target to 16. Thus a campaign that already
-has 40 training and 8 verification points and requests eight more training
-points automatically receives eight catch-up verification points, producing
-eight training plus eight verification simulations in that command.
+For six dimensions, the lean anchor is 24 training and 8
+acquisition-verification points. A campaign with 40 training and 8 verification
+points that requests eight more training points reaches the second milestone
+at 48 training and receives eight catch-up verification points. Subsequent
+$2d$ training milestones add four verification observations at a time.
 
 Automatic verification points use the current GP with at least `3.0`
 exploration weight and `2.0` novelty power so they improve error-observation
@@ -762,8 +762,8 @@ is used so queued-but-not-yet-simulated verification points are not generated
 again. The CLI prints the same decision, including the next scheduled training
 trigger, in a compact status line.
 
-The automatic policy applies only when the primary batch is a GP-UCB training
-batch. Set `--verification-policy off` to disable it, or use
+The automatic policy applies when the primary batch is a hybrid or GP-UCB
+training batch. Set `--verification-policy off` to disable it, or use
 `--verification-interval`, `--verification-batch`, and
 `--verification-max-add` to override the milestone spacing, growth amount, and
 per-command catch-up cap. A parameter-range extension remains a separate
@@ -1544,16 +1544,17 @@ trial.
 
 After the initial fit, use its geometry-level verification errors to select new
 EM points. Simulate the returned points before continuing to the refit stage.
-There are two fully supported error-directed selectors plus the separate range
-extension workflow:
+There are three supported adaptive selectors plus the separate range-extension
+workflow:
 
 | Update method | Acquisition option | Use it when |
 | --- | --- | --- |
-| Gaussian-process UCB | `--acquisition gp-ucb` | **Default.** Use it to balance predicted error, posterior uncertainty, and distance from existing points. |
+| Hybrid adaptive GP | `--acquisition hybrid` | **Default.** Divides every dimension-scaled batch among predicted-error exploitation, posterior-uncertainty reduction, and maximin coverage. |
+| Gaussian-process UCB | `--acquisition gp-ucb` | Compatibility method using a single upper-confidence score plus novelty. It now posterior-updates between batch selections. |
 | Non-GP error-distance | `--acquisition error-distance` | Use it for direct, local refinement around measured high-error verification points without fitting an error-surface model. |
 | One-sided range extension | `generate --extend-range` | A declared parameter bound must move outward and the new slab needs guaranteed coverage before error-directed refinement. |
 
-Quick links: [GP-UCB sizing table](#how-many-points-for-the-default-gp-ucb-workflow),
+Quick links: [hybrid sizing table](#how-many-points-for-the-default-hybrid-gp-workflow),
 [non-GP batch-size table](#non-gp-error-distance-batch-size-table), and
 [one-sided range extension](#extending-an-existing-parameter-range).
 
@@ -1564,7 +1565,7 @@ the rest of the simulation budget.
 
 ### Non-GP Error-Distance Additional Points
 
-The non-GP method is not removed or deprecated, but GP-UCB is now the default.
+The non-GP method is not removed or deprecated, but the hybrid GP is now the default.
 Select this alternative explicitly with `--acquisition error-distance`. It
 requires a completed fit with `verification_metrics.csv`, but it does not fit a
 Gaussian process and does not depend on a particular neural-network size.
@@ -1642,7 +1643,7 @@ new `verification_metrics.csv`. The command also writes
 JSON; pass that cumulative CSV as the single `--existing-points` input in the
 next round so no previous geometry can be selected again.
 
-### Using GP to Determine Additional Points
+### Using the Hybrid GP to Determine Additional Points
 
 This is the direct workflow for using the Gaussian-process selector to choose
 new EM geometries. It is separate from GP hyperparameter optimization: this
@@ -1653,9 +1654,9 @@ The GP workflow requires an existing DNN, KBNN, or Neuro-TF fit containing
 `verification_metrics.csv`; it cannot choose an informed first design before
 any verification errors exist.
 
-Use the [default GP-UCB sizing table](#how-many-points-for-the-default-gp-ucb-workflow)
-in Section 1 for both the lean initial training/verification split and the
-recommended number of new points per acquisition round.
+Use the [default hybrid sizing table](#how-many-points-for-the-default-hybrid-gp-workflow)
+in Section 1 for the initial training/acquisition-verification split. For later
+rounds, prefer `--count auto` with an explicit accuracy target.
 
 #### First GP Addition Round
 
@@ -1668,19 +1669,21 @@ Assume:
 - `outputs/dnn_adaptive/` is the optimize result containing `best_model/`; and
 - the fit's verification metrics use the same geometry parameters.
 
-Request eight additional training geometries with this complete command:
+Let the current accuracy and dimensionality determine the primary batch:
 
 ```bash
 python3 surrogate.py points suggest-additional \
-  --count 8 \
+  --count auto \
   --fit-dir outputs/dnn_adaptive \
   --existing-points geometries.csv \
-  --acquisition gp-ucb \
+  --acquisition hybrid \
   --candidate-method maximin-lhs \
   --candidate-count 1600 \
   --lhs-candidates 32 \
   --metric evm_pct \
-  --exploration-weight 2.0 \
+  --target-error 1.0 \
+  --exploration-weight auto \
+  --gp-ard auto \
   --gp-noise-variance 1e-6 \
   --novelty-power 1.0 \
   --min-distance 0.05 \
@@ -1702,16 +1705,18 @@ The important inputs are:
 | `--combined-out` | Optional combined cumulative geometry CSV path. It contains the deduplicated union of existing CSV/MDIF points and the new suggestions. Its name must not contain a training or verification role word. Default: `<out>_all_geometries.csv`. Its same-stem JSON, coverage PNG, and strict `_training.csv`/`_verification.csv` views are written automatically. |
 | `--parameter-json` | Explicit geometry metadata source when no original point CSV is supplied, such as an MDIF-only workflow. It is normally unnecessary. |
 | `--parameter` | Optional backward-compatible domain override. Repeat it for every parameter only when intentionally bypassing the generated JSON. |
-| `--count` | Number of new expensive geometries to return, not candidate-pool size. Start with roughly one or two points per dimension. |
+| `--count` | Primary training geometries to return, or `auto` for the dimension-, accuracy-, and progress-scaled recommendation. Automatic verification additions are extra. |
 | `--candidate-count` | Number of inexpensive candidate locations scored by the GP. Only the best `--count` locations are written for simulation. |
 | `--metric` | Per-row error column from `verification_metrics.csv`. Typical choices are `evm_pct`, `rmse_abs`, and `max_abs`; `auto` chooses an available metric. |
-| `--exploration-weight` | GP-UCB uncertainty weight. `2.0` is balanced; smaller values exploit known high-error regions and larger values explore uncertain regions. |
+| `--target-error` | Desired RMS geometry-level value of `--metric`; this gives `--count auto` an explicit definition of acceptable accuracy. |
+| `--previous-verification-metrics` | Repeat prior-round metrics paths in oldest-to-newest order so the recommendation can detect improvement, plateau, or regression. |
+| `--exploration-weight` | `auto` uses 2.5 while error observations are sparse, then reduces to 1.0 or 0.75 as the error model matures or plateaus. A numeric value overrides the schedule. |
 | `--novelty-power` and `--min-distance` | Encourage separation from simulated points and from other points selected in the same batch. Distances use normalized geometry coordinates. |
 
 The command writes a new-point simulation set, a cumulative history set, and
 the acquisition diagnostics:
 
-- `outputs/gp_round_1_points.csv`: the eight new geometries to simulate;
+- `outputs/gp_round_1_points.csv`: the recommended new geometries to simulate;
 - `outputs/gp_round_1_points.json`: parameter ranges and GP/acquisition
   metadata; and
 - `outputs/gp_round_1_all_geometries.csv`: all existing and newly
@@ -2042,11 +2047,19 @@ python3 surrogate.py points generate \
   --out geometries_{method}.csv
 ```
 
-### Gaussian-Process Adaptive Loop
+### Hybrid Gaussian-Process Adaptive Loop
 
-`suggest-additional` also provides a true Gaussian-process upper-confidence
-bound acquisition mode. It fits a Matérn-5/2 GP to the natural logarithm of the
-current geometry-level error and scores candidate point $\mathbf p$ using
+`suggest-additional` defaults to a long-term hybrid acquisition. It fits a
+Matérn-5/2 GP to the natural logarithm of the current geometry-level error,
+then divides each dimension-scaled batch among three jobs:
+
+- `exploitation` resolves areas with high GP-predicted fitting error;
+- `uncertainty` improves areas where the error GP does not yet know enough;
+- `coverage` protects against repeatedly sampling only the current error
+  hotspot.
+
+The explicit `gp-ucb` compatibility mode combines those motives into one
+score for candidate point $\mathbf p$:
 
 $$
 A(\mathbf p)=
@@ -2063,9 +2076,11 @@ likelihood unless `--gp-length-scale` is supplied.
 the exact target construction, covariance, posterior, batch acquisition,
 diagnostics, limitations, and references.
 
-The GP sizing table in Section 1 does not enforce an $8d$ or power-of-two initial-point
-minimum. Its six-parameter row starts with 32 points: 24 training and 8
-acquisition-verification points.
+The Section 1 sizing table retains the lean $\max(4d,12)$ training anchor and
+$\max(d+2,6)$ acquisition-verification seed. Its six-parameter row therefore
+starts with 32 points: 24 training and 8 acquisition-verification points. The
+verification inventory then grows automatically as training crosses the
+dimension-scaled milestones described in Section 1.
 
 ```bash
 python3 surrogate.py points generate \
@@ -2080,14 +2095,14 @@ python3 surrogate.py points generate \
 Both initial generation and adaptive candidate generation use `maximin-lhs` by
 default. `minimax-lhs` is accepted as an alias for the same standard maximin
 Latin-hypercube method. After simulating the initial points and fitting the
-chosen provisional network, request a small next batch:
+chosen provisional network, let current accuracy choose the next batch:
 
 ```bash
 python3 surrogate.py points suggest-additional \
-  --count 6 \
   --fit-dir outputs/dnn_compact \
   --existing-points adaptive_round_0.csv \
-  --acquisition gp-ucb \
+  --acquisition hybrid \
+  --target-error 1.0 \
   --target-dataset train \
   --out adaptive_round_1.csv
 ```
@@ -2113,12 +2128,21 @@ configuration. Persistent failure of only the compact network, while a larger
 reference succeeds at the same points, indicates capacity limitation rather
 than missing data.
 
-The suggested CSV records `predicted_error`, `gp_log_uncertainty`, and
-`gp_upper_confidence_error`. Its companion JSON records the fitted length
-scale, observation count, likelihood, noise variance, and exploration weight.
-GP-UCB is the default acquisition mode. Use
-`--acquisition error-distance` whenever a controlled comparison or direct local
-error-focused refinement is preferred.
+The suggested CSV records `selection_component`, `predicted_error`,
+`gp_log_uncertainty`, `distance_to_existing`, and
+`gp_upper_confidence_error`. A spread-out GP batch is normally selecting
+uncertainty or coverage; a tightly clustered error-distance batch is resolving
+the currently measured hotspots. For long campaigns, the hybrid output keeps
+both behaviors visible instead of allowing either one to consume the whole
+round. Use `--acquisition gp-ucb` for the former combined score or
+`--acquisition error-distance` for a controlled, fully local comparison.
+
+Under hybrid selection, compare `acquisition_score` only between rows with the
+same `selection_component`: exploitation, uncertainty, and coverage deliberately
+use different score definitions and their raw values are not cross-component
+ranks. The companion JSON records the fitted per-parameter length scales,
+observation count, likelihood, noise variance, component allocation, and
+accuracy-based point-count recommendation.
 
 ### Copyable Adaptive Point-Generation Examples
 
@@ -2342,7 +2366,7 @@ Before sending a suggested batch to EM simulation, inspect the generated
 outputs:
 
 - `<out>.csv` is ordered by `additional_sequence` and contains the selected
-  geometries, `predicted_error`, `gp_log_uncertainty`,
+  geometries, `selection_component`, `predicted_error`, `gp_log_uncertainty`,
   `gp_upper_confidence_error`, `distance_to_existing`, and the final
   `acquisition_score`.
 - The same-stem `*_verification_error_regions.csv`, or the explicit `--analysis-out`,
@@ -2352,10 +2376,25 @@ outputs:
   length scale, GP observation count, likelihood, noise variance, and
   acquisition settings needed to reproduce the batch.
 
-If the command warns that there are fewer distinct error observations than
-dimensions plus one, treat the batch as exploration-heavy. Simulate a small
-batch, refit, and rebuild the GP rather than requesting one large batch from a
-sparsely observed error surface.
+Interpret the hybrid rows as follows:
+
+| `selection_component` | What should stand out in that row | Why it was selected |
+| --- | --- | --- |
+| `exploitation` | High `predicted_error`; usually a relatively small `nearest_error_distance` and high nearby `fit_error_score` | Repair a measured or GP-predicted error region. |
+| `uncertainty` | High `gp_log_uncertainty`, even when `predicted_error` is only moderate | Learn where the sparse error GP does not yet know whether the RF fit is good. |
+| `coverage` | High `distance_to_existing`; error columns may be unremarkable | Prevent a targeted campaign from leaving large parameter-space holes. |
+| `verification-uncertainty` | `dataset=verification` with high uncertainty and separation | Expand the acquisition-error observation set; never put this row into training. |
+
+If `predicted_error` is nearly constant while `gp_log_uncertainty` and
+`distance_to_existing` drive every row, the GP is behaving mostly as a
+space-filling design. If every error-distance row sits near the same top
+`fit_error_score`, it is strongly exploiting one known hotspot and may miss
+another region. The hybrid method makes that tradeoff explicit instead of
+requiring either extreme.
+
+If the command warns that there are fewer than $\max(3d,12)$ distinct error
+observations, expect the allocation to reserve more uncertainty and coverage
+points. ARD activates automatically when that observation target is reached.
 
 For a one-sided range change, first create guaranteed coverage of only the new
 slab. This shared seed step extends the upper `W` bound from `0.80mm` to
@@ -2495,16 +2534,19 @@ unambiguous.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: non-GP <code>error-distance</code> or Matérn-5/2 <code>gp-ucb</code>. Default: <code>gp-ucb</code>. | <nobr><code>--acquisition error-distance</code></nobr> |
+| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: default <code>hybrid</code>, compatibility <code>gp-ucb</code>, or non-GP <code>error-distance</code>. Hybrid assigns explicit exploitation, uncertainty, and coverage roles. | <nobr><code>--acquisition hybrid</code></nobr> |
 | <nobr><code>--allow-nonpassive</code></nobr> | <code>suggest-additional</code> | Allows an all-passivity-ineligible optimize/sweep run's retained verification errors to drive point selection. This is an explicit acquisition-only opt-in and never makes the source model exportable. | <nobr><code>--fit-dir outputs/dnn_adaptive --allow-nonpassive</code></nobr> |
-| <nobr><code>--exploration-weight FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative GP-UCB multiplier $\kappa$ on posterior log-error uncertainty. Default: <code>2.0</code>. | <nobr><code>--exploration-weight 2.5</code></nobr> |
+| <nobr><code>--exploration-weight VALUE</code></nobr> | <code>suggest-additional</code> | Non-negative GP uncertainty multiplier or <code>auto</code>. Auto starts at <code>2.5</code> for sparse observations and reduces to <code>1.0</code> or <code>0.75</code> as the fit matures. Default: <code>auto</code>. | <nobr><code>--exploration-weight auto</code></nobr> |
+| <nobr><code>--gp-ard {auto,on,off}</code></nobr> | <code>suggest-additional</code> | Per-parameter length-scale fitting. Auto activates at <code>max(3*d,12)</code> error observations. Default: <code>auto</code>. | <nobr><code>--gp-ard auto</code></nobr> |
 | <nobr><code>--gp-error-floor FLOAT</code></nobr> | <code>suggest-additional</code> | Positive floor applied before taking the natural logarithm of geometry error. Default: <code>1e-12</code>. | <nobr><code>--gp-error-floor 1e-9</code></nobr> |
-| <nobr><code>--gp-length-scale FLOAT</code></nobr> | <code>suggest-additional</code> | Optional positive Matérn-5/2 length scale in normalized geometry coordinates. When omitted, it is selected by log marginal likelihood. | <nobr><code>--gp-length-scale 0.4</code></nobr> |
+| <nobr><code>--gp-length-scale VALUE</code></nobr> | <code>suggest-additional</code> | Optional fixed normalized Matérn-5/2 scale: one value for isotropic behavior or one comma-separated value per parameter. Omit it for likelihood/ARD selection. | <nobr><code>--gp-length-scale 0.3,0.6,0.4</code></nobr> |
 | <nobr><code>--gp-noise-variance FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative normalized covariance nugget for GP stability and noisy error observations. Default: <code>1e-6</code>. | <nobr><code>--gp-noise-variance 1e-5</code></nobr> |
-| <nobr><code>--verification-batch INT</code></nobr> | <code>suggest-additional</code> | Automatic acquisition-verification points per crossed training milestone. Default: <code>max(2, ceil(2*d/3))</code>. | <nobr><code>--verification-batch 4</code></nobr> |
+| <nobr><code>--previous-verification-metrics PATH</code></nobr> | <code>suggest-additional</code> | Repeat prior metrics files in oldest-to-newest order to include latest RMS improvement in automatic count and allocation decisions. | <nobr><code>--previous-verification-metrics round_2/verification_metrics.csv</code></nobr> |
+| <nobr><code>--target-error FLOAT</code></nobr> | <code>suggest-additional</code> | Positive desired RMS geometry-level value of the selected metric. Enables target-relative automatic sizing and a zero-point target-met result. | <nobr><code>--target-error 1.0</code></nobr> |
+| <nobr><code>--verification-batch INT</code></nobr> | <code>suggest-additional</code> | Automatic acquisition-verification points per crossed training milestone. Default: <code>max(2,ceil(2*d/3))</code>. | <nobr><code>--verification-batch 4</code></nobr> |
 | <nobr><code>--verification-interval INT</code></nobr> | <code>suggest-additional</code> | Positive training-point growth between automatic verification milestones. Default: <code>2*d</code>. | <nobr><code>--verification-interval 12</code></nobr> |
-| <nobr><code>--verification-max-add INT</code></nobr> | <code>suggest-additional</code> | Positive cap on automatic verification points added by one command, including catch-up. Default: <code>max(d+2, 6)</code>. | <nobr><code>--verification-max-add 8</code></nobr> |
-| <nobr><code>--verification-policy {auto,off}</code></nobr> | <code>suggest-additional</code> | Enables or disables milestone-based acquisition-verification growth for GP-UCB training batches. Default: <code>auto</code>. | <nobr><code>--verification-policy off</code></nobr> |
+| <nobr><code>--verification-max-add INT</code></nobr> | <code>suggest-additional</code> | Positive cap on automatic verification points added by one command, including catch-up. Default: <code>max(d+2,6)</code>. | <nobr><code>--verification-max-add 8</code></nobr> |
+| <nobr><code>--verification-policy {auto,off}</code></nobr> | <code>suggest-additional</code> | Enables dimension-scaled acquisition-verification growth for hybrid and GP-UCB training batches. Default: <code>auto</code>. | <nobr><code>--verification-policy off</code></nobr> |
 
 ### Output and Dataset Splits
 
@@ -2512,7 +2554,7 @@ unambiguous.
 | --- | --- | --- | --- |
 | <nobr><code>--analysis-out PATH</code></nobr> | <code>suggest-additional</code> | Ranked verification-error-region CSV. Because it contains verification information only, its basename must contain <code>verification</code>. Default: <code>&lt;out&gt;_verification_error_regions.csv</code>. | <nobr><code>--analysis-out verification_error_regions.csv</code></nobr> |
 | <nobr><code>--combined-out PATH</code></nobr> | <code>suggest-additional</code> | Deduplicated combined cumulative geometry CSV containing prior CSV/MDIF points and the new suggestions. Its basename cannot contain a training or verification role word. Same-stem JSON/coverage PNG and strict split CSV/PNGs are also written. Default: <code>&lt;out&gt;_all_geometries.csv</code>. | <nobr><code>--combined-out gp_round_1_all_geometries.csv</code></nobr> |
-| <nobr><code>--count INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Positive number of primary points. Required except for <code>generate --extend-range</code>, which calculates and uses a recommendation when omitted. For a GP-UCB training suggestion, automatically triggered verification points are additional to this count and are reported explicitly. | <nobr><code>--count 80</code></nobr> |
+| <nobr><code>--count VALUE</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Generate accepts a positive integer. Suggest accepts a positive integer or defaults to <code>auto</code>, which uses dimension, current/target RMS error, observation density, and optional prior progress. Automatically triggered verification points are additional. | <nobr><code>--count auto</code></nobr> |
 | <nobr><code>--decimal-places INT</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Rounds generated values and defines duplicate identity at this many decimal places in each declared unit. Generation refills rounded collisions; acquisition excludes occupied/collapsed candidates. Accepts <code>0</code> through <code>15</code>; omitted values retain the existing full-precision behavior. | <nobr><code>--decimal-places 3</code></nobr> |
 | <nobr><code>--existing-points PATH</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | With <code>generate --extend-range</code>, the original CSV retained at the start of the combined output. With <code>suggest-additional</code>, a CSV of simulated points to avoid; its same-stem geometry JSON supplies the parameter domain automatically. After the first acquisition, use the latest <code>*_all_geometries.csv</code> combined cumulative output. The option remains repeatable for compatibility and multiple independent sources. | <nobr><code>--existing-points gp_round_1_all_geometries.csv</code></nobr> |
 | <nobr><code>--include-normalized</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Adds each parameter's normalized <code>u_NAME</code> coordinate to the output. | <nobr><code>--include-normalized</code></nobr> |
@@ -2556,6 +2598,24 @@ For each adaptive round:
    plots with the preceding round.
 5. Request another small point batch only while held-out performance continues
    to improve meaningfully.
+
+For automatic sizing, preserve the earlier metrics paths and pass them in
+oldest-to-newest order. The current file still comes from `--fit-dir`:
+
+```bash
+python3 surrogate.py --options-json options.json points suggest-additional \
+  --count auto \
+  --target-error 1.0 \
+  --previous-verification-metrics outputs/round_1/verification_metrics.csv \
+  --previous-verification-metrics outputs/round_2/verification_metrics.csv \
+  --fit-dir outputs/round_3 \
+  --existing-points outputs/round_2_all_geometries.csv \
+  --out outputs/round_3_points.csv
+```
+
+The console prints current RMS, p90, maximum error, current/target ratio,
+latest improvement, recommendation stage, and resolved count. The same data is
+saved under `point_count_recommendation` in both generated geometry JSON files.
 
 Each round writes `<out>_all_geometries.csv` with a same-stem JSON. This
 cumulative pair carries the union of prior and new geometries plus the parameter
@@ -6590,10 +6650,13 @@ One adaptive round follows this sequence:
 4. Normalize every geometry variable to the unit hypercube.
 5. Fit the GP to the logarithm of geometry error.
 6. Generate a finite maximin-LHS candidate pool.
-7. Score candidates using an upper confidence bound and a diversity factor.
-8. Select a batch, write its physical parameter values to CSV, and simulate
+7. Recommend a primary batch size from dimension, current error, target error,
+   observation density, and optional prior-round improvement.
+8. Allocate the default hybrid batch among exploitation, uncertainty, and
+   coverage; posterior-condition on each provisional selection.
+9. Write its physical parameter values to CSV and simulate
    that batch externally.
-9. Append the resulting MDIF blocks, refit the RF surrogate, and repeat.
+10. Append the resulting MDIF blocks, refit the RF surrogate, and repeat.
 
 The GP is rebuilt on every invocation. It is not serialized as part of the DNN,
 KBNN, Neuro-TF, Verilog-A, ADS ANN, or ADS HB model.
@@ -6665,13 +6728,14 @@ one-standard-deviation interval in the original error domain.
 
 ### C.4 Matérn-5/2 covariance and fitting
 
-The implementation uses one isotropic length scale $\ell$ for all normalized
-geometry dimensions. Define
+The initial likelihood search uses one isotropic length scale. When
+`--gp-ard auto` has at least $\max(3d,12)$ distinct error observations, it refines one
+length scale $\ell_j$ per normalized geometry dimension. Define
 
 $$
 r(\mathbf u,\mathbf u')=
 \sqrt{\sum_{j=1}^{d}
-\left(\frac{u_j-u'_j}{\ell}\right)^2}.
+\left(\frac{u_j-u'_j}{\ell_j}\right)^2}.
 $$
 
 The unit-amplitude Matérn-5/2 covariance is
@@ -6693,14 +6757,14 @@ nugget for noisy error observations and numerical stability. The system is
 factored using a dense Cholesky decomposition; progressively larger diagonal
 jitter is added only if needed to stabilize that factorization.
 
-When `--gp-length-scale` is omitted, the code tests
+When `--gp-length-scale` is omitted, the code first tests
 
 $$
 \ell\in
 \{0.08,0.12,0.18,0.27,0.40,0.60,0.90,1.35\}
 $$
 
-and chooses the value with the largest log marginal likelihood
+and chooses the isotropic value with the largest log marginal likelihood
 
 $$
 \log p(\mathbf z\mid\ell)=
@@ -6709,9 +6773,14 @@ $$
 -\frac{n}{2}\log(2\pi),
 $$
 
-where $K=LL^{\mathsf T}$. This is a small deterministic grid search, not a
-continuous optimizer and not automatic relevance determination. Supplying
-`--gp-length-scale` bypasses this search.
+where $K=LL^{\mathsf T}$. ARD then performs a coordinate-wise likelihood search
+over that scale family plus local $0.5\ell$, $1.5\ell$, and $2\ell$ candidates
+clipped to $[0.05,2]$, with a weak log-scale shrinkage penalty toward the
+isotropic solution. This avoids an exponential Cartesian search and limits
+sparse-data overfitting. `--gp-ard on` forces refinement, while `off` retains
+the isotropic result. Supplying one `--gp-length-scale` value fixes an
+isotropic kernel; supplying a comma-separated value for every parameter fixes
+an explicit anisotropic kernel.
 
 ### C.5 Posterior prediction
 
@@ -6769,22 +6838,61 @@ D(\mathbf u)=
 \right).
 $$
 
-The implemented acquisition score is
+The explicit `gp-ucb` compatibility method uses
 
 $$
 A(\mathbf u)=U(\mathbf u)D(\mathbf u)^{\nu},
 $$
 
 where $\nu$ is `--novelty-power`. Candidates closer than `--min-distance` to
-any occupied point are rejected before scoring. After selecting the best
-candidate, that point is added to $\mathcal O$ and all remaining candidates
-are rescored. This sequential diversity penalty keeps one batch from
-collapsing around a single peak.
+any occupied point are rejected before scoring.
 
-The GP posterior itself is not fantasy-updated after each point in the batch;
-only the diversity term changes. Consequently, this is a practical batch
-GP-UCB-inspired acquisition rule, not an implementation of a joint batch
-Bayesian-optimization proof or its convergence guarantees.
+After every GP or hybrid selection, the point is provisionally conditioned at
+its current posterior mean (the Kriging-believer rule). The posterior mean is
+therefore preserved while posterior variance around the selected point falls,
+and remaining candidates are rescored. This avoids selecting a large batch of
+points that all address the same uncertainty peak.
+
+The default hybrid method does not collapse error, uncertainty, and coverage
+into one product. It assigns exact component counts that scale with $d$, error
+observation density, target ratio, and latest progress. Its normal allocation
+is 50% exploitation, 25% uncertainty, and 25% coverage. Sparse observations
+use 35/35/30, far-from-target mature fits use 60/20/20, near-target fits use
+45/25/30, and plateaus use 40/25/35. Integer rounding preserves the requested
+total and gives every component at least one point when the batch has at least
+three rows.
+
+Exploitation candidates maximize predicted error with a weak diversity term.
+Uncertainty rows maximize posterior log-error standard deviation with
+diversity. Coverage rows maximize distance from the occupied set. The CSV's
+`selection_component` column exposes which rule selected each row. This is a
+practical robust batch strategy rather than a joint Bayesian-optimization
+convergence guarantee.
+
+#### Accuracy-based point-count recommendation
+
+For `--count auto`, let $e_{\mathrm{rms}}$ be the RMS of the current
+geometry-level errors and $e_t$ be `--target-error`. The target ratio is
+$\rho=e_{\mathrm{rms}}/e_t$. Before sparse-data and progress adjustments, the
+primary recommendation is
+
+$$
+n_{\mathrm{add}}=
+\begin{cases}
+0, & \rho\le 1,\\
+\max(\lceil1.5d\rceil,d,4), & 1<\rho<2,\\
+\max(2d,4), & 2\le\rho<4,\\
+\max(3d,4), & \rho\ge4.
+\end{cases}
+$$
+
+Without a target, the baseline is $2d$. Fewer than $\max(4d,12)$ training
+points or $\max(3d,12)$ error observations keeps the recommendation at least
+$2d$. A latest improvement below 5% caps it at $2d$ and records `plateau`; a
+regression uses a diagnostic batch of $\max(d,4)$. At least 20% improvement
+caps the next batch at $2d$ so another fit can measure the benefit before a
+larger expenditure. Explicit `--count` always overrides the recommendation,
+but the recommendation and its rationale are still printed and saved.
 
 ### C.7 Candidate generation
 
@@ -6844,7 +6952,8 @@ The suggested-point CSV contains:
 
 | Column | Meaning |
 | --- | --- |
-| `acquisition_score` | Final GP upper-confidence error multiplied by the diversity penalty. |
+| `acquisition_score` | Score used by that row's `selection_component`. Compare it only within the same component; hybrid component scores use different units. In `gp-ucb` mode it is upper-confidence error multiplied by the diversity penalty. |
+| `selection_component` | Hybrid role: `exploitation`, `uncertainty`, `coverage`, or an automatically added `verification-uncertainty` row. Legacy modes report their acquisition name. |
 | `distance_to_existing` | Raw Euclidean distance to the nearest occupied normalized point at selection time. |
 | `fit_error_score` | Error at the nearest observed verification geometry; this is contextual and is not the GP prediction. |
 | `gp_log_uncertainty` | Posterior standard deviation in natural-log-error space. |
@@ -6853,8 +6962,10 @@ The suggested-point CSV contains:
 
 The companion JSON records the kernel, target transform, observation count,
 chosen length scale, selection mode, nugget, exploration weight, and log
-marginal likelihood. The companion `*_verification_error_regions.csv` ranks the source
-error geometries used by both acquisition modes.
+marginal likelihood, per-parameter ARD scales, hybrid allocation, posterior
+batch-update rule, and point-count recommendation. The companion
+`*_verification_error_regions.csv` ranks the source error geometries used by
+all acquisition modes.
 
 When passivity criteria reject every completed optimize trial, the sweep
 retains one acquisition source at
@@ -6889,20 +7000,21 @@ final audit set that never enters GP acquisition.
 
 - The auxiliary GP models one scalar aggregate error, not individual
   S-parameter errors or the underlying complex response.
-- One isotropic length scale assumes comparable smoothness across normalized
-  dimensions. Strongly anisotropic problems may need more observations or a
-  future per-dimension length-scale implementation.
+- ARD requires enough error observations to distinguish parameter
+  sensitivities. Before $\max(3d,12)$ observations, `auto` deliberately retains
+  an isotropic scale rather than overfitting six or more independent scales.
 - GP quality depends on the provisional RF surrogate. A persistent error caused
   by insufficient neural capacity may attract additional EM points without
   resolving the architecture limitation.
 - Sparse initial observations can make uncertainty dominate. The command warns
-  when there are fewer distinct error observations than $d+1$.
+  below $\max(3d,12)$ and shifts the hybrid allocation toward uncertainty and
+  coverage.
 - Dense GP fitting costs $O(n^3)$ in the number of observed error geometries,
   and posterior evaluation uses dense triangular solves for every candidate.
   The implementation is intended for expensive-EM campaigns with modest
   geometry counts, not millions of observations.
 - The method does not automatically run ADS/EM simulation, merge MDIF blocks,
-  retrain a surrogate, or decide convergence. Those remain explicit steps so
+  or retrain a surrogate. Those remain explicit steps so
   each new expensive simulation batch can be inspected.
 
 ### C.11 References and normative source map
@@ -6954,7 +7066,7 @@ examples, although hyphenated keys are accepted too.
 | `options init` | Write a ready-to-edit reusable options JSON. `options generate` is an alias; add `--overwrite` to replace an existing file. | `python3 surrogate.py options init --out options.json` |
 | `options discover` | Recursively recover a new options JSON from existing options, geometry, audit, model, optimize, report, log, and saved-command artifacts; also write a provenance report. | `python3 surrogate.py options discover existing_project --out options.json` |
 | `points generate` | Create an initial design, append a one-sided range extension, and write CSV/JSON/PNG coverage artifacts. | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 24 --out geometries.csv` |
-| `points suggest-additional` | Use saved verification metrics and existing geometry metadata to select another legacy or GP-UCB batch. | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --count 8 --out additions.csv` |
+| `points suggest-additional` | Use saved verification metrics and existing geometry metadata to select a recommended hybrid batch or an explicit legacy/GP-UCB alternative. | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --target-error 1.0 --out additions.csv` |
 | `audit` | Check raw MDIF passivity, reciprocity, coverage, grids, duplicates, and train/verification consistency. | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | `--model MODEL inspect-mdif` | Summarize blocks, S-parameter labels, inferred variables, split values, and frequency span. | `python3 surrogate.py --model dnn inspect-mdif --mdif train_verify.mdif` |
 | `--model MODEL train` | Fit one DNN, KBNN, or Neuro-TF configuration and write its model and verification report. | `python3 surrogate.py --model dnn train --mdif train_verify.mdif --out-dir dnn_model` |
@@ -7047,7 +7159,7 @@ Options are alphabetized. The **generate** and **suggest** labels below mean
 | Option | Applies to | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- | --- |
 | `--bare-values MODE` | Generate, suggest | Interprets unitless values read from existing CSV, MDIF, or metrics. Generate accepts `parameter-units` and `base-units` and defaults to parameter units. Suggest additionally accepts and defaults to `auto`, selecting parameter or SI base units independently for the metrics file and each geometry/MDIF source according to the saved geometry domain. | `--bare-values auto`  | `workflows.points.commands.{generate,suggest-additional}.bare_values` |
-| `--count INT` | Generate, suggest | Number of primary new points. Required for suggestions and ordinary generation; a range extension can infer a density-based recommendation when omitted. GP-UCB may append separately reported automatic verification points beyond this primary count. | `--count 12`  | `workflows.points.commands.{generate,suggest-additional}.count` |
+| `--count VALUE` | Generate, suggest | Generate accepts an integer. Suggest accepts an integer or defaults to `auto`, using dimension, current/target RMS error, observation density, and optional prior progress. Hybrid/GP methods may append separately reported automatic verification points. | `--count auto`  | `workflows.points.commands.{generate,suggest-additional}.count` |
 | `--decimal-places INT` | Generate, suggest | Rounds values and defines duplicate identity in each declared unit; generation refills rounded collisions and acquisition excludes occupied/collapsed candidates. Allowed range is 0 through 15. | `--decimal-places 4`  | `workflows.points.commands.{generate,suggest-additional}.decimal_places` |
 | `--existing-points PATH` | Generate | Original CSV retained and appended when `--extend-range` is used. | `--existing-points geometries.csv`  | `workflows.points.commands.generate.existing_points` |
 | `--extend-range NAME=LOW:HIGH` | Generate | Extends exactly one existing parameter on one side and samples only the added slab. Requires `--existing-points`. | `--extend-range W=0.4mm:1.0mm`  | `workflows.points.commands.generate.extend_range` |
@@ -7071,7 +7183,7 @@ options in D.5 also apply where marked.
 
 | Option | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- |
-| `--acquisition {gp-ucb,error-distance}` | Selection method. Default: `gp-ucb`; `error-distance` is the legacy non-GP selector. | `--acquisition gp-ucb`  | `workflows.points.commands.suggest-additional.acquisition` |
+| `--acquisition {hybrid,gp-ucb,error-distance}` | Selection method. Default `hybrid` explicitly allocates exploitation, uncertainty, and coverage rows; `gp-ucb` is the one-score compatibility method; `error-distance` is non-GP. | `--acquisition hybrid`  | `workflows.points.commands.suggest-additional.acquisition` |
 | `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive`  | `workflows.points.commands.suggest-additional.allow_nonpassive` |
 | `--analysis-out PATH` | Ranked verification-error-region CSV. Its basename must contain `verification`. Default: `<out>_verification_error_regions.csv`. | `--analysis-out additions_verification_regions.csv`  | `workflows.points.commands.suggest-additional.analysis_out` |
 | `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, planned total * candidate-factor)`, where planned total includes triggered automatic verification points. | `--candidate-count 4000`  | `workflows.points.commands.suggest-additional.candidate_count` |
@@ -7080,35 +7192,39 @@ options in D.5 also apply where marked.
 | `--combined-out PATH` | Combined cumulative existing-plus-new geometry CSV for the next GP round. Its basename cannot contain a training or verification role word; same-stem JSON/coverage PNG and strict split views are also written. Default: `<out>_all_geometries.csv`. | `--combined-out additions_all_geometries.csv`  | `workflows.points.commands.suggest-additional.combined_out` |
 | `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. | `--existing-mdif train_verify.mdif`  | `workflows.points.commands.suggest-additional.existing_mdif` |
 | `--existing-points PATH` | CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. In later rounds, use the latest combined cumulative `*_all_geometries.csv`; repeat only for independent sources. | `--existing-points gp_round_1_all_geometries.csv`  | `workflows.points.commands.suggest-additional.existing_points` |
-| `--exploration-weight FLOAT` | GP-UCB uncertainty multiplier; larger values explore more. Default: `2.0`. | `--exploration-weight 2.5`  | `workflows.points.commands.suggest-additional.exploration_weight` |
+| `--exploration-weight VALUE` | GP uncertainty multiplier or `auto`. Auto uses `2.5` for sparse observations and reduces to `1.0`/`0.75` as the error model matures. Default: `auto`. | `--exploration-weight auto`  | `workflows.points.commands.suggest-additional.exploration_weight` |
 | `--fit-dir PATH` | Fit/model directory or optimize/sweep root. A sweep root resolves `best_model/verification_metrics.csv`, or `point_generation_fallback/verification_metrics.csv` with `--allow-nonpassive`. | `--fit-dir dnn_opt`  | `workflows.points.commands.suggest-additional.fit_dir` |
 | `--focus-power FLOAT` | Exponent on measured verification-error scores for legacy error-distance selection. Default: `1.0`. | `--focus-power 1.5`  | `workflows.points.commands.suggest-additional.focus_power` |
 | `--focus-radius FLOAT` | Normalized radius around high-error verification points for legacy selection. Default: `0.25`. | `--focus-radius 0.2`  | `workflows.points.commands.suggest-additional.focus_radius` |
+| `--gp-ard {auto,on,off}` | Per-parameter GP length-scale refinement. Auto activates at `max(3*d,12)` distinct error observations. | `--gp-ard auto` | `workflows.points.commands.suggest-additional.gp_ard` |
 | `--gp-error-floor FLOAT` | Positive floor before the GP log-error transform. Default: `1e-12`. | `--gp-error-floor 1e-10`  | `workflows.points.commands.suggest-additional.gp_error_floor` |
-| `--gp-length-scale FLOAT` | Fixed normalized Matérn-5/2 length scale. If omitted, log marginal likelihood selects it. | `--gp-length-scale 0.3`  | `workflows.points.commands.suggest-additional.gp_length_scale` |
+| `--gp-length-scale VALUE` | One fixed isotropic scale or a comma-separated value per parameter. Omit for isotropic likelihood followed by optional ARD. | `--gp-length-scale 0.3,0.6,0.4`  | `workflows.points.commands.suggest-additional.gp_length_scale` |
 | `--gp-noise-variance FLOAT` | Non-negative normalized covariance nugget. Default: `1e-6`. | `--gp-noise-variance 1e-5`  | `workflows.points.commands.suggest-additional.gp_noise_variance` |
 | `--metric NAME` | Per-geometry row column from `verification_metrics.csv`; use `auto` for a known available metric. Default: `evm_pct`. Summary-only fields such as `weighted_evm_pct` are not valid here. | `--metric evm_pct`  | `workflows.points.commands.suggest-additional.metric` |
 | `--min-distance FLOAT` | Rejects candidates closer than this normalized distance to occupied or newly selected points. Default: `0`. | `--min-distance 0.08`  | `workflows.points.commands.suggest-additional.min_distance` |
 | `--novelty-power FLOAT` | Exponent on candidate distance/diversity. Default: `1.0`. | `--novelty-power 2`  | `workflows.points.commands.suggest-additional.novelty_power` |
 | `--out PATH` | New-points-only simulation CSV; a same-stem JSON and PNG are also written, in addition to the cumulative output. Default: `targeted_additional_points.csv`. | `--out additions.csv`  | `workflows.points.commands.suggest-additional.out` |
 | `--parameter-json PATH` | Explicit geometry metadata JSON. Normally inferred beside `--existing-points`. | `--parameter-json geometries.json`  | `workflows.points.commands.suggest-additional.parameter_json` |
+| `--previous-verification-metrics PATH` | Repeat prior metrics in oldest-to-newest order so automatic sizing can detect improvement, plateau, or regression. | `--previous-verification-metrics round_2/verification_metrics.csv` | `workflows.points.commands.suggest-additional.previous_verification_metrics` |
 | `--target-dataset {train,verification}` | Canonical dataset written on primary suggested points. Default: `train`; automatic verification additions remain `verification`. Legacy acquisition labels are migrated to `train`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
-| `--verification-batch INT` | Automatic acquisition-verification points per crossed training milestone. Default: `max(2, ceil(2*d/3))`. | `--verification-batch 4`  | `workflows.points.commands.suggest-additional.verification_batch` |
+| `--target-error FLOAT` | Desired RMS geometry-level value of the selected metric; drives target-relative automatic sizing. | `--target-error 1.0` | `workflows.points.commands.suggest-additional.target_error` |
+| `--verification-batch INT` | Automatic acquisition-verification points per crossed training milestone. Default: `max(2,ceil(2*d/3))`. | `--verification-batch 4`  | `workflows.points.commands.suggest-additional.verification_batch` |
 | `--verification-interval INT` | Positive training growth between automatic verification milestones. Default: `2*d`. | `--verification-interval 12`  | `workflows.points.commands.suggest-additional.verification_interval` |
-| `--verification-max-add INT` | Per-command cap on automatic verification catch-up. Default: `max(d+2, 6)`. | `--verification-max-add 8`  | `workflows.points.commands.suggest-additional.verification_max_add` |
+| `--verification-max-add INT` | Per-command cap on automatic verification catch-up. Default: `max(d+2,6)`. | `--verification-max-add 8`  | `workflows.points.commands.suggest-additional.verification_max_add` |
 | `--verification-metrics PATH` | Direct metrics CSV path; overrides `--fit-dir`. | `--verification-metrics dnn_model/verification_metrics.csv`  | `workflows.points.commands.suggest-additional.verification_metrics` |
-| `--verification-policy {auto,off}` | Enables or disables milestone-based verification growth for GP-UCB training batches. Default: `auto`. | `--verification-policy off`  | `workflows.points.commands.suggest-additional.verification_policy` |
+| `--verification-policy {auto,off}` | Enables dimension-scaled verification growth for hybrid/GP-UCB training batches. Default: `auto`. | `--verification-policy off`  | `workflows.points.commands.suggest-additional.verification_policy` |
 
-Complete GP-UCB example without re-entering parameter ranges:
+Complete default hybrid example without re-entering parameter ranges:
 
 ```bash
 python3 surrogate.py points suggest-additional \
   --fit-dir dnn_opt/best_model \
   --existing-points geometries.csv \
   --existing-mdif train_verify.mdif \
-  --count 10 \
-  --acquisition gp-ucb \
-  --exploration-weight 2 \
+  --count auto \
+  --target-error 1.0 \
+  --acquisition hybrid \
+  --exploration-weight auto \
   --min-distance 0.08 \
   --out additions.csv
 ```

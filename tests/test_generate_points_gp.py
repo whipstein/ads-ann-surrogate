@@ -46,10 +46,10 @@ class GaussianAdaptivePointTests(unittest.TestCase):
         self.assertEqual(combined_keys, training_keys | verification_keys)
         self.assertEqual(len(combined_keys), len(combined_rows))
 
-    def test_gp_ucb_is_the_default_acquisition(self) -> None:
+    def test_hybrid_is_the_default_acquisition(self) -> None:
         parser = POINTS.build_suggest_parser()
         args = parser.parse_args(["--count", "2"])
-        self.assertEqual(args.acquisition, "gp-ucb")
+        self.assertEqual(args.acquisition, "hybrid")
         self.assertEqual(args.verification_policy, "auto")
         self.assertEqual(args.target_dataset, "train")
 
@@ -1219,6 +1219,247 @@ class GaussianAdaptivePointTests(unittest.TestCase):
         )
         self.assertEqual(len({tuple(item.unit_point) for item in suggestions}), 4)
 
+    def test_point_recommendation_scales_with_dimension_accuracy_and_progress(self) -> None:
+        regions = [
+            POINTS.ErrorRegion(
+                source_index=str(index),
+                unit_point=[(index + dimension) % 11 / 10.0 for dimension in range(6)],
+                score=4.0,
+                worst_sparam="S21",
+                worst_sparam_score=4.0,
+                row_count=1,
+            )
+            for index in range(18)
+        ]
+        far = POINTS.recommend_additional_point_count(
+            dimensions=6,
+            regions=regions,
+            existing_training_count=56,
+            target_error=1.0,
+        )
+        plateau = POINTS.recommend_additional_point_count(
+            dimensions=6,
+            regions=regions,
+            existing_training_count=56,
+            target_error=1.0,
+            previous_error_rms=[4.1],
+        )
+        met_regions = [
+            POINTS.ErrorRegion(
+                source_index="1",
+                unit_point=[0.5] * 6,
+                score=0.5,
+                worst_sparam="S21",
+                worst_sparam_score=0.5,
+                row_count=1,
+            )
+        ]
+        met = POINTS.recommend_additional_point_count(
+            dimensions=6,
+            regions=met_regions,
+            existing_training_count=80,
+            target_error=1.0,
+        )
+
+        self.assertEqual(far.recommended_count, 18)
+        self.assertEqual(far.stage, "far-from-target")
+        self.assertEqual(plateau.recommended_count, 12)
+        self.assertEqual(plateau.stage, "plateau")
+        self.assertEqual(met.recommended_count, 0)
+        self.assertEqual(met.stage, "target-met")
+
+        for dimensions, expected_near, expected_above, expected_far in (
+            (2, 4, 4, 6),
+            (3, 5, 6, 9),
+            (4, 6, 8, 12),
+            (6, 9, 12, 18),
+            (8, 12, 16, 24),
+        ):
+            with self.subTest(dimensions=dimensions):
+                observation_count = max(3 * dimensions, 12)
+                inventory = [
+                    POINTS.ErrorRegion(
+                        source_index=str(index),
+                        unit_point=[
+                            ((index * (axis + 1)) % observation_count + 0.5)
+                            / observation_count
+                            for axis in range(dimensions)
+                        ],
+                        score=1.5,
+                        worst_sparam="S21",
+                        worst_sparam_score=1.5,
+                        row_count=1,
+                    )
+                    for index in range(observation_count)
+                ]
+                counts = []
+                for score in (1.5, 2.5, 4.5):
+                    scaled = [
+                        POINTS.ErrorRegion(
+                            source_index=region.source_index,
+                            unit_point=region.unit_point,
+                            score=score,
+                            worst_sparam=region.worst_sparam,
+                            worst_sparam_score=score,
+                            row_count=1,
+                        )
+                        for region in inventory
+                    ]
+                    counts.append(
+                        POINTS.recommend_additional_point_count(
+                            dimensions=dimensions,
+                            regions=scaled,
+                            existing_training_count=max(4 * dimensions, 12),
+                            target_error=1.0,
+                        ).recommended_count
+                    )
+                self.assertEqual(
+                    counts,
+                    [expected_near, expected_above, expected_far],
+                )
+
+    def test_hybrid_allocation_and_selection_cover_all_three_roles(self) -> None:
+        regions = [
+            POINTS.ErrorRegion(
+                source_index=str(index),
+                unit_point=[x, y],
+                score=0.2 + 2.0 * x,
+                worst_sparam="S21",
+                worst_sparam_score=0.2 + 2.0 * x,
+                row_count=1,
+            )
+            for index, (x, y) in enumerate(
+                ((0.05, 0.1), (0.2, 0.8), (0.45, 0.35), (0.75, 0.7), (0.95, 0.2)),
+                start=1,
+            )
+        ]
+        allocation = POINTS.hybrid_component_allocation(
+            6,
+            dimensions=2,
+            observation_count=len(regions),
+            target_ratio=3.0,
+            latest_improvement_fraction=None,
+        )
+        candidates = POINTS.maximin_lhs_points(
+            count=80,
+            dimensions=2,
+            rng=__import__("random").Random(23),
+            candidates=6,
+        )
+        suggestions, model, diagnostics = POINTS.select_hybrid_points(
+            candidates,
+            regions,
+            [region.unit_point for region in regions],
+            count=6,
+            allocation=allocation,
+            exploration_weight=2.0,
+            novelty_power=1.0,
+            min_distance=0.01,
+            length_scale=None,
+            noise_variance=1e-6,
+            error_floor=1e-12,
+        )
+
+        self.assertEqual(len(suggestions), 6)
+        self.assertEqual(
+            {item.selection_component for item in suggestions},
+            {"exploitation", "uncertainty", "coverage"},
+        )
+        self.assertEqual(sum(diagnostics["selected_components"].values()), 6)
+        self.assertEqual(
+            diagnostics["batch_posterior_update"],
+            "kriging-believer-posterior-mean",
+        )
+        self.assertEqual(len(model.length_scales), 2)
+
+    def test_ard_uses_one_length_scale_per_dimension_when_observations_allow(self) -> None:
+        regions = [
+            POINTS.ErrorRegion(
+                source_index=str(index),
+                unit_point=[
+                    (index + 0.5) / 18.0,
+                    ((index * 5) % 18 + 0.5) / 18.0,
+                    ((index * 11) % 18 + 0.5) / 18.0,
+                ],
+                score=0.2 + 3.0 * ((index + 0.5) / 18.0) ** 2,
+                worst_sparam="S21",
+                worst_sparam_score=1.0,
+                row_count=1,
+            )
+            for index in range(18)
+        ]
+        model = POINTS.fit_error_gaussian_process(
+            regions,
+            length_scale=None,
+            noise_variance=1e-6,
+            error_floor=1e-12,
+            ard_mode="auto",
+        )
+        self.assertEqual(len(model.length_scales), 3)
+        self.assertEqual(model.length_scale_selection, "ard-coordinate-likelihood")
+        self.assertTrue(all(value > 0.0 for value in model.length_scales))
+
+    def test_auto_count_and_hybrid_metadata_are_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metrics = root / "verification_metrics.csv"
+            output = root / "hybrid.csv"
+            parameter_names = [f"p{index}" for index in range(1, 4)]
+            with metrics.open("w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["source_index", "sparam", "evm_pct", *parameter_names],
+                )
+                writer.writeheader()
+                for index in range(12):
+                    writer.writerow(
+                        {
+                            "source_index": index + 1,
+                            "sparam": "S21",
+                            "evm_pct": 4.0 + index / 10.0,
+                            **{
+                                name: ((index + dim * 3) % 12 + 0.5) / 12.0
+                                for dim, name in enumerate(parameter_names)
+                            },
+                        }
+                    )
+            arguments = ["suggest-additional"]
+            for name in parameter_names:
+                arguments.extend(["--parameter", f"{name}=0:1"])
+            arguments.extend(
+                [
+                    "--count",
+                    "auto",
+                    "--target-error",
+                    "1.0",
+                    "--verification-metrics",
+                    str(metrics),
+                    "--candidate-count",
+                    "96",
+                    "--lhs-candidates",
+                    "4",
+                    "--out",
+                    str(output),
+                ]
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(POINTS.main(arguments), 0)
+            with output.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            metadata = json.loads(output.with_suffix(".json").read_text())
+
+        self.assertEqual(len(rows), 9)
+        self.assertEqual(
+            {row["selection_component"] for row in rows},
+            {"exploitation", "uncertainty", "coverage"},
+        )
+        recommendation = metadata["point_count_recommendation"]
+        self.assertEqual(recommendation["count_mode"], "auto")
+        self.assertEqual(recommendation["recommended_primary_count"], 9)
+        self.assertEqual(recommendation["resolved_primary_count"], 9)
+        self.assertEqual(metadata["acquisition_method"], "hybrid")
+        self.assertIn("allocation", metadata["hybrid"])
+
     def test_gp_cli_uses_maximin_lhs_and_writes_auditable_columns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1258,6 +1499,8 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                     "96",
                     "--lhs-candidates",
                     "6",
+                    "--acquisition",
+                    "gp-ucb",
                     "--include-normalized",
                     "--out",
                     str(output),
