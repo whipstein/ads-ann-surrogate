@@ -209,7 +209,10 @@ def starter_options_payload() -> dict[str, object]:
                         "template_mdif": None,
                     },
                     "export-veriloga": {"model_dir": None, "out_dir": None},
-                    "optimize": {"out_dir": None},
+                    "optimize": {
+                        "optimize_parameter": None,
+                        "out_dir": None,
+                    },
                     "predict": {"model_dir": None, "out_mdif": None},
                     "rerank-sweep": {"sweep_dir": None},
                     "train": {"out_dir": None},
@@ -235,7 +238,10 @@ def starter_options_payload() -> dict[str, object]:
                         "template_mdif": None,
                     },
                     "export-veriloga": {"model_dir": None, "out_dir": None},
-                    "optimize": {"out_dir": None},
+                    "optimize": {
+                        "optimize_parameter": None,
+                        "out_dir": None,
+                    },
                     "predict": {"model_dir": None, "out_mdif": None},
                     "rerank-sweep": {"sweep_dir": None},
                     "train": {"out_dir": None},
@@ -253,7 +259,10 @@ def starter_options_payload() -> dict[str, object]:
                         "template_mdif": None,
                     },
                     "export-veriloga": {"model_dir": None, "out_dir": None},
-                    "optimize": {"out_dir": None},
+                    "optimize": {
+                        "optimize_parameter": None,
+                        "out_dir": None,
+                    },
                     "predict": {"model_dir": None, "out_mdif": None},
                     "train": {"out_dir": None},
                 }

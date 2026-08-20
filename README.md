@@ -1420,7 +1420,104 @@ A new model's saved DC network is self-contained, so its report does not add
 an explicit path selection, commands also include `--dc-port-paths`. These
 values are easy to edit before export.
 
-#### Distinct DC Point
+### Model Fitting Troubleshooting
+
+Use `training_history.csv` and `training_history.pdf` to distinguish optimizer
+instability from overfitting or a data problem. The RF trainer records
+`epoch`, `train_loss`, and `val_loss`; `dc_training_history.csv` is a separate
+geometry-only DC fit and should be diagnosed independently. KBNN also retains
+the fitted coarse model's history under `coarse_model/`, so first identify
+whether the coarse network or the final fine network is unstable.
+
+The shared neural engine uses Adam with a fixed learning rate. It does not
+currently schedule the learning rate or clip gradients. At the end of a run it
+restores the weights and biases from the epoch with the lowest recorded
+validation loss. Consequently, a bad-looking tail in the history wastes time
+and is evidence of instability, but it should not by itself replace an earlier
+good checkpoint in the saved model. If the saved model is still poor, compare
+the best conditioned validation loss with physical verification metrics such
+as EVM, worst-case S-parameter error, and passivity; they are related but are
+not the same ranking quantity.
+
+#### Read the Loss Pattern First
+
+For each history, locate the minimum `val_loss`, its epoch and corresponding
+`train_loss`, the final-to-minimum loss ratio, and the first epoch that exceeds
+five to ten times its running minimum. Treat `nan` or `inf` as immediate
+optimizer failure.
+
+| Observed pattern | Most likely explanation | First diagnostic or correction |
+| --- | --- | --- |
+| Training and validation losses rise sharply together | Learning rate or gradient magnitude is too large | Reduce `--learning-rate` by four to ten times. |
+| Training loss continues downward while validation rises | Overfitting, verification-domain mismatch, or leakage | Use early stopping, reduce network capacity, and audit the train/verification split. |
+| Both curves show isolated or periodic spikes | A rare geometry, frequency, or heavily weighted minibatch produces a large update | Increase `--batch-size`; temporarily remove weights; inspect the affected data. |
+| Loss is stable until passivity enforcement becomes influential | DNN/KBNN passivity penalty is overwhelming the response-error gradient | Compare with `--passivity-mode off`, then lower `--passivity-penalty`. |
+| A `tanh` run jumps and then becomes almost flat | Hidden activations have saturated | Lower the learning rate and try a smaller network; compare with ReLU. |
+| A ReLU run becomes flat after a jump | Many units may have become inactive | Lower the learning rate and compare with `tanh`. |
+| Validation is noisy while training is smooth | Verification set is too small, uneven, or changing between rounds | Keep a fixed comparison subset and grow acquisition verification as documented in Section 1. |
+| Instability begins only after adding new GP points | One or more new simulations, parameter units, or block associations may be inconsistent | Audit the new MDIF alone, then audit it together with the accumulated data. |
+| KBNN fine history is unstable but its coarse history is stable | Fine residuals or reconstructed-response passivity gradients are difficult | Inspect coarse-versus-fine residual magnitude and reduce the fine learning rate or penalty. |
+| Neuro-TF history is unstable | Learning rate, frequency weighting, or rational-basis conditioning is suspect | Reduce the learning rate and inspect rational-fit condition diagnostics, order, damping, and ridge. |
+
+#### Isolate One Cause at a Time
+
+Keep the data, seed, architecture, and split fixed during the following
+comparisons. Changing several controls at once makes a better curve difficult
+to attribute.
+
+1. Re-run the same configuration with `--loss-interval 1`, a finite
+   `--patience`, and the same `--seed`. A large loss interval hides the exact
+   divergence epoch and makes early stopping less responsive.
+2. Reduce the default `0.002` learning rate to `0.0005`; if both curves still
+   diverge, try `0.0002`. This is the highest-value first test when both losses
+   fail together.
+3. Increase the batch size. Frequency weights are normalized over the complete
+   training set, not separately inside every shuffled minibatch, so a small
+   batch containing several high-weight rows can still have a much larger
+   update than an ordinary batch.
+4. Temporarily omit `--frequency-weights` and, for DNN/KBNN,
+   `--sparam-weights`. If this fixes the history, restore them with a smaller
+   maximum-to-minimum weight ratio or retain the larger batch size.
+5. For DNN or KBNN, run one diagnostic with `--passivity-mode off`. If that is
+   stable, restore the required passivity policy and reduce
+   `--passivity-penalty` from `10` to `1`, then to `0.1` if necessary. A zero
+   penalty or `off` is a diagnostic unless non-passive output is acceptable.
+6. Compare `tanh` and `relu` at the stabilized learning rate. Do not use an
+   activation comparison to conceal an otherwise exploding optimizer.
+7. Audit the newest blocks and review per-geometry verification errors. A
+   duplicate geometry with different S-parameters, an incorrect unit scale,
+   or one corrupt frequency sweep can resemble optimizer divergence.
+
+A controlled low-learning-rate diagnostic run using reusable JSON settings is:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn train \
+  --learning-rate 5e-4 \
+  --loss-interval 1 \
+  --patience 100 \
+  --out-dir outputs/dnn_lr_diagnostic
+```
+
+For an optimize run, include learning rate, activation, batch size, and—on DNN
+or KBNN—passivity penalty in the adaptive domains instead of relying on a broad
+preselected grid:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn optimize \
+  --search-mode adaptive \
+  --optimize-parameter learning_rate=1e-4:2e-3:log \
+  --optimize-parameter batch_size=64:512:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter passivity_penalty=0.1:10:log \
+  --adaptive-initial-trials 8 \
+  --max-trials 32 \
+  --out-dir outputs/dnn_stability_optimize
+```
+
+The detailed domain syntax, supported names, interactions, and JSON form are
+listed in [Appendix D.9](#detailed-optimize-parameter-domain-reference).
+
+### Distinct DC Point
 
 DC is a separate, geometry-dependent model derived only from the actual
 exact-zero-frequency S-matrix in each fitted MDIF block.
@@ -7317,7 +7414,7 @@ optimize unless the applicability column says otherwise.
 | `--max-passivity-sigma FLOAT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for worst predicted S-matrix singular value. | `--max-passivity-sigma 1.000001`  | `models.commands.optimize.max_passivity_sigma`<br>`models.MODEL.commands.rerank-sweep.max_passivity_sigma` |
 | `--max-passivity-violations INT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for violating sampled points. | `--max-passivity-violations 0`  | `models.commands.optimize.max_passivity_violations`<br>`models.MODEL.commands.rerank-sweep.max_passivity_violations` |
 | `--max-trials INT` | All-model optimize | Trial budget or product truncation. Default: `24`. | `--max-trials 40`  | `models.commands.optimize.max_trials` |
-| `--optimize-parameter SPEC` | All-model optimize | Repeatable adaptive domain, such as numeric `name=low:high:log`, categories, explicit layouts, or structured hidden-layer ranges. | `--optimize-parameter learning_rate=1e-4:1e-2:log`  | `models.commands.optimize.optimize_parameter` |
+| `--optimize-parameter SPEC` | All-model optimize | Repeatable adaptive domain, such as numeric `name=low:high:log`, categories, explicit layouts, or structured hidden-layer ranges. | `--optimize-parameter learning_rate=1e-4:1e-2:log`  | `models.MODEL.commands.optimize.optimize_parameter` |
 | `--overwrite` | DNN/KBNN `rerank-sweep` | Allows replacement of an existing reranked destination. | `--overwrite`  | `models.MODEL.commands.rerank-sweep.overwrite` |
 | `--promote-best` | DNN/KBNN `rerank-sweep` | Copies the selected retained trial model to `--best-model-dir`. | `--promote-best`  | `models.MODEL.commands.rerank-sweep.promote_best` |
 | `--replace-current-best` | DNN/KBNN `rerank-sweep` | Replaces `<sweep-dir>/best_model` with the selected retained trial. | `--replace-current-best`  | `models.MODEL.commands.rerank-sweep.replace_current_best` |
@@ -7328,6 +7425,146 @@ optimize unless the applicability column says otherwise.
 | `--sweep-dir PATH` | DNN/KBNN `rerank-sweep` | Required existing optimize output directory. | `--sweep-dir dnn_opt`  | `models.MODEL.commands.rerank-sweep.sweep_dir` |
 | `--trial-seed-mode {fixed,indexed}` | All-model optimize | `fixed` reuses `--seed`; `indexed` uses seed plus trial number. Default: `fixed`. | `--trial-seed-mode fixed`  | `models.commands.optimize.trial_seed_mode` |
 | `--trial-worst-plots INT` | All-model optimize | Worst-case plot pairs written per trial. Default: `1`; `0` speeds large searches. | `--trial-worst-plots 0`  | `models.commands.optimize.trial_worst_plots` |
+
+#### Detailed Optimize-Parameter Domain Reference
+
+The command-line option is the repeatable singular
+`--optimize-parameter`. The options JSON key is also singular
+`optimize_parameter`, but its value is an array of domain strings. The spelling
+`optimize_parameters` is not a recognized JSON key. These domains are used
+only by `--search-mode adaptive`; use the normal plural candidate options for
+grid or random search.
+
+An adaptive command can repeat the option:
+
+```bash
+--optimize-parameter learning_rate=1e-4:2e-3:log \
+--optimize-parameter activation=tanh,relu \
+--optimize-parameter 'hidden_layers=1:4x32:256:log'
+```
+
+The equivalent model-specific JSON is:
+
+```json
+{
+  "models": {
+    "dnn": {
+      "commands": {
+        "optimize": {
+          "optimize_parameter": [
+            "learning_rate=1e-4:2e-3:log",
+            "activation=tanh,relu",
+            "hidden_layers=1:4x32:256:log"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+Keep model-specific domains at
+`models.MODEL.commands.optimize.optimize_parameter`. A shared list at
+`models.commands.optimize.optimize_parameter` is valid only when every named
+parameter is supported by every model that will use it. A narrower list
+replaces the broader list; lists are not concatenated across JSON scopes. If
+even one `--optimize-parameter` is supplied explicitly on the command line,
+the complete CLI list replaces the JSON list rather than appending to it. A
+JSON `null` is ignored, which is why the starter file can show the key without
+enabling adaptive domains.
+
+##### Domain Grammar
+
+Parameter names are case-insensitive; hyphens are normalized to underscores.
+Specify each name only once. For a setting that should remain constant, use its
+normal train-compatible option instead of a one-value adaptive domain.
+
+| Domain form | Syntax | Exact behavior | Example |
+| --- | --- | --- | --- |
+| Boolean choices | `NAME=false,true` | Accepts only `true` and `false`; the levels participate in categorical balancing. | `include_coarse_input=false,true` |
+| Categorical choices | `NAME=A,B,...` | Samples explicit levels. Numeric comma lists are also treated categorically rather than as a continuous coordinate. | `activation=tanh,relu` |
+| Explicit hidden layouts | `hidden_layers=L1;L2;...` | Each semicolon-separated item is one comma-separated positive-width layout. Quote it in a shell because `;` is a command separator. | `'hidden_layers=64,64;128,128,64'` |
+| Hidden depth/width range | `hidden_layers=D0:D1xW0:W1[:SCALE]` | Samples integer depth and one uniform width per candidate. Width is quantized by `--adaptive-hidden-width-step`; `SCALE` is `linear` or `log`. | `'hidden_layers=1:4x32:256:log'` |
+| Linear numeric range | `NAME=LOW:HIGH` or `NAME=LOW:HIGH:linear` | Stratifies the finite candidate pool across the interval. Integer parameters are rounded and deduplicated. | `batch_size=64:512` |
+| Log numeric range | `NAME=LOW:HIGH:log` | Samples uniformly in log space. Both bounds must be positive. | `learning_rate=1e-4:2e-3:log` |
+
+All numeric bounds must be finite and ordered. Integer domains require integer
+bounds. A log domain cannot include zero; to compare zero with positive values,
+use an explicit comma list such as `passivity_penalty=0,0.1,1,10`. Duplicate
+or quantized configurations are removed, so narrow integer or hidden-width
+ranges can produce fewer unique candidates than `--adaptive-candidate-pool`.
+
+##### Parameters Shared by DNN, KBNN, and Neuro-TF
+
+| Name | Kind | Meaning and constraints | Representative domain |
+| --- | --- | --- | --- |
+| `activation` | Categorical | Hidden activation; supported values are `tanh` and `relu`. First stabilize learning rate before using activation to explain divergence. | `activation=tanh,relu` |
+| `batch_size` | Positive integer | Minibatch row count. Larger batches reduce update variance from strong frequency weights but use more memory. | `batch_size=64:512:log` |
+| `epochs` | Positive integer | Maximum RF training epochs for each trial. Early stopping can finish earlier. Increasing this does not repair an unstable learning rate. | `epochs=600:2400` |
+| `hidden_layers` | Structured/categorical | Positive hidden widths. Structured ranges generate uniform-width networks; use explicit layouts for tapered architectures. | `hidden_layers=1:4x32:256:log` |
+| `learning_rate` | Positive float | Fixed Adam step size. Log scale is normally appropriate; include lower values when histories initially improve and then diverge. | `learning_rate=1e-4:2e-3:log` |
+| `patience` | Non-negative integer | Epochs without a better recorded validation loss before stopping; `0` disables early stopping. Interpret it together with `--loss-interval`. | `patience=50:300` |
+
+##### DNN-Specific Parameters
+
+| Name | Kind | Meaning and constraints | Representative domain |
+| --- | --- | --- | --- |
+| `freq_transform` | Categorical | Frequency input feature: `log`, `linear`, or `log-linear`. | `freq_transform=log,log-linear,linear` |
+| `output_domain` | Categorical | `s` fits S directly; `y` fits converted admittance targets. `--passivity-mode enforce` is incompatible with `y`, and the S-domain differentiable penalty is unavailable there. | `output_domain=s,y` |
+| `passivity_penalty` | Non-negative float | Weight of the differentiable S-domain passivity penalty. Keep `--passivity-mode` fixed outside the domain. A high value can destabilize otherwise good response fitting. | `passivity_penalty=0.1:10:log` |
+| `target_z0` | Positive float | Reference impedance used to construct direct-Y targets; meaningful when `output_domain=y`. Avoid varying it unless the intended electrical reference is genuinely uncertain. | `target_z0=45:55` |
+
+##### KBNN-Specific Parameters
+
+| Name | Kind | Meaning and constraints | Representative domain |
+| --- | --- | --- | --- |
+| `freq_transform` | Categorical | Fine-network frequency feature: `log`, `linear`, or `log-linear`. | `freq_transform=log,log-linear,linear` |
+| `include_coarse_input` | Boolean | Adds the frozen coarse response to fine-network inputs. `prior-input` requires `true`; `plain` requires `false`. Invalid combinations are filtered. | `include_coarse_input=false,true` |
+| `mode` | Categorical | `plain`, `residual`, or `prior-input`. Residual and prior-input require `--coarse-model-dir` or a coarse fit produced for the run. | `mode=residual,prior-input` |
+| `passivity_penalty` | Non-negative float | Weight applied to passivity of the reconstructed fine response, not merely its neural residual. Large coarse-plus-fine violations can create large gradients. | `passivity_penalty=0.1:10:log` |
+
+##### Neuro-TF-Specific Parameters
+
+| Name | Kind | Meaning and constraints | Representative domain |
+| --- | --- | --- | --- |
+| `order` | Positive integer | Number of fixed rational poles. Higher order increases coefficient count and needs enough RF frequency rows and rank for conditioning. | `order=6:20` |
+| `pole_damping` | Positive float | Real damping applied to complex pole pairs. Use positive values so the fixed poles remain in the stable half-plane. | `pole_damping=0.05:0.5:log` |
+| `ridge` | Non-negative float | Regularization for rational coefficient fitting and response conditioning. Use an explicit list to include zero because logarithmic ranges must be positive. | `ridge=1e-12:1e-5:log` |
+
+##### Settings That Are Intentionally Fixed During Adaptive Search
+
+The adaptive-name whitelist is exact. Settings such as `frequency_weights`,
+`sparam_weights`, `passivity_margin`, `passivity_mode`, `reciprocity_mode`,
+`seed`, data paths, split definitions, and KBNN coarse-fitting options cannot
+be placed in `optimize_parameter`. Set them through their normal CLI or options
+JSON locations. Keeping the data definition and objective fixed is necessary
+for trial metrics to remain comparable.
+
+Passivity eligibility options such as `--require-passive`,
+`--max-passivity-violations`, and `--max-passivity-sigma` constrain promotion;
+they are not training parameters. While no feasible trial exists, adaptive
+selection uses passivity-violation severity to find a feasible region. Once
+feasible trials exist, `--selection-metric` supplies the primary ordering.
+
+`--adaptive-candidate-pool` creates a finite stratified pool; it does not fit
+that many models. `--max-trials` is the fitting budget. The first
+`--adaptive-initial-trials` are category-balanced and maximin-separated, after
+which a Matérn-5/2 GP selects one trial at a time. Explicit numeric lists are
+categorical levels and therefore receive the same coverage balancing as
+`activation`. Continuous numeric ranges are represented as continuous GP
+coordinates. `hidden_layers` contributes depth, mean-width, and total-width
+features rather than treating every layout as unrelated text.
+
+##### Complete Model-Specific JSON Examples
+
+The following fragments belong under each model's `commands.optimize` object.
+They are intentionally separate because the supported names differ by model.
+
+| Model | `optimize_parameter` JSON value |
+| --- | --- |
+| DNN | `["learning_rate=1e-4:2e-3:log", "batch_size=64:512:log", "activation=tanh,relu", "hidden_layers=1:4x32:256:log", "passivity_penalty=0.1:10:log"]` |
+| KBNN | `["mode=residual,prior-input", "include_coarse_input=false,true", "learning_rate=1e-4:2e-3:log", "hidden_layers=1:4x32:192:log", "passivity_penalty=0.1:10:log"]` |
+| Neuro-TF | `["order=6:20", "pole_damping=0.05:0.5:log", "ridge=1e-12:1e-5:log", "learning_rate=1e-4:2e-3:log", "activation=tanh,relu"]` |
 
 ### D.10 DNN-only fitting options
 

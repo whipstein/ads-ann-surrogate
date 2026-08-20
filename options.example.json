@@ -65,6 +65,7 @@
           "out_dir": null
         },
         "optimize": {
+          "optimize_parameter": null,
           "out_dir": null
         },
         "predict": {
@@ -109,6 +110,7 @@
           "out_dir": null
         },
         "optimize": {
+          "optimize_parameter": null,
           "out_dir": null
         },
         "predict": {
@@ -144,6 +146,7 @@
           "out_dir": null
         },
         "optimize": {
+          "optimize_parameter": null,
           "out_dir": null
         },
         "predict": {
