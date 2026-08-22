@@ -172,14 +172,48 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertTrue(verification_queue.is_file())
             self.assertFalse(training_queue.with_suffix(".json").exists())
             self.assertFalse(verification_queue.with_suffix(".json").exists())
-            self.assertTrue(
-                (root / "round_3_training_parameter_coverage.png").is_file()
+            cumulative = root / "round_3_all_geometries.csv"
+            cumulative_training = root / "round_3_all_geometries_training.csv"
+            cumulative_verification = (
+                root / "round_3_all_geometries_verification.csv"
             )
-            self.assertTrue(
-                (root / "round_3_verification_parameter_coverage.png").is_file()
+            for path in (cumulative, cumulative_training, cumulative_verification):
+                self.assertTrue(path.is_file())
+            with training_queue.open(newline="") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))), 8)
+            with verification_queue.open(newline="") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))), 8)
+            with cumulative_training.open(newline="") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))), 48)
+            with cumulative_verification.open(newline="") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))), 16)
+            with cumulative.open(newline="") as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))), 64)
+            single_coverage_plot = (
+                root / "round_3_all_geometries_parameter_coverage.png"
+            )
+            self.assertTrue(single_coverage_plot.is_file())
+            self.assertFalse((root / "round_3_parameter_coverage.png").exists())
+            self.assertFalse(
+                (root / "round_3_training_parameter_coverage.png").exists()
+            )
+            self.assertFalse(
+                (root / "round_3_verification_parameter_coverage.png").exists()
+            )
+            self.assertFalse(
+                (
+                    root
+                    / "round_3_all_geometries_training_parameter_coverage.png"
+                ).exists()
+            )
+            self.assertFalse(
+                (
+                    root
+                    / "round_3_all_geometries_verification_parameter_coverage.png"
+                ).exists()
             )
             with Image.open(
-                root / "round_3_parameter_coverage.png"
+                single_coverage_plot
             ) as image:
                 combined_colors = {
                     color
@@ -191,33 +225,26 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertIn((37, 99, 235), combined_colors)
             self.assertIn((249, 115, 22), combined_colors)
             self.assertIn((22, 163, 74), combined_colors)
-            with Image.open(
-                root / "round_3_training_parameter_coverage.png"
-            ) as image:
-                training_colors = {
-                    color
-                    for _, color in image.convert("RGB").getcolors(
-                        maxcolors=image.width * image.height
-                    )
-                    or []
-                }
-            self.assertIn((37, 99, 235), training_colors)
-            self.assertIn((22, 163, 74), training_colors)
-            self.assertNotIn((249, 115, 22), training_colors)
-            with Image.open(
-                root / "round_3_verification_parameter_coverage.png"
-            ) as image:
-                verification_colors = {
-                    color
-                    for _, color in image.convert("RGB").getcolors(
-                        maxcolors=image.width * image.height
-                    )
-                    or []
-                }
-            self.assertIn((249, 115, 22), verification_colors)
-            self.assertIn((22, 163, 74), verification_colors)
-            self.assertNotIn((37, 99, 235), verification_colors)
+            self.assertIn((168, 85, 247), combined_colors)
             metadata = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual(
+                metadata["parameter_coverage_plot"],
+                single_coverage_plot.name,
+            )
+            self.assertEqual(
+                metadata["output_files"]["new_points_only"]["verification"],
+                str(verification_queue),
+            )
+            self.assertEqual(
+                metadata["output_files"]["cumulative_all_points"][
+                    "verification"
+                ],
+                str(cumulative_verification),
+            )
+            self.assertEqual(
+                metadata["output_files"]["coverage_plot_all_points"],
+                str(single_coverage_plot),
+            )
             policy = metadata["automatic_verification"]
             self.assertEqual(policy["projected_training_count"], 48)
             self.assertEqual(policy["target_verification_count"], 16)
@@ -266,33 +293,23 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertTrue(coverage_plot.is_file())
             self.assertFalse(train_points.with_suffix(".json").exists())
             self.assertFalse(verification_points.with_suffix(".json").exists())
-            self.assertTrue(train_coverage_plot.is_file())
-            self.assertTrue(verification_coverage_plot.is_file())
+            self.assertFalse(train_coverage_plot.is_file())
+            self.assertFalse(verification_coverage_plot.is_file())
             self.assertFalse(
                 (root / "geometries_parameter_coverage.svg").exists()
             )
-            with Image.open(train_coverage_plot) as image:
-                train_colors = {
+            with Image.open(coverage_plot) as image:
+                coverage_colors = {
                     color
                     for _, color in image.convert("RGB").getcolors(
                         maxcolors=image.width * image.height
                     )
                     or []
                 }
-            self.assertIn((37, 99, 235), train_colors)
-            self.assertNotIn((249, 115, 22), train_colors)
-            self.assertNotIn((22, 163, 74), train_colors)
-            with Image.open(verification_coverage_plot) as image:
-                verification_colors = {
-                    color
-                    for _, color in image.convert("RGB").getcolors(
-                        maxcolors=image.width * image.height
-                    )
-                    or []
-                }
-            self.assertIn((249, 115, 22), verification_colors)
-            self.assertNotIn((37, 99, 235), verification_colors)
-            self.assertNotIn((22, 163, 74), verification_colors)
+            self.assertIn((37, 99, 235), coverage_colors)
+            self.assertIn((249, 115, 22), coverage_colors)
+            self.assertNotIn((22, 163, 74), coverage_colors)
+            self.assertNotIn((168, 85, 247), coverage_colors)
             metadata = json.loads(geometries.with_suffix(".json").read_text())
             self.assertEqual(
                 metadata["parameter_coverage_plot"],
@@ -910,29 +927,18 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 ],
                 6,
             )
-            self.assertTrue(
+            self.assertFalse(
                 (root / "additional_parameter_coverage.png").is_file()
             )
             self.assertEqual(
                 metadata["parameter_coverage_plot"],
-                "additional_parameter_coverage.png",
+                "additional_all_geometries_parameter_coverage.png",
             )
             with output.open(newline="") as stream:
                 additional_rows = list(csv.DictReader(stream))
             self.assertTrue(
                 all(row["point_origin"] == "additional" for row in additional_rows)
             )
-            with Image.open(root / "additional_parameter_coverage.png") as image:
-                additional_plot_colors = {
-                    color
-                    for _, color in image.convert("RGB").getcolors(
-                        maxcolors=image.width * image.height
-                    )
-                    or []
-                }
-            self.assertIn((22, 163, 74), additional_plot_colors)
-            self.assertIn((37, 99, 235), additional_plot_colors)
-            self.assertIn((249, 115, 22), additional_plot_colors)
             combined = root / "additional_all_geometries.csv"
             combined_json = combined.with_suffix(".json")
             combined_plot = root / "additional_all_geometries_parameter_coverage.png"
@@ -973,12 +979,23 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertIn((37, 99, 235), combined_plot_colors)
             self.assertIn((249, 115, 22), combined_plot_colors)
             self.assertIn((22, 163, 74), combined_plot_colors)
+            self.assertNotIn((168, 85, 247), combined_plot_colors)
             self.assertEqual(
                 POINTS.coverage_point_group(
                     {"dataset": "train", "point_origin": "additional"},
                     "dataset",
                 ),
-                "additional",
+                "additional_training",
+            )
+            self.assertEqual(
+                POINTS.coverage_point_group(
+                    {
+                        "dataset": "verification",
+                        "point_origin": "additional",
+                    },
+                    "dataset",
+                ),
+                "additional_verification",
             )
             self.assertEqual(
                 POINTS.coverage_point_group(
@@ -1563,7 +1580,8 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(coverage_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             with Image.open(coverage_path) as coverage_image:
                 self.assertEqual(coverage_image.format, "PNG")
-                self.assertEqual(coverage_image.size, (1302, 1372))
+                self.assertGreaterEqual(coverage_image.width, 1302)
+                self.assertEqual(coverage_image.height, 1372)
                 color_counts = coverage_image.convert("RGB").getcolors(
                     maxcolors=coverage_image.width * coverage_image.height
                 )
@@ -1755,6 +1773,152 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 stderr.getvalue(),
             )
 
+    def test_missing_neurotf_prediction_and_metrics_are_rebuilt_from_model(self) -> None:
+        import surrogate_common
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sweep_dir = root / "sweep"
+            best_model_dir = sweep_dir / "best_model"
+            best_model_dir.mkdir(parents=True)
+            source_mdif = Path(__file__).resolve().parents[1] / (
+                "neuro_tf_sample_training_verification.mdif"
+            )
+            source_blocks = surrogate_common.read_mdif(source_mdif)
+            split = surrogate_common.split_blocks(
+                source_blocks,
+                split_var="dataset",
+                train_values={"train", "training"},
+                verify_values={"verify", "verification", "test", "validation"},
+                holdout_fraction=0.2,
+                seed=1234,
+            )
+            labels = surrogate_common.common_sparameter_labels(source_blocks)
+            (best_model_dir / "model.npz").write_text("model placeholder")
+            (best_model_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "parameter_names": ["L", "W"],
+                        "sparam_labels": labels,
+                        "verification_blocks": len(split.verify),
+                        "sparam_weights": {label: 1.0 for label in labels},
+                        "frequency_weights": None,
+                    }
+                )
+            )
+            (sweep_dir / "neurotf_best_config.json").write_text(
+                json.dumps(
+                    {
+                        "trial": 2,
+                        "best_model_dir": str(best_model_dir),
+                        "fit_data": {
+                            "mdif": str(source_mdif),
+                            "split_var": "dataset",
+                            "train_values": "train,training",
+                            "verify_values": "verify,verification,test,validation",
+                            "holdout_fraction": 0.2,
+                            "seed": 1234,
+                        },
+                    }
+                )
+            )
+            fake_model = mock.Mock()
+            fake_model.predict_blocks.return_value = split.verify
+            fake_neurotf = mock.Mock()
+            fake_neurotf.load.return_value = fake_model
+            fake_module = mock.Mock(NeuroTF=fake_neurotf)
+
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(sweep_dir)]
+            )
+            with mock.patch.dict("sys.modules", {"neuro_tf": fake_module}):
+                recovered = POINTS.verification_metrics_path(args, parser)
+
+            self.assertEqual(
+                recovered,
+                best_model_dir / "verification_metrics.csv",
+            )
+            self.assertTrue(recovered.is_file())
+            self.assertTrue(
+                (best_model_dir / "predicted_verification.mdif").is_file()
+            )
+            fake_neurotf.load.assert_called_once_with(best_model_dir)
+
+    def test_moved_sweep_uses_local_best_config_relationship(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sweep_dir = Path(temp_dir) / "copied_sweep"
+            best_model_dir = sweep_dir / "best_model"
+            best_model_dir.mkdir(parents=True)
+            retained_metrics = (
+                sweep_dir
+                / "trials"
+                / "trial_0004"
+                / "verification_metrics.csv"
+            )
+            retained_metrics.parent.mkdir(parents=True)
+            retained_metrics.write_text(
+                "source_index,evm_pct,p\n1,0.2,0.25\n"
+            )
+            (sweep_dir / "neurotf_best_config.json").write_text(
+                json.dumps(
+                    {
+                        "trial": 4,
+                        "best_model_dir": "/old/location/neurotf/best_model",
+                    }
+                )
+            )
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(sweep_dir)]
+            )
+            self.assertEqual(
+                POINTS.verification_metrics_path(args, parser),
+                retained_metrics,
+            )
+
+    def test_missing_metrics_reports_zero_recognized_verification_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fit_dir = Path(temp_dir) / "neurotf_model"
+            fit_dir.mkdir(parents=True)
+            (fit_dir / "metadata.json").write_text(
+                json.dumps({"verification_blocks": 0})
+            )
+            (fit_dir / "verification_summary.json").write_text(
+                json.dumps({"warning": "No verification blocks were available"})
+            )
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(fit_dir)]
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    POINTS.verification_metrics_path(args, parser)
+            message = stderr.getvalue()
+            self.assertIn("zero recognized verification blocks", message)
+            self.assertIn("--verification-mdif", message)
+
+    def test_missing_optimize_metrics_reports_trial_split_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sweep_dir = Path(temp_dir) / "neurotf_optimize"
+            trial_dir = sweep_dir / "trials" / "trial_0001"
+            trial_dir.mkdir(parents=True)
+            (trial_dir / "verification_summary.json").write_text(
+                json.dumps({"warning": "No verification blocks were available"})
+            )
+            parser = POINTS.build_suggest_parser()
+            args = parser.parse_args(
+                ["--count", "1", "--fit-dir", str(sweep_dir)]
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    POINTS.verification_metrics_path(args, parser)
+            message = stderr.getvalue()
+            self.assertIn("optimize trials report", message)
+            self.assertIn("--split-var/--verify-values", message)
+
     def test_missing_promoted_metrics_resolve_from_retained_selected_trial(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             sweep_dir = Path(temp_dir) / "sweep"
@@ -1876,6 +2040,185 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 7,
             )
             self.assertEqual(metadata["verification_metrics_source"], str(metrics))
+
+    def test_best_and_nonpassive_fit_dirs_write_complete_equivalent_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            geometries = root / "geometries.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--parameter",
+                            "L=0:1",
+                            "--count",
+                            "8",
+                            "--verification-count",
+                            "2",
+                            "--lhs-candidates",
+                            "3",
+                            "--out",
+                            str(geometries),
+                        ]
+                    ),
+                    0,
+                )
+            with geometries.open(newline="") as stream:
+                original_rows = list(csv.DictReader(stream))
+            verification_rows = [
+                row for row in original_rows if row["dataset"] == "verification"
+            ]
+
+            best_sweep = root / "best_sweep"
+            best_metrics = best_sweep / "best_model" / "verification_metrics.csv"
+            best_metrics.parent.mkdir(parents=True)
+            fallback_sweep = root / "fallback_sweep"
+            fallback_dir = fallback_sweep / "point_generation_fallback"
+            fallback_metrics = fallback_dir / "verification_metrics.csv"
+            fallback_dir.mkdir(parents=True)
+            for metrics_path in (best_metrics, fallback_metrics):
+                with metrics_path.open("w", newline="") as stream:
+                    writer = csv.DictWriter(
+                        stream,
+                        fieldnames=["source_index", "sparam", "evm_pct", "W", "L"],
+                    )
+                    writer.writeheader()
+                    for index, row in enumerate(verification_rows, start=1):
+                        writer.writerow(
+                            {
+                                "source_index": index,
+                                "sparam": "S21",
+                                "evm_pct": float(index),
+                                "W": row["W"],
+                                "L": row["L"],
+                            }
+                        )
+            fallback_source = {
+                "status": "passivity_ineligible",
+                "purpose": "gp_point_generation_only",
+                "eligible_for_export": False,
+                "source_trial": 4,
+                "selection_metric": "evm_pct",
+                "metric": 1.0,
+            }
+            (fallback_dir / "point_generation_source.json").write_text(
+                json.dumps(fallback_source)
+            )
+
+            generated_new_points: list[set[tuple[str, str]]] = []
+            cases = (
+                ("best", best_sweep, False, "best_model", True),
+                (
+                    "fallback",
+                    fallback_sweep,
+                    True,
+                    "nonpassive_optimization_fallback",
+                    False,
+                ),
+            )
+            for name, fit_dir, allow_nonpassive, source_kind, export_eligible in cases:
+                output = root / f"{name}_additional.csv"
+                stale_training = POINTS.split_output_path(output, "train")
+                stale_training.write_text("stale\n")
+                stale_plot = POINTS.geometry_coverage_plot_path(output)
+                stale_plot.write_bytes(b"stale")
+                command = [
+                    "suggest-additional",
+                    "--count",
+                    "2",
+                    "--fit-dir",
+                    str(fit_dir),
+                    "--existing-points",
+                    str(geometries),
+                    "--target-dataset",
+                    "verification",
+                    "--verification-policy",
+                    "off",
+                    "--acquisition",
+                    "error-distance",
+                    "--candidate-count",
+                    "48",
+                    "--lhs-candidates",
+                    "3",
+                    "--out",
+                    str(output),
+                ]
+                if allow_nonpassive:
+                    command.append("--allow-nonpassive")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(POINTS.main(command), 0)
+
+                new_verification = POINTS.split_output_path(
+                    output, "verification"
+                )
+                cumulative = POINTS.accumulated_geometry_path(output)
+                cumulative_training = POINTS.split_output_path(
+                    cumulative, "train"
+                )
+                cumulative_verification = POINTS.split_output_path(
+                    cumulative, "verification"
+                )
+                coverage_plot = POINTS.geometry_coverage_plot_path(cumulative)
+                self.assertFalse(stale_training.exists())
+                self.assertFalse(stale_plot.exists())
+                for path in (
+                    output,
+                    new_verification,
+                    cumulative,
+                    cumulative_training,
+                    cumulative_verification,
+                    coverage_plot,
+                ):
+                    self.assertTrue(path.is_file(), path)
+
+                with output.open(newline="") as stream:
+                    new_rows = list(csv.DictReader(stream))
+                self.assertEqual(len(new_rows), 2)
+                self.assertEqual(
+                    {row["dataset"] for row in new_rows},
+                    {"verification"},
+                )
+                generated_new_points.append(
+                    {(row["W"], row["L"]) for row in new_rows}
+                )
+                with cumulative_training.open(newline="") as stream:
+                    self.assertEqual(len(list(csv.DictReader(stream))), 6)
+                with cumulative_verification.open(newline="") as stream:
+                    self.assertEqual(len(list(csv.DictReader(stream))), 4)
+                with cumulative.open(newline="") as stream:
+                    self.assertEqual(len(list(csv.DictReader(stream))), 10)
+
+                metadata = json.loads(output.with_suffix(".json").read_text())
+                resolution = metadata["verification_metrics_resolution"]
+                self.assertEqual(resolution["kind"], source_kind)
+                self.assertEqual(resolution["export_eligible"], export_eligible)
+                self.assertEqual(
+                    metadata["output_files"]["new_points_only"]["verification"],
+                    str(new_verification),
+                )
+                self.assertEqual(
+                    metadata["output_files"]["cumulative_all_points"][
+                        "training"
+                    ],
+                    str(cumulative_training),
+                )
+                if allow_nonpassive:
+                    self.assertEqual(
+                        metadata["nonpassive_point_generation_source"][
+                            "source_trial"
+                        ],
+                        4,
+                    )
+                else:
+                    self.assertNotIn(
+                        "nonpassive_point_generation_source", metadata
+                    )
+
+            self.assertEqual(generated_new_points[0], generated_new_points[1])
 
 
 if __name__ == "__main__":

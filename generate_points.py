@@ -615,6 +615,17 @@ def geometry_coverage_plot_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}_parameter_coverage.png")
 
 
+def remove_coverage_plots(paths: Sequence[Path], *, keep: Path | None = None) -> None:
+    """Remove superseded coverage plots for an output family."""
+
+    keep_resolved = keep.resolve() if keep is not None else None
+    for path in paths:
+        if keep_resolved is not None and path.resolve() == keep_resolved:
+            continue
+        if path.is_file():
+            path.unlink()
+
+
 def coverage_axis_label(parameter: ParameterSpec) -> str:
     details = [value for value in (parameter.unit, parameter.scale if parameter.scale == "log" else "") if value]
     return (
@@ -749,6 +760,8 @@ def coverage_point_group(
     split_var: str,
     default_dataset: object = "train",
 ) -> str:
+    split_value = lookup_row_value(row, split_var) or default_dataset or "train"
+    split_group = coverage_split_group(split_value)
     origin = lookup_row_value(row, "point_origin")
     if origin is not None and str(origin).strip():
         origin_token = normalize_key(origin)
@@ -759,12 +772,9 @@ def coverage_point_group(
             "targeted",
             "acquisition",
         }:
-            return "additional"
+            return f"additional_{split_group}"
         if origin_token in {"existing", "original", "prior"}:
-            return coverage_split_group(
-                lookup_row_value(row, split_var) or default_dataset or "train"
-            )
-    split_value = lookup_row_value(row, split_var) or default_dataset or "train"
+            return split_group
     if normalize_key(split_value) in {
         "additional",
         "added",
@@ -772,13 +782,12 @@ def coverage_point_group(
         "targeted",
         "acquisition",
     }:
-        return "additional"
-    split_group = coverage_split_group(split_value)
+        return "additional_training"
     if split_group != "training":
         return split_group
     method = normalize_key(lookup_row_value(row, "method") or "")
     if method.startswith("targeted_") or method.startswith("gp_ucb_"):
-        return "additional"
+        return "additional_training"
     return "training"
 
 
@@ -805,7 +814,8 @@ def write_parameter_coverage_png(
     grouped_points: dict[str, list[list[float]]] = {
         "training": [],
         "verification": [],
-        "additional": [],
+        "additional_training": [],
+        "additional_verification": [],
     }
     default_dataset = geometry_file_split_group(geometry_path) or "train"
     dataset_counts = {"training": 0, "verification": 0}
@@ -859,7 +869,7 @@ def write_parameter_coverage_png(
     right_margin = px(24)
     top_margin = px(104)
     bottom_margin = px(60)
-    width = max(px(520), left_margin + dimension_count * cell_size + right_margin)
+    width = max(px(720), left_margin + dimension_count * cell_size + right_margin)
     height = top_margin + dimension_count * cell_size + bottom_margin
     plot_inset_left = px(20)
     plot_inset_right = px(10)
@@ -867,7 +877,8 @@ def write_parameter_coverage_png(
     plot_inset_bottom = px(25)
     training_color = (37, 99, 235, 255)
     verification_color = (249, 115, 22, 255)
-    additional_color = (22, 163, 74, 255)
+    additional_training_color = (22, 163, 74, 255)
+    additional_verification_color = (168, 85, 247, 255)
     background_color = (248, 250, 252, 255)
     cell_color = (255, 255, 255, 255)
     border_color = (203, 213, 225, 255)
@@ -909,18 +920,32 @@ def write_parameter_coverage_png(
         font=title_font,
         fill=title_color,
     )
+    has_additional_points = bool(
+        grouped_points["additional_training"]
+        or grouped_points["additional_verification"]
+    )
     group_labels = {
-        "training": "Training",
-        "verification": "Verification",
-        "additional": "Added",
+        "training": "Existing training" if has_additional_points else "Training",
+        "verification": (
+            "Existing verification" if has_additional_points else "Verification"
+        ),
+        "additional_training": "Added training",
+        "additional_verification": "Added verification",
     }
     group_colors = {
         "training": training_color,
         "verification": verification_color,
-        "additional": additional_color,
+        "additional_training": additional_training_color,
+        "additional_verification": additional_verification_color,
     }
     present_groups = [
-        name for name in ("training", "verification", "additional")
+        name
+        for name in (
+            "training",
+            "verification",
+            "additional_training",
+            "additional_verification",
+        )
         if grouped_points[name]
     ]
     draw.text(
@@ -955,7 +980,7 @@ def write_parameter_coverage_png(
             font=label_font,
             fill=text_color,
         )
-        legend_x += px(112 if group_name == "verification" else 82)
+        legend_x += px(138)
 
     for column, parameter in enumerate(parameters):
         center_x = left_margin + column * cell_size + cell_size / 2
@@ -1137,6 +1162,8 @@ def write_geometry_metadata(
     extra: dict[str, object] | None = None,
     decimal_places: int | None = None,
     bare_values: str = "parameter-units",
+    generate_coverage_plot: bool = True,
+    coverage_plot_path: Path | None = None,
 ) -> Path:
     validate_geometry_output_rows(
         geometry_path,
@@ -1198,14 +1225,20 @@ def write_geometry_metadata(
     if extra:
         metadata.update(extra)
 
-    coverage_plot_path = write_parameter_coverage_png(
-        geometry_path,
-        parameters,
-        rows,
-        split_var,
-        bare_values=bare_values,
-    )
-    metadata["parameter_coverage_plot"] = coverage_plot_path.name
+    if generate_coverage_plot:
+        coverage_plot_path = write_parameter_coverage_png(
+            geometry_path,
+            parameters,
+            rows,
+            split_var,
+            bare_values=bare_values,
+        )
+    if coverage_plot_path is not None:
+        metadata_dir = geometry_metadata_path(geometry_path).parent
+        metadata["parameter_coverage_plot"] = os.path.relpath(
+            coverage_plot_path,
+            start=metadata_dir,
+        )
 
     metadata_path = geometry_metadata_path(geometry_path)
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -1422,11 +1455,21 @@ def write_points_csv(
         decimal_places=decimal_places,
     )
     written = [path, metadata_path, geometry_coverage_plot_path(path)]
+    remove_coverage_plots(
+        [
+            geometry_coverage_plot_path(split_output_path(path, "train")),
+            geometry_coverage_plot_path(split_output_path(path, "verification")),
+        ]
+    )
+    split_paths = {
+        split_value: split_output_path(path, split_value)
+        for split_value in ("train", "verification")
+    }
     if write_split_files:
         split_values = ["train", "verification"] if verification_count else ["train"]
         for split_value in split_values:
             split_rows = [row for row in rows if row.get(split_var) == split_value]
-            split_path = split_output_path(path, split_value)
+            split_path = split_paths[split_value]
             validate_geometry_output_rows(
                 split_path,
                 split_rows,
@@ -1436,13 +1479,13 @@ def write_points_csv(
                 decimal_places=decimal_places,
             )
             write_rows_csv(split_path, split_rows, fields)
-            split_plot_path = write_parameter_coverage_png(
-                split_path,
-                parameters,
-                split_rows,
-                split_var,
-            )
-            written.extend([split_path, split_plot_path])
+            written.append(split_path)
+    for split_value, split_path in split_paths.items():
+        if not write_split_files or split_value not in (
+            ["train", "verification"] if verification_count else ["train"]
+        ):
+            if split_path.is_file():
+                split_path.unlink()
     return written
 
 
@@ -1630,12 +1673,22 @@ def write_range_extension_csv(
         extra=extension_metadata,
     )
     written = [path, metadata_path, geometry_coverage_plot_path(path)]
+    remove_coverage_plots(
+        [
+            geometry_coverage_plot_path(split_output_path(path, "train")),
+            geometry_coverage_plot_path(split_output_path(path, "verification")),
+        ]
+    )
+    split_paths = {
+        split_value: split_output_path(path, split_value)
+        for split_value in ("train", "verification")
+    }
     if write_split_files:
         for split_value in split_counts:
             split_rows = [
                 row for row in rows if str(row.get(split_var, "")) == split_value
             ]
-            split_path = split_output_path(path, split_value)
+            split_path = split_paths[split_value]
             validate_geometry_output_rows(
                 split_path,
                 split_rows,
@@ -1645,14 +1698,11 @@ def write_range_extension_csv(
                 decimal_places=decimal_places,
             )
             write_rows_csv(split_path, split_rows, fields)
-            split_plot_path = write_parameter_coverage_png(
-                split_path,
-                plan.overall_parameters,
-                split_rows,
-                split_var,
-                bare_values=bare_values,
-            )
-            written.extend([split_path, split_plot_path])
+            written.append(split_path)
+    for split_value, split_path in split_paths.items():
+        if not write_split_files or split_value not in split_counts:
+            if split_path.is_file():
+                split_path.unlink()
     return written
 
 
@@ -3508,6 +3558,7 @@ def write_suggested_points_csv(
     include_normalized: bool,
     decimal_places: int | None = None,
     acquisition_metadata: dict[str, object] | None = None,
+    coverage_plot_path: Path | None = None,
 ) -> Path:
     method_name = (
         f"targeted-{candidate_method}"
@@ -3625,6 +3676,8 @@ def write_suggested_points_csv(
             "candidate_method": candidate_method,
             **(acquisition_metadata or {}),
         },
+        generate_coverage_plot=False,
+        coverage_plot_path=coverage_plot_path,
     )
 
 
@@ -3641,14 +3694,13 @@ def write_dataset_split_geometry_views(
     *,
     bare_values: str = "parameter-units",
     decimal_places: int | None = None,
-    coverage_rows: Sequence[dict[str, object]] | None = None,
 ) -> list[Path]:
-    """Write RFPro queues with coverage plots placed in full prior context."""
+    """Write strict training and verification CSV views of a geometry file."""
 
     fields, rows = read_csv_table(source_path)
-    contextual_rows = list(coverage_rows) if coverage_rows is not None else rows
     written: list[Path] = []
     for group, suffix in (("training", "train"), ("verification", "verification")):
+        split_path = split_output_path(source_path, suffix)
         split_rows = [
             row
             for row in rows
@@ -3658,16 +3710,9 @@ def write_dataset_split_geometry_views(
             == group
         ]
         if not split_rows:
+            if split_path.is_file():
+                split_path.unlink()
             continue
-        split_coverage_rows = [
-            row
-            for row in contextual_rows
-            if coverage_split_group(
-                lookup_row_value(row, split_var) or "train"
-            )
-            == group
-        ]
-        split_path = split_output_path(source_path, suffix)
         validate_geometry_output_rows(
             split_path,
             split_rows,
@@ -3677,15 +3722,212 @@ def write_dataset_split_geometry_views(
             decimal_places=decimal_places,
         )
         write_rows_csv(split_path, split_rows, fields)
-        plot_path = write_parameter_coverage_png(
-            split_path,
-            parameters,
-            split_coverage_rows or split_rows,
-            split_var,
-            bare_values=bare_values,
-        )
-        written.extend([split_path, plot_path])
+        written.append(split_path)
     return written
+
+
+def geometry_dataset_keys_from_csv(
+    path: Path,
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    decimal_places: int | None,
+) -> dict[str, set[tuple[str, ...]]]:
+    """Read and validate one generated CSV, returning keys by dataset role."""
+
+    _fields, rows = read_csv_table(path)
+    validate_geometry_output_rows(
+        path,
+        rows,
+        parameters,
+        split_var,
+        bare_values="parameter-units",
+        decimal_places=decimal_places,
+    )
+    keys = {"train": set(), "verification": set()}
+    for row in rows:
+        dataset = canonical_dataset_label(lookup_row_value(row, split_var))
+        key = geometry_output_key_from_row(
+            row,
+            parameters,
+            decimal_places,
+            bare_values="parameter-units",
+        )
+        assert key is not None
+        keys[dataset].add(key)
+    return keys
+
+
+def validate_suggest_output_family(
+    out_path: Path,
+    combined_path: Path,
+    parameters: Sequence[ParameterSpec],
+    split_var: str,
+    decimal_places: int | None,
+    coverage_plot_path: Path,
+) -> dict[str, dict[str, int]]:
+    """Require new-only and cumulative artifacts to agree exactly on disk."""
+
+    family_keys = {
+        "new": geometry_dataset_keys_from_csv(
+            out_path,
+            parameters,
+            split_var,
+            decimal_places,
+        ),
+        "cumulative": geometry_dataset_keys_from_csv(
+            combined_path,
+            parameters,
+            split_var,
+            decimal_places,
+        ),
+    }
+    for family_name, source_path in (
+        ("new", out_path),
+        ("cumulative", combined_path),
+    ):
+        for dataset in ("train", "verification"):
+            expected = family_keys[family_name][dataset]
+            split_path = split_output_path(source_path, dataset)
+            if not expected:
+                if split_path.exists():
+                    raise ValueError(
+                        f"Stale {dataset} split exists even though {source_path} "
+                        f"contains no {dataset} rows: {split_path}"
+                    )
+                continue
+            if not split_path.is_file():
+                raise ValueError(
+                    f"Missing {dataset} split for {source_path}: {split_path}"
+                )
+            split_keys = geometry_dataset_keys_from_csv(
+                split_path,
+                parameters,
+                split_var,
+                decimal_places,
+            )
+            if split_keys[dataset] != expected:
+                raise ValueError(
+                    f"{split_path} does not exactly match the {dataset} rows "
+                    f"in {source_path}"
+                )
+            other_dataset = "verification" if dataset == "train" else "train"
+            if split_keys[other_dataset]:
+                raise ValueError(
+                    f"{split_path} contains unexpected {other_dataset} rows"
+                )
+
+    for dataset in ("train", "verification"):
+        missing_from_cumulative = (
+            family_keys["new"][dataset] - family_keys["cumulative"][dataset]
+        )
+        if missing_from_cumulative:
+            raise ValueError(
+                f"The cumulative geometry inventory is missing "
+                f"{len(missing_from_cumulative)} new {dataset} point(s)"
+            )
+
+    if not coverage_plot_path.is_file():
+        raise ValueError(
+            f"The all-point coverage plot is missing: {coverage_plot_path}"
+        )
+    redundant_plots = [
+        geometry_coverage_plot_path(out_path),
+        geometry_coverage_plot_path(split_output_path(out_path, "train")),
+        geometry_coverage_plot_path(
+            split_output_path(out_path, "verification")
+        ),
+        geometry_coverage_plot_path(split_output_path(combined_path, "train")),
+        geometry_coverage_plot_path(
+            split_output_path(combined_path, "verification")
+        ),
+    ]
+    unexpected_plots = [
+        path
+        for path in redundant_plots
+        if path.resolve() != coverage_plot_path.resolve() and path.exists()
+    ]
+    if unexpected_plots:
+        raise ValueError(
+            "Unexpected redundant coverage plot(s): "
+            + ", ".join(str(path) for path in unexpected_plots)
+        )
+
+    for family_name, metadata_path in (
+        ("new", geometry_metadata_path(out_path)),
+        ("cumulative", geometry_metadata_path(combined_path)),
+    ):
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Could not validate output metadata {metadata_path}: {exc}"
+            ) from exc
+        raw_plot_path = metadata.get("parameter_coverage_plot")
+        if not raw_plot_path:
+            raise ValueError(
+                f"Output metadata does not identify the coverage plot: {metadata_path}"
+            )
+        recorded_plot_path = Path(str(raw_plot_path))
+        if not recorded_plot_path.is_absolute():
+            recorded_plot_path = metadata_path.parent / recorded_plot_path
+        if recorded_plot_path.resolve() != coverage_plot_path.resolve():
+            raise ValueError(
+                f"Output metadata {metadata_path} identifies the wrong coverage "
+                f"plot: {raw_plot_path}"
+            )
+        expected_counts = {
+            dataset: len(keys)
+            for dataset, keys in family_keys[family_name].items()
+            if keys
+        }
+        if metadata.get("split_counts") != expected_counts:
+            raise ValueError(
+                f"Output metadata {metadata_path} has incorrect split_counts: "
+                f"expected {expected_counts}, found {metadata.get('split_counts')}"
+            )
+        if metadata.get("point_count") != sum(expected_counts.values()):
+            raise ValueError(
+                f"Output metadata {metadata_path} has an incorrect point_count"
+            )
+
+        output_files = metadata.get("output_files")
+        if not isinstance(output_files, dict):
+            raise ValueError(
+                f"Output metadata does not contain output_files: {metadata_path}"
+            )
+        new_files = output_files.get("new_points_only")
+        cumulative_files = output_files.get("cumulative_all_points")
+        if not isinstance(new_files, dict) or not isinstance(
+            cumulative_files, dict
+        ):
+            raise ValueError(
+                f"Output metadata has incomplete output_files: {metadata_path}"
+            )
+        expected_file_paths = {
+            "new all": (new_files.get("all_new"), out_path),
+            "cumulative all": (
+                cumulative_files.get("training_and_verification"),
+                combined_path,
+            ),
+            "coverage": (
+                output_files.get("coverage_plot_all_points"),
+                coverage_plot_path,
+            ),
+        }
+        for label, (raw_path, expected_path) in expected_file_paths.items():
+            if not raw_path or Path(str(raw_path)).resolve() != expected_path.resolve():
+                raise ValueError(
+                    f"Output metadata {metadata_path} identifies the wrong "
+                    f"{label} path: {raw_path}"
+                )
+
+    return {
+        family_name: {
+            dataset: len(keys)
+            for dataset, keys in dataset_keys.items()
+        }
+        for family_name, dataset_keys in family_keys.items()
+    }
 
 
 def write_accumulated_geometries(
@@ -4445,9 +4687,10 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         "--out",
         default="targeted_additional_points.csv",
         help=(
-            "New-points-only CSV path. A same-stem JSON/coverage plot and a "
-            "combined cumulative all-geometries CSV/JSON plus strict split "
-            "views are also written."
+            "New-points-only CSV path. A same-stem JSON and a combined "
+            "cumulative all-geometries CSV/JSON plus strict split views are "
+            "also written. The cumulative inventory receives the one coverage "
+            "plot."
         ),
     )
     parser.add_argument(
@@ -4846,7 +5089,19 @@ def _best_config_records(
                 Path(__file__).resolve().parent / raw_path,
                 config_path.parent / raw_path,
             ]
-            if not any(candidate.resolve() == target_resolved for candidate in model_candidates):
+            matches_saved_path = any(
+                candidate.resolve() == target_resolved
+                for candidate in model_candidates
+            )
+            # A completed sweep is often moved or copied as one directory.  In
+            # that case an absolute best_model_dir saved by the old run no
+            # longer resolves, even though the config and promoted model still
+            # have their original relative relationship.
+            matches_moved_sweep = (
+                target_model_dir.parent.resolve() == config_path.parent.resolve()
+                and raw_path.name == target_model_dir.name
+            )
+            if not matches_saved_path and not matches_moved_sweep:
                 continue
         elif "reranked" in config_path.name and target_model_dir.name == "best_model":
             # A rerank report is not necessarily promoted over the primary model.
@@ -4884,7 +5139,7 @@ def _recover_promoted_verification_metrics(
 
     predicted_path = target_model_dir / "predicted_verification.mdif"
     metadata_path = target_model_dir / "metadata.json"
-    if not predicted_path.is_file() or not metadata_path.is_file():
+    if not metadata_path.is_file():
         return None, None
 
     records = _best_config_records(sweep_dir, target_model_dir)
@@ -4921,6 +5176,7 @@ def _recover_promoted_verification_metrics(
             split_blocks,
             verification_metrics,
             write_csv,
+            write_mdif,
         )
 
         metadata = json.loads(metadata_path.read_text())
@@ -4952,7 +5208,34 @@ def _recover_promoted_verification_metrics(
                 seed=int(setting("seed", "--seed", 1234)),
             )
             truth_blocks = split.verify
-        predicted_blocks = read_mdif(predicted_path)
+        if predicted_path.is_file():
+            predicted_blocks = read_mdif(predicted_path)
+        else:
+            config_name = config_path.name.lower()
+            model_path = target_model_dir / "model.npz"
+            if not model_path.is_file():
+                raise ValueError(
+                    "the promoted model has neither a saved verification "
+                    "prediction nor a loadable model.npz"
+                )
+            if "neurotf" in config_name or "neuro_tf" in config_name:
+                from neuro_tf import NeuroTF
+
+                predicted_blocks = NeuroTF.load(target_model_dir).predict_blocks(
+                    truth_blocks
+                )
+            elif "dnn" in config_name:
+                from dnn import DNN
+
+                predicted_blocks = DNN.load(target_model_dir).predict_blocks(
+                    truth_blocks
+                )
+            else:
+                raise ValueError(
+                    "the saved verification prediction is missing and automatic "
+                    "model evaluation is not available for this model type"
+                )
+            write_mdif(predicted_path, predicted_blocks, labels)
         truth_rf = positive_frequency_blocks(
             truth_blocks,
             purpose="verification-metrics recovery",
@@ -5027,22 +5310,120 @@ def _recover_promoted_verification_metrics(
             raise ValueError("the recovered verification comparison produced no rows")
         recovered_path = target_model_dir / "verification_metrics.csv"
         write_csv(recovered_path, metric_rows)
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except Exception as exc:
         return None, str(exc)
 
     print(
-        "recovered missing promoted verification metrics from the saved "
-        f"verification prediction and source data: {recovered_path}",
+        "recovered missing promoted verification metrics from the promoted "
+        f"model artifacts and source data: {recovered_path}",
         file=sys.stderr,
     )
     return recovered_path, None
 
 
+def _missing_verification_metrics_detail(
+    fit_dir: Path,
+    target_model_dir: Path,
+) -> str:
+    """Explain why a fit directory has no usable verification metrics."""
+
+    model_dirs: list[Path] = []
+    for candidate in (fit_dir, target_model_dir):
+        if candidate not in model_dirs:
+            model_dirs.append(candidate)
+
+    for model_dir in model_dirs:
+        metadata_path = model_dir / "metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            metadata = None
+        if isinstance(metadata, dict):
+            raw_count = metadata.get("verification_blocks")
+            try:
+                verification_count = int(raw_count)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                verification_count = None
+            if verification_count == 0:
+                return (
+                    f"The model metadata in {model_dir} reports zero recognized "
+                    "verification blocks, so verification_metrics.csv could not "
+                    "be created. Supply --verification-mdif, or correct "
+                    "--split-var/--verify-values so the combined MDIF contains "
+                    "recognized verification blocks, and refit the model."
+                )
+            if verification_count is not None and verification_count > 0:
+                return (
+                    f"The model metadata in {model_dir} reports "
+                    f"{verification_count} verification block(s), but its "
+                    "verification artifacts are incomplete. Re-run the fit or "
+                    "point --fit-dir at the original sweep root so its selected "
+                    "trial/source-data recovery information is available."
+                )
+
+        summary_path = model_dir / "verification_summary.json"
+        try:
+            summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            summary = None
+        if isinstance(summary, dict):
+            warning = str(summary.get("warning") or "").strip()
+            error = str(summary.get("error") or "").strip()
+            if warning or error:
+                return (
+                    f"The verification summary in {model_dir} reports: "
+                    f"{warning or error}"
+                )
+
+    sweep_dir = fit_dir.parent if fit_dir.name.startswith("best_model") else fit_dir
+    trial_summaries = sorted(sweep_dir.glob("trials/trial_*/verification_summary.json"))
+    for summary_path in trial_summaries:
+        try:
+            summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(summary, dict):
+            continue
+        warning = str(summary.get("warning") or "").strip()
+        if "no verification blocks" in warning.lower():
+            return (
+                "The optimize trials report that no verification blocks were "
+                "recognized, so no trial could create verification_metrics.csv. "
+                "Supply --verification-mdif, or correct "
+                "--split-var/--verify-values for the combined MDIF, and rerun "
+                "the optimization."
+            )
+
+    for config_path in sorted(sweep_dir.glob("*_best_config.json")):
+        try:
+            config = json.loads(config_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(config, dict) and config.get("status") == "no_eligible_trial":
+            return (
+                "The optimize run has no eligible best model and did not retain "
+                "a usable point-generation fallback. If the trials only failed "
+                "passivity, rerun the optimization and use --allow-nonpassive "
+                "when suggesting points; also confirm that verification data "
+                "was supplied to the fit."
+            )
+
+    searched = [
+        fit_dir / "verification_metrics.csv",
+        target_model_dir / "verification_metrics.csv",
+        fit_dir / "point_generation_fallback" / "verification_metrics.csv",
+    ]
+    unique_paths = list(dict.fromkeys(str(path) for path in searched))
+    return "Searched: " + ", ".join(unique_paths) + "."
+
+
 def verification_metrics_path(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Path:
     fallback_manifest: Path | None = None
     recovery_error: str | None = None
+    source_kind = "unknown"
     if args.verification_metrics:
         path = Path(args.verification_metrics)
+        source_kind = "explicit_verification_metrics"
         sibling_manifest = path.parent / "point_generation_source.json"
         if sibling_manifest.is_file():
             fallback_manifest = sibling_manifest
@@ -5060,16 +5441,24 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
         )
         if direct_path.is_file():
             path = direct_path
+            source_kind = (
+                "best_model"
+                if fit_dir.name.startswith("best_model")
+                else "direct_fit"
+            )
             sibling_manifest = fit_dir / "point_generation_source.json"
             if sibling_manifest.is_file():
                 fallback_manifest = sibling_manifest
         elif best_model_path.is_file():
             path = best_model_path
+            source_kind = "best_model"
         elif fallback_path.is_file():
             path = fallback_path
+            source_kind = "nonpassive_optimization_fallback"
             fallback_manifest = fallback_path.parent / "point_generation_source.json"
         elif fit_dir.name == "best_model" and parent_fallback_path.is_file():
             path = parent_fallback_path
+            source_kind = "nonpassive_optimization_fallback"
             fallback_manifest = (
                 parent_fallback_path.parent / "point_generation_source.json"
             )
@@ -5088,12 +5477,15 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
             )
             if selected_trial_path is not None:
                 path = selected_trial_path
+                source_kind = "retained_selected_trial"
             else:
                 recovered_path, recovery_error = _recover_promoted_verification_metrics(
                     sweep_dir,
                     target_model_dir,
                 )
                 path = recovered_path or direct_path
+                if recovered_path is not None:
+                    source_kind = "recovered_best_model"
     else:
         parser.error("Either --fit-dir or --verification-metrics is required")
     if not path.exists():
@@ -5102,10 +5494,20 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
             if recovery_error
             else ""
         )
+        fit_detail = ""
+        if args.fit_dir:
+            fit_detail = " " + _missing_verification_metrics_detail(
+                Path(args.fit_dir),
+                (
+                    Path(args.fit_dir)
+                    if Path(args.fit_dir).name.startswith("best_model")
+                    else Path(args.fit_dir) / "best_model"
+                ),
+            )
         parser.error(
             f"Verification metrics file does not exist: {path}. For an optimize "
             "run, pass the sweep directory or its best_model directory."
-            f"{recovery_detail}"
+            f"{recovery_detail}{fit_detail}"
         )
     if fallback_manifest is not None:
         if not getattr(args, "allow_nonpassive", False):
@@ -5118,7 +5520,22 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
             source_payload = json.loads(fallback_manifest.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             parser.error(f"Could not read point-generation fallback metadata: {exc}")
+        if not isinstance(source_payload, dict):
+            parser.error(
+                "Point-generation fallback metadata must be a JSON object: "
+                f"{fallback_manifest}"
+            )
+        if (
+            source_payload.get("purpose") != "gp_point_generation_only"
+            or source_payload.get("eligible_for_export") is not False
+        ):
+            parser.error(
+                "Point-generation fallback metadata is incomplete or unsafe: "
+                f"{fallback_manifest}. Expected purpose=gp_point_generation_only "
+                "and eligible_for_export=false."
+            )
         args.nonpassive_source = source_payload
+        source_kind = "nonpassive_optimization_fallback"
         source_trial = source_payload.get("source_trial", "unknown")
         print(
             "warning: using verification errors from passivity-ineligible trial "
@@ -5128,6 +5545,12 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
         )
     else:
         args.nonpassive_source = None
+    args.verification_metrics_resolution = {
+        "kind": source_kind,
+        "path": str(path),
+        "fit_dir": str(args.fit_dir) if args.fit_dir else None,
+        "export_eligible": fallback_manifest is None,
+    }
     return path
 
 
@@ -5453,6 +5876,9 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         "decimal_places": args.decimal_places,
     }
     acquisition_metadata["verification_metrics_source"] = str(metrics_path)
+    acquisition_metadata["verification_metrics_resolution"] = dict(
+        getattr(args, "verification_metrics_resolution", {})
+    )
     acquisition_metadata["bare_values_mode"] = args.bare_values
     acquisition_metadata["bare_values_interpretation"] = effective_bare_values
     acquisition_metadata["verification_metrics_bare_values_interpretation"] = (
@@ -5747,6 +6173,23 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             )
     except ValueError as exc:
         parser.error(str(exc))
+    coverage_plot_path = geometry_coverage_plot_path(combined_path)
+    remove_coverage_plots(
+        [
+            geometry_coverage_plot_path(out_path),
+            geometry_coverage_plot_path(split_output_path(out_path, "train")),
+            geometry_coverage_plot_path(
+                split_output_path(out_path, "verification")
+            ),
+            geometry_coverage_plot_path(
+                split_output_path(combined_path, "train")
+            ),
+            geometry_coverage_plot_path(
+                split_output_path(combined_path, "verification")
+            ),
+        ],
+        keep=coverage_plot_path,
+    )
     normalized_target_dataset = canonical_dataset_label(args.target_dataset)
     if normalized_target_dataset != normalize_key(args.target_dataset):
         print(
@@ -5802,6 +6245,47 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         "current_batch_origin": "additional",
         "existing_point_origin": "existing",
     }
+    acquisition_metadata["output_files"] = {
+        "new_points_only": {
+            "all_new": str(out_path),
+            **(
+                {"training": str(split_output_path(out_path, "train"))}
+                if "train" in batch_dataset_labels
+                else {}
+            ),
+            **(
+                {
+                    "verification": str(
+                        split_output_path(out_path, "verification")
+                    )
+                }
+                if "verification" in batch_dataset_labels
+                else {}
+            ),
+        },
+        "cumulative_all_points": {
+            "training_and_verification": str(combined_path),
+            **(
+                {
+                    "training": str(
+                        split_output_path(combined_path, "train")
+                    )
+                }
+                if "train" in cumulative_dataset_labels
+                else {}
+            ),
+            **(
+                {
+                    "verification": str(
+                        split_output_path(combined_path, "verification")
+                    )
+                }
+                if "verification" in cumulative_dataset_labels
+                else {}
+            ),
+        },
+        "coverage_plot_all_points": str(coverage_plot_path),
+    }
     write_error_regions_csv(analysis_path, regions, parameters)
     metadata_path = write_suggested_points_csv(
         out_path,
@@ -5816,6 +6300,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         include_normalized=args.include_normalized,
         decimal_places=args.decimal_places,
         acquisition_metadata=acquisition_metadata,
+        coverage_plot_path=coverage_plot_path,
     )
     method_name = (
         f"targeted-{candidate_method}"
@@ -5857,28 +6342,12 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     except ValueError as exc:
         parser.error(str(exc))
-    _, coverage_context_rows = read_csv_table(combined_path)
-    cumulative_training_count = sum(
-        canonical_dataset_label(lookup_row_value(row, args.split_var)) == "train"
-        for row in coverage_context_rows
-    )
-    cumulative_verification_count = (
-        len(coverage_context_rows) - cumulative_training_count
-    )
-    write_parameter_coverage_png(
-        out_path,
-        parameters,
-        coverage_context_rows,
-        args.split_var,
-        bare_values=args.bare_values,
-    )
     split_view_paths = write_dataset_split_geometry_views(
         out_path,
         parameters,
         args.split_var,
         bare_values=args.bare_values,
         decimal_places=args.decimal_places,
-        coverage_rows=coverage_context_rows,
     )
     cumulative_split_view_paths = write_dataset_split_geometry_views(
         combined_path,
@@ -5886,8 +6355,18 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         args.split_var,
         bare_values=args.bare_values,
         decimal_places=args.decimal_places,
-        coverage_rows=coverage_context_rows,
     )
+    try:
+        output_integrity = validate_suggest_output_family(
+            out_path,
+            combined_path,
+            parameters,
+            args.split_var,
+            args.decimal_places,
+            coverage_plot_path,
+        )
+    except ValueError as exc:
+        parser.error(f"Additional-point output integrity check failed: {exc}")
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(
         f"considered {len(existing_points)} existing point(s) and "
@@ -5949,22 +6428,25 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                 "automatic verification: disabled"
                 + (f" ({reason})" if reason else "")
             )
-    print(f"wrote {out_path}")
-    print(f"wrote {metadata_path}")
-    print(f"wrote {geometry_coverage_plot_path(out_path)}")
+    print("new-point simulation queues:")
+    print(f"  all new points: {out_path}")
     for split_view_path in split_view_paths:
-        print(f"wrote {split_view_path}")
-    print(f"wrote {analysis_path}")
-    print(f"wrote {combined_path}")
-    print(f"wrote {combined_metadata_path}")
-    print(f"wrote {geometry_coverage_plot_path(combined_path)}")
+        split_role = geometry_file_split_group(split_view_path) or "combined"
+        print(f"  new {split_role} points: {split_view_path}")
+    print("cumulative geometry inventories:")
+    print(f"  all training and verification points: {combined_path}")
     for split_view_path in cumulative_split_view_paths:
-        print(f"wrote {split_view_path}")
+        split_role = geometry_file_split_group(split_view_path) or "combined"
+        print(f"  all {split_role} points: {split_view_path}")
+    print(f"coverage plot (all points): {coverage_plot_path}")
+    print(f"new-point metadata: {metadata_path}")
+    print(f"cumulative metadata: {combined_metadata_path}")
+    print(f"verification-error analysis: {analysis_path}")
     print(
         "geometry integrity: "
-        f"{len(coverage_context_rows)} unique combined point(s) = "
-        f"{cumulative_training_count} training + "
-        f"{cumulative_verification_count} verification; "
+        f"{sum(output_integrity['cumulative'].values())} unique combined "
+        f"point(s) = {output_integrity['cumulative']['train']} training + "
+        f"{output_integrity['cumulative']['verification']} verification; "
         "training/verification overlap: 0"
     )
     print(
