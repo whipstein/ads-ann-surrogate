@@ -1859,6 +1859,15 @@ Geometry CSV naming is strict and deliberately matches file content:
 | `<out>_all_geometries_training.csv` | All previous training points plus the new training points. |
 | `<out>_all_geometries_verification.csv` | All previous verification points plus the new verification points. |
 
+Always pass `<out>_all_geometries.csv` into the next round. If an options JSON
+or command accidentally supplies a generated new-only CSV or one of its split
+views, `suggest-additional` now follows the companion JSON's `output_files`
+manifest back to the authoritative cumulative CSV before it counts, selects,
+plots, or writes points. The substitution is printed and recorded under
+`existing_geometry_resolution` in the new metadata. This also prevents a
+new-only training queue from silently dropping the existing verification
+inventory.
+
 `--out` and `--combined-out` are combined outputs and therefore reject names
 containing a complete training or verification role word. Every
 `suggest-additional` run derives its split CSVs from the same deduplicated

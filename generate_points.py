@@ -791,6 +791,14 @@ def coverage_point_group(
     return "training"
 
 
+COVERAGE_GROUP_COLORS: dict[str, tuple[int, int, int]] = {
+    "training": (37, 99, 235),
+    "verification": (249, 115, 22),
+    "additional_training": (22, 163, 74),
+    "additional_verification": (168, 85, 247),
+}
+
+
 def write_parameter_coverage_png(
     geometry_path: Path,
     parameters: Sequence[ParameterSpec],
@@ -875,10 +883,6 @@ def write_parameter_coverage_png(
     plot_inset_right = px(10)
     plot_inset_top = px(10)
     plot_inset_bottom = px(25)
-    training_color = (37, 99, 235, 255)
-    verification_color = (249, 115, 22, 255)
-    additional_training_color = (22, 163, 74, 255)
-    additional_verification_color = (168, 85, 247, 255)
     background_color = (248, 250, 252, 255)
     cell_color = (255, 255, 255, 255)
     border_color = (203, 213, 225, 255)
@@ -933,10 +937,7 @@ def write_parameter_coverage_png(
         "additional_verification": "Added verification",
     }
     group_colors = {
-        "training": training_color,
-        "verification": verification_color,
-        "additional_training": additional_training_color,
-        "additional_verification": additional_verification_color,
+        name: (*color, 255) for name, color in COVERAGE_GROUP_COLORS.items()
     }
     present_groups = [
         name
@@ -1347,6 +1348,159 @@ def parameter_specs_equal(
         ):
             return False
     return True
+
+
+def existing_geometry_path_from_metadata(
+    metadata_path: Path,
+    *,
+    include_geometry_file: bool = True,
+) -> Path | None:
+    """Resolve the complete cumulative geometry CSV named by metadata."""
+
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    raw_candidates: list[object] = []
+    output_files = payload.get("output_files")
+    if isinstance(output_files, dict):
+        cumulative = output_files.get("cumulative_all_points")
+        if isinstance(cumulative, dict):
+            raw_candidates.append(cumulative.get("training_and_verification"))
+    raw_candidates.append(payload.get("next_gp_existing_points"))
+    cumulative_splits = payload.get("cumulative_split_files")
+    if isinstance(cumulative_splits, dict):
+        raw_candidates.append(cumulative_splits.get("combined"))
+    if include_geometry_file:
+        generation_kind = str(payload.get("generation_kind") or "")
+        if generation_kind in {
+            "generated",
+            "range_extension",
+            "accumulated_geometries",
+            "accumulated_training_geometries",
+        }:
+            raw_candidates.append(payload.get("geometry_file"))
+
+    for raw_candidate in raw_candidates:
+        text = str(raw_candidate or "").strip()
+        if not text:
+            continue
+        supplied = Path(text).expanduser()
+        candidates = [supplied] if supplied.is_absolute() else [
+            Path.cwd() / supplied,
+            metadata_path.parent / supplied,
+            metadata_path.parent / supplied.name,
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.absolute()
+    return None
+
+
+def resolve_existing_geometry_inputs(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    """Replace partial/new-only inputs with their authoritative cumulative CSV."""
+
+    requested_paths = [Path(raw_path) for raw_path in args.existing_points]
+    original_paths = list(requested_paths)
+    parameter_json_inventory = (
+        existing_geometry_path_from_metadata(Path(args.parameter_json))
+        if args.parameter_json
+        else None
+    )
+    parameter_json_cumulative = (
+        existing_geometry_path_from_metadata(
+            Path(args.parameter_json),
+            include_geometry_file=False,
+        )
+        if args.parameter_json
+        else None
+    )
+    if not original_paths and parameter_json_inventory is not None:
+        inferred = parameter_json_inventory
+        if inferred is not None:
+            original_paths.append(inferred)
+
+    resolved_paths: list[Path] = []
+    resolutions: list[dict[str, str]] = []
+    for original_path in original_paths:
+        resolved_path = original_path
+        found_companion_inventory = False
+        for metadata_path in companion_geometry_metadata_candidates(original_path):
+            if not metadata_path.is_file():
+                continue
+            cumulative_path = existing_geometry_path_from_metadata(
+                metadata_path,
+                include_geometry_file=False,
+            )
+            if cumulative_path is not None:
+                resolved_path = cumulative_path
+                found_companion_inventory = True
+                break
+            geometry_path = existing_geometry_path_from_metadata(metadata_path)
+            if geometry_path is None:
+                continue
+            original_absolute = original_path.expanduser().absolute()
+            geometry_absolute = geometry_path.expanduser().absolute()
+            standard_split_companion = any(
+                original_path.stem.endswith(suffix)
+                and original_path.stem[: -len(suffix)] == metadata_path.stem
+                and geometry_path.stem == metadata_path.stem
+                for suffix in (
+                    "_train",
+                    "_training",
+                    "_verification",
+                    "_verify",
+                    "_validation",
+                    "_test",
+                )
+            )
+            if geometry_absolute == original_absolute or standard_split_companion:
+                resolved_path = geometry_path
+                found_companion_inventory = True
+                break
+        if (
+            not found_companion_inventory
+            and len(original_paths) == 1
+            and parameter_json_cumulative is not None
+        ):
+            resolved_path = parameter_json_cumulative
+        if not resolved_path.is_file():
+            parser.error(f"Existing-points CSV does not exist: {resolved_path}")
+        resolved_path = resolved_path.absolute()
+        if resolved_path not in resolved_paths:
+            resolved_paths.append(resolved_path)
+        if resolved_path != original_path.expanduser().absolute():
+            resolutions.append(
+                {
+                    "requested": str(original_path),
+                    "resolved_cumulative": str(resolved_path),
+                }
+            )
+
+    args.existing_points = [str(path) for path in resolved_paths]
+    args.existing_geometry_resolution = {
+        "requested": [str(path) for path in requested_paths],
+        "inferred_from_parameter_json": (
+            str(parameter_json_inventory)
+            if not requested_paths and parameter_json_inventory is not None
+            else None
+        ),
+        "resolved": list(args.existing_points),
+        "cumulative_replacements": resolutions,
+    }
+    for resolution in resolutions:
+        print(
+            "existing geometry input: replaced partial/new-only CSV "
+            f"{resolution['requested']} with cumulative inventory "
+            f"{resolution['resolved_cumulative']}",
+            file=sys.stderr,
+        )
 
 
 def generated_point_rows(
@@ -3781,6 +3935,14 @@ def validate_suggest_output_family(
             decimal_places,
         ),
     }
+    _combined_fields, combined_rows = read_csv_table(combined_path)
+    coverage_role_counts = {
+        group: 0 for group in COVERAGE_GROUP_COLORS
+    }
+    for row in combined_rows:
+        coverage_role_counts[
+            coverage_point_group(row, split_var)
+        ] += 1
     for family_name, source_path in (
         ("new", out_path),
         ("cumulative", combined_path),
@@ -3829,6 +3991,31 @@ def validate_suggest_output_family(
     if not coverage_plot_path.is_file():
         raise ValueError(
             f"The all-point coverage plot is missing: {coverage_plot_path}"
+        )
+    try:
+        from PIL import Image
+
+        with Image.open(coverage_plot_path) as image:
+            rgb_image = image.convert("RGB")
+            pixels = (
+                rgb_image.get_flattened_data()
+                if hasattr(rgb_image, "get_flattened_data")
+                else rgb_image.getdata()
+            )
+            rendered_colors = set(pixels)
+    except (ImportError, OSError) as exc:
+        raise ValueError(
+            f"Could not validate all-point coverage plot {coverage_plot_path}: {exc}"
+        ) from exc
+    missing_role_colors = [
+        group
+        for group, count in coverage_role_counts.items()
+        if count and COVERAGE_GROUP_COLORS[group] not in rendered_colors
+    ]
+    if missing_role_colors:
+        raise ValueError(
+            "The all-point coverage plot omits color(s) for data it contains: "
+            + ", ".join(missing_role_colors)
         )
     redundant_plots = [
         geometry_coverage_plot_path(out_path),
@@ -3889,6 +4076,15 @@ def validate_suggest_output_family(
             raise ValueError(
                 f"Output metadata {metadata_path} has an incorrect point_count"
             )
+        if (
+            family_name == "cumulative"
+            and metadata.get("coverage_role_counts") != coverage_role_counts
+        ):
+            raise ValueError(
+                f"Output metadata {metadata_path} has incorrect "
+                f"coverage_role_counts: expected {coverage_role_counts}, found "
+                f"{metadata.get('coverage_role_counts')}"
+            )
 
         output_files = metadata.get("output_files")
         if not isinstance(output_files, dict):
@@ -3921,13 +4117,15 @@ def validate_suggest_output_family(
                     f"{label} path: {raw_path}"
                 )
 
-    return {
+    output_counts = {
         family_name: {
             dataset: len(keys)
             for dataset, keys in dataset_keys.items()
         }
         for family_name, dataset_keys in family_keys.items()
     }
+    output_counts["coverage_roles"] = coverage_role_counts
+    return output_counts
 
 
 def write_accumulated_geometries(
@@ -4185,6 +4383,12 @@ def write_accumulated_geometries(
             )
         rows.append(row)
 
+    coverage_role_counts = {
+        group: 0 for group in COVERAGE_GROUP_COLORS
+    }
+    for row in rows:
+        coverage_role_counts[coverage_point_group(row, split_var)] += 1
+
     validate_geometry_output_rows(
         path,
         rows,
@@ -4237,6 +4441,7 @@ def write_accumulated_geometries(
             "legacy_filename_role_mismatches": filename_role_mismatch_count,
             "next_gp_existing_points": str(path),
             **(metadata_extra or {}),
+            "coverage_role_counts": coverage_role_counts,
         },
     )
 
@@ -5590,6 +5795,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         if value is not None and value <= 0:
             parser.error(f"--{option_name.replace('_', '-')} must be positive")
     validate_shared_sampling_args(parser, args)
+    resolve_existing_geometry_inputs(parser, args)
     parameters = resolve_suggest_parameters(parser, args)
     validate_parameter_decimal_places(parser, parameters, args.decimal_places)
     if isinstance(args.gp_length_scale, list) and len(args.gp_length_scale) not in {
@@ -5878,6 +6084,9 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     acquisition_metadata["verification_metrics_source"] = str(metrics_path)
     acquisition_metadata["verification_metrics_resolution"] = dict(
         getattr(args, "verification_metrics_resolution", {})
+    )
+    acquisition_metadata["existing_geometry_resolution"] = dict(
+        getattr(args, "existing_geometry_resolution", {})
     )
     acquisition_metadata["bare_values_mode"] = args.bare_values
     acquisition_metadata["bare_values_interpretation"] = effective_bare_values

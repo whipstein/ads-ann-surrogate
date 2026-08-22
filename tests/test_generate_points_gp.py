@@ -251,6 +251,177 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(policy["selected_additional_verification_count"], 8)
             self.assertIn("automatic verification: 8 point(s) added", stdout.getvalue())
 
+    def test_next_round_recovers_cumulative_inventory_from_new_only_csv(self) -> None:
+        """A prior new-only queue must never replace the accumulated history."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            initial = root / "initial.csv"
+            metrics = root / "verification_metrics.csv"
+            round_one = root / "round_one.csv"
+            round_two = root / "round_two.csv"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "generate",
+                            "--parameter",
+                            "W=0:1",
+                            "--parameter",
+                            "L=0:1",
+                            "--count",
+                            "18",
+                            "--verification-count",
+                            "6",
+                            "--lhs-candidates",
+                            "4",
+                            "--out",
+                            str(initial),
+                        ]
+                    ),
+                    0,
+                )
+            with initial.open(newline="") as stream:
+                initial_rows = list(csv.DictReader(stream))
+            initial_verification = [
+                row for row in initial_rows if row["dataset"] == "verification"
+            ]
+            with metrics.open("w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["source_index", "sparam", "evm_pct", "W", "L"],
+                )
+                writer.writeheader()
+                for index, row in enumerate(initial_verification, start=1):
+                    writer.writerow(
+                        {
+                            "source_index": index,
+                            "sparam": "S21",
+                            "evm_pct": 0.25 + index / 10.0,
+                            "W": row["W"],
+                            "L": row["L"],
+                        }
+                    )
+
+            common = [
+                "--count",
+                "2",
+                "--verification-metrics",
+                str(metrics),
+                "--candidate-count",
+                "64",
+                "--lhs-candidates",
+                "4",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            *common,
+                            "--existing-points",
+                            str(initial),
+                            "--out",
+                            str(round_one),
+                        ]
+                    ),
+                    0,
+                )
+
+            # Deliberately supply the prior round's *new-only training split*.
+            # Its combined companion JSON must redirect the command to the
+            # complete round_one_all_geometries inventory.
+            prior_partial = POINTS.split_output_path(round_one, "train")
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                stderr
+            ):
+                self.assertEqual(
+                    POINTS.main(
+                        [
+                            "suggest-additional",
+                            *common,
+                            "--existing-points",
+                            str(prior_partial),
+                            "--out",
+                            str(round_two),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertIn("replaced partial/new-only CSV", stderr.getvalue())
+
+            new_training = POINTS.split_output_path(round_two, "train")
+            new_verification = POINTS.split_output_path(round_two, "verification")
+            cumulative = POINTS.accumulated_geometry_path(round_two)
+            all_training = POINTS.split_output_path(cumulative, "train")
+            all_verification = POINTS.split_output_path(cumulative, "verification")
+            for path in (
+                new_training,
+                new_verification,
+                cumulative,
+                all_training,
+                all_verification,
+            ):
+                self.assertTrue(path.is_file(), path)
+
+            def rows(path: Path) -> list[dict[str, str]]:
+                with path.open(newline="") as stream:
+                    return list(csv.DictReader(stream))
+
+            self.assertEqual(len(rows(new_training)), 2)
+            self.assertEqual(len(rows(new_verification)), 2)
+            self.assertEqual(len(rows(all_training)), 16)
+            self.assertEqual(len(rows(all_verification)), 8)
+            self.assertEqual(len(rows(cumulative)), 24)
+            self.assertTrue(
+                all(row["dataset"] == "train" for row in rows(new_training))
+            )
+            self.assertTrue(
+                all(
+                    row["dataset"] == "verification"
+                    for row in rows(new_verification)
+                )
+            )
+            self.assert_geometry_splits_are_disjoint(cumulative, ["W", "L"])
+
+            cumulative_rows = rows(cumulative)
+            role_counts = {
+                role: sum(
+                    POINTS.coverage_point_group(row, "dataset") == role
+                    for row in cumulative_rows
+                )
+                for role in POINTS.COVERAGE_GROUP_COLORS
+            }
+            self.assertEqual(
+                role_counts,
+                {
+                    "training": 14,
+                    "verification": 6,
+                    "additional_training": 2,
+                    "additional_verification": 2,
+                },
+            )
+            metadata = json.loads(round_two.with_suffix(".json").read_text())
+            cumulative_metadata = json.loads(cumulative.with_suffix(".json").read_text())
+            self.assertEqual(cumulative_metadata["coverage_role_counts"], role_counts)
+            self.assertEqual(
+                Path(
+                    metadata["existing_geometry_resolution"]["resolved"][0]
+                ),
+                POINTS.accumulated_geometry_path(round_one),
+            )
+            coverage_plot = POINTS.geometry_coverage_plot_path(cumulative)
+            with Image.open(coverage_plot) as image:
+                rgb_image = image.convert("RGB")
+                colors = set(
+                    rgb_image.get_flattened_data()
+                    if hasattr(rgb_image, "get_flattened_data")
+                    else rgb_image.getdata()
+                )
+            for color in POINTS.COVERAGE_GROUP_COLORS.values():
+                self.assertIn(color, colors)
+
     def test_split_points_csv_uses_single_combined_geometry_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
