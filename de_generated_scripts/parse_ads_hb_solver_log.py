@@ -6,7 +6,7 @@ StatusLevel=4 or StatusLevel=5.  It deliberately ignores the per-inner-iteration
 Krylov table printed at level 5: the Newton summary row already contains the
 total Krylov iterations for that Newton step.
 
-No ADS installation or third-party Python package is required.
+No ADS installation is required. Pillow is used for the report's PNG plots.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import re
 import statistics
 import sys
 from dataclasses import dataclass, field
-from html import escape as html_escape
 from pathlib import Path
 from typing import Iterable, Pattern, Sequence
 
@@ -758,371 +757,188 @@ def _short_label(value: object, limit: int = 18) -> str:
     return text if len(text) <= limit else f"{text[: limit - 1]}…"
 
 
-def _svg_text(
-    x: float,
-    y: float,
-    text: object,
-    *,
-    size: int = 13,
-    anchor: str = "middle",
-    weight: str = "normal",
-    fill: str = "#1f2937",
-    rotate: float | None = None,
-) -> str:
-    transform = f' transform="rotate({rotate:g} {x:.2f} {y:.2f})"' if rotate else ""
-    return (
-        f'<text x="{x:.2f}" y="{y:.2f}" text-anchor="{anchor}" '
-        f'font-family="Arial,Helvetica,sans-serif" font-size="{size}" '
-        f'font-weight="{weight}" fill="{fill}"{transform}>'
-        f"{html_escape(str(text))}</text>"
+def _plot_font(size: int, bold: bool = False):
+    try:
+        from PIL import ImageFont
+    except ImportError as exc:
+        raise RuntimeError("ADS HB report PNG output requires Pillow") from exc
+    candidates = (
+        ["/System/Library/Fonts/Supplemental/Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
+        if bold
+        else ["/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
     )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
-def _svg_begin(width: int, height: int, title: str) -> list[str]:
-    return [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
-            f'aria-label="{html_escape(title, quote=True)}">'
-        ),
-        '<rect width="100%" height="100%" fill="#ffffff"/>',
-        _svg_text(width / 2, 32, title, size=21, weight="bold"),
-    ]
+def _png_canvas(width: int, height: int, title: str):
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("ADS HB report PNG output requires Pillow") from exc
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text(
+        (width / 2, 28),
+        title,
+        font=_plot_font(30, bold=True),
+        fill="#111827",
+        anchor="ma",
+    )
+    return image, draw
 
 
-def _append_y_axis(
-    elements: list[str],
+def _draw_png_y_axis(
+    draw: object,
     left: float,
     top: float,
     plot_width: float,
     plot_height: float,
     y_max: float,
-    y_label: str,
+    label: str,
 ) -> None:
-    for index in range(6):
-        value = y_max * index / 5.0
-        y = top + plot_height - plot_height * index / 5.0
-        elements.append(
-            f'<line x1="{left:.2f}" y1="{y:.2f}" '
-            f'x2="{left + plot_width:.2f}" y2="{y:.2f}" '
-            'stroke="#e5e7eb" stroke-width="1"/>'
-        )
-        elements.append(
-            _svg_text(
-                left - 9,
-                y + 4,
-                _format_axis_number(value),
-                size=11,
-                anchor="end",
-                fill="#4b5563",
-            )
-        )
-    elements.append(
-        f'<line x1="{left:.2f}" y1="{top:.2f}" x2="{left:.2f}" '
-        f'y2="{top + plot_height:.2f}" stroke="#6b7280"/>'
-    )
-    elements.append(
-        f'<line x1="{left:.2f}" y1="{top + plot_height:.2f}" '
-        f'x2="{left + plot_width:.2f}" y2="{top + plot_height:.2f}" '
-        'stroke="#6b7280"/>'
-    )
-    elements.append(
-        _svg_text(
-            left - 52,
-            top + plot_height / 2,
-            y_label,
-            size=12,
-            rotate=-90,
-        )
-    )
+    text_font = _plot_font(15)
+    label_font = _plot_font(17, bold=True)
+    for tick in range(6):
+        value = tick * y_max / 5.0
+        y = top + plot_height * (1.0 - tick / 5.0)
+        draw.line((left, y, left + plot_width, y), fill="#e5e7eb", width=2)
+        draw.text((left - 10, y), _format_number(value), font=text_font, fill="#475569", anchor="rm")
+    draw.line((left, top, left, top + plot_height), fill="#64748b", width=2)
+    draw.line((left, top + plot_height, left + plot_width, top + plot_height), fill="#64748b", width=2)
+    draw.text((left - 72, top + plot_height / 2), label, font=label_font, fill="#334155", anchor="mm")
 
 
-def _write_total_work_svg(
+def _write_total_work_png(
     path: Path, summary_rows: Sequence[dict[str, object]]
 ) -> None:
-    width = 1040
-    height = 470
-    elements = _svg_begin(width, height, "Total solver work by model")
+    width, height = 1800, 760
+    image, draw = _png_canvas(width, height, "Total solver work by model")
     models = [str(row["model"]) for row in summary_rows]
     panels = [
         ("Total Newton iterations", "total_newton_iterations"),
         ("Total Krylov iterations", "total_krylov_iterations"),
     ]
-    panel_width = 490.0
+    panel_width = 830
     for panel_index, (title, key) in enumerate(panels):
-        panel_x = 20.0 + panel_index * 515.0
-        left = panel_x + 72.0
-        top = 82.0
-        plot_width = panel_width - 100.0
-        plot_height = 285.0
+        panel_x = 55 + panel_index * 875
+        left, top, plot_width, plot_height = panel_x + 120, 155, 660, 440
         values = [_metric_number(row[key]) for row in summary_rows]
         y_max = _nice_axis_max(max(values, default=0.0))
-        elements.append(
-            _svg_text(panel_x + panel_width / 2, 63, title, size=16, weight="bold")
-        )
-        _append_y_axis(
-            elements,
-            left,
-            top,
-            plot_width,
-            plot_height,
-            y_max,
-            "Iterations",
-        )
+        draw.text((panel_x + panel_width / 2, 95), title, font=_plot_font(23, bold=True), fill="#1f2937", anchor="ma")
+        _draw_png_y_axis(draw, left, top, plot_width, plot_height, y_max, "Iterations")
         group_width = plot_width / max(1, len(models))
-        bar_width = min(72.0, group_width * 0.58)
+        bar_width = min(100.0, group_width * 0.58)
         for index, (model, value) in enumerate(zip(models, values)):
-            x = left + group_width * (index + 0.5) - bar_width / 2.0
+            x = left + group_width * (index + 0.5) - bar_width / 2
             bar_height = plot_height * value / y_max
             y = top + plot_height - bar_height
             color = PLOT_COLORS[index % len(PLOT_COLORS)]
-            elements.append(
-                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" '
-                f'height="{bar_height:.2f}" rx="3" fill="{color}"/>'
-            )
-            elements.append(
-                _svg_text(
-                    x + bar_width / 2,
-                    max(top + 12, y - 7),
-                    _format_number(value),
-                    size=11,
-                    weight="bold",
-                )
-            )
-            elements.append(
-                _svg_text(
-                    x + bar_width / 2,
-                    top + plot_height + 23,
-                    _short_label(model),
-                    size=11,
-                )
-            )
-    elements.append(
-        _svg_text(
-            width / 2,
-            451,
-            "Totals include every detected HB solve in each Gain Compression log.",
-            size=12,
-            fill="#4b5563",
-        )
-    )
-    elements.append("</svg>")
-    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+            draw.rounded_rectangle((x, y, x + bar_width, top + plot_height), radius=5, fill=color)
+            draw.text((x + bar_width / 2, max(top + 14, y - 12)), _format_number(value), font=_plot_font(15, bold=True), fill="#111827", anchor="ms")
+            draw.text((x + bar_width / 2, top + plot_height + 30), _short_label(model), font=_plot_font(15), fill="#334155", anchor="ma")
+    draw.text((width / 2, 725), "Totals include every detected HB solve in each Gain Compression log.", font=_plot_font(17), fill="#4b5563", anchor="ma")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="PNG", dpi=(144, 144), optimize=True)
 
 
-def _write_runtime_svg(
+def _write_runtime_png(
     path: Path, summary_rows: Sequence[dict[str, object]]
 ) -> None:
-    width = 1450
-    height = 470
-    elements = _svg_begin(width, height, "ADS Resource usage timing")
+    width, height = 2200, 760
+    image, draw = _png_canvas(width, height, "ADS Resource usage timing")
     available = any(
         row["wall_clock_seconds"] != ""
         or row["simulation_stopwatch_seconds"] != ""
         for row in summary_rows
     )
     if not available:
-        elements.extend(
-            [
-                _svg_text(
-                    width / 2,
-                    210,
-                    "No ADS stopwatch timing was found in the supplied logs.",
-                    size=18,
-                    weight="bold",
-                    fill="#9a3412",
-                ),
-                _svg_text(
-                    width / 2,
-                    246,
-                    "Enable ADS event timing or pass --wall-clock-seconds.",
-                    size=15,
-                    fill="#4b5563",
-                ),
-                "</svg>",
-            ]
-        )
-        path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+        draw.text((width / 2, 325), "No ADS stopwatch timing was found in the supplied logs.", font=_plot_font(28, bold=True), fill="#9a3412", anchor="mm")
+        draw.text((width / 2, 380), "Enable ADS Resource usage output or pass --wall-clock-seconds.", font=_plot_font(22), fill="#4b5563", anchor="mm")
+        image.save(path, format="PNG", dpi=(144, 144), optimize=True)
         return
-
     models = [str(row["model"]) for row in summary_rows]
     panels = [
         ("Total stopwatch time", "wall_clock_seconds"),
         ("Simulation stopwatch time", "simulation_stopwatch_seconds"),
         ("Total stopwatch / HB solve", "wall_clock_per_solve_seconds"),
     ]
-    panel_width = 450.0
+    panel_width = 690
     for panel_index, (title, key) in enumerate(panels):
-        panel_x = 10.0 + panel_index * 480.0
-        left = panel_x + 72.0
-        top = 82.0
-        plot_width = panel_width - 100.0
-        plot_height = 285.0
+        panel_x = 20 + panel_index * 720
+        left, top, plot_width, plot_height = panel_x + 120, 155, 530, 440
         raw_values = [row[key] for row in summary_rows]
-        numeric_values = [
-            _metric_number(value) for value in raw_values if value != ""
-        ]
+        numeric_values = [_metric_number(value) for value in raw_values if value != ""]
         y_max = _nice_axis_max(max(numeric_values, default=0.0))
-        elements.append(
-            _svg_text(panel_x + panel_width / 2, 63, title, size=16, weight="bold")
-        )
-        _append_y_axis(
-            elements,
-            left,
-            top,
-            plot_width,
-            plot_height,
-            y_max,
-            "Seconds",
-        )
+        draw.text((panel_x + panel_width / 2, 95), title, font=_plot_font(22, bold=True), fill="#1f2937", anchor="ma")
+        _draw_png_y_axis(draw, left, top, plot_width, plot_height, y_max, "Seconds")
         group_width = plot_width / max(1, len(models))
-        bar_width = min(72.0, group_width * 0.58)
+        bar_width = min(90.0, group_width * 0.58)
         for index, (model, raw_value) in enumerate(zip(models, raw_values)):
-            x = left + group_width * (index + 0.5) - bar_width / 2.0
+            x = left + group_width * (index + 0.5) - bar_width / 2
             color = PLOT_COLORS[index % len(PLOT_COLORS)]
             if raw_value != "":
                 value = _metric_number(raw_value)
                 bar_height = plot_height * value / y_max
                 y = top + plot_height - bar_height
-                elements.append(
-                    f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width:.2f}" '
-                    f'height="{bar_height:.2f}" rx="3" fill="{color}"/>'
-                )
-                elements.append(
-                    _svg_text(
-                        x + bar_width / 2,
-                        max(top + 12, y - 7),
-                        _format_duration(value),
-                        size=11,
-                        weight="bold",
-                    )
-                )
+                draw.rounded_rectangle((x, y, x + bar_width, top + plot_height), radius=5, fill=color)
+                draw.text((x + bar_width / 2, max(top + 14, y - 12)), _format_duration(value), font=_plot_font(15, bold=True), fill="#111827", anchor="ms")
             else:
-                elements.append(
-                    _svg_text(
-                        x + bar_width / 2,
-                        top + plot_height - 9,
-                        "n/a",
-                        size=12,
-                        weight="bold",
-                        fill="#9a3412",
-                    )
-                )
-            elements.append(
-                _svg_text(
-                    x + bar_width / 2,
-                    top + plot_height + 23,
-                    _short_label(model),
-                    size=11,
-                )
-            )
-    elements.append(
-        _svg_text(
-            width / 2,
-            451,
-            "Per-solve time is Total stopwatch time divided by detected HB solves.",
-            size=12,
-            fill="#4b5563",
-        )
-    )
-    elements.append("</svg>")
-    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+                draw.text((x + bar_width / 2, top + plot_height - 10), "n/a", font=_plot_font(16, bold=True), fill="#9a3412", anchor="ms")
+            draw.text((x + bar_width / 2, top + plot_height + 30), _short_label(model), font=_plot_font(15), fill="#334155", anchor="ma")
+    draw.text((width / 2, 725), "Per-solve time is Total stopwatch time divided by detected HB solves.", font=_plot_font(17), fill="#4b5563", anchor="ma")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="PNG", dpi=(144, 144), optimize=True)
 
 
-def _write_krylov_statistics_svg(
+def _write_krylov_statistics_png(
     path: Path, summary_rows: Sequence[dict[str, object]]
 ) -> None:
-    width = 1040
-    height = 500
-    elements = _svg_begin(width, height, "Krylov work per detected HB solve")
+    width, height = 1800, 800
+    image, draw = _png_canvas(width, height, "Krylov work per detected HB solve")
     metrics = [
         ("Mean", "mean_krylov_per_solve"),
         ("Median", "median_krylov_per_solve"),
         ("95th percentile", "p95_krylov_per_solve"),
         ("Maximum", "max_krylov_per_solve"),
     ]
-    left = 82.0
-    top = 86.0
-    plot_width = 920.0
-    plot_height = 310.0
-    values = [
-        _metric_number(row[key]) for _, key in metrics for row in summary_rows
-    ]
+    left, top, plot_width, plot_height = 150, 145, 1570, 470
+    values = [_metric_number(row[key]) for _, key in metrics for row in summary_rows]
     y_max = _nice_axis_max(max(values, default=0.0))
-    _append_y_axis(
-        elements,
-        left,
-        top,
-        plot_width,
-        plot_height,
-        y_max,
-        "Krylov iterations / solve",
-    )
+    _draw_png_y_axis(draw, left, top, plot_width, plot_height, y_max, "Krylov iterations / solve")
     group_width = plot_width / len(metrics)
     model_count = max(1, len(summary_rows))
-    bar_width = min(46.0, group_width * 0.72 / model_count)
+    bar_width = min(75.0, group_width * 0.72 / model_count)
     for metric_index, (metric_label, key) in enumerate(metrics):
-        group_center = left + group_width * (metric_index + 0.5)
-        total_bar_width = bar_width * model_count
+        center = left + group_width * (metric_index + 0.5)
+        total_width = bar_width * model_count
         for model_index, row in enumerate(summary_rows):
             value = _metric_number(row[key])
-            x = group_center - total_bar_width / 2.0 + model_index * bar_width
-            bar_height = plot_height * value / y_max
-            y = top + plot_height - bar_height
+            x = center - total_width / 2 + model_index * bar_width
+            y = top + plot_height - plot_height * value / y_max
             color = PLOT_COLORS[model_index % len(PLOT_COLORS)]
-            elements.append(
-                f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width - 2:.2f}" '
-                f'height="{bar_height:.2f}" rx="2" fill="{color}"/>'
-            )
+            draw.rectangle((x, y, x + bar_width - 4, top + plot_height), fill=color)
             if len(summary_rows) <= 4:
-                elements.append(
-                    _svg_text(
-                        x + (bar_width - 2) / 2,
-                        max(top + 11, y - 6),
-                        _format_number(value),
-                        size=10,
-                    )
-                )
-        elements.append(
-            _svg_text(
-                group_center,
-                top + plot_height + 24,
-                metric_label,
-                size=12,
-            )
-        )
-    legend_y = 466.0
-    legend_width = min(190.0, 850.0 / max(1, len(summary_rows)))
-    legend_start = width / 2.0 - legend_width * len(summary_rows) / 2.0
+                draw.text((x + (bar_width - 4) / 2, max(top + 12, y - 10)), _format_number(value), font=_plot_font(14), fill="#111827", anchor="ms")
+        draw.text((center, top + plot_height + 34), metric_label, font=_plot_font(17), fill="#334155", anchor="ma")
+    legend_x = 190
     for index, row in enumerate(summary_rows):
-        x = legend_start + index * legend_width
         color = PLOT_COLORS[index % len(PLOT_COLORS)]
-        elements.append(
-            f'<rect x="{x:.2f}" y="{legend_y - 11:.2f}" width="14" '
-            f'height="14" rx="2" fill="{color}"/>'
-        )
-        elements.append(
-            _svg_text(
-                x + 20,
-                legend_y,
-                _short_label(row["model"]),
-                size=11,
-                anchor="start",
-            )
-        )
-    elements.append("</svg>")
-    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+        draw.rectangle((legend_x, 720, legend_x + 20, 740), fill=color)
+        draw.text((legend_x + 30, 730), _short_label(row["model"]), font=_plot_font(16), fill="#334155", anchor="lm")
+        legend_x += 300
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="PNG", dpi=(144, 144), optimize=True)
 
 
-def _write_krylov_by_solve_svg(path: Path, results: Sequence[ParseResult]) -> None:
-    width = 1040
-    height = 520
-    elements = _svg_begin(width, height, "Krylov iterations by HB solve sequence")
-    left = 82.0
-    top = 90.0
-    plot_width = 920.0
-    plot_height = 330.0
+def _write_krylov_by_solve_png(path: Path, results: Sequence[ParseResult]) -> None:
+    width, height = 1800, 820
+    image, draw = _png_canvas(width, height, "Krylov iterations by HB solve sequence")
+    left, top, plot_width, plot_height = 150, 145, 1570, 500
     all_values = [
         sum(row.krylov_iterations for row in solve.newton)
         for result in results
@@ -1130,92 +946,34 @@ def _write_krylov_by_solve_svg(path: Path, results: Sequence[ParseResult]) -> No
     ]
     max_solves = max((len(result.solves) for result in results), default=1)
     y_max = _nice_axis_max(max(all_values, default=0.0))
-    _append_y_axis(
-        elements,
-        left,
-        top,
-        plot_width,
-        plot_height,
-        y_max,
-        "Krylov iterations",
-    )
+    _draw_png_y_axis(draw, left, top, plot_width, plot_height, y_max, "Krylov iterations")
     tick_step = max(1, math.ceil(max_solves / 10))
-    x_ticks = list(range(1, max_solves + 1, tick_step))
-    if x_ticks[-1] != max_solves:
-        x_ticks.append(max_solves)
-    for solve_index in x_ticks:
-        x = (
-            left + plot_width / 2.0
-            if max_solves == 1
-            else left + plot_width * (solve_index - 1) / (max_solves - 1)
-        )
-        elements.append(
-            f'<line x1="{x:.2f}" y1="{top:.2f}" x2="{x:.2f}" '
-            f'y2="{top + plot_height:.2f}" stroke="#f3f4f6"/>'
-        )
-        elements.append(
-            _svg_text(x, top + plot_height + 22, solve_index, size=11)
-        )
-    elements.append(
-        _svg_text(
-            left + plot_width / 2,
-            top + plot_height + 48,
-            "Detected HB solve sequence",
-            size=12,
-        )
-    )
+    for solve_index in range(1, max_solves + 1, tick_step):
+        x = left + plot_width / 2 if max_solves == 1 else left + plot_width * (solve_index - 1) / (max_solves - 1)
+        draw.line((x, top, x, top + plot_height), fill="#f3f4f6", width=1)
+        draw.text((x, top + plot_height + 25), str(solve_index), font=_plot_font(14), fill="#475569", anchor="ma")
     for model_index, result in enumerate(results):
         color = PLOT_COLORS[model_index % len(PLOT_COLORS)]
-        points: list[tuple[float, float]] = []
+        points = []
         for solve in result.solves:
             value = sum(row.krylov_iterations for row in solve.newton)
-            x = (
-                left + plot_width / 2.0
-                if max_solves == 1
-                else left + plot_width * (solve.solve_index - 1) / (max_solves - 1)
-            )
+            x = left + plot_width / 2 if max_solves == 1 else left + plot_width * (solve.solve_index - 1) / (max_solves - 1)
             y = top + plot_height - plot_height * value / y_max
             points.append((x, y))
         if len(points) > 1:
-            path_data = " ".join(
-                f"{'M' if index == 0 else 'L'} {x:.2f} {y:.2f}"
-                for index, (x, y) in enumerate(points)
-            )
-            elements.append(
-                f'<path d="{path_data}" fill="none" stroke="{color}" '
-                'stroke-width="2.4" stroke-linejoin="round"/>'
-            )
+            draw.line(points, fill=color, width=4)
         for x, y in points:
-            elements.append(
-                f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4" fill="{color}" '
-                'stroke="#ffffff" stroke-width="1.2"/>'
-            )
-    legend_y = 497.0
-    legend_width = min(190.0, 850.0 / max(1, len(results)))
-    legend_start = width / 2.0 - legend_width * len(results) / 2.0
+            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=color, outline="white", width=2)
+    draw.text((left + plot_width / 2, top + plot_height + 65), "Detected HB solve sequence", font=_plot_font(18, bold=True), fill="#334155", anchor="ma")
+    legend_x = 190
     for index, result in enumerate(results):
-        x = legend_start + index * legend_width
         color = PLOT_COLORS[index % len(PLOT_COLORS)]
-        elements.append(
-            f'<line x1="{x:.2f}" y1="{legend_y - 5:.2f}" '
-            f'x2="{x + 17:.2f}" y2="{legend_y - 5:.2f}" '
-            f'stroke="{color}" stroke-width="3"/>'
-        )
-        elements.append(
-            f'<circle cx="{x + 8.5:.2f}" cy="{legend_y - 5:.2f}" r="3.5" '
-            f'fill="{color}"/>'
-        )
-        elements.append(
-            _svg_text(
-                x + 23,
-                legend_y,
-                _short_label(result.model),
-                size=11,
-                anchor="start",
-            )
-        )
-    elements.append("</svg>")
-    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+        draw.line((legend_x, 755, legend_x + 35, 755), fill=color, width=5)
+        draw.ellipse((legend_x + 12, 748, legend_x + 26, 762), fill=color)
+        draw.text((legend_x + 45, 755), _short_label(result.model), font=_plot_font(16), fill="#334155", anchor="lm")
+        legend_x += 320
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="PNG", dpi=(144, 144), optimize=True)
 
 
 def _markdown_escape(value: object) -> str:
@@ -1461,7 +1219,7 @@ def _write_markdown_report(
         "",
         "## Runtime",
         "",
-        f"![ADS Resource usage timing by model]({plot_href('runtime_comparison.svg')})",
+        f"![ADS Resource usage timing by model]({plot_href('runtime_comparison.png')})",
         "",
         _markdown_table(
             [
@@ -1499,19 +1257,19 @@ def _write_markdown_report(
         "",
         "## Total solver work",
         "",
-        f"![Total Newton and Krylov iterations by model]({plot_href('solver_work_totals.svg')})",
+        f"![Total Newton and Krylov iterations by model]({plot_href('solver_work_totals.png')})",
         "",
         "Totals are affected by both work per solve and the number of adaptive Gain Compression solves.",
         "",
         "## Normalized Krylov work",
         "",
-        f"![Krylov work statistics per HB solve]({plot_href('krylov_per_solve_statistics.svg')})",
+        f"![Krylov work statistics per HB solve]({plot_href('krylov_per_solve_statistics.png')})",
         "",
         "These statistics normalize for different numbers of adaptive HB solves.",
         "",
         "## Solve sequence",
         "",
-        f"![Krylov iterations by detected HB solve]({plot_href('krylov_by_solve.svg')})",
+        f"![Krylov iterations by detected HB solve]({plot_href('krylov_by_solve.png')})",
         "",
         (
             "Solve indices represent execution order. They are directly comparable "
@@ -1608,15 +1366,15 @@ def _write_report_artifacts(
 ) -> tuple[list[str], list[str]]:
     artifact_names = [
         "ads_hb_solver_report.md",
-        "runtime_comparison.svg",
-        "solver_work_totals.svg",
-        "krylov_per_solve_statistics.svg",
-        "krylov_by_solve.svg",
+        "runtime_comparison.png",
+        "solver_work_totals.png",
+        "krylov_per_solve_statistics.png",
+        "krylov_by_solve.png",
     ]
-    _write_runtime_svg(out_dir / artifact_names[1], summary_rows)
-    _write_total_work_svg(out_dir / artifact_names[2], summary_rows)
-    _write_krylov_statistics_svg(out_dir / artifact_names[3], summary_rows)
-    _write_krylov_by_solve_svg(out_dir / artifact_names[4], results)
+    _write_runtime_png(out_dir / artifact_names[1], summary_rows)
+    _write_total_work_png(out_dir / artifact_names[2], summary_rows)
+    _write_krylov_statistics_png(out_dir / artifact_names[3], summary_rows)
+    _write_krylov_by_solve_png(out_dir / artifact_names[4], results)
     plot_hrefs: dict[str, str] = {}
     for name in artifact_names[1:]:
         source_path = out_dir / name

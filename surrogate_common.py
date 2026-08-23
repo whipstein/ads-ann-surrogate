@@ -13550,9 +13550,9 @@ def plot_sweep_diagnostics_matplotlib(
                     ax.legend(loc="best", fontsize=9, frameon=True)
             pdf.savefig(fig)
             image_path = path.parent / (
-                f"{image_prefix}_{safe_filename(metric_name.lower())}_trend.svg"
+                f"{image_prefix}_{safe_filename(metric_name.lower())}_trend.png"
             )
-            fig.savefig(image_path, format="svg", bbox_inches="tight")
+            fig.savefig(image_path, format="png", dpi=160, bbox_inches="tight")
             image_paths.append(image_path)
             plt.close(fig)
     return image_paths
@@ -13637,17 +13637,7 @@ def plot_sweep_diagnostics_fallback_pdf(
     save_pdf_pages(path, canvases)
 
 
-def sweep_svg_escape(value: object) -> str:
-    return (
-        str(value)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def plot_sweep_diagnostics_fallback_svgs(
+def plot_sweep_diagnostics_fallback_pngs(
     plot_dir: Path,
     image_prefix: str,
     rows: Sequence[dict[str, object]],
@@ -13655,173 +13645,152 @@ def plot_sweep_diagnostics_fallback_svgs(
     metric_names: Sequence[str],
     selection_metric: str,
 ) -> list[Path]:
-    """Write dependency-free SVG trend plots when Matplotlib is unavailable."""
+    """Write raster trend plots when Matplotlib is unavailable."""
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError(
+            "Sweep diagnostic PNG output requires Pillow when Matplotlib is unavailable"
+        ) from exc
+
+    def load_font(size: int, bold: bool = False):
+        candidates = (
+            ["/System/Library/Fonts/Supplemental/Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
+            if bold
+            else ["/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+        )
+        for candidate in candidates:
+            try:
+                return ImageFont.truetype(candidate, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
 
     image_paths: list[Path] = []
     columns = 2 if len(swept_columns) > 1 else 1
-    panel_width = 570.0
-    panel_height = 330.0
-    page_width = 40.0 + columns * panel_width
+    panel_width = 850
+    panel_height = 500
     page_rows = int(math.ceil(len(swept_columns) / columns))
-    page_height = 105.0 + page_rows * panel_height
+    page_width = 60 + columns * panel_width
+    page_height = 165 + page_rows * panel_height
+    title_font = load_font(30, bold=True)
+    panel_font = load_font(22, bold=True)
+    text_font = load_font(16)
+    tick_font = load_font(13)
 
     for metric_name in metric_names:
         metric_label = sweep_diagnostic_metric_label(metric_name, selection_metric)
-        svg = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            (
-                f'<svg xmlns="http://www.w3.org/2000/svg" width="{page_width:.0f}" '
-                f'height="{page_height:.0f}" viewBox="0 0 {page_width:.0f} {page_height:.0f}">'
-            ),
-            '<rect width="100%" height="100%" fill="#ffffff"/>',
-            (
-                f'<text x="{page_width / 2:.1f}" y="30" text-anchor="middle" '
-                'font-family="sans-serif" font-size="20" font-weight="bold">'
-                f'Sweep error diagnostics: {sweep_svg_escape(metric_label)}</text>'
-            ),
-            '<circle cx="32" cy="62" r="5" fill="#1f77b4"/>',
-            '<text x="44" y="67" font-family="sans-serif" font-size="12">passivity OK</text>',
-            '<path d="M 155 57 l 10 10 M 165 57 l -10 10" stroke="#d62728" stroke-width="2"/>',
-            '<text x="173" y="67" font-family="sans-serif" font-size="12">passivity fail</text>',
-            '<line x1="288" y1="62" x2="318" y2="62" stroke="#6c757d" stroke-width="2" stroke-dasharray="6 4"/>',
-            '<text x="326" y="67" font-family="sans-serif" font-size="12">mean, all trials</text>',
-            '<line x1="454" y1="62" x2="484" y2="62" stroke="#ff7f0e" stroke-width="2"/>',
-            '<text x="492" y="67" font-family="sans-serif" font-size="12">mean, passive trials</text>',
+        image = Image.new("RGB", (page_width, page_height), "white")
+        draw = ImageDraw.Draw(image)
+        draw.text(
+            (page_width / 2, 25),
+            f"Sweep error diagnostics: {metric_label}",
+            font=title_font,
+            fill="#111827",
+            anchor="ma",
+        )
+        legend = [
+            ("passivity OK", "#1f77b4"),
+            ("passivity fail", "#d62728"),
+            ("mean, all trials", "#6c757d"),
+            ("mean, passive trials", "#ff7f0e"),
         ]
+        legend_x = 45
+        for label, color in legend:
+            draw.ellipse((legend_x, 82, legend_x + 16, 98), fill=color)
+            draw.text((legend_x + 24, 90), label, font=text_font, fill="#334155", anchor="lm")
+            legend_x += 245
 
         for panel_index, parameter_name in enumerate(swept_columns):
             panel_column = panel_index % columns
             panel_row = panel_index // columns
-            panel_x = 20.0 + panel_column * panel_width
-            panel_y = 88.0 + panel_row * panel_height
-            chart_left = panel_x + 72.0
-            chart_top = panel_y + 36.0
-            chart_width = panel_width - 105.0
-            chart_height = panel_height - 92.0
-            pairs = finite_metric_pairs(rows, parameter_name, metric_name)
-            svg.extend(
-                [
-                    (
-                        f'<rect x="{panel_x + 8:.1f}" y="{panel_y + 4:.1f}" '
-                        f'width="{panel_width - 16:.1f}" height="{panel_height - 14:.1f}" '
-                        'rx="5" fill="#ffffff" stroke="#d1d5db"/>'
-                    ),
-                    (
-                        f'<text x="{panel_x + panel_width / 2:.1f}" y="{panel_y + 26:.1f}" '
-                        'text-anchor="middle" font-family="sans-serif" font-size="15" '
-                        f'font-weight="bold">{sweep_svg_escape(parameter_name)}</text>'
-                    ),
-                ]
+            panel_x = 30 + panel_column * panel_width
+            panel_y = 125 + panel_row * panel_height
+            chart_left = panel_x + 115
+            chart_top = panel_y + 58
+            chart_width = panel_width - 165
+            chart_height = panel_height - 140
+            draw.rounded_rectangle(
+                (panel_x + 8, panel_y + 5, panel_x + panel_width - 12, panel_y + panel_height - 18),
+                radius=8,
+                fill="white",
+                outline="#d1d5db",
+                width=2,
             )
+            draw.text(
+                (panel_x + panel_width / 2, panel_y + 25),
+                parameter_name,
+                font=panel_font,
+                fill="#111827",
+                anchor="ma",
+            )
+            pairs = finite_metric_pairs(rows, parameter_name, metric_name)
             if not pairs:
-                svg.append(
-                    f'<text x="{panel_x + panel_width / 2:.1f}" y="{panel_y + 155:.1f}" '
-                    'text-anchor="middle" font-family="sans-serif" font-size="13" '
-                    'fill="#6b7280">No metric values</text>'
+                draw.text(
+                    (panel_x + panel_width / 2, panel_y + panel_height / 2),
+                    "No metric values",
+                    font=text_font,
+                    fill="#64748b",
+                    anchor="mm",
                 )
                 continue
 
-            y_values = np.asarray([pair[1] for pair in pairs], dtype=float)
-            y_min = float(np.min(y_values))
-            y_max = float(np.max(y_values))
-            y_span = y_max - y_min
-            y_padding = 0.08 * y_span if y_span > EPS else max(abs(y_max) * 0.08, 1e-6)
-            y_low = y_min - y_padding
-            y_high = y_max + y_padding
-
+            y_values = [float(pair[1]) for pair in pairs]
+            y_min = min(y_values)
+            y_max = max(y_values)
+            y_pad = 0.08 * max(y_max - y_min, abs(y_max) * 1e-4, 1e-9)
+            y_low = y_min - y_pad
+            y_high = y_max + y_pad
             numeric_values = [csv_number(pair[0]) for pair in pairs]
             numeric_axis = all(value is not None for value in numeric_values)
             if numeric_axis:
-                x_raw = [float(value) for value in numeric_values if value is not None]
-                ordered_keys: list[object] = sorted(set(x_raw))
-                x_low = min(x_raw)
-                x_high = max(x_raw)
-
-                def x_position(value: object) -> float:
-                    numeric = float(value)
-                    if x_high <= x_low + EPS:
-                        return chart_left + chart_width / 2.0
-                    return chart_left + chart_width * (numeric - x_low) / (x_high - x_low)
-
-                tick_keys = ordered_keys
-                if len(tick_keys) > 7:
-                    tick_keys = [tick_keys[index] for index in np.linspace(0, len(tick_keys) - 1, 7, dtype=int)]
+                ordered_keys: list[object] = sorted(
+                    {float(value) for value in numeric_values if value is not None}
+                )
             else:
                 ordered_keys = sorted(
                     {str(pair[0]) for pair in pairs}, key=sort_category_key
                 )
-                category_index = {
-                    str(value): index for index, value in enumerate(ordered_keys)
-                }
 
-                def x_position(value: object) -> float:
-                    if len(ordered_keys) <= 1:
-                        return chart_left + chart_width / 2.0
-                    return chart_left + chart_width * category_index[str(value)] / (
-                        len(ordered_keys) - 1
-                    )
-
-                tick_keys = ordered_keys
+            def x_position(value: object) -> float:
+                if len(ordered_keys) <= 1:
+                    return chart_left + chart_width / 2
+                if numeric_axis:
+                    low = float(ordered_keys[0])
+                    high = float(ordered_keys[-1])
+                    return chart_left + chart_width * (float(value) - low) / max(high - low, EPS)
+                return chart_left + chart_width * ordered_keys.index(str(value)) / (len(ordered_keys) - 1)
 
             def y_position(value: float) -> float:
                 return chart_top + chart_height * (y_high - value) / (y_high - y_low)
 
-            for tick_index in range(5):
-                fraction = tick_index / 4.0
-                y_value = y_high - fraction * (y_high - y_low)
-                y = chart_top + fraction * chart_height
-                svg.extend(
-                    [
-                        (
-                            f'<line x1="{chart_left:.1f}" y1="{y:.1f}" '
-                            f'x2="{chart_left + chart_width:.1f}" y2="{y:.1f}" '
-                            'stroke="#e5e7eb"/>'
-                        ),
-                        (
-                            f'<text x="{chart_left - 8:.1f}" y="{y + 4:.1f}" '
-                            'text-anchor="end" font-family="sans-serif" font-size="10" '
-                            f'fill="#4b5563">{sweep_svg_escape(metric_text(y_value))}</text>'
-                        ),
-                    ]
-                )
-            svg.extend(
-                [
-                    (
-                        f'<line x1="{chart_left:.1f}" y1="{chart_top:.1f}" '
-                        f'x2="{chart_left:.1f}" y2="{chart_top + chart_height:.1f}" '
-                        'stroke="#6b7280"/>'
-                    ),
-                    (
-                        f'<line x1="{chart_left:.1f}" y1="{chart_top + chart_height:.1f}" '
-                        f'x2="{chart_left + chart_width:.1f}" y2="{chart_top + chart_height:.1f}" '
-                        'stroke="#6b7280"/>'
-                    ),
-                ]
-            )
+            for tick in range(5):
+                value = y_low + tick * (y_high - y_low) / 4
+                y = y_position(value)
+                draw.line((chart_left, y, chart_left + chart_width, y), fill="#e5e7eb", width=1)
+                draw.text((chart_left - 10, y), f"{value:.5g}", font=tick_font, fill="#475569", anchor="rm")
+            draw.line((chart_left, chart_top, chart_left, chart_top + chart_height), fill="#64748b", width=2)
+            draw.line((chart_left, chart_top + chart_height, chart_left + chart_width, chart_top + chart_height), fill="#64748b", width=2)
 
-            visible_ticks = list(tick_keys)
-            if not numeric_axis and len(visible_ticks) > 8:
-                step = int(math.ceil(len(visible_ticks) / 8.0))
-                visible_ticks = visible_ticks[::step]
-            for key in visible_ticks:
-                x = x_position(key)
+            visible_keys = ordered_keys
+            if len(visible_keys) > 8:
+                step = int(math.ceil(len(visible_keys) / 8))
+                visible_keys = visible_keys[::step]
+            for key in visible_keys:
                 label = str(key)
-                if len(label) > 18:
-                    label = label[:15] + "..."
-                svg.append(
-                    f'<text x="{x:.1f}" y="{chart_top + chart_height + 18:.1f}" '
-                    'text-anchor="middle" font-family="sans-serif" font-size="10" '
-                    f'fill="#4b5563">{sweep_svg_escape(label)}</text>'
-                )
+                if len(label) > 16:
+                    label = label[:13] + "..."
+                draw.text((x_position(key), chart_top + chart_height + 22), label, font=tick_font, fill="#475569", anchor="ma")
 
-            def mean_polyline(passive_only: bool) -> list[tuple[float, float]]:
+            def trend(passive_only: bool) -> list[tuple[float, float]]:
                 points: list[tuple[float, float]] = []
                 for key in ordered_keys:
                     values = [
-                        pair[1]
+                        float(pair[1])
                         for pair in pairs
                         if (
-                            (float(pair[0]) == float(key))
+                            math.isclose(float(pair[0]), float(key), rel_tol=0.0, abs_tol=0.0)
                             if numeric_axis
                             else str(pair[0]) == str(key)
                         )
@@ -13831,38 +13800,25 @@ def plot_sweep_diagnostics_fallback_svgs(
                         points.append((x_position(key), y_position(float(np.mean(values)))))
                 return points
 
-            for passive_only, color, dash in [
-                (False, "#6c757d", ' stroke-dasharray="6 4"'),
-                (True, "#ff7f0e", ""),
-            ]:
-                trend = mean_polyline(passive_only)
-                if len(trend) >= 2:
-                    points_text = " ".join(f"{x:.1f},{y:.1f}" for x, y in trend)
-                    svg.append(
-                        f'<polyline points="{points_text}" fill="none" stroke="{color}" '
-                        f'stroke-width="2"{dash}/>'
-                    )
-
-            for raw_x, y_value, _trial, passivity_failed in pairs:
+            all_trend = trend(False)
+            passive_trend = trend(True)
+            if len(all_trend) > 1:
+                draw.line(all_trend, fill="#6c757d", width=3)
+            if len(passive_trend) > 1:
+                draw.line(passive_trend, fill="#ff7f0e", width=4)
+            for raw_x, y_value, _trial, failed in pairs:
                 x = x_position(float(raw_x) if numeric_axis else str(raw_x))
                 y = y_position(float(y_value))
-                if passivity_failed:
-                    svg.append(
-                        f'<path d="M {x - 4:.1f} {y - 4:.1f} l 8 8 '
-                        f'M {x + 4:.1f} {y - 4:.1f} l -8 8" '
-                        'stroke="#d62728" stroke-width="2"/>'
-                    )
+                if failed:
+                    draw.line((x - 6, y - 6, x + 6, y + 6), fill="#d62728", width=3)
+                    draw.line((x + 6, y - 6, x - 6, y + 6), fill="#d62728", width=3)
                 else:
-                    svg.append(
-                        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" '
-                        'fill="#1f77b4" fill-opacity="0.78"/>'
-                    )
+                    draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill="#1f77b4", outline="white", width=1)
 
-        svg.append("</svg>")
         image_path = plot_dir / (
-            f"{image_prefix}_{safe_filename(metric_name.lower())}_trend.svg"
+            f"{image_prefix}_{safe_filename(metric_name.lower())}_trend.png"
         )
-        image_path.write_text("\n".join(svg))
+        image.save(image_path, format="PNG", dpi=(144, 144), optimize=True)
         image_paths.append(image_path)
     return image_paths
 
@@ -13907,7 +13863,7 @@ def plot_sweep_diagnostics(
             metric_names,
             selection_metric,
         )
-        image_paths = plot_sweep_diagnostics_fallback_svgs(
+        image_paths = plot_sweep_diagnostics_fallback_pngs(
             plot_dir,
             prefix,
             usable_rows,

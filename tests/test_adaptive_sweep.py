@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+from PIL import Image
 
 import dnn
 import kbnn
@@ -348,7 +349,7 @@ class AdaptiveSweepTests(unittest.TestCase):
                 (out_dir / "sweep_diagnostics" / "test_error_vs_swept_parameters.pdf").is_file()
             )
             self.assertTrue(
-                (out_dir / "sweep_diagnostics" / "test_metric_trend.svg").is_file()
+                (out_dir / "sweep_diagnostics" / "test_metric_trend.png").is_file()
             )
             summary_text = (out_dir / "summary.md").read_text()
             self.assertIn("## Selection Status", summary_text)
@@ -360,7 +361,7 @@ class AdaptiveSweepTests(unittest.TestCase):
             self.assertIn("## Trial Ranking", summary_text)
             self.assertIn(
                 "![Sweep trend plot: test metric trend]"
-                "(sweep_diagnostics/test_metric_trend.svg)",
+                "(sweep_diagnostics/test_metric_trend.png)",
                 summary_text,
             )
             self.assertLess(
@@ -604,7 +605,7 @@ class AdaptiveSweepTests(unittest.TestCase):
         self.assertEqual(trial_args.order, candidate["order"])
 
     @mock.patch("surrogate_common.load_matplotlib_modules", return_value=None)
-    def test_dependency_free_sweep_plot_is_embeddable_svg(self, _modules) -> None:
+    def test_dependency_free_sweep_plot_is_embeddable_png(self, _modules) -> None:
         rows = [
             {
                 "trial": 1,
@@ -634,11 +635,17 @@ class AdaptiveSweepTests(unittest.TestCase):
             self.assertEqual(len(artifacts), 2)
             self.assertTrue(all(path.is_file() for path in artifacts))
             self.assertTrue(images)
-            self.assertTrue(all(path.suffix == ".svg" for path in images))
-            svg = images[0].read_text()
-            self.assertIn("<svg", svg)
-            self.assertIn("mean, all trials", svg)
-            self.assertIn("passivity fail", svg)
+            self.assertTrue(all(path.suffix == ".png" for path in images))
+            with Image.open(images[0]) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertGreater(image.width, 800)
+                colors = image.convert("RGB").getcolors(
+                    maxcolors=image.width * image.height
+                )
+            self.assertIsNotNone(colors)
+            rendered = {color for _count, color in colors or []}
+            self.assertIn((31, 119, 180), rendered)
+            self.assertIn((214, 39, 40), rendered)
 
 
 if __name__ == "__main__":

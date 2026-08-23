@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import html
 import json
 import math
 import os
@@ -898,12 +897,32 @@ def write_csv(path: Path, rows: Sequence[dict[str, object]], preferred_fields: S
         writer.writerows(rows)
 
 
-def svg_passivity_plot(path: Path, block_rows: Sequence[dict[str, object]], limit: float) -> bool:
+def png_passivity_plot(path: Path, block_rows: Sequence[dict[str, object]], limit: float) -> bool:
+    """Write the raw-data passivity summary as a document-scale PNG."""
+
     plotted = [row for row in block_rows if isinstance(row.get("max_singular_value"), (int, float))]
     if not plotted:
         return False
-    width, height = 1000, 420
-    left, right, top, bottom = 78, 25, 42, 62
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("Dataset audit PNG output requires Pillow") from exc
+
+    def load_font(size: int, bold: bool = False):
+        candidates = (
+            ["/System/Library/Fonts/Supplemental/Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
+            if bold
+            else ["/System/Library/Fonts/Supplemental/Arial.ttf", "DejaVuSans.ttf"]
+        )
+        for candidate in candidates:
+            try:
+                return ImageFont.truetype(candidate, size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    width, height = 1800, 760
+    left, right, top, bottom = 150, 50, 100, 115
     plot_width = width - left - right
     plot_height = height - top - bottom
     values = [float(row["max_singular_value"]) for row in plotted]
@@ -924,45 +943,56 @@ def svg_passivity_plot(path: Path, block_rows: Sequence[dict[str, object]], limi
         ("coarse", "train"): "#059669",
         ("coarse", "verification"): "#a855f7",
     }
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="white"/>',
-        '<text x="500" y="25" text-anchor="middle" font-family="sans-serif" font-size="18">Raw MDIF passivity by block</text>',
-        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#444"/>',
-        f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#444"/>',
-    ]
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = load_font(34, bold=True)
+    label_font = load_font(22, bold=True)
+    text_font = load_font(18)
+    draw.text((width / 2, 35), "Raw MDIF passivity by block", font=title_font, fill="#111827", anchor="ma")
+    draw.line((left, top, left, top + plot_height), fill="#444444", width=2)
+    draw.line((left, top + plot_height, left + plot_width, top + plot_height), fill="#444444", width=2)
     for tick in range(6):
         value = y_min + tick * (y_max - y_min) / 5.0
         y = y_coord(value)
-        lines.extend(
-            [
-                f'<line x1="{left}" y1="{y:.2f}" x2="{left + plot_width}" y2="{y:.2f}" stroke="#e5e7eb"/>',
-                f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="sans-serif" font-size="11">{value:.5g}</text>',
-            ]
-        )
+        draw.line((left, y, left + plot_width, y), fill="#e5e7eb", width=2)
+        draw.text((left - 14, y), f"{value:.6g}", font=text_font, fill="#334155", anchor="rm")
     limit_y = y_coord(limit)
-    lines.append(
-        f'<line x1="{left}" y1="{limit_y:.2f}" x2="{left + plot_width}" y2="{limit_y:.2f}" stroke="#dc2626" stroke-width="2" stroke-dasharray="7 5"/>'
-    )
+    for x in range(left, left + plot_width, 26):
+        draw.line((x, limit_y, min(x + 15, left + plot_width), limit_y), fill="#dc2626", width=4)
     for index, row in enumerate(plotted):
         key = (str(row["dataset"]), str(row["role"]))
         color = colors.get(key, "#64748b")
         value = float(row["max_singular_value"])
-        title = html.escape(
-            f"{row['dataset']} {row['role']} block {row['block']}: sigma={value:.9g}"
+        x = x_coord(index)
+        y = y_coord(value)
+        draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=color, outline="white", width=1)
+    draw.text((left + plot_width / 2, height - 48), "Block sequence (fine then coarse; training and verification)", font=label_font, fill="#1f2937", anchor="ma")
+    y_label = Image.new("RGBA", (460, 45), (255, 255, 255, 0))
+    y_draw = ImageDraw.Draw(y_label)
+    y_draw.text((230, 22), "Maximum singular value", font=label_font, fill="#1f2937", anchor="mm")
+    y_label = y_label.rotate(90, expand=True)
+    image.paste(y_label, (20, int(top + plot_height / 2 - y_label.height / 2)), y_label)
+    draw.text((left + plot_width - 4, limit_y - 10), f"passivity limit = {limit:.9g}", font=text_font, fill="#dc2626", anchor="rs")
+
+    legend_items = [
+        ("Fine training", colors[("fine", "train")]),
+        ("Fine verification", colors[("fine", "verification")]),
+    ]
+    present = {(str(row["dataset"]), str(row["role"])) for row in plotted}
+    if any(key[0] == "coarse" for key in present):
+        legend_items.extend(
+            [
+                ("Coarse training", colors[("coarse", "train")]),
+                ("Coarse verification", colors[("coarse", "verification")]),
+            ]
         )
-        lines.append(
-            f'<circle cx="{x_coord(index):.2f}" cy="{y_coord(value):.2f}" r="3.2" fill="{color}"><title>{title}</title></circle>'
-        )
-    lines.extend(
-        [
-            f'<text x="{left + plot_width / 2:.2f}" y="{height - 18}" text-anchor="middle" font-family="sans-serif" font-size="13">Block sequence (fine then coarse; train and verification)</text>',
-            f'<text x="18" y="{top + plot_height / 2:.2f}" transform="rotate(-90 18 {top + plot_height / 2:.2f})" text-anchor="middle" font-family="sans-serif" font-size="13">Maximum singular value</text>',
-            '<text x="790" y="49" font-family="sans-serif" font-size="11" fill="#dc2626">passivity limit</text>',
-            '</svg>',
-        ]
-    )
-    path.write_text("\n".join(lines) + "\n")
+    legend_x = left
+    for label, color in legend_items:
+        draw.ellipse((legend_x, 72, legend_x + 16, 88), fill=color)
+        draw.text((legend_x + 25, 80), label, font=text_font, fill="#334155", anchor="lm")
+        legend_x += 260
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="PNG", dpi=(144, 144), optimize=True)
     return True
 
 
@@ -1782,7 +1812,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     coverage_path = out_dir / "dataset_parameter_coverage.csv"
     duplicates_path = out_dir / "dataset_duplicates.csv"
     neighbors_path = out_dir / "dataset_neighbor_consistency.csv"
-    plot_path = out_dir / "dataset_passivity.svg"
+    plot_path = out_dir / "dataset_passivity.png"
     json_path = out_dir / "dataset_audit.json"
     markdown_path = out_dir / "dataset_audit.md"
     write_csv(issues_path, problems)
@@ -1792,7 +1822,7 @@ def run_audit(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     write_csv(coverage_path, coverage_rows)
     write_csv(duplicates_path, duplicate_rows)
     write_csv(neighbors_path, neighbor_rows)
-    plot_written = svg_passivity_plot(plot_path, block_rows, 1.0 + args.passivity_tolerance)
+    plot_written = png_passivity_plot(plot_path, block_rows, 1.0 + args.passivity_tolerance)
     geometry_domain_summary = (
         {
             "source": "geometry_generation_json",

@@ -119,6 +119,7 @@ dispatcher calls the relevant internal script and returns its exit status:
 | Generate or extend geometry points | `python3 surrogate.py points generate [OPTIONS]` |
 | Select adaptive points | `python3 surrogate.py points suggest-additional [OPTIONS]` |
 | Audit MDIF data | `python3 surrogate.py audit [OPTIONS]` |
+| Diagnose model error and passivity | `python3 surrogate.py debug-model --run-dir RUN_DIR [OPTIONS]` |
 | Fit, optimize, inspect, predict, rerank, or export a model | `python3 surrogate.py --model {dnn,kbnn,neuro-tf} COMMAND [OPTIONS]` |
 | Compare ADS HB solver logs | `python3 surrogate.py hb-report [OPTIONS] LOG [LOG ...]` |
 
@@ -1375,7 +1376,7 @@ itself.
 If every completed trial fails training or the passivity constraints, the
 command returns a nonzero status and does not promote `best_model/`, but it
 still writes the normal results CSV, best-config JSON, Markdown sweep summary,
-diagnostic PDF, inline SVG trend plots, and diagnostic CSV. The Markdown
+diagnostic PDF, inline PNG trend plots, and diagnostic CSV. The Markdown
 identifies the closest available ineligible trial and embeds the trend plots
 directly in the report. Diagnostic plots retain all trial points, and the CSV
 contains both passive-only statistics and `all_*` statistics so trends are
@@ -1417,6 +1418,63 @@ an explicit path selection, commands also include `--dc-port-paths`. These
 values are easy to edit before export.
 
 ### Model Fitting Troubleshooting
+
+#### Generate a Model Debug Report
+
+Use the model debugger when fitting error improves but every DNN or KBNN trial
+still violates passivity. It reads the optimize ranking CSV and each retained
+`verification_summary.json`, so it does not require the trial's
+`metadata.json` or `model.npz`:
+
+```bash
+python3 surrogate.py debug-model \
+  --run-dir outputs/dnn_opt \
+  --audit outputs/data_audit \
+  --out-dir outputs/dnn_opt/model_debug
+```
+
+For KBNN, point `--run-dir` at the KBNN optimize root and either allow model
+inference or add `--model kbnn`. `--audit` accepts either the audit directory or
+its `dataset_audit.json`; omit it only when the audit is unavailable.
+
+The command writes:
+
+- `model_debug.md`, with prioritized reasons and corrective actions;
+- `model_debug.json`, for automated review;
+- `model_debug_trials.csv`, combining the ranking and retained per-trial
+  verification/passivity fields; and
+- `model_debug_passivity.png`, comparing response error and maximum S-matrix
+  singular value by trial.
+
+The findings distinguish raw non-passive data, disabled enforcement, training
+rows that are passive while verification rows are not, marginal versus material
+singular-value excursions, excessive global RF contraction, and response-error
+improvement without passivity feasibility. A missing per-trial `metadata.json`
+is normally the result of optimize cleanup, especially when no trial was
+eligible for promotion to `best_model/`. Use `--keep-trial-models` only for a
+small follow-up optimize run when inspection of the actual network weights or
+KBNN coarse/fine packages is required; it is not needed for this report.
+
+The same command can be configured in `options.json`:
+
+```json
+{
+  "workflows": {
+    "debug-model": {
+      "commands": {
+        "debug-model": {
+          "run_dir": "outputs/dnn_opt",
+          "audit": "outputs/data_audit",
+          "out_dir": "outputs/dnn_opt/model_debug",
+          "top": 12
+        }
+      }
+    }
+  }
+}
+```
+
+Then run `python3 surrogate.py --options-json options.json debug-model`.
 
 Use `training_history.csv` and `training_history.pdf` to distinguish optimizer
 instability from overfitting or a data problem. The RF trainer records
@@ -3448,31 +3506,31 @@ The report directory contains:
   worst-case solver work, ADS total and simulation stopwatch times, total
   stopwatch time per detected solve, and CPU time for every model;
 - `ads_hb_solver_summary.json`: the same aggregate data and messages in a
-  machine-readable form, plus the exact content-versioned SVG filenames used
+  machine-readable form, plus the exact content-versioned PNG filenames used
   by the Markdown report;
 - `ads_hb_solver_report.md`: an easy-to-scan comparison report containing the
   runtime and solver-work summary tables, changes relative to the first model,
   per-frequency results, highest-work solves, source coverage, and inline
   plots;
-- `runtime_comparison.svg`: ADS total stopwatch time, simulation stopwatch time,
+- `runtime_comparison.png`: ADS total stopwatch time, simulation stopwatch time,
   and derived total stopwatch time per detected HB solve;
-- `solver_work_totals.svg`: total Newton and Krylov work by model;
-- `krylov_per_solve_statistics.svg`: mean, median, 95th-percentile, and maximum
+- `solver_work_totals.png`: total Newton and Krylov work by model;
+- `krylov_per_solve_statistics.png`: mean, median, 95th-percentile, and maximum
   Krylov work per detected HB solve;
-- `krylov_by_solve.svg`: solve-sequence comparison for finding localized
+- `krylov_by_solve.png`: solve-sequence comparison for finding localized
   convergence-cost differences.
 
-Each stable SVG also has a content-versioned copy such as
-`runtime_comparison.a1b2c3d4e5f6.svg`. The Markdown report references these
+Each stable PNG also has a content-versioned copy such as
+`runtime_comparison.a1b2c3d4e5f6.png`. The Markdown report references these
 physical copies directly, and `embedded_plot_artifacts` in the summary JSON
 lists all four filenames.
 
-The SVG plots are generated with the Python standard library and are referenced
+The PNG plots are generated as document-scale raster images and are referenced
 with relative paths inside `ads_hb_solver_report.md`, so the report directory is
 portable and the plots render inline in normal Markdown viewers. The image links
-point to real SVG files whose filenames include a content fingerprint. This
+point to real PNG files whose filenames include a content fingerprint. This
 keeps the links portable across Markdown renderers and prevents a rerun in the
-same directory from displaying a stale cached plot. The stable SVG filenames
+same directory from displaying a stale cached plot. The stable PNG filenames
 are also retained for direct access and automation. The first log is treated as
 the baseline for percentage-change tables; put the standard model first in the
 command.
@@ -3998,7 +4056,7 @@ promoted from the best completed trial by default, its plot set comes from
 `--trial-worst-plots`. Use `--retrain-best` when you want the older behavior:
 the winning configuration is fit again after the sweep and `--worst-plots`
 controls that final model's verification plots. After each sweep, the summary
-embeds SVG trend plots and links a diagnostics PDF and CSV under
+embeds PNG trend plots and links a diagnostics PDF and CSV under
 `sweep_diagnostics/`, comparing error metrics against each swept option.
 Passivity-failing trials are shown in red on those plots. Passive-only grouped
 statistics remain available, while dashed all-trial means and `all_*` CSV
@@ -4753,7 +4811,7 @@ promoted from the best completed trial by default, its plot set comes from
 `--trial-worst-plots`. Use `--retrain-best` when you want the older behavior:
 the winning configuration is fit again after the sweep and `--worst-plots`
 controls that final model's verification plots. After each sweep, the summary
-embeds SVG trend plots and links a diagnostics PDF and CSV under
+embeds PNG trend plots and links a diagnostics PDF and CSV under
 `sweep_diagnostics/`, comparing error metrics against each swept option.
 Passivity-failing trials are shown in red. Passive-only grouped statistics
 remain available, while dashed all-trial means and `all_*` CSV columns preserve
@@ -5415,7 +5473,7 @@ promoted from the best completed trial by default, its plot set comes from
 `--trial-worst-plots`. Use `--retrain-best` when you want the older behavior:
 the winning configuration is fit again after the sweep and `--worst-plots`
 controls that final model's verification plots. After each sweep, the summary
-embeds SVG trend plots and links a diagnostics PDF and CSV under
+embeds PNG trend plots and links a diagnostics PDF and CSV under
 `sweep_diagnostics/`, comparing error metrics against each swept option.
 Passivity-failing trials are shown in red on those plots. Passive-only grouped
 statistics remain available, while dashed all-trial means and `all_*` CSV
@@ -7182,6 +7240,7 @@ examples, although hyphenated keys are accepted too.
 | `points generate` | Create an initial design, append a one-sided range extension, and write CSV/JSON/PNG coverage artifacts. | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 24 --out geometries.csv` |
 | `points suggest-additional` | Use saved verification metrics and existing geometry metadata to select a recommended hybrid batch or an explicit legacy/GP-UCB alternative. | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --target-error 1.0 --out additions.csv` |
 | `audit` | Check raw MDIF passivity, reciprocity, coverage, grids, duplicates, and train/verification consistency. | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
+| `debug-model` | Diagnose why a DNN/KBNN run improves in response error without reaching verification passivity; trial metadata is optional. | `python3 surrogate.py debug-model --run-dir dnn_opt --audit audit --out-dir dnn_opt/model_debug` |
 | `--model MODEL inspect-mdif` | Summarize blocks, S-parameter labels, inferred variables, split values, and frequency span. | `python3 surrogate.py --model dnn inspect-mdif --mdif train_verify.mdif` |
 | `--model MODEL train` | Fit one DNN, KBNN, or Neuro-TF configuration and write its model and verification report. | `python3 surrogate.py --model dnn train --mdif train_verify.mdif --out-dir dnn_model` |
 | `--model MODEL optimize` | Run adaptive, grid, or random hyperparameter trials and promote the best completed model. `sweep` is an alias. | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --max-trials 24` |
@@ -7204,7 +7263,7 @@ spellings `neuro_tf` and `neurotf` are normalized to `neuro-tf`.
 | `--model {dnn,kbnn,neuro-tf}` | Every model command | Selects the model backend. Place it before the model subcommand. It is not used for `points`, `audit`, or `hb-report`. | `python3 surrogate.py --model kbnn train --help`  | Not stored (CLI control) |
 | `--options-json PATH` | Every executable model/data workflow | Loads reusable typed defaults from a structured JSON file. It may appear before or after the route/subcommand; explicit CLI values override JSON values. It is intentionally not accepted by `options init` or `options discover`, which create the file. | `python3 surrogate.py --options-json options.json --model dnn train --mdif data.mdif --out-dir dnn_model`  | Not stored (CLI control) |
 | `--update-options-json` | Every executable model/data workflow | Atomically saves explicitly supplied CLI options into the selected exact command section after completion. With `--explain-options`, declining execution captures them immediately; approving execution saves them after the command completes. Requires `--options-json`; it cannot be enabled from inside the JSON. | `python3 surrogate.py --options-json options.json points generate --parameter W=1:2 --count 16 --explain-options --update-options-json`  | Not stored (CLI control) |
-| `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, or `hb-report`. | `python3 surrogate.py options init --help`  | Not stored (CLI control) |
+| `workflow` | Non-model commands | Positional route: `options`, `points`, `audit`, `debug-model`, or `hb-report`. | `python3 surrogate.py debug-model --help`  | Not stored (CLI control) |
 
 ### D.3 Options JSON creation and discovery
 
@@ -7735,7 +7794,20 @@ the positional log list can be supplied by the options JSON.
 | `--power-regex REGEX` | Release-specific regex with named `value` and optional `unit` groups. | `--power-regex 'Pin=(?P<value>[-+0-9.]+)(?P<unit>dBm)'`  | `workflows.hb-report.commands.hb-report.power_regex` |
 | `--wall-clock-seconds SECONDS [...]` | Optional elapsed-time overrides, exactly one per log. Alias: `--elapsed-seconds`. | `--wall-clock-seconds 75.2 63.8`  | `workflows.hb-report.commands.hb-report.wall_clock_seconds` |
 
-### D.16 Copyable end-to-end command set
+### D.16 Model debug options
+
+The `debug-model` route analyzes a completed DNN or KBNN train/optimize output.
+It does not require retained trial model packages or per-trial metadata.
+
+| Option | Explanation | Example | Options JSON location |
+| --- | --- | --- | --- |
+| `--audit PATH` | Optional `dataset_audit.json` or its containing directory. If omitted, the command also checks `RUN_DIR/audit` and the adjacent `audit` directory. | `--audit outputs/audit` | `workflows.debug-model.commands.debug-model.audit` |
+| `--model {auto,dnn,kbnn}` | Model-family override. Default: `auto`, inferred from result filenames, directory names, or surviving metadata. | `--model kbnn` | `workflows.debug-model.commands.debug-model.model` |
+| `--out-dir PATH` | Diagnostic artifact directory. Default: `RUN_DIR/model_debug`. | `--out-dir dnn_opt/model_debug` | `workflows.debug-model.commands.debug-model.out_dir` |
+| `--run-dir PATH` | Required completed train, optimize, or sweep output directory. It can be supplied solely by options JSON. | `--run-dir dnn_opt` | `workflows.debug-model.commands.debug-model.run_dir` |
+| `--top INT` | Positive number of lowest-passivity-error trials shown in the Markdown report. Default: `12`. | `--top 20` | `workflows.debug-model.commands.debug-model.top` |
+
+### D.17 Copyable end-to-end command set
 
 This compact example shows the normal command order while keeping every action
 on the primary entry point:
@@ -7747,6 +7819,7 @@ on the primary entry point:
 | Generate | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 32 --verification-count 8 --out geometries.csv` |
 | Audit | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |
+| Diagnose | `python3 surrogate.py debug-model --run-dir dnn_opt --audit audit --out-dir dnn_opt/model_debug` |
 | Add points | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --existing-mdif train_verify.mdif --count 8 --out additions.csv --combined-out additions_all_geometries.csv` |
 | Next GP round | `python3 surrogate.py points suggest-additional --fit-dir dnn_refit --existing-points additions_all_geometries.csv --count 6 --out additions_round_2.csv` |
 | Refit | `python3 surrogate.py --model dnn train --mdif updated_train_verify.mdif --out-dir dnn_final --hidden-layers 128,128,64 --activation tanh --learning-rate 0.001` |

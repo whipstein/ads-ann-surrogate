@@ -42,7 +42,7 @@ ANSI_RESET = "\033[0m"
 
 MODEL_NAMES = {"dnn", "kbnn", "neuro-tf"}
 MODEL_ALIASES = {"neuro_tf": "neuro-tf", "neurotf": "neuro-tf"}
-WORKFLOW_NAMES = {"points", "audit", "hb-report"}
+WORKFLOW_NAMES = {"points", "audit", "debug-model", "hb-report"}
 COMMAND_ALIASES = {
     "sweep": "optimize",
     "export-ads": "export-ads-mdif",
@@ -51,6 +51,7 @@ COMMAND_NAMES = {
     "generate",
     "suggest-additional",
     "audit",
+    "debug-model",
     "hb-report",
     "inspect-mdif",
     "train",
@@ -280,6 +281,17 @@ def starter_options_payload() -> dict[str, object]:
                     "parameter_names": None,
                     "passivity_tolerance": 1e-6,
                     "verification_mdif": None,
+                }
+            },
+            "debug-model": {
+                "commands": {
+                    "debug-model": {
+                        "audit": None,
+                        "model": "auto",
+                        "out_dir": None,
+                        "run_dir": None,
+                        "top": 12,
+                    }
                 }
             },
             "points": {

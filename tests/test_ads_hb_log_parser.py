@@ -5,7 +5,8 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from xml.etree import ElementTree
+
+from PIL import Image
 
 from de_generated_scripts import parse_ads_hb_solver_log as PARSER
 
@@ -101,15 +102,15 @@ class AdsHbLogParserTests(unittest.TestCase):
             source_file="baseline.log",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "runtime_comparison.svg"
-            PARSER._write_runtime_svg(
+            path = Path(temp_dir) / "runtime_comparison.png"
+            PARSER._write_runtime_png(
                 path,
                 [PARSER.summarize_result(result)],
             )
-            plot = path.read_text()
-        self.assertNotIn("No ADS stopwatch timing", plot)
-        self.assertIn("Simulation stopwatch time", plot)
-        self.assertIn(">11.25 s</text>", plot)
+            with Image.open(path) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertGreater(image.width, 1500)
+                self.assertIsNotNone(image.getbbox())
 
     def test_prefers_total_time_and_rejects_stage_elapsed_as_total(self) -> None:
         without_footer = LEVEL5_LOG.replace(
@@ -231,25 +232,24 @@ Iters Residual
             for stem, target in zip(expected_stems, image_targets):
                 self.assertRegex(
                     target,
-                    rf"^{re.escape(stem)}\.[0-9a-f]{{12}}\.svg$",
+                    rf"^{re.escape(stem)}\.[0-9a-f]{{12}}\.png$",
                 )
                 self.assertNotIn("?", target)
                 self.assertTrue(
                     (output / target).is_file(),
                     f"Markdown image target does not exist: {target}",
                 )
-                ElementTree.parse(output / target)
+                with Image.open(output / target) as image:
+                    self.assertEqual(image.format, "PNG")
             for name in (
-                "runtime_comparison.svg",
-                "solver_work_totals.svg",
-                "krylov_per_solve_statistics.svg",
-                "krylov_by_solve.svg",
+                "runtime_comparison.png",
+                "solver_work_totals.png",
+                "krylov_per_solve_statistics.png",
+                "krylov_by_solve.png",
             ):
-                ElementTree.parse(output / name)
-            self.assertIn(
-                ">10.5</text>",
-                (output / "krylov_per_solve_statistics.svg").read_text(),
-            )
+                with Image.open(output / name) as image:
+                    self.assertEqual(image.format, "PNG")
+                    self.assertGreater(image.width, 1000)
             summary_json = json.loads(
                 (output / "ads_hb_solver_summary.json").read_text()
             )
@@ -257,10 +257,10 @@ Iters Residual
                 summary_json["report_artifacts"],
                 [
                     "ads_hb_solver_report.md",
-                    "runtime_comparison.svg",
-                    "solver_work_totals.svg",
-                    "krylov_per_solve_statistics.svg",
-                    "krylov_by_solve.svg",
+                    "runtime_comparison.png",
+                    "solver_work_totals.png",
+                    "krylov_per_solve_statistics.png",
+                    "krylov_by_solve.png",
                 ],
             )
             self.assertEqual(
@@ -304,7 +304,8 @@ Iters Residual
             self.assertNotEqual(previous_runtime_target, refreshed_targets[0])
             for target in refreshed_targets:
                 self.assertTrue((output / target).is_file())
-                ElementTree.parse(output / target)
+                with Image.open(output / target) as image:
+                    self.assertEqual(image.format, "PNG")
 
     def test_cli_timing_override_replaces_log_timing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

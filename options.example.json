@@ -173,6 +173,17 @@
         "verification_mdif": null
       }
     },
+    "debug-model": {
+      "commands": {
+        "debug-model": {
+          "audit": null,
+          "model": "auto",
+          "out_dir": null,
+          "run_dir": null,
+          "top": 12
+        }
+      }
+    },
     "points": {
       "commands": {
         "generate": {

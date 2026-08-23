@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import audit_dataset
+import debug_model
 import dnn
 import generate_points
 import kbnn
@@ -332,6 +333,7 @@ class OptionsJSONTests(unittest.TestCase):
                 generate_points.build_suggest_parser,
             ),
             ("audit", "audit", audit_dataset.build_parser),
+            ("debug-model", "debug-model", debug_model.build_parser),
             (
                 "hb-report",
                 "hb-report",

@@ -35,12 +35,14 @@ MODEL_TYPE_ALIASES = {
 WORKFLOW_SCRIPTS = {
     "points": "generate_points.py",
     "audit": "audit_dataset.py",
+    "debug-model": "debug_model.py",
     "hb-report": "de_generated_scripts/parse_ads_hb_solver_log.py",
 }
 
 WORKFLOW_DESCRIPTIONS = {
     "points": "generate initial points or suggest adaptive additions",
     "audit": "audit training and verification MDIF data",
+    "debug-model": "diagnose fitting and passivity from retained run artifacts",
     "hb-report": "compare ADS HB Newton/Krylov logs and runtimes",
 }
 
@@ -69,7 +71,7 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         ),
         add_help=add_help,
         usage=(
-            "%(prog)s {options,points,audit,hb-report} [COMMAND] [OPTIONS]\n"
+            "%(prog)s {options,points,audit,debug-model,hb-report} [COMMAND] [OPTIONS]\n"
             "       %(prog)s --model {dnn,kbnn,neuro-tf} COMMAND [OPTIONS]"
         ),
         epilog=(
@@ -79,6 +81,7 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
             "  python3 surrogate.py points generate --parameter W=1mm:2mm "
             "--count 24 --out geometries.csv\n"
             "  python3 surrogate.py audit --mdif data.mdif\n"
+            "  python3 surrogate.py debug-model --run-dir outputs/dnn_opt --audit audit\n"
             "  python3 surrogate.py --model dnn train "
             "--mdif data.mdif --out-dir outputs/dnn\n"
             "  python3 surrogate.py --model neuro-tf export-veriloga --help\n"
@@ -100,7 +103,7 @@ def build_arg_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
         "workflow",
         nargs="?",
         choices=workflow_names(),
-        metavar="{options,points,audit,hb-report}",
+        metavar="{options,points,audit,debug-model,hb-report}",
         help=(
             "Non-model workflow command: "
             + "; ".join(

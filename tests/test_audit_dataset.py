@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+from PIL import Image
 
 import audit_dataset as AUDIT
 import generate_points as POINTS
@@ -158,7 +159,11 @@ class DatasetAuditTests(unittest.TestCase):
             self.assertEqual(summary["passivity"]["violating_rows"], 0)
             self.assertEqual(summary["verdict_reasons"], [])
             self.assertTrue((out_dir / "dataset_audit.md").is_file())
-            self.assertTrue((out_dir / "dataset_passivity.svg").is_file())
+            plot_path = out_dir / "dataset_passivity.png"
+            self.assertTrue(plot_path.is_file())
+            with Image.open(plot_path) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertGreaterEqual(image.width, 1600)
 
     def test_nonpassive_conflicting_train_verification_overlap_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
