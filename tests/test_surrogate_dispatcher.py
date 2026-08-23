@@ -95,6 +95,48 @@ class SurrogateDispatcherTests(unittest.TestCase):
             "surrogate.py --model kbnn",
         )
 
+    def test_debug_model_reads_required_run_dir_from_options_json_through_dispatcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "dnn_model"
+            run_dir.mkdir()
+            (run_dir / "verification_summary.json").write_text(
+                json.dumps(
+                    {
+                        "weighted_evm_pct": 0.25,
+                        "passivity": {
+                            "violating_points": 0,
+                            "max_singular_value": 0.999,
+                        },
+                    }
+                )
+            )
+            options_path = root / "options.json"
+            options_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "workflows": {
+                            "debug-model": {
+                                "commands": {
+                                    "debug-model": {
+                                        "run_dir": str(run_dir),
+                                        "out_dir": str(root / "debug"),
+                                    }
+                                }
+                            }
+                        },
+                    }
+                )
+            )
+
+            status = surrogate.main(
+                ["--options-json", str(options_path), "debug-model"]
+            )
+
+            self.assertEqual(status, 0)
+            self.assertTrue((root / "debug" / "model_debug.md").is_file())
+
     def test_model_option_can_appear_after_the_backend_subcommand(self) -> None:
         completed = mock.Mock(returncode=0)
         with mock.patch("surrogate.subprocess.run", return_value=completed) as run:

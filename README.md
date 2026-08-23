@@ -1455,7 +1455,10 @@ eligible for promotion to `best_model/`. Use `--keep-trial-models` only for a
 small follow-up optimize run when inspection of the actual network weights or
 KBNN coarse/fine packages is required; it is not needed for this report.
 
-The same command can be configured in `options.json`:
+The same command can be configured in `options.json`. New starter files already
+contain this location. In an existing file, edit the `debug-model` member inside
+the one existing top-level `workflows` object; do not add a second complete
+`workflows` object:
 
 ```json
 {
@@ -1475,6 +1478,17 @@ The same command can be configured in `options.json`:
 ```
 
 Then run `python3 surrogate.py --options-json options.json debug-model`.
+To confirm the selected file, resolved paths, and their exact JSON locations
+before execution, run:
+
+```bash
+python3 surrogate.py --options-json options.json debug-model --explain-options
+```
+
+The `--run-dir` value must name the completed DNN/KBNN train or optimize output,
+not the future `model_debug` output directory. Disjoint duplicate object
+fragments are merged for compatibility, while conflicting duplicate settings
+now produce a specific duplicate-key error instead of being silently ignored.
 
 Use `training_history.csv` and `training_history.pdf` to distinguish optimizer
 instability from overfitting or a data problem. The RF trainer records

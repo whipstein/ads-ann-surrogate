@@ -346,6 +346,58 @@ class OptionsJSONError(ValueError):
     """Raised when an options JSON file cannot be applied safely."""
 
 
+def _merge_duplicate_json_objects(
+    pairs: Sequence[tuple[str, object]],
+) -> dict[str, object]:
+    """Merge disjoint duplicate JSON objects instead of silently discarding one.
+
+    This primarily protects an existing options file when a documented workflow
+    fragment is pasted as a second ``workflows`` object. Conflicting duplicate
+    leaves remain an error because their precedence would be ambiguous.
+    """
+
+    merged: dict[str, object] = {}
+
+    def merge_mapping(
+        target: dict[str, object],
+        incoming: Mapping[str, object],
+        context: str,
+    ) -> None:
+        for key, value in incoming.items():
+            if key not in target:
+                target[key] = value
+                continue
+            existing = target[key]
+            if isinstance(existing, dict) and isinstance(value, dict):
+                merge_mapping(existing, value, f"{context}.{key}")
+                continue
+            raise OptionsJSONError(
+                "Conflicting duplicate JSON key "
+                f"{context}.{key}; keep one value or combine the objects"
+            )
+
+    for key, value in pairs:
+        if key not in merged:
+            merged[key] = value
+            continue
+        existing = merged[key]
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merge_mapping(existing, value, key)
+            continue
+        raise OptionsJSONError(
+            f"Conflicting duplicate JSON key {key!r}; keep only one occurrence"
+        )
+    return merged
+
+
+def _read_options_json(source: Path) -> dict[str, object]:
+    payload = json.loads(
+        source.read_text(encoding="utf-8"),
+        object_pairs_hook=_merge_duplicate_json_objects,
+    )
+    return _mapping(payload, "options JSON root")
+
+
 def normalize_model_name(value: str) -> str:
     normalized = value.strip().lower()
     return MODEL_ALIASES.get(normalized, normalized)
@@ -740,7 +792,7 @@ def load_options_json_resolution(
 
     source = Path(path).expanduser()
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload = _read_options_json(source)
     except OSError as exc:
         raise OptionsJSONError(f"Could not read options JSON {source}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -1401,8 +1453,7 @@ def finalize_options_json_update(args: argparse.Namespace, status: int) -> int:
             args,
             command=command,
         )
-        payload = json.loads(source.read_text(encoding="utf-8"))
-        root = _mapping(payload, "options JSON root")
+        root = _read_options_json(source)
         command_node, location = _exact_command_node(
             root,
             model=model,

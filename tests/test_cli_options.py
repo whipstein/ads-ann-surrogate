@@ -17,6 +17,7 @@ import neuro_tf
 from de_generated_scripts import parse_ads_hb_solver_log
 
 from cli_options import (
+    OptionsJSONError,
     add_options_json_argument,
     finalize_options_json_update,
     fit_shared_option_keys,
@@ -45,6 +46,47 @@ def example_parser() -> argparse.ArgumentParser:
 
 
 class OptionsJSONTests(unittest.TestCase):
+    def test_disjoint_duplicate_workflow_objects_are_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "options.json"
+            config.write_text(
+                """{
+                  "workflows": {"audit": {"common": {"mdif": "data.mdif"}}},
+                  "workflows": {"debug-model": {"commands": {"debug-model": {
+                    "run_dir": "outputs/dnn_opt", "top": 20
+                  }}}}
+                }""",
+                encoding="utf-8",
+            )
+
+            defaults, sources = load_options_json_resolution(
+                config,
+                workflow="debug-model",
+                command="debug-model",
+            )
+
+        self.assertEqual(defaults["run_dir"], "outputs/dnn_opt")
+        self.assertEqual(defaults["top"], 20)
+        self.assertIn("workflows.debug-model", sources["run_dir"])
+
+    def test_conflicting_duplicate_option_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "options.json"
+            config.write_text(
+                '{"workflows": {"debug-model": {"run_dir": "one", '
+                '"run_dir": "two"}}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                OptionsJSONError,
+                "Conflicting duplicate JSON key",
+            ):
+                load_options_json_resolution(
+                    config,
+                    workflow="debug-model",
+                    command="debug-model",
+                )
+
     def test_audit_reuses_common_fit_mdif_inputs_from_options_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self.write_config(
