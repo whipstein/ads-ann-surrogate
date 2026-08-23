@@ -1439,8 +1439,10 @@ its `dataset_audit.json`; omit it only when the audit is unavailable.
 
 The command writes:
 
-- `model_debug.md`, with prioritized reasons and corrective actions;
-- `model_debug.json`, for automated review;
+- `model_debug.md`, with prioritized reasons, observed-versus-suggested option
+  changes, and copyable follow-up commands;
+- `model_debug.json`, for automated review, including the structured
+  `suggested_commands` list;
 - `model_debug_trials.csv`, combining the ranking and retained per-trial
   verification/passivity fields; and
 - `model_debug_passivity.png`, comparing response error and maximum S-matrix
@@ -1450,10 +1452,28 @@ The findings distinguish raw non-passive data, disabled enforcement, training
 rows that are passive while verification rows are not, marginal versus material
 singular-value excursions, excessive global RF contraction, and response-error
 improvement without passivity feasibility. A missing per-trial `metadata.json`
-is normally the result of optimize cleanup, especially when no trial was
-eligible for promotion to `best_model/`. Use `--keep-trial-models` only for a
-small follow-up optimize run when inspection of the actual network weights or
-KBNN coarse/fine packages is required; it is not needed for this report.
+indicates a legacy cleaned run or a trial that failed before saving its model.
+New optimize runs retain `metadata.json` for every completed DNN, KBNN, and
+Neuro-TF trial. Use `--keep-trial-models` only when the actual network weights
+or complete KBNN coarse/fine packages must also remain available; it is not
+needed for this report.
+
+The suggested-command section is conditional. It can produce:
+
+- a source-data audit command before any fitting change when audit evidence is
+  missing or non-passive RF rows are present;
+- a constrained adaptive DNN/KBNN search that varies passivity penalty and
+  learning rate, applies an evidence-based passivity margin, and makes
+  feasibility part of adaptive selection;
+- a passive-only reranking command when usable passive trials already exist;
+  or
+- a small metadata-refresh run for legacy optimize directories.
+
+When `debug-model` is itself run with `--options-json`, generated fitting and
+audit commands reuse that file for unchanged MDIF, split, weighting, and model
+settings. Without it, commands clearly mark `PATH_TO_*` values that must be
+replaced. Commands never recommend forcing passivity while the supplied audit
+still reports non-passive positive-frequency training rows.
 
 The same command can be configured in `options.json`. New starter files already
 contain this location. In an existing file, edit the `debug-model` member inside
@@ -4478,7 +4498,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Category-balanced, maximin-separated trials evaluated before GP guidance. Categorical marginal counts differ by at most one when the candidate pool permits; the count is raised to cover every level once if necessary. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir dnn_sweep/best_model_passive</code></nobr> |
 | <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
-| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
+| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. Without this flag, each completed trial still retains `metadata.json`, its verification summary, and lightweight plots, while large model-weight and auxiliary files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
 | <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget; in `random` mode it limits the sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
@@ -5229,7 +5249,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Category-balanced, maximin-separated trials evaluated before GP guidance. Categorical marginal counts differ by at most one when the candidate pool permits; the count is raised to cover every level once if necessary. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--best-model-dir PATH</code></nobr> | <code>rerank-sweep</code> | Destination for `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | <nobr><code>--best-model-dir kbnn_sweep/best_model_passive</code></nobr> |
 | <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
-| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
+| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. Without this flag, each completed trial still retains `metadata.json`, its verification summary, and lightweight plots, while large model-weight and auxiliary files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code>, <code>rerank-sweep</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
 | <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget. Default: `24`. | <nobr><code>--max-trials 24</code></nobr> |
@@ -5649,7 +5669,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--adaptive-hidden-width-step INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Positive neuron-width increment used by structured `hidden_layers` ranges. Default: `8`. | <nobr><code>--adaptive-hidden-width-step 16</code></nobr> |
 | <nobr><code>--adaptive-initial-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Category-balanced, maximin-separated trials evaluated before GP guidance. Categorical marginal counts differ by at most one when the candidate pool permits; the count is raised to cover every level once if necessary. Default: `6`. | <nobr><code>--adaptive-initial-trials 8</code></nobr> |
 | <nobr><code>--jobs INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Number of independent grid/random trials to train in parallel. Adaptive search is sequential and forces one job. Default: `1`. | <nobr><code>--jobs 4</code></nobr> |
-| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. By default, each trial keeps lightweight summary and plot artifacts while large model files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
+| <nobr><code>--keep-trial-models</code></nobr> | <code>sweep</code>, <code>optimize</code> | Keep full per-trial model directories under `trials/`. Without this flag, each completed trial still retains `metadata.json`, its verification summary, and lightweight plots, while large model-weight and auxiliary files are removed. | <nobr><code>--keep-trial-models</code></nobr> |
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
 | <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget; in `random` mode it limits the sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
@@ -7499,7 +7519,7 @@ optimize unless the applicability column says otherwise.
 | `--adaptive-initial-trials INT` | All-model optimize | Category-balanced, maximin-separated trials before GP guidance. Marginal category counts differ by at most one when possible, and the count is raised to cover all levels once when needed. Default: `6`. | `--adaptive-initial-trials 8`  | `models.commands.optimize.adaptive_initial_trials` |
 | `--best-model-dir PATH` | DNN/KBNN `rerank-sweep` | Destination used by `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | `--best-model-dir dnn_opt/best_passive`  | `models.MODEL.commands.rerank-sweep.best_model_dir` |
 | `--jobs INT` | All-model optimize | Parallel workers for grid/random search; adaptive search is sequential. Default: `1`. | `--jobs 4`  | `models.commands.optimize.jobs` |
-| `--keep-trial-models` | All-model optimize | Retains every full trial model so a later rerank can promote it. | `--keep-trial-models`  | `models.commands.optimize.keep_trial_models` |
+| `--keep-trial-models` | All-model optimize | Retains every full trial model so a later rerank can promote it. Without the flag, every completed trial still retains `metadata.json`, but its model weights are removed. | `--keep-trial-models`  | `models.commands.optimize.keep_trial_models` |
 | `--learning-rates LIST` | All-model optimize | Comma-separated Adam learning-rate candidates. Default: `0.001,0.002,0.005`; single-value alias: `--learning-rate`. | `--learning-rates 0.0005,0.001,0.002`  | `models.commands.optimize.learning_rates` |
 | `--max-passivity-sigma FLOAT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for worst predicted S-matrix singular value. | `--max-passivity-sigma 1.000001`  | `models.commands.optimize.max_passivity_sigma`<br>`models.MODEL.commands.rerank-sweep.max_passivity_sigma` |
 | `--max-passivity-violations INT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for violating sampled points. | `--max-passivity-violations 0`  | `models.commands.optimize.max_passivity_violations`<br>`models.MODEL.commands.rerank-sweep.max_passivity_violations` |

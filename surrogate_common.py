@@ -12335,11 +12335,12 @@ def write_training_history_plot(
 
 
 def cleanup_trial_dir(trial_dir: Path, keep_trial_models: bool) -> None:
+    """Remove heavyweight trial artifacts while always retaining metadata."""
+
     if keep_trial_models:
         return
     for name in [
         "model.npz",
-        "metadata.json",
         "dc_model.npz",
         "dc_model.json",
         "composite_model_manifest.json",

@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import csv
 import io
@@ -13,6 +14,46 @@ import surrogate
 
 
 class ModelDebugTests(unittest.TestCase):
+    def test_nonpassive_source_suppresses_enforcement_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "dnn_opt"
+            run_dir.mkdir()
+            rows = [
+                {
+                    "trial": 1,
+                    "rmse_abs": 0.1,
+                    "passivity_violating_points": 5,
+                    "passivity_max_singular_value": 1.2,
+                    "source_rf_passivity_violating_points": 3,
+                }
+            ]
+            findings = DEBUG.build_findings(
+                rows,
+                "rmse_abs",
+                {"passivity": {"violating_rf_rows": 3}},
+                [],
+                "dnn",
+            )
+            suggestions = DEBUG.build_command_suggestions(
+                argparse.Namespace(options_json=None),
+                run_dir,
+                "dnn",
+                rows,
+                "rmse_abs",
+                findings,
+                [],
+            )
+
+        identifiers = {suggestion["id"] for suggestion in suggestions}
+        self.assertIn("audit-source-data", identifiers)
+        self.assertNotIn("passivity-feasibility-search", identifiers)
+        self.assertTrue(
+            all(
+                "--passivity-mode enforce" not in suggestion["command"]
+                for suggestion in suggestions
+            )
+        )
+
     def test_sweep_debug_works_without_trial_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -91,15 +132,39 @@ class ModelDebugTests(unittest.TestCase):
             out_dir = run_dir / "model_debug"
             payload = json.loads((out_dir / "model_debug.json").read_text())
             codes = {finding["code"] for finding in payload["findings"]}
-            self.assertIn("MODEL_METADATA_CLEANED", codes)
+            self.assertIn("MODEL_METADATA_MISSING", codes)
             self.assertIn("TRAIN_PASSIVE_VERIFY_NONPASSIVE", codes)
             self.assertIn("MARGINAL_SIGMA_EXCURSION", codes)
             self.assertIn("ERROR_IMPROVES_WITHOUT_FEASIBILITY", codes)
             self.assertEqual(payload["verification_summaries_found"], 4)
             self.assertEqual(payload["statistics"]["passive_trials"], 0)
+            suggestions = {
+                suggestion["id"]: suggestion
+                for suggestion in payload["suggested_commands"]
+            }
+            self.assertIn("passivity-feasibility-search", suggestions)
+            self.assertIn("refresh-legacy-metadata", suggestions)
+            feasibility_command = suggestions["passivity-feasibility-search"][
+                "command"
+            ]
+            self.assertIn("--passivity-mode enforce", feasibility_command)
+            self.assertIn("--output-domain s", feasibility_command)
+            self.assertIn(
+                "--optimize-parameter passivity_penalty=",
+                feasibility_command,
+            )
+            self.assertTrue(
+                suggestions["passivity-feasibility-search"]["requires_editing"]
+            )
             report = (out_dir / "model_debug.md").read_text()
-            self.assertIn("missing per-trial `metadata.json` is normal", report)
+            self.assertIn(
+                "Current optimize runs retain every completed trial's `metadata.json`",
+                report,
+            )
             self.assertIn("model_debug_passivity.png", report)
+            self.assertIn("## Suggested command changes", report)
+            self.assertIn("Option or control", report)
+            self.assertIn("PATH_TO_TRAINING_MDIF", report)
             plot_path = out_dir / "model_debug_passivity.png"
             with Image.open(plot_path) as image:
                 self.assertEqual(image.format, "PNG")
@@ -131,6 +196,11 @@ class ModelDebugTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
+                        "models": {
+                            "commands": {
+                                "fit": {"mdif": "training.mdif"}
+                            }
+                        },
                         "workflows": {
                             "debug-model": {
                                 "commands": {
@@ -144,6 +214,15 @@ class ModelDebugTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(DEBUG.main(["--options-json", str(config)]), 0)
             self.assertTrue((run_dir / "model_debug" / "model_debug.md").is_file())
+            payload = json.loads(
+                (run_dir / "model_debug" / "model_debug.json").read_text()
+            )
+            commands = [
+                suggestion["command"]
+                for suggestion in payload["suggested_commands"]
+            ]
+            self.assertTrue(any("--options-json" in command for command in commands))
+            self.assertTrue(all("PATH_TO_" not in command for command in commands))
 
 
 if __name__ == "__main__":

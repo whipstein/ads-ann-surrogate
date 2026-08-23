@@ -22,6 +22,29 @@ from surrogate_common import (
 
 
 class AdaptiveSweepTests(unittest.TestCase):
+    def test_trial_cleanup_always_retains_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trial_dir = Path(temp_dir) / "trial_0001"
+            trial_dir.mkdir()
+            metadata = {"model_type": "dnn", "hidden_layers": [64, 64]}
+            (trial_dir / "metadata.json").write_text(json.dumps(metadata))
+            (trial_dir / "model.npz").write_bytes(b"large model")
+            (trial_dir / "dc_model.json").write_text("{}")
+            (trial_dir / "verification_summary.json").write_text("{}")
+
+            surrogate_common.cleanup_trial_dir(
+                trial_dir,
+                keep_trial_models=False,
+            )
+
+            self.assertEqual(
+                json.loads((trial_dir / "metadata.json").read_text()),
+                metadata,
+            )
+            self.assertFalse((trial_dir / "model.npz").exists())
+            self.assertFalse((trial_dir / "dc_model.json").exists())
+            self.assertTrue((trial_dir / "verification_summary.json").exists())
+
     def test_numeric_and_hidden_layer_ranges_build_unique_pool(self) -> None:
         candidates, columns, log_parameters, categorical_values = (
             build_adaptive_candidate_pool(
@@ -486,6 +509,12 @@ class AdaptiveSweepTests(unittest.TestCase):
                     / "trial_0001"
                     / "verification_metrics.csv"
                 ).exists()
+            )
+            self.assertTrue(
+                (out_dir / "trials" / "trial_0001" / "metadata.json").is_file()
+            )
+            self.assertFalse(
+                (out_dir / "trials" / "trial_0001" / "model.npz").exists()
             )
             best_config = json.loads((out_dir / "best_config.json").read_text())
             self.assertEqual(

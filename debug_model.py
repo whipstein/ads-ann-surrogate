@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Diagnose model-fit and passivity behavior from retained run artifacts.
 
-Optimization normally removes per-trial model.npz and metadata.json files to
-keep a sweep compact.  This command therefore treats the sweep CSV and each
-trial's verification_summary.json as the authoritative diagnostic record, then
-uses surviving model metadata and a dataset audit only when available.
+Optimization removes heavyweight per-trial model weights unless full trial
+retention is requested, but current runs always keep metadata.json. This command
+also supports legacy runs whose metadata was cleaned by treating the sweep CSV
+and each trial's verification_summary.json as authoritative diagnostic records.
 """
 
 from __future__ import annotations
@@ -14,14 +14,17 @@ import csv
 import json
 import math
 import os
+import shlex
 import statistics
 import sys
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from cli_options import (
+    OptionsJSONError,
     add_options_json_argument,
     finalize_options_json_update,
+    load_options_json_resolution,
     parse_args_with_options_json,
 )
 
@@ -250,7 +253,6 @@ def surviving_metadata(run_dir: Path) -> list[tuple[Path, dict[str, object]]]:
         run_dir / "best_model" / "metadata.json",
         run_dir / "coarse_model" / "metadata.json",
         run_dir / "best_model" / "coarse_model" / "metadata.json",
-        run_dir / "point_generation_fallback" / "point_generation_source.json",
     ]
     paths.extend(sorted((run_dir / "trials").glob("trial_*/metadata.json")))
     paths.extend(
@@ -262,6 +264,467 @@ def surviving_metadata(run_dir: Path) -> list[tuple[Path, dict[str, object]]]:
         if payload is not None:
             records.append((path, payload))
     return records
+
+
+def ranked_trial_rows(
+    rows: Sequence[Mapping[str, object]],
+    metric_name: str | None,
+) -> list[dict[str, object]]:
+    return sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            integer(row.get("passivity_violating_points"))
+            if integer(row.get("passivity_violating_points")) is not None
+            else 10**18,
+            number(row.get("passivity_max_singular_value"))
+            if number(row.get("passivity_max_singular_value")) is not None
+            else float("inf"),
+            number(row.get(metric_name))
+            if metric_name and number(row.get(metric_name)) is not None
+            else float("inf"),
+        ),
+    )
+
+
+def representative_metadata(
+    run_dir: Path,
+    rows: Sequence[Mapping[str, object]],
+    metric_name: str | None,
+    metadata_records: Sequence[tuple[Path, Mapping[str, object]]],
+) -> dict[str, object]:
+    ranked = ranked_trial_rows(rows, metric_name)
+    if ranked:
+        trial = integer(ranked[0].get("trial"))
+        if trial is not None:
+            preferred = read_json(
+                run_dir / "trials" / f"trial_{trial:04d}" / "metadata.json"
+            )
+            if preferred:
+                return preferred
+    for path, payload in metadata_records:
+        if path.name == "metadata.json" and "coarse_model" not in path.parts:
+            return dict(payload)
+    return {}
+
+
+def command_path(path: str | Path) -> str:
+    expanded = Path(path).expanduser()
+    try:
+        return os.path.relpath(expanded.resolve(), Path.cwd())
+    except OSError:
+        return str(expanded)
+
+
+def numeric_text(value: float) -> str:
+    return f"{float(value):.6g}"
+
+
+def observed_setting(
+    row: Mapping[str, object],
+    metadata: Mapping[str, object],
+    key: str,
+    fallback: object = "unknown",
+) -> object:
+    value = row.get(key)
+    if value not in (None, ""):
+        return value
+    value = metadata.get(key)
+    return fallback if value in (None, "") else value
+
+
+def model_optimize_command_base(
+    args: argparse.Namespace,
+    model: str,
+) -> tuple[list[str], bool]:
+    command = ["python3", "surrogate.py"]
+    options_json = getattr(args, "options_json", None)
+    defaults: dict[str, object] = {}
+    if options_json:
+        command.extend(["--options-json", command_path(options_json)])
+        try:
+            defaults, _sources = load_options_json_resolution(
+                options_json,
+                model=model,
+                command="optimize",
+            )
+        except (OSError, OptionsJSONError):
+            defaults = {}
+    command.extend(["--model", model, "optimize"])
+    requires_editing = not bool(defaults.get("mdif"))
+    if not defaults.get("mdif"):
+        command.extend(["--mdif", "PATH_TO_TRAINING_MDIF"])
+    if model == "kbnn":
+        mode = str(defaults.get("mode") or "residual").strip().lower()
+        coarse_available = bool(
+            defaults.get("coarse_mdif") or defaults.get("coarse_model_dir")
+        )
+        if mode != "plain" and not coarse_available:
+            command.extend(["--coarse-mdif", "PATH_TO_COARSE_MDIF"])
+            requires_editing = True
+    return command, requires_editing
+
+
+def add_command_suggestion(
+    suggestions: list[dict[str, object]],
+    *,
+    identifier: str,
+    title: str,
+    triggered_by: Sequence[str],
+    rationale: str,
+    command: Sequence[str],
+    changes: Sequence[Mapping[str, object]],
+    notes: Sequence[str] = (),
+    requires_editing: bool = False,
+) -> None:
+    suggestions.append(
+        {
+            "id": identifier,
+            "title": title,
+            "triggered_by": list(triggered_by),
+            "rationale": rationale,
+            "command": shlex.join([str(value) for value in command]),
+            "changes": [dict(change) for change in changes],
+            "notes": list(notes),
+            "requires_editing": bool(requires_editing),
+        }
+    )
+
+
+def build_command_suggestions(
+    args: argparse.Namespace,
+    run_dir: Path,
+    model: str,
+    rows: Sequence[Mapping[str, object]],
+    metric_name: str | None,
+    findings: Sequence[Mapping[str, str]],
+    metadata_records: Sequence[tuple[Path, Mapping[str, object]]],
+) -> list[dict[str, object]]:
+    """Translate diagnostic findings into ordered, copyable follow-up commands."""
+
+    suggestions: list[dict[str, object]] = []
+    codes = {str(finding.get("code") or "") for finding in findings}
+    ranked = ranked_trial_rows(rows, metric_name)
+    reference_row: Mapping[str, object] = ranked[0] if ranked else {}
+    metadata = representative_metadata(
+        run_dir,
+        rows,
+        metric_name,
+        metadata_records,
+    )
+    options_json = getattr(args, "options_json", None)
+    audit_out = run_dir.parent / f"{run_dir.name}_audit_debug"
+
+    if codes & {
+        "RAW_DATA_AUDIT_MISSING",
+        "RAW_RF_DATA_NONPASSIVE",
+        "TRAINING_SOURCE_NONPASSIVE",
+    }:
+        audit_command = ["python3", "surrogate.py"]
+        audit_defaults: dict[str, object] = {}
+        if options_json:
+            audit_command.extend(["--options-json", command_path(options_json)])
+            try:
+                audit_defaults, _sources = load_options_json_resolution(
+                    options_json,
+                    workflow="audit",
+                    command="audit",
+                )
+            except (OSError, OptionsJSONError):
+                audit_defaults = {}
+        audit_command.append("audit")
+        requires_editing = not bool(audit_defaults.get("mdif"))
+        if not audit_defaults.get("mdif"):
+            audit_command.extend(["--mdif", "PATH_TO_TRAINING_MDIF"])
+        audit_command.extend(
+            [
+                "--passivity-tolerance",
+                "1e-6",
+                "--out-dir",
+                command_path(audit_out),
+            ]
+        )
+        raw_nonpassive = bool(
+            codes & {"RAW_RF_DATA_NONPASSIVE", "TRAINING_SOURCE_NONPASSIVE"}
+        )
+        add_command_suggestion(
+            suggestions,
+            identifier="audit-source-data",
+            title=(
+                "Re-audit and isolate non-passive RF rows"
+                if raw_nonpassive
+                else "Audit the exact data used by this run"
+            ),
+            triggered_by=sorted(
+                codes
+                & {
+                    "RAW_DATA_AUDIT_MISSING",
+                    "RAW_RF_DATA_NONPASSIVE",
+                    "TRAINING_SOURCE_NONPASSIVE",
+                }
+            ),
+            rationale=(
+                "Passivity enforcement cannot reconcile contradictory non-passive training targets."
+                if raw_nonpassive
+                else "The fitting recommendations should be applied only after the positive-frequency source data is confirmed passive."
+            ),
+            command=audit_command,
+            changes=[
+                {
+                    "option": "--passivity-tolerance",
+                    "observed": "not independently confirmed" if not raw_nonpassive else "violations reported",
+                    "suggested": "1e-6",
+                    "reason": "List the exact block/frequency rows that exceed the passive limit.",
+                }
+            ],
+            notes=(
+                "Inspect dataset_passivity.csv before changing neural-network settings.",
+                "Do not force passivity until erroneous or intentionally active source rows are resolved.",
+            ),
+            requires_editing=requires_editing,
+        )
+
+    raw_data_conflict = bool(
+        codes & {"RAW_RF_DATA_NONPASSIVE", "TRAINING_SOURCE_NONPASSIVE"}
+    )
+    passivity_problem = bool(
+        codes
+        & {
+            "NO_PASSIVE_TRIAL",
+            "PASSIVITY_ENFORCEMENT_DISABLED",
+            "TRAIN_PASSIVE_VERIFY_NONPASSIVE",
+            "TRAINING_SAFEGUARD_NOT_PASSIVE",
+            "MARGINAL_SIGMA_EXCURSION",
+            "MODERATE_SIGMA_EXCURSION",
+            "MATERIAL_SIGMA_EXCURSION",
+            "ERROR_IMPROVES_WITHOUT_FEASIBILITY",
+            "LARGE_RF_CONTRACTION",
+        }
+    )
+    if passivity_problem and not raw_data_conflict and model in {"dnn", "kbnn"}:
+        base, requires_editing = model_optimize_command_base(args, model)
+        observed_penalty = number(
+            observed_setting(reference_row, metadata, "passivity_penalty", 10.0)
+        )
+        current_penalty = 10.0 if observed_penalty is None else observed_penalty
+        observed_learning_rate = number(
+            observed_setting(reference_row, metadata, "learning_rate", 0.002)
+        )
+        current_learning_rate = (
+            0.002 if observed_learning_rate is None else observed_learning_rate
+        )
+        observed_margin = number(
+            observed_setting(reference_row, metadata, "passivity_margin", 0.001)
+        )
+        current_margin = 0.001 if observed_margin is None else observed_margin
+        penalty_low = max(0.1, current_penalty / 10.0)
+        penalty_high = max(30.0, current_penalty * 10.0)
+        learning_low = max(1.0e-5, current_learning_rate / 10.0)
+        learning_high = max(learning_low * 2.0, current_learning_rate)
+        if "LARGE_RF_CONTRACTION" in codes:
+            suggested_margin = min(current_margin, 5.0e-4)
+        elif "MARGINAL_SIGMA_EXCURSION" in codes:
+            suggested_margin = max(current_margin, 2.0e-3)
+        elif "MODERATE_SIGMA_EXCURSION" in codes:
+            suggested_margin = max(current_margin, 5.0e-3)
+        else:
+            suggested_margin = current_margin
+        selection = (
+            metric_name
+            if metric_name
+            in {
+                "rmse_abs",
+                "max_abs",
+                "evm_pct",
+                "weighted_rmse_abs",
+                "weighted_evm_pct",
+            }
+            else "rmse_abs"
+        )
+        output_dir = run_dir.parent / f"{run_dir.name}_passivity_search"
+        command = [*base]
+        if model == "dnn":
+            command.extend(["--output-domain", "s"])
+        command.extend(
+            [
+                "--passivity-mode",
+                "enforce",
+                "--passivity-margin",
+                numeric_text(suggested_margin),
+                "--search-mode",
+                "adaptive",
+                "--selection-metric",
+                selection,
+                "--require-passive",
+                "--max-passivity-sigma",
+                "1.000001",
+                "--optimize-parameter",
+                f"passivity_penalty={numeric_text(penalty_low)}:{numeric_text(penalty_high)}:log",
+                "--optimize-parameter",
+                f"learning_rate={numeric_text(learning_low)}:{numeric_text(learning_high)}:log",
+            ]
+        )
+        if "MATERIAL_SIGMA_EXCURSION" in codes:
+            command.extend(
+                [
+                    "--optimize-parameter",
+                    "hidden_layers=1:4x64:256:log",
+                ]
+            )
+        command.extend(
+            [
+                "--adaptive-initial-trials",
+                "8",
+                "--max-trials",
+                "24",
+                "--out-dir",
+                command_path(output_dir),
+            ]
+        )
+        changes: list[dict[str, object]] = [
+            {
+                "option": "--passivity-mode",
+                "observed": observed_setting(reference_row, metadata, "passivity_mode"),
+                "suggested": "enforce",
+                "reason": "Make passivity protection explicit during this feasibility search.",
+            },
+            {
+                "option": "--passivity-penalty",
+                "observed": numeric_text(current_penalty),
+                "suggested": f"adaptive {numeric_text(penalty_low)} to {numeric_text(penalty_high)} (log)",
+                "reason": "Determine whether the penalty is too weak or overwhelms response-error learning.",
+            },
+            {
+                "option": "--learning-rate",
+                "observed": numeric_text(current_learning_rate),
+                "suggested": f"adaptive {numeric_text(learning_low)} to {numeric_text(learning_high)} (log)",
+                "reason": "Search lower update sizes where the passivity gradient is less likely to destabilize fitting.",
+            },
+            {
+                "option": "--passivity-margin",
+                "observed": numeric_text(current_margin),
+                "suggested": numeric_text(suggested_margin),
+                "reason": (
+                    "Reduce avoidable global response contraction."
+                    if "LARGE_RF_CONTRACTION" in codes
+                    else "Add a controlled verification buffer without excessive RF loss."
+                ),
+            },
+            {
+                "option": "passivity eligibility",
+                "observed": "no fully passive eligible trial" if "NO_PASSIVE_TRIAL" in codes else "constraint problems reported",
+                "suggested": "--require-passive --max-passivity-sigma 1.000001",
+                "reason": "Teach adaptive optimization to prefer feasible trials before comparing response error.",
+            },
+        ]
+        if model == "dnn":
+            changes.insert(
+                0,
+                {
+                    "option": "--output-domain",
+                    "observed": observed_setting(reference_row, metadata, "output_domain"),
+                    "suggested": "s",
+                    "reason": "DNN passivity enforcement operates on a complete S-domain output.",
+                },
+            )
+        notes = [
+            "Keep the original data, split, seed policy, weights, and parameter names unchanged so the comparison isolates these settings.",
+            "The adaptive objective already includes the requested passivity constraints; the response metric ranks trials once they become feasible.",
+        ]
+        if "RAW_DATA_AUDIT_MISSING" in codes:
+            notes.insert(0, "Run the suggested audit first and continue only if its RF rows pass.")
+        if "MATERIAL_SIGMA_EXCURSION" in codes:
+            notes.append("The hidden-layer range is included because a material excursion can indicate insufficient capacity, not just a weak penalty.")
+        add_command_suggestion(
+            suggestions,
+            identifier="passivity-feasibility-search",
+            title="Run a constrained adaptive passivity search",
+            triggered_by=sorted(
+                codes
+                & {
+                    "NO_PASSIVE_TRIAL",
+                    "PASSIVITY_ENFORCEMENT_DISABLED",
+                    "TRAIN_PASSIVE_VERIFY_NONPASSIVE",
+                    "TRAINING_SAFEGUARD_NOT_PASSIVE",
+                    "MARGINAL_SIGMA_EXCURSION",
+                    "MODERATE_SIGMA_EXCURSION",
+                    "MATERIAL_SIGMA_EXCURSION",
+                    "ERROR_IMPROVES_WITHOUT_FEASIBILITY",
+                    "LARGE_RF_CONTRACTION",
+                }
+            ),
+            rationale="Search response accuracy and passivity controls together instead of continuing an error-only trajectory.",
+            command=command,
+            changes=changes,
+            notes=notes,
+            requires_editing=requires_editing,
+        )
+
+    if "PASSIVE_TRIAL_AVAILABLE" in codes and model in {"dnn", "kbnn"}:
+        selection = metric_name or "rmse_abs"
+        command = [
+            "python3",
+            "surrogate.py",
+            "--model",
+            model,
+            "rerank-sweep",
+            "--sweep-dir",
+            command_path(run_dir),
+            "--selection-metric",
+            selection,
+            "--require-passive",
+        ]
+        add_command_suggestion(
+            suggestions,
+            identifier="rerank-passive-trials",
+            title="Re-rank only the passive trials",
+            triggered_by=["PASSIVE_TRIAL_AVAILABLE"],
+            rationale="Once feasibility exists, choose the lowest-error member of the passive subset.",
+            command=command,
+            changes=[
+                {
+                    "option": "selection filter",
+                    "observed": "mixed passive and non-passive trials",
+                    "suggested": "--require-passive",
+                    "reason": "Prevent a lower-error non-passive model from winning the ranking.",
+                }
+            ],
+            notes=(
+                "Reranking does not retrain. Promotion still requires retained model.npz files, but the ranking report works from saved summaries.",
+            ),
+        )
+
+    if "MODEL_METADATA_MISSING" in codes and model in {"dnn", "kbnn"}:
+        base, requires_editing = model_optimize_command_base(args, model)
+        output_dir = run_dir.parent / f"{run_dir.name}_metadata_refresh"
+        command = [
+            *base,
+            "--max-trials",
+            "4",
+            "--out-dir",
+            command_path(output_dir),
+        ]
+        add_command_suggestion(
+            suggestions,
+            identifier="refresh-legacy-metadata",
+            title="Refresh a legacy run with retained trial metadata",
+            triggered_by=["MODEL_METADATA_MISSING"],
+            rationale="Current runs retain metadata.json automatically, so a small controlled rerun restores architecture and training-setting evidence.",
+            command=command,
+            changes=[
+                {
+                    "option": "--max-trials",
+                    "observed": "legacy metadata unavailable",
+                    "suggested": "4",
+                    "reason": "A small diagnostic run is usually sufficient to restore metadata without repeating the full search.",
+                }
+            ],
+            notes=(
+                "Add --keep-trial-models only if the corresponding model.npz weights must also survive.",
+            ),
+            requires_editing=requires_editing,
+        )
+
+    return suggestions
 
 
 def improvement_fraction(values: Sequence[float]) -> float | None:
@@ -486,9 +949,9 @@ def build_findings(
         add_finding(
             findings,
             "INFO",
-            "MODEL_METADATA_CLEANED",
-            "No metadata.json survives, which is normal after an optimization with trial cleanup and no eligible best_model.",
-            "This report uses retained verification summaries; use --keep-trial-models only for a focused diagnostic run.",
+            "MODEL_METADATA_MISSING",
+            "No metadata.json was found. Current optimize runs retain it for every completed model trial; this is expected only for a legacy cleaned run or a trial that failed before saving a model.",
+            "This report can still use retained verification summaries; rerun only the affected configuration if model architecture details are required.",
         )
     return findings
 
@@ -623,6 +1086,76 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> 
     return "\n".join(lines)
 
 
+def suggested_commands_markdown(
+    suggestions: Sequence[Mapping[str, object]],
+) -> list[str]:
+    lines = [
+        "## Suggested command changes",
+        "",
+        "These commands are generated from the findings above. Paths are relative to the current working directory. Review the change table before running a command.",
+        "",
+    ]
+    if not suggestions:
+        lines.extend(
+            [
+                "No command change is justified by the available evidence. Resolve missing inputs or inspect the detailed trial table first.",
+                "",
+            ]
+        )
+        return lines
+    for index, suggestion in enumerate(suggestions, start=1):
+        lines.extend(
+            [
+                f"### {index}. {suggestion['title']}",
+                "",
+                f"Triggered by: `{', '.join(str(value) for value in suggestion.get('triggered_by', []))}`",
+                "",
+                str(suggestion.get("rationale") or ""),
+                "",
+            ]
+        )
+        changes = suggestion.get("changes")
+        if isinstance(changes, list) and changes:
+            lines.extend(
+                [
+                    markdown_table(
+                        ["Option or control", "Observed", "Suggested", "Why"],
+                        [
+                            [
+                                change.get("option", "") if isinstance(change, dict) else "",
+                                change.get("observed", "") if isinstance(change, dict) else "",
+                                change.get("suggested", "") if isinstance(change, dict) else "",
+                                change.get("reason", "") if isinstance(change, dict) else "",
+                            ]
+                            for change in changes
+                        ],
+                    ),
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                "```bash",
+                str(suggestion.get("command") or ""),
+                "```",
+                "",
+            ]
+        )
+        if suggestion.get("requires_editing"):
+            lines.extend(
+                [
+                    "> Replace the `PATH_TO_*` placeholder(s) before running this command. Passing the project options JSON to `debug-model` allows future reports to reuse the configured data paths automatically.",
+                    "",
+                ]
+            )
+        notes = suggestion.get("notes")
+        if isinstance(notes, list):
+            lines.extend(f"- {note}" for note in notes)
+            if notes:
+                lines.append("")
+    return lines
+
+
 def build_parser() -> argparse.ArgumentParser:
     dispatcher_prog = os.environ.get("ADS_SURROGATE_CLI_PROG")
     parser = argparse.ArgumentParser(
@@ -662,6 +1195,16 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     audit = read_json(audit_path) if audit_path else None
     metadata_records = surviving_metadata(run_dir)
     findings = build_findings(rows, metric_name, audit, metadata_records, model)
+    ordered = ranked_trial_rows(rows, metric_name)
+    suggestions = build_command_suggestions(
+        args,
+        run_dir,
+        model,
+        rows,
+        metric_name,
+        findings,
+        metadata_records,
+    )
 
     trials_csv = out_dir / "model_debug_trials.csv"
     report_json = out_dir / "model_debug.json"
@@ -681,7 +1224,7 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         "trial_rows": len(rows),
         "verification_summaries_found": summaries_found,
         "metadata_files_found": [str(path) for path, _payload in metadata_records],
-        "metadata_optional_reason": "Optimization cleanup removes per-trial metadata unless --keep-trial-models is enabled.",
+        "metadata_policy": "metadata.json is retained for every completed model trial; --keep-trial-models controls heavyweight model files.",
         "audit_file": str(audit_path) if audit_path else None,
         "statistics": {
             "passive_trials": sum(value == 0 for value in violations),
@@ -693,6 +1236,7 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             "late_vs_early_best_metric_improvement_fraction": improvement_fraction(metrics),
         },
         "findings": findings,
+        "suggested_commands": suggestions,
         "artifacts": {
             "report": report_md.name,
             "trials": trials_csv.name,
@@ -701,14 +1245,6 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     }
     report_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
-    ordered = sorted(
-        rows,
-        key=lambda row: (
-            integer(row.get("passivity_violating_points")) if integer(row.get("passivity_violating_points")) is not None else 10**18,
-            number(row.get("passivity_max_singular_value")) if number(row.get("passivity_max_singular_value")) is not None else float("inf"),
-            number(row.get(metric_name)) if metric_name and number(row.get(metric_name)) is not None else float("inf"),
-        ),
-    )
     lines = [
         "# Model Fit and Passivity Debug Report",
         "",
@@ -718,7 +1254,7 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         f"- Audit: `{audit_path}`" if audit_path else "- Audit: not found",
         f"- Per-trial verification summaries found: `{summaries_found}`",
         "",
-        "> A missing per-trial `metadata.json` is normal after optimization cleanup. This report reads the retained `verification_summary.json` files and sweep CSV instead.",
+        "> Current optimize runs retain every completed trial's `metadata.json`, even without `--keep-trial-models`. Legacy cleaned runs remain supported through `verification_summary.json` and the sweep CSV.",
         "",
         "## Findings and recommended actions",
         "",
@@ -728,6 +1264,7 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         ),
         "",
     ]
+    lines.extend(suggested_commands_markdown(suggestions))
     if plot_written:
         lines.extend(["## Error and passivity by trial", "", f"![Model passivity diagnostics]({plot_path.name})", ""])
     lines.extend(
