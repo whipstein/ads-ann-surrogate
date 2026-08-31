@@ -44,6 +44,7 @@ from surrogate_common import (  # noqa: E402
     add_dc_port_paths_argument,
     add_adaptive_search_arguments,
     add_debug_argument,
+    add_passivity_collocation_arguments,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
@@ -52,6 +53,7 @@ from surrogate_common import (  # noqa: E402
     apply_candidate_overrides,
     build_ads_export_blocks,
     build_adaptive_candidate_pool,
+    build_passivity_collocation_blocks,
     build_training_export_commands,
     cleanup_trial_dir,
     common_sparameter_labels,
@@ -83,6 +85,8 @@ from surrogate_common import (  # noqa: E402
     parse_sparam_weights,
     parse_text_options,
     passivity_summary,
+    passivity_columns_summary,
+    passivity_max_singular_values_from_columns,
     progress_interval_from_args,
     plot_sweep_diagnostics,
     plot_worst_case_fits,
@@ -777,6 +781,26 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         else None
     )
     passivity_target_sigma = 1.0 - passivity_margin
+    collocation_geometry_count = int(
+        getattr(args, "passivity_collocation_geometries", 0)
+    )
+    collocation_refresh = int(
+        getattr(args, "passivity_collocation_refresh", 25)
+    )
+    if collocation_geometry_count < 0:
+        raise ValueError("--passivity-collocation-geometries must be non-negative")
+    if collocation_geometry_count and not passivity_enforced:
+        raise ValueError(
+            "Passivity collocation requires active S-domain passivity enforcement; "
+            "use --output-domain s and --passivity-mode enforce (or passive source "
+            "data with auto mode)"
+        )
+    if collocation_geometry_count and passivity_penalty <= 0.0:
+        raise ValueError(
+            "Passivity collocation requires --passivity-penalty greater than zero"
+        )
+    if collocation_geometry_count and collocation_refresh <= 0:
+        raise ValueError("--passivity-collocation-refresh must be positive")
 
     reciprocity_mode = str(getattr(args, "reciprocity_mode", "enforce"))
     reciprocity_tolerance = float(getattr(args, "reciprocity_tolerance", 1e-6))
@@ -860,12 +884,66 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         x_verify = None
         y_verify = None
 
+    collocation_base_blocks: list[MDIFBlock] = []
+    collocation_candidate_blocks: list[MDIFBlock] = []
+    collocation_metadata: dict[str, object] = {"enabled": False}
+    if collocation_geometry_count:
+        (
+            collocation_base_blocks,
+            collocation_candidate_blocks,
+            collocation_metadata,
+        ) = build_passivity_collocation_blocks(
+            fit_train_blocks,
+            parameter_names,
+            labels,
+            geometry_count=collocation_geometry_count,
+            frequency_count=int(
+                getattr(args, "passivity_collocation_frequencies", 32)
+            ),
+            candidate_multiplier=int(
+                getattr(args, "passivity_collocation_candidate_multiplier", 4)
+            ),
+            frequency_transform=args.freq_transform,
+            seed=args.seed + 701,
+            geometry_json=getattr(
+                args,
+                "passivity_collocation_geometry_json",
+                None,
+            ),
+        )
+
     x_scaler = Standardizer().fit(x_train)
     y_scaler, floored_output_columns, output_std_floor = fit_output_standardizer(y_train, labels)
     x_train_scaled = x_scaler.transform(x_train)
     y_train_scaled = y_scaler.transform(y_train)
     x_verify_scaled = x_scaler.transform(x_verify) if x_verify is not None else None
     y_verify_scaled = y_scaler.transform(y_verify) if y_verify is not None else None
+
+    collocation_x_scaled: np.ndarray | None = None
+    collocation_fixed_count = 0
+    collocation_hard_count = 0
+    if collocation_base_blocks:
+        collocation_blocks = [
+            *collocation_base_blocks,
+            *collocation_candidate_blocks,
+        ]
+        collocation_x, _collocation_placeholder_y = make_feature_target_samples(
+            collocation_blocks,
+            parameter_names,
+            labels,
+            args.freq_transform,
+            "s",
+            target_z0,
+        )
+        collocation_x_scaled = x_scaler.transform(collocation_x)
+        collocation_fixed_count = sum(
+            len(block.freq_hz) for block in collocation_base_blocks
+        )
+        collocation_candidate_count = len(collocation_x_scaled) - collocation_fixed_count
+        collocation_hard_count = min(
+            collocation_fixed_count,
+            collocation_candidate_count,
+        )
 
     layer_sizes = [x_train.shape[1], *hidden_layers, y_train.shape[1]]
     mlp = MLP(layer_sizes, activation=args.activation, seed=args.seed)
@@ -906,6 +984,43 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         if passivity_enforced and passivity_penalty > 0.0
         else None
     )
+
+    def collocation_response_columns(predicted_scaled: np.ndarray) -> np.ndarray:
+        return y_scaler.inverse_transform(np.asarray(predicted_scaled, dtype=float))
+
+    auxiliary_loss_gradient = None
+    auxiliary_score = None
+    checkpoint_constraint = None
+    if collocation_x_scaled is not None:
+        assert passivity_loss_gradient is not None
+
+        def auxiliary_loss_gradient(
+            predicted_scaled: np.ndarray,
+            _sample_indices: np.ndarray,
+        ) -> tuple[float, np.ndarray]:
+            return passivity_loss_gradient(
+                predicted_scaled,
+                np.zeros_like(predicted_scaled),
+                np.ones(len(predicted_scaled), dtype=float),
+            )
+
+        def auxiliary_score(
+            predicted_scaled: np.ndarray,
+            _sample_indices: np.ndarray,
+        ) -> np.ndarray:
+            return passivity_max_singular_values_from_columns(
+                collocation_response_columns(predicted_scaled),
+                labels,
+            )
+
+        def checkpoint_constraint(network: MLP) -> dict[str, float | int]:
+            assert collocation_x_scaled is not None
+            return passivity_columns_summary(
+                collocation_response_columns(network.predict(collocation_x_scaled)),
+                labels,
+                target_sigma=passivity_target_sigma,
+            )
+
     history = mlp.train(
         x_train_scaled,
         y_train_scaled,
@@ -927,6 +1042,13 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         ),
         progress_interval=progress_interval,
         extra_loss_gradient=passivity_loss_gradient,
+        auxiliary_x=collocation_x_scaled,
+        auxiliary_loss_gradient=auxiliary_loss_gradient,
+        auxiliary_score=auxiliary_score,
+        auxiliary_fixed_count=collocation_fixed_count,
+        auxiliary_hard_count=collocation_hard_count,
+        auxiliary_refresh_interval=collocation_refresh,
+        checkpoint_constraint=checkpoint_constraint,
     )
     if reciprocity_enforced:
         fold_raw_output_projection(
@@ -955,11 +1077,25 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         predicted_train_before_scale,
         labels,
     )
+    collocation_passivity_before_scale = None
+    if collocation_x_scaled is not None:
+        collocation_passivity_before_scale = passivity_columns_summary(
+            collocation_response_columns(mlp.predict(collocation_x_scaled)),
+            labels,
+            target_sigma=passivity_target_sigma,
+        )
     rf_response_scale = 1.0
     if passivity_enforced:
-        predicted_sigma = predicted_train_passivity_before_scale[
-            "max_singular_value"
+        sigma_candidates = [
+            predicted_train_passivity_before_scale["max_singular_value"]
         ]
+        if collocation_passivity_before_scale is not None:
+            sigma_candidates.append(
+                collocation_passivity_before_scale["max_singular_value"]
+            )
+        predicted_sigma = max(
+            float(value) for value in sigma_candidates if value is not None
+        )
         if predicted_sigma is None or not math.isfinite(float(predicted_sigma)):
             raise ValueError("Could not assess the fitted DNN response for passivity")
         if float(predicted_sigma) > passivity_target_sigma:
@@ -973,6 +1109,30 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         model.predict_blocks(fit_train_blocks),
         labels,
     )
+    collocation_passivity_after_scale = None
+    if collocation_x_scaled is not None:
+        collocation_passivity_after_scale = passivity_columns_summary(
+            collocation_response_columns(mlp.predict(collocation_x_scaled)),
+            labels,
+            target_sigma=passivity_target_sigma,
+        )
+        collocation_metadata.update(
+            {
+                "refresh_interval_epochs": collocation_refresh,
+                "hard_sample_count": collocation_hard_count,
+                "active_sample_count": (
+                    collocation_fixed_count + collocation_hard_count
+                ),
+                "checkpoint_policy": (
+                    "passivity_feasibility_then_validation_error"
+                ),
+                "passivity_before_final_scale": (
+                    collocation_passivity_before_scale
+                ),
+                "passivity_after_final_scale": collocation_passivity_after_scale,
+                "included_in_final_rf_scale": True,
+            }
+        )
     max_abs_training_target = float(np.max(np.abs(y_train)))
     metadata = {
         "training_blocks": len(train_blocks),
@@ -1018,7 +1178,12 @@ def train_model(args: argparse.Namespace) -> tuple[DNN, list[MDIFBlock], list[st
         "predicted_train_passivity_before_scale": predicted_train_passivity_before_scale,
         "rf_response_scale": rf_response_scale,
         "predicted_train_passivity_after_scale": predicted_train_passivity_after_scale,
-        "passivity_assessment_scope": "positive-frequency training blocks only",
+        "passivity_collocation": collocation_metadata,
+        "passivity_assessment_scope": (
+            "positive-frequency training blocks plus unlabeled collocation domain"
+            if collocation_x_scaled is not None
+            else "positive-frequency training blocks only"
+        ),
         **dc_metadata,
         "dc_model_history_rows": len(dc_history),
     }
@@ -1180,6 +1345,7 @@ def command_train(args: argparse.Namespace) -> int:
         "predicted_train_passivity_after_scale": metadata[
             "predicted_train_passivity_after_scale"
         ],
+        "passivity_collocation": metadata["passivity_collocation"],
     }
     plot_context = model_settings_title(
         "DNN",
@@ -1243,6 +1409,7 @@ def command_train(args: argparse.Namespace) -> int:
                 "predicted_train_passivity_after_scale": metadata[
                     "predicted_train_passivity_after_scale"
                 ],
+                "passivity_collocation": metadata["passivity_collocation"],
             }
         )
         (out_dir / "verification_summary.json").write_text(
@@ -1281,6 +1448,14 @@ def command_train(args: argparse.Namespace) -> int:
     )
 
     if not getattr(args, "quiet", False):
+        selected_checkpoint = next(
+            (
+                row
+                for row in history
+                if float(row.get("selected_checkpoint", 0.0)) > 0.5
+            ),
+            history[-1] if history else None,
+        )
         print(json.dumps({
             "out_dir": str(out_dir),
             "training_summary": str(out_dir / "training_summary.md"),
@@ -1316,6 +1491,7 @@ def command_train(args: argparse.Namespace) -> int:
             "export_commands": dict(export_commands),
             "final_train_loss": history[-1]["train_loss"] if history else None,
             "final_val_loss": history[-1]["val_loss"] if history else None,
+            "selected_checkpoint": selected_checkpoint,
         }, indent=2))
     return 0
 
@@ -2168,6 +2344,21 @@ def namespace_for_trial(
         passivity_mode=args.passivity_mode,
         passivity_margin=args.passivity_margin,
         passivity_penalty=args.passivity_penalty,
+        passivity_collocation_geometries=getattr(
+            args, "passivity_collocation_geometries", 0
+        ),
+        passivity_collocation_frequencies=getattr(
+            args, "passivity_collocation_frequencies", 32
+        ),
+        passivity_collocation_candidate_multiplier=getattr(
+            args, "passivity_collocation_candidate_multiplier", 4
+        ),
+        passivity_collocation_refresh=getattr(
+            args, "passivity_collocation_refresh", 25
+        ),
+        passivity_collocation_geometry_json=getattr(
+            args, "passivity_collocation_geometry_json", None
+        ),
         reciprocity_mode=args.reciprocity_mode,
         reciprocity_tolerance=args.reciprocity_tolerance,
         worst_plots=plots,
@@ -2429,6 +2620,7 @@ def add_data_args(parser: argparse.ArgumentParser) -> None:
             "an adaptive --optimize-parameter (default: 10)"
         ),
     )
+    add_passivity_collocation_arguments(parser)
     parser.add_argument(
         "--reciprocity-mode",
         choices=["auto", "enforce", "off"],

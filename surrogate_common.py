@@ -7878,6 +7878,336 @@ def parameter_matrix(blocks: Sequence[MDIFBlock], parameter_names: Sequence[str]
     return np.asarray(matrix, dtype=float)
 
 
+def _passivity_collocation_parameter_domain(
+    train_blocks: Sequence[MDIFBlock],
+    parameter_names: Sequence[str],
+    geometry_json: str | Path | None,
+) -> tuple[np.ndarray, np.ndarray, list[str], str]:
+    """Resolve base-unit collocation bounds from metadata or fitted rows."""
+
+    training_values = parameter_matrix(train_blocks, parameter_names)
+    lower = np.min(training_values, axis=0)
+    upper = np.max(training_values, axis=0)
+    scales = ["linear"] * len(parameter_names)
+    if geometry_json is None:
+        return lower, upper, scales, "training_parameter_bounds"
+
+    path = Path(geometry_json).expanduser()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Could not read passivity collocation geometry JSON {path}: {exc}"
+        ) from exc
+    raw_parameters = payload.get("parameters")
+    if not isinstance(raw_parameters, list) or not raw_parameters:
+        raise ValueError(
+            f"Passivity collocation geometry JSON {path} has no non-empty "
+            "'parameters' list"
+        )
+    by_name: dict[str, dict[str, object]] = {}
+    for raw in raw_parameters:
+        if not isinstance(raw, dict):
+            continue
+        name = normalize_name(str(raw.get("name") or "")).lower()
+        if name:
+            by_name[name] = raw
+    resolved_lower: list[float] = []
+    resolved_upper: list[float] = []
+    resolved_scales: list[str] = []
+    for name in parameter_names:
+        raw = by_name.get(normalize_name(name).lower())
+        if raw is None:
+            raise ValueError(
+                f"Passivity collocation geometry JSON {path} has no parameter "
+                f"matching {name!r}"
+            )
+        base_range = raw.get("base_unit_range")
+        declared_range = raw.get("range")
+        if not isinstance(base_range, dict):
+            raise ValueError(
+                f"Parameter {name!r} in {path} has no base_unit_range object"
+            )
+        try:
+            base_low = float(base_range["lower"])
+            base_high = float(base_range["upper"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Parameter {name!r} in {path} needs numeric base-unit bounds"
+            ) from exc
+        declared_low = base_low
+        declared_high = base_high
+        if isinstance(declared_range, dict):
+            try:
+                declared_low = float(declared_range["lower"])
+                declared_high = float(declared_range["upper"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Parameter {name!r} in {path} needs numeric declared bounds"
+                ) from exc
+        scale = str(raw.get("scale") or "linear").strip().lower()
+        if (
+            not math.isfinite(base_low)
+            or not math.isfinite(base_high)
+            or base_high < base_low
+            or not math.isfinite(declared_low)
+            or not math.isfinite(declared_high)
+            or declared_high < declared_low
+        ):
+            raise ValueError(
+                f"Parameter {name!r} in {path} has invalid bounds"
+            )
+        if scale not in {"linear", "log"}:
+            raise ValueError(
+                f"Parameter {name!r} in {path} has unsupported scale {scale!r}"
+            )
+        if scale == "log" and min(base_low, declared_low) <= 0.0:
+            raise ValueError(
+                f"Log-scaled parameter {name!r} in {path} needs positive bounds"
+            )
+        parameter_index = len(resolved_lower)
+        observed = training_values[:, parameter_index]
+
+        def range_score(low: float, high: float) -> tuple[int, float]:
+            span = max(high - low, abs(low), abs(high), EPS)
+            below = np.maximum(0.0, low - observed)
+            above = np.maximum(0.0, observed - high)
+            outside = int(np.count_nonzero((below > 0.0) | (above > 0.0)))
+            distance = float(np.mean((below + above) / span))
+            midpoint = 0.5 * (low + high)
+            proximity = float(np.mean(np.abs(observed - midpoint)) / span)
+            return outside, distance + 1e-6 * proximity
+
+        if range_score(declared_low, declared_high) < range_score(
+            base_low,
+            base_high,
+        ):
+            low, high = declared_low, declared_high
+        else:
+            low, high = base_low, base_high
+        resolved_lower.append(low)
+        resolved_upper.append(high)
+        resolved_scales.append(scale)
+    return (
+        np.asarray(resolved_lower, dtype=float),
+        np.asarray(resolved_upper, dtype=float),
+        resolved_scales,
+        f"geometry_json_auto_units:{path.resolve()}",
+    )
+
+
+def _latin_hypercube_unit(count: int, dimensions: int, rng: np.random.Generator) -> np.ndarray:
+    if count <= 0:
+        return np.empty((0, dimensions), dtype=float)
+    values = np.empty((count, dimensions), dtype=float)
+    for dimension in range(dimensions):
+        strata = (np.arange(count, dtype=float) + rng.random(count)) / count
+        values[:, dimension] = strata[rng.permutation(count)]
+    return values
+
+
+def _map_collocation_parameters(
+    unit_values: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    scales: Sequence[str],
+) -> np.ndarray:
+    mapped = np.empty_like(unit_values)
+    for index, scale in enumerate(scales):
+        if math.isclose(float(lower[index]), float(upper[index]), rel_tol=0.0, abs_tol=0.0):
+            mapped[:, index] = lower[index]
+        elif scale == "log":
+            mapped[:, index] = np.exp(
+                np.log(lower[index])
+                + unit_values[:, index]
+                * (np.log(upper[index]) - np.log(lower[index]))
+            )
+        else:
+            mapped[:, index] = lower[index] + unit_values[:, index] * (
+                upper[index] - lower[index]
+            )
+    return mapped
+
+
+def build_passivity_collocation_blocks(
+    train_blocks: Sequence[MDIFBlock],
+    parameter_names: Sequence[str],
+    labels: Sequence[str],
+    *,
+    geometry_count: int,
+    frequency_count: int,
+    candidate_multiplier: int,
+    frequency_transform: str,
+    seed: int,
+    geometry_json: str | Path | None = None,
+) -> tuple[list[MDIFBlock], list[MDIFBlock], dict[str, object]]:
+    """Create fixed-coverage and mining-candidate physics-only samples.
+
+    The blocks intentionally contain zero placeholder responses.  Model-specific
+    feature builders use their parameter/frequency coordinates, while passivity
+    callbacks operate solely on predicted S matrices.
+    """
+
+    geometry_count = int(geometry_count)
+    frequency_count = int(frequency_count)
+    candidate_multiplier = int(candidate_multiplier)
+    if geometry_count <= 0:
+        return [], [], {
+            "enabled": False,
+            "geometry_count": 0,
+            "frequency_count": 0,
+            "candidate_multiplier": candidate_multiplier,
+        }
+    if frequency_count <= 0:
+        raise ValueError("--passivity-collocation-frequencies must be positive")
+    if candidate_multiplier <= 0:
+        raise ValueError(
+            "--passivity-collocation-candidate-multiplier must be positive"
+        )
+    if not train_blocks:
+        raise ValueError("Passivity collocation requires positive-frequency training blocks")
+
+    lower, upper, scales, domain_source = _passivity_collocation_parameter_domain(
+        train_blocks,
+        parameter_names,
+        geometry_json,
+    )
+    all_frequencies = np.concatenate(
+        [np.asarray(block.freq_hz, dtype=float) for block in train_blocks]
+    )
+    all_frequencies = all_frequencies[
+        np.isfinite(all_frequencies) & (all_frequencies > 0.0)
+    ]
+    if all_frequencies.size == 0:
+        raise ValueError("Passivity collocation requires positive RF frequencies")
+    frequency_min = float(np.min(all_frequencies))
+    frequency_max = float(np.max(all_frequencies))
+    logarithmic_frequency = frequency_transform in {"log", "log-linear"}
+
+    def map_frequency(unit_values: np.ndarray) -> np.ndarray:
+        if math.isclose(frequency_min, frequency_max, rel_tol=0.0, abs_tol=0.0):
+            return np.full_like(unit_values, frequency_min, dtype=float)
+        if logarithmic_frequency:
+            return np.exp(
+                math.log(frequency_min)
+                + unit_values * (math.log(frequency_max) - math.log(frequency_min))
+            )
+        return frequency_min + unit_values * (frequency_max - frequency_min)
+
+    rng = np.random.default_rng(int(seed))
+    base_unit = _latin_hypercube_unit(geometry_count, len(parameter_names), rng)
+    boundary_anchors: list[np.ndarray] = []
+    if len(parameter_names):
+        boundary_anchors.append(
+            np.full(len(parameter_names), 0.5, dtype=float)
+        )
+        for dimension in range(len(parameter_names)):
+            for boundary in (0.0, 1.0):
+                anchor = np.full(len(parameter_names), 0.5, dtype=float)
+                anchor[dimension] = boundary
+                boundary_anchors.append(anchor)
+    anchor_count = min(len(boundary_anchors), geometry_count)
+    if anchor_count:
+        base_unit[:anchor_count] = np.asarray(
+            boundary_anchors[:anchor_count],
+            dtype=float,
+        )
+    candidate_geometry_count = geometry_count * candidate_multiplier
+    candidate_unit = _latin_hypercube_unit(
+        candidate_geometry_count,
+        len(parameter_names),
+        rng,
+    )
+    base_parameters = _map_collocation_parameters(base_unit, lower, upper, scales)
+    candidate_parameters = _map_collocation_parameters(
+        candidate_unit,
+        lower,
+        upper,
+        scales,
+    )
+    if frequency_count == 1:
+        base_frequencies = map_frequency(np.asarray([0.5], dtype=float))
+    else:
+        base_frequencies = map_frequency(
+            np.linspace(0.0, 1.0, frequency_count, dtype=float)
+        )
+
+    def blocks_for_parameters(
+        values: np.ndarray,
+        *,
+        randomized_frequencies: bool,
+        source_offset: int,
+    ) -> list[MDIFBlock]:
+        blocks: list[MDIFBlock] = []
+        for row_index, row in enumerate(values):
+            if randomized_frequencies and frequency_count > 1:
+                frequency_unit = (
+                    np.arange(frequency_count, dtype=float)
+                    + rng.random(frequency_count)
+                ) / frequency_count
+                frequencies = np.sort(map_frequency(frequency_unit))
+            else:
+                frequencies = base_frequencies.copy()
+            blocks.append(
+                MDIFBlock(
+                    params={
+                        name: f"{float(value):.17g}"
+                        for name, value in zip(parameter_names, row)
+                    },
+                    freq_hz=frequencies,
+                    sparams={
+                        label: np.zeros(len(frequencies), dtype=complex)
+                        for label in labels
+                    },
+                    source_index=source_offset + row_index,
+                )
+            )
+        return blocks
+
+    base_blocks = blocks_for_parameters(
+        base_parameters,
+        randomized_frequencies=False,
+        source_offset=-geometry_count,
+    )
+    candidate_blocks = blocks_for_parameters(
+        candidate_parameters,
+        randomized_frequencies=True,
+        source_offset=-(geometry_count + candidate_geometry_count),
+    )
+    metadata = {
+        "enabled": True,
+        "geometry_count": geometry_count,
+        "frequency_count": frequency_count,
+        "fixed_sample_count": geometry_count * frequency_count,
+        "fixed_boundary_anchor_count": anchor_count,
+        "candidate_geometry_count": candidate_geometry_count,
+        "candidate_sample_count": candidate_geometry_count * frequency_count,
+        "candidate_multiplier": candidate_multiplier,
+        "frequency_min_hz": frequency_min,
+        "frequency_max_hz": frequency_max,
+        "frequency_sampling": (
+            "log_stratified" if logarithmic_frequency else "linear_stratified"
+        ),
+        "parameter_domain_source": domain_source,
+        "parameter_bounds_model_coordinates": {
+            name: {
+                "lower": float(low),
+                "upper": float(high),
+                "scale": scale,
+            }
+            for name, low, high, scale in zip(
+                parameter_names,
+                lower,
+                upper,
+                scales,
+            )
+        },
+        "seed": int(seed),
+        "uses_response_targets": False,
+    }
+    return base_blocks, candidate_blocks, metadata
+
+
 def common_sparameter_labels(blocks: Sequence[MDIFBlock]) -> list[str]:
     common = set(blocks[0].sparams)
     for block in blocks[1:]:
@@ -8268,11 +8598,26 @@ class MLP:
             tuple[float, np.ndarray],
         ]
         | None = None,
+        auxiliary_x: np.ndarray | None = None,
+        auxiliary_loss_gradient: Callable[
+            [np.ndarray, np.ndarray],
+            tuple[float, np.ndarray],
+        ]
+        | None = None,
+        auxiliary_score: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
+        auxiliary_fixed_count: int = 0,
+        auxiliary_hard_count: int = 0,
+        auxiliary_refresh_interval: int = 25,
+        checkpoint_constraint: Callable[["MLP"], dict[str, float | int]] | None = None,
     ) -> list[dict[str, float]]:
         if extra_loss_gradient is not None and indexed_extra_loss_gradient is not None:
             raise ValueError(
                 "Specify only one of extra_loss_gradient and "
                 "indexed_extra_loss_gradient"
+            )
+        if (auxiliary_x is None) != (auxiliary_loss_gradient is None):
+            raise ValueError(
+                "auxiliary_x and auxiliary_loss_gradient must be supplied together"
             )
         if output_weights is None:
             output_weights = np.ones(y_train.shape[1], dtype=float)
@@ -8334,7 +8679,76 @@ class MLP:
         best_weights = [w.copy() for w in self.weights]
         best_biases = [b.copy() for b in self.biases]
         best_epoch = 0
+        best_checkpoint_key: tuple[float, ...] | None = None
         stale = 0
+
+        auxiliary_values: np.ndarray | None = None
+        active_auxiliary_indices = np.asarray([], dtype=int)
+        auxiliary_order = np.asarray([], dtype=int)
+        auxiliary_cursor = 0
+        if auxiliary_x is not None:
+            auxiliary_values = np.asarray(auxiliary_x, dtype=float)
+            if auxiliary_values.ndim != 2 or auxiliary_values.shape[1] != x_train.shape[1]:
+                raise ValueError(
+                    "Auxiliary feature columns must match the fitted input columns"
+                )
+            if len(auxiliary_values) == 0:
+                raise ValueError("Auxiliary feature data must contain at least one row")
+            auxiliary_fixed_count = int(auxiliary_fixed_count)
+            auxiliary_hard_count = int(auxiliary_hard_count)
+            auxiliary_refresh_interval = int(auxiliary_refresh_interval)
+            if not 0 <= auxiliary_fixed_count <= len(auxiliary_values):
+                raise ValueError("auxiliary_fixed_count is outside the auxiliary data")
+            candidate_count = len(auxiliary_values) - auxiliary_fixed_count
+            if not 0 <= auxiliary_hard_count <= candidate_count:
+                raise ValueError("auxiliary_hard_count is outside the candidate pool")
+            if auxiliary_hard_count and auxiliary_score is None:
+                raise ValueError("Hard-negative auxiliary mining requires auxiliary_score")
+            if auxiliary_refresh_interval <= 0:
+                raise ValueError("auxiliary_refresh_interval must be positive")
+
+        def refresh_auxiliary_indices() -> None:
+            nonlocal active_auxiliary_indices, auxiliary_order, auxiliary_cursor
+            if auxiliary_values is None:
+                return
+            fixed = np.arange(auxiliary_fixed_count, dtype=int)
+            candidate = np.arange(
+                auxiliary_fixed_count,
+                len(auxiliary_values),
+                dtype=int,
+            )
+            selected = np.asarray([], dtype=int)
+            if auxiliary_hard_count:
+                assert auxiliary_score is not None
+                candidate_prediction = self.predict(auxiliary_values[candidate])
+                scores = np.asarray(
+                    auxiliary_score(candidate_prediction, candidate),
+                    dtype=float,
+                ).reshape(-1)
+                if scores.shape != (len(candidate),):
+                    raise ValueError(
+                        "Auxiliary hard-negative score count does not match the "
+                        "candidate pool"
+                    )
+                if np.any(~np.isfinite(scores)):
+                    raise ValueError("Auxiliary hard-negative scores are non-finite")
+                order_by_score = np.argsort(scores, kind="stable")
+                selected = candidate[order_by_score[-auxiliary_hard_count :]]
+            active_auxiliary_indices = np.concatenate([fixed, selected])
+            auxiliary_order = rng.permutation(active_auxiliary_indices)
+            auxiliary_cursor = 0
+
+        def next_auxiliary_batch(requested: int) -> np.ndarray:
+            nonlocal auxiliary_order, auxiliary_cursor
+            if active_auxiliary_indices.size == 0:
+                return np.asarray([], dtype=int)
+            count = min(max(1, int(requested)), len(active_auxiliary_indices))
+            if auxiliary_cursor + count > len(auxiliary_order):
+                auxiliary_order = rng.permutation(active_auxiliary_indices)
+                auxiliary_cursor = 0
+            selected = auxiliary_order[auxiliary_cursor : auxiliary_cursor + count]
+            auxiliary_cursor += count
+            return selected
 
         batch_size = max(1, min(batch_size, len(x_train)))
         loss_interval = max(1, int(loss_interval))
@@ -8344,6 +8758,10 @@ class MLP:
         n_layers = len(self.weights)
         scale_base = 2.0 / y_train.shape[1]
         for epoch in range(1, epochs + 1):
+            if auxiliary_values is not None and (
+                epoch == 1 or (epoch - 1) % auxiliary_refresh_interval == 0
+            ):
+                refresh_auxiliary_indices()
             rng.shuffle(order)
             for start in range(0, len(order), batch_size):
                 indices = order[start : start + batch_size]
@@ -8391,6 +8809,39 @@ class MLP:
                         delta = (delta @ self.weights[layer].T) * self.activation_grad_from_activation(
                             activations[layer]
                         )
+
+                if auxiliary_values is not None:
+                    auxiliary_indices = next_auxiliary_batch(len(xb))
+                    if auxiliary_indices.size:
+                        auxiliary_prediction, auxiliary_activations = self.forward_training(
+                            auxiliary_values[auxiliary_indices]
+                        )
+                        assert auxiliary_loss_gradient is not None
+                        _auxiliary_loss, auxiliary_delta = auxiliary_loss_gradient(
+                            auxiliary_prediction,
+                            auxiliary_indices,
+                        )
+                        auxiliary_delta = np.asarray(auxiliary_delta, dtype=float)
+                        if auxiliary_delta.shape != auxiliary_prediction.shape:
+                            raise ValueError(
+                                "Auxiliary-loss gradient shape does not match the MLP "
+                                "output"
+                            )
+                        if np.any(~np.isfinite(auxiliary_delta)):
+                            raise ValueError(
+                                "Auxiliary-loss gradient contains non-finite values"
+                            )
+                        for layer in reversed(range(n_layers)):
+                            auxiliary_previous = auxiliary_activations[layer]
+                            assert grad_w[layer] is not None and grad_b[layer] is not None
+                            grad_w[layer] += auxiliary_previous.T @ auxiliary_delta
+                            grad_b[layer] += np.sum(auxiliary_delta, axis=0)
+                            if layer > 0:
+                                auxiliary_delta = (
+                                    auxiliary_delta @ self.weights[layer].T
+                                ) * self.activation_grad_from_activation(
+                                    auxiliary_activations[layer]
+                                )
 
                 step += 1
                 beta1_power *= beta1
@@ -8468,9 +8919,46 @@ class MLP:
                 if val_prediction is not None and y_val is not None
                 else train_loss
             )
-            history.append({"epoch": float(epoch), "train_loss": train_loss, "val_loss": val_loss})
+            history_row: dict[str, float] = {
+                "epoch": float(epoch),
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            }
+            if checkpoint_constraint is not None:
+                constraint = checkpoint_constraint(self)
+                violations = int(constraint.get("violating_points", 0))
+                max_sigma = float(constraint.get("max_singular_value", float("inf")))
+                target_sigma = float(constraint.get("target_sigma", 1.0))
+                if violations < 0 or not math.isfinite(max_sigma):
+                    raise ValueError("Checkpoint passivity summary is invalid")
+                history_row.update(
+                    {
+                        "checkpoint_passivity_violations": float(violations),
+                        "checkpoint_max_singular_value": max_sigma,
+                        "checkpoint_target_sigma": target_sigma,
+                    }
+                )
+                # Feasibility is lexicographically prior to response error.  Once
+                # feasible, validation loss selects the most accurate checkpoint;
+                # while infeasible, violation count and then sigma guide recovery.
+                if violations == 0:
+                    checkpoint_key = (0.0, float(val_loss), max_sigma, 0.0)
+                else:
+                    checkpoint_key = (
+                        1.0,
+                        float(violations),
+                        max_sigma,
+                        float(val_loss),
+                    )
+            else:
+                checkpoint_key = (float(val_loss),)
+            history.append(history_row)
 
-            if val_loss < best_val - 1e-10:
+            improved_checkpoint = (
+                best_checkpoint_key is None or checkpoint_key < best_checkpoint_key
+            )
+            if improved_checkpoint:
+                best_checkpoint_key = checkpoint_key
                 best_val = val_loss
                 best_weights = [w.copy() for w in self.weights]
                 best_biases = [b.copy() for b in self.biases]
@@ -8491,12 +8979,22 @@ class MLP:
                         "best_epoch": best_epoch,
                         "stale": stale,
                         "stopped": stopped,
+                        "checkpoint_passivity_violations": history_row.get(
+                            "checkpoint_passivity_violations"
+                        ),
+                        "checkpoint_max_singular_value": history_row.get(
+                            "checkpoint_max_singular_value"
+                        ),
                     }
                 )
 
             if stopped:
                 break
 
+        for row in history:
+            row["selected_checkpoint"] = (
+                1.0 if int(row.get("epoch", 0.0)) == best_epoch else 0.0
+            )
         self.weights = best_weights
         self.biases = best_biases
         return history
@@ -10390,6 +10888,14 @@ def make_training_progress_callback(
         if best_val is not None:
             best_epoch = int(event.get("best_epoch") or 0)
             parts.append(f"best_val={best_val}@{best_epoch}")
+        checkpoint_violations = number_text(
+            event.get("checkpoint_passivity_violations")
+        )
+        checkpoint_sigma = number_text(event.get("checkpoint_max_singular_value"))
+        if checkpoint_violations is not None:
+            parts.append(f"collocation_pv={checkpoint_violations}")
+        if checkpoint_sigma is not None:
+            parts.append(f"collocation_sigma={checkpoint_sigma}")
         if event.get("stopped"):
             parts.append("early_stop")
         if is_final:
@@ -10444,6 +10950,55 @@ def passivity_summary(blocks: Sequence[MDIFBlock], labels: Sequence[str]) -> dic
         "nports": nports,
         "max_singular_value": max_sigma,
         "violating_points": violating,
+    }
+
+
+def passivity_max_singular_values_from_columns(
+    response_columns: np.ndarray,
+    labels: Sequence[str],
+) -> np.ndarray:
+    """Return the largest S-matrix singular value for each real/imag row."""
+
+    values = np.asarray(response_columns, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 2 * len(labels):
+        raise ValueError(
+            "Passivity response columns must have one real and imaginary column "
+            "for every S-parameter label"
+        )
+    nports = infer_complete_sparameter_ports(labels)
+    rows: list[int] = []
+    cols: list[int] = []
+    for label in labels:
+        indices = sparam_indices(label)
+        if indices is None:
+            raise ValueError(f"Label {label!r} is not an S-parameter name")
+        row, col = indices
+        rows.append(row - 1)
+        cols.append(col - 1)
+    complex_values = values[:, : len(labels)] + 1j * values[:, len(labels) :]
+    matrices = np.zeros((len(values), nports, nports), dtype=complex)
+    matrices[:, np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)] = (
+        complex_values
+    )
+    singular_values = np.linalg.svd(matrices, compute_uv=False)
+    return singular_values[:, 0]
+
+
+def passivity_columns_summary(
+    response_columns: np.ndarray,
+    labels: Sequence[str],
+    *,
+    target_sigma: float = 1.0 + DEFAULT_DC_PASSIVITY_TOLERANCE,
+) -> dict[str, float | int | None]:
+    """Summarize sampled matrix passivity for model-output column arrays."""
+
+    sigmas = passivity_max_singular_values_from_columns(response_columns, labels)
+    return {
+        "nports": infer_complete_sparameter_ports(labels),
+        "sample_count": int(len(sigmas)),
+        "target_sigma": float(target_sigma),
+        "max_singular_value": float(np.max(sigmas)) if sigmas.size else None,
+        "violating_points": int(np.count_nonzero(sigmas > float(target_sigma))),
     }
 
 
@@ -12196,8 +12751,13 @@ def write_history(
     history: Sequence[dict[str, float]],
     plot_title: str = "Model performance vs epoch",
 ) -> None:
+    fields = ["epoch", "train_loss", "val_loss"]
+    for row in history:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss"])
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(history)
     write_training_history_plot(path.with_suffix(".pdf"), history, title=plot_title)
@@ -12891,24 +13451,44 @@ def write_training_markdown(
 
     if history:
         final = history[-1]
+        selected = next(
+            (
+                row
+                for row in history
+                if float(row.get("selected_checkpoint", 0.0)) > 0.5
+            ),
+            final,
+        )
         lines.extend(
             [
-                "## Final Training Loss",
+                "## Selected Training Checkpoint",
                 "",
-                "| Epoch | Train Loss | Validation Loss |",
-                "| ---: | ---: | ---: |",
+                "| Epoch | Train Loss | Validation Loss | Collocation violations | Collocation max sigma |",
+                "| ---: | ---: | ---: | ---: | ---: |",
                 "| "
                 + " | ".join(
                     [
-                        metric_text(final.get("epoch")),
-                        metric_text(final.get("train_loss")),
-                        metric_text(final.get("val_loss")),
+                        metric_text(selected.get("epoch")),
+                        metric_text(selected.get("train_loss")),
+                        metric_text(selected.get("val_loss")),
+                        metric_text(
+                            selected.get("checkpoint_passivity_violations")
+                        ),
+                        metric_text(selected.get("checkpoint_max_singular_value")),
                     ]
                 )
                 + " |",
                 "",
             ]
         )
+        if selected is not final:
+            lines.extend(
+                [
+                    "The saved model restores this checkpoint; later epochs remain "
+                    "in `training_history.csv` for diagnosis.",
+                    "",
+                ]
+            )
 
     metric_rows = [
         ("RMSE abs", summary.get("rmse_abs")),
@@ -13966,6 +14546,54 @@ def add_adaptive_search_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=8,
         help="Width quantization for a hidden_layers depth/width range. Default: 8.",
+    )
+
+
+def add_passivity_collocation_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add shared physics-only passivity coverage controls."""
+
+    parser.add_argument(
+        "--passivity-collocation-geometries",
+        type=int,
+        default=0,
+        help=(
+            "Number of fixed stratified geometry samples used for unlabeled "
+            "passivity constraints. 0 disables collocation (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--passivity-collocation-frequencies",
+        type=int,
+        default=32,
+        help=(
+            "RF frequency samples per collocation geometry, including the fitted "
+            "frequency limits (default: 32)."
+        ),
+    )
+    parser.add_argument(
+        "--passivity-collocation-candidate-multiplier",
+        type=int,
+        default=4,
+        help=(
+            "Multiplier for the additional geometry pool scanned by hard-negative "
+            "passivity mining (default: 4)."
+        ),
+    )
+    parser.add_argument(
+        "--passivity-collocation-refresh",
+        type=int,
+        default=25,
+        help=(
+            "Epoch interval for rescoring the candidate pool and selecting the "
+            "worst passivity samples (default: 25)."
+        ),
+    )
+    parser.add_argument(
+        "--passivity-collocation-geometry-json",
+        help=(
+            "Generated geometries.json whose base-unit parameter ranges define "
+            "the collocation domain. Defaults to fitted training bounds."
+        ),
     )
 
 

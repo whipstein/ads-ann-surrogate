@@ -1518,14 +1518,112 @@ the fitted coarse model's history under `coarse_model/`, so first identify
 whether the coarse network or the final fine network is unstable.
 
 The shared neural engine uses Adam with a fixed learning rate. It does not
-currently schedule the learning rate or clip gradients. At the end of a run it
-restores the weights and biases from the epoch with the lowest recorded
-validation loss. Consequently, a bad-looking tail in the history wastes time
-and is evidence of instability, but it should not by itself replace an earlier
-good checkpoint in the saved model. If the saved model is still poor, compare
+currently schedule the learning rate or clip gradients. Without passivity
+collocation, it restores the weights and biases from the epoch with the lowest
+recorded validation loss. With collocation enabled, checkpoint selection first
+requires collocation feasibility; validation loss then selects the most accurate
+feasible epoch. Consequently, a bad-looking tail in the history wastes time and
+is evidence of instability, but it should not by itself replace an earlier good
+checkpoint in the saved model. If the saved model is still poor, compare
 the best conditioned validation loss with physical verification metrics such
 as EVM, worst-case S-parameter error, and passivity; they are related but are
 not the same ranking quantity.
+
+#### Passivity-First Collocation and Hard-Negative Mining
+
+Use passivity collocation when training rows are passive but every DNN or KBNN
+optimization trial remains non-passive on verification. Ordinary passivity
+penalties see only fitted response rows. Collocation adds geometry/frequency
+coordinates throughout the declared domain and evaluates the predicted matrix
+singular values there. These coordinates have no S-parameter targets and require
+no additional EM or RFPro simulations.
+
+The implementation maintains two physics-only sets:
+
+1. A fixed stratified geometry set with center and parameter-face anchors,
+   crossed with a stratified RF frequency grid, preserves broad domain coverage.
+2. A larger candidate set is rescored periodically. The worst predicted
+   singular-value samples are added to each auxiliary training pass as hard
+   negatives.
+
+Checkpoint selection is feasibility-first. While every checkpoint violates the
+target, fewer violations and lower maximum singular value win. Once a checkpoint
+has zero collocation violations, validation response error selects the saved
+checkpoint. The final RF contraction is calculated from both measured training
+rows and the complete collocation pool. Verification responses remain holdout
+data and are never used as passivity-loss targets.
+
+For a six-dimensional model, start with 48 to 64 collocation geometries and 32
+frequencies. These are inexpensive neural evaluations, not new simulated
+geometries. Increase to 96 geometries or 48 frequencies only if violations remain
+localized between the initial constraint samples. A candidate multiplier of 4
+and refresh interval of 25 epochs are reasonable defaults.
+
+Run a DNN passivity-first search with:
+
+```bash
+python3 surrogate.py --options-json options.json --model dnn optimize \
+  --output-domain s \
+  --passivity-mode enforce \
+  --passivity-margin 0.005 \
+  --passivity-collocation-geometries 64 \
+  --passivity-collocation-frequencies 32 \
+  --passivity-collocation-candidate-multiplier 4 \
+  --passivity-collocation-refresh 25 \
+  --passivity-collocation-geometry-json path/to/geometries.json \
+  --loss-interval 5 \
+  --search-mode adaptive \
+  --selection-metric passivity.max_singular_value \
+  --require-passive \
+  --max-passivity-sigma 1.000001 \
+  --optimize-parameter passivity_penalty=1:100:log \
+  --optimize-parameter learning_rate=1e-4:1e-3:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter 'hidden_layers=1:3x64:192:log' \
+  --adaptive-initial-trials 8 \
+  --max-trials 24 \
+  --keep-trial-models \
+  --out-dir outputs/dnn_passivity_collocation
+```
+
+For KBNN, constrain the reconstructed fine response. The integrated coarse DNN
+also receives the collocation settings and is fitted before the fine trials:
+
+```bash
+python3 surrogate.py --options-json options.json --model kbnn optimize \
+  --mode residual \
+  --passivity-mode enforce \
+  --passivity-margin 0.005 \
+  --passivity-collocation-geometries 64 \
+  --passivity-collocation-frequencies 32 \
+  --passivity-collocation-candidate-multiplier 4 \
+  --passivity-collocation-refresh 25 \
+  --passivity-collocation-geometry-json path/to/geometries.json \
+  --loss-interval 5 \
+  --search-mode adaptive \
+  --selection-metric passivity.max_singular_value \
+  --require-passive \
+  --max-passivity-sigma 1.000001 \
+  --optimize-parameter passivity_penalty=1:100:log \
+  --optimize-parameter learning_rate=1e-4:1e-3:log \
+  --optimize-parameter activation=tanh,relu \
+  --optimize-parameter 'hidden_layers=1:3x64:192:log' \
+  --adaptive-initial-trials 8 \
+  --max-trials 24 \
+  --keep-trial-models \
+  --out-dir outputs/kbnn_passivity_collocation
+```
+
+The geometry JSON is optional; without it, the fitted training minima and maxima
+define the constraint domain. Supplying it is preferred because it covers the
+intended generation range. Its declared and base-unit ranges are compared with
+the MDIF values automatically, preventing `um` versus base-unit mismatches.
+
+After passive trials appear, rerank them by accuracy as described under sweep
+selection, then narrow the learning-rate, penalty, and architecture ranges around
+the passive configurations. `metadata.json` and `verification_summary.json`
+record the collocation domain, fixed/candidate sample counts, hard-negative count,
+checkpoint policy, and singular-value summaries before and after final scaling.
 
 #### Read the Loss Pattern First
 
@@ -4010,7 +4108,9 @@ blocks. If they form a complete passive S-matrix, the DNN loss penalizes the
 amount by which the largest singular value exceeds
 $1-\texttt{passivity-margin}$. The penalty combines the mean squared excess
 with an RMS-of-squared-excess term, so a narrow violation is not hidden by a
-large frequency grid. After training, any remaining sampled training-domain
+large frequency grid. With passivity collocation enabled, the same loss also
+receives physics-only parameter/frequency rows selected from fixed coverage and
+hard-negative candidate sets. After training, any remaining sampled guard-domain
 overshoot is removed by the uniform factor
 
 $$
@@ -4018,17 +4118,21 @@ $$
 =\min\!\left(
 1,
 \frac{1-\texttt{passivity-margin}}
-     {\max_{(\mathbf p,f)\in\mathcal D_{\mathrm{train}}}
+     {\max_{(\mathbf p,f)\in\mathcal D_{\mathrm{guard}}}
       \sigma_{\max}(\widehat{\mathbf S}(\mathbf p,f))}
 \right).
 $$
 
-This last factor is folded into the existing linear output layer. It does not
+Here $\mathcal D_{\mathrm{guard}}$ is the measured training set alone when
+collocation is disabled, or training plus the complete fixed/candidate
+collocation pool when enabled. This last factor is folded into the existing
+linear output layer. It does not
 add an SVD or any other operation to prediction, Verilog-A, sampled MDIF, or
-ADS HB evaluation. Verification points are never used in the passivity loss,
-early-stage audit, or final scale; their independent passivity result remains in
-`verification_summary.json`. `--passivity-mode enforce` applies the same
-training-domain behavior even when the source data are non-passive, while
+ADS HB evaluation. Verification responses are never used in the passivity loss,
+early-stage audit, collocation mining, or final scale; their independent
+passivity result remains in `verification_summary.json`. `--passivity-mode
+enforce` applies the same guard-domain behavior even when the source data are
+non-passive, while
 `off` disables both the loss and safeguard. If contraction is larger than you
 are willing to accept, inspect `rf_response_scale` and optimize
 `passivity_penalty` rather than silently accepting the RF error tradeoff.
@@ -4476,10 +4580,15 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
 | <nobr><code>--max-y-condition FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Reject direct-Y fitting when the worst training-row $\kappa(\mathbf I+\mathbf S)$ exceeds this value. The error identifies the block, frequency, and parameters. Default: $10^{10}$. | <nobr><code>--max-y-condition 1e8</code></nobr> |
 | <nobr><code>--output-domain {s,y}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Training target domain. `s` predicts S-parameters and supports automatic reciprocity/passivity protection. `y` converts the MDIF S-data to admittance targets using `--target-z0`, but is rejected for ill-conditioned conversions and cannot use S-domain passivity enforcement. Default: `s`. | <nobr><code>--output-domain s</code></nobr> |
-| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Saved S-domain response target below unit maximum singular value. The final training-only safeguard uses $1-\text{margin}$. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.0001</code></nobr> |
+| <nobr><code>--passivity-collocation-candidate-multiplier INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Additional geometry-pool multiplier for periodic worst-singular-value mining. Default: `4`. | <nobr><code>--passivity-collocation-candidate-multiplier 4</code></nobr> |
+| <nobr><code>--passivity-collocation-frequencies INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Positive RF constraint frequencies per collocation geometry. Default: `32`. | <nobr><code>--passivity-collocation-frequencies 32</code></nobr> |
+| <nobr><code>--passivity-collocation-geometries INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Physics-only geometry count. A positive value enables hard-negative passivity training and feasibility-first checkpointing; `0` disables it. Default: `0`. | <nobr><code>--passivity-collocation-geometries 64</code></nobr> |
+| <nobr><code>--passivity-collocation-geometry-json PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Generated geometry metadata defining the intended parameter domain. Declared/base-unit bounds are matched automatically to MDIF coordinates. | <nobr><code>--passivity-collocation-geometry-json geometries.json</code></nobr> |
+| <nobr><code>--passivity-collocation-refresh INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Epoch interval for rescoring hard-negative candidates. Default: `25`. | <nobr><code>--passivity-collocation-refresh 25</code></nobr> |
+| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Saved S-domain response target below unit maximum singular value. The final safeguard uses training plus enabled collocation samples and targets $1-\text{margin}$. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.0001</code></nobr> |
 | <nobr><code>--passivity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` protects complete passive positive-frequency training data; `enforce` always protects an S-domain complete matrix; `off` disables the passivity loss and folded safeguard. Verification data remain independent. Default: `auto`. | <nobr><code>--passivity-mode auto</code></nobr> |
-| <nobr><code>--passivity-penalty FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Non-negative weight for the differentiable largest-singular-value loss. It may also be varied with `--optimize-parameter passivity_penalty=...`. Final sampled training-domain contraction still provides the safeguard. Default: `10`. | <nobr><code>--passivity-penalty 10</code></nobr> |
-| <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
+| <nobr><code>--passivity-penalty FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Non-negative weight for the differentiable largest-singular-value loss. It may also be varied with `--optimize-parameter passivity_penalty=...`; collocation requires a positive value. Default: `10`. | <nobr><code>--passivity-penalty 10</code></nobr> |
+| <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without checkpoint improvement. Checkpoints use validation loss normally and passivity feasibility followed by validation loss when collocation is enabled. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
 | <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
 | <nobr><code>--reciprocity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `enforce` always ties reciprocal pairs; `auto` ties them only when positive-frequency training data pass the tolerance; `off` keeps independent outputs. The projection is folded into the last layer. Default: `enforce`. | <nobr><code>--reciprocity-mode enforce</code></nobr> |
 | <nobr><code>--reciprocity-tolerance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum relative $S_{ij}$/$S_{ji}$ source-data mismatch accepted by reciprocity `auto` mode. Default: $10^{-6}$. | <nobr><code>--reciprocity-tolerance 1e-5</code></nobr> |
@@ -5228,7 +5337,12 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
 | <nobr><code>--mode {plain,residual,prior-input}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code>, <code>export-ads-ann</code> | KBNN formulation. `residual` learns $\mathbf S_{\mathrm{fine}}-\widehat{\mathbf S}_{\mathrm{coarse}}$; `prior-input` predicts fine S using fitted coarse-DNN predictions as inputs; `plain` uses no coarse model. Default: `residual`. | <nobr><code>--mode residual</code></nobr> |
 | <nobr><code>--modes LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated KBNN model modes. The singular `--mode` accepts one train-compatible value; `--mode-options` remains an alias. Default: `residual,prior-input`. | <nobr><code>--modes residual,prior-input</code></nobr> |
-| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Target margin below $\sigma_{\max}=1$ for the reconstructed fine S-matrix. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.001</code></nobr> |
+| <nobr><code>--passivity-collocation-candidate-multiplier INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Additional geometry-pool multiplier for periodic hard-negative mining. Applies to the integrated coarse DNN and reconstructed fine response. Default: `4`. | <nobr><code>--passivity-collocation-candidate-multiplier 4</code></nobr> |
+| <nobr><code>--passivity-collocation-frequencies INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Positive RF constraint frequencies per collocation geometry. Default: `32`. | <nobr><code>--passivity-collocation-frequencies 32</code></nobr> |
+| <nobr><code>--passivity-collocation-geometries INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Physics-only geometry count; positive enables hard-negative training and feasibility-first checkpointing. Default: `0`. | <nobr><code>--passivity-collocation-geometries 64</code></nobr> |
+| <nobr><code>--passivity-collocation-geometry-json PATH</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Generated geometry metadata defining the parameter domain, with automatic declared/base-unit matching. | <nobr><code>--passivity-collocation-geometry-json geometries.json</code></nobr> |
+| <nobr><code>--passivity-collocation-refresh INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Epoch interval for rescoring hard-negative candidates. Default: `25`. | <nobr><code>--passivity-collocation-refresh 25</code></nobr> |
+| <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Target margin below $\sigma_{\max}=1$ for reconstructed fine S. Final scaling includes enabled collocation samples. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.001</code></nobr> |
 | <nobr><code>--passivity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` protects complete passive positive-frequency fine training data; `enforce` always protects a complete fine S-matrix; `off` disables the penalty and final safeguard. Residual mode evaluates coarse plus correction. Default: `auto`. | <nobr><code>--passivity-mode auto</code></nobr> |
 | <nobr><code>--passivity-penalty FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Non-negative weight of the differentiable largest-singular-value penalty on reconstructed fine S. It is also an adaptive `--optimize-parameter`. Default: `10`. | <nobr><code>--passivity-penalty 10</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience in epochs for each candidate. Use `0` to disable. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
@@ -6240,9 +6354,13 @@ value uses its leading left and right singular vectors. The first term shapes
 all violating samples; the second emphasizes narrow spikes without a
 discontinuous hard maximum.
 
-After restoring the early-stopping checkpoint, the implementation measures the
-largest singular value over the positive-frequency training predictions. If it
-still exceeds $1-m$, it multiplies every RF S output by the uniform factor
+Without collocation, early stopping restores the lowest-validation-loss
+checkpoint. With collocation, it first prefers zero physics-only constraint
+violations and then uses validation loss among feasible checkpoints. After
+restoring that checkpoint, the implementation measures the largest singular
+value over positive-frequency training predictions and, when enabled, the
+complete collocation pool. If it still exceeds $1-m$, it multiplies every RF S
+output by the uniform factor
 
 $$
 \alpha=\frac{1-m}{\max_k\sigma_{\max}(\widehat{\mathbf S}_k)}.
@@ -6251,8 +6369,9 @@ $$
 The multiplication is represented as a raw-output linear projection and folded
 algebraically into the existing final weight matrix and bias. No runtime SVD,
 projection, or extra layer is added to the saved model or exports. Metadata
-records the source passivity, passivity before and after the safeguard, and
-`rf_response_scale`. Verification data never determine $\alpha$.
+records the source passivity, passivity before and after the safeguard,
+collocation coverage/mining settings, and `rf_response_scale`. Verification
+data never determine $\alpha$.
 
 By default, `--reciprocity-mode enforce` constructs a projection that replaces
 each predicted $S_{ij}$ and $S_{ji}$ real/imaginary pair by their average. This
@@ -6271,9 +6390,10 @@ geometry interpolation are learned simultaneously. It therefore commonly
 needs more full-wave geometries than KBNN when a useful coarse model exists,
 and it offers less structural frequency regularization than Neuro-TF. The
 S-domain implementation preserves reciprocal source structure exactly and
-protects passive source data on the sampled training domain. Verification and
-unsampled interpolation remain independently measured, so `--require-passive`
-is still useful during optimization.
+protects passive source data on the sampled training domain. Collocation extends
+that sampled guard domain without requiring response targets. Verification and
+remaining unsampled interpolation remain independently measured, so
+`--require-passive` is still useful during optimization.
 
 #### Persistence and inference
 
@@ -6424,12 +6544,13 @@ rejects an incompatible reused coarse model instead of claiming a property the
 composite response cannot have.
 
 These controls guarantee reciprocity structurally and passivity on the sampled
-positive-frequency training rows after the final safeguard. Verification rows
-and unsampled parameter/frequency points remain independent tests; use sweep
-passivity filters and a sufficiently dense export-validation grid. The metadata
-records source fine passivity/reciprocity, coarse reciprocity, passivity before
-and after scaling, `rf_response_scale`, and the final training reciprocity
-error.
+positive-frequency training rows plus the complete collocation pool after the
+final safeguard. Verification rows and remaining unsampled parameter/frequency
+points remain independent tests; use sweep passivity filters and a sufficiently
+dense export-validation grid. The metadata records source fine
+passivity/reciprocity, coarse reciprocity, collocation coverage/mining,
+passivity before and after scaling, `rf_response_scale`, and the final training
+reciprocity error.
 
 #### Coarse versus fine DC
 
@@ -6757,7 +6878,7 @@ Thus scaling changes the ADS unit convention without changing the fitted model.
 | Prior model | None | Frozen fitted S-domain DNN | Fixed rational basis |
 | Typical strength | Maximum response flexibility | Efficient correction when useful coarse data exists | Compact broadband frequency representation |
 | Main risk | Data demand and unconstrained frequency interpolation | Bias or error inherited from coarse model and mode choice | Insufficient pole order/basis placement or nonsmooth coefficient map |
-| RF passivity enforcement | S-domain singular-value loss plus automatic sampled training-domain contraction for passive source data; verification remains independent | None | Automatic sampled training-domain contraction for passive source data; verification remains independent |
+| RF passivity enforcement | S-domain singular-value loss, optional hard-negative collocation, feasibility-first checkpointing, and automatic sampled guard-domain contraction | Reconstructed-fine-S singular-value loss, optional coarse/fine collocation, feasibility-first checkpointing, and sampled guard-domain contraction | Automatic sampled training-domain contraction for passive source data; verification remains independent |
 | Exact DC | Separate Appendix A model | Separate fine-data Appendix A model | Separate Appendix A model |
 
 ### B.9 References and implementation provenance
@@ -7684,6 +7805,11 @@ They are intentionally separate because the supported names differ by model.
 | `--freq-transforms LIST` | DNN optimize | Transform candidates; aliases: `--freq-transform-options`, single-value `--freq-transform`. Default: `log,linear,log-linear`. | `--freq-transforms log,log-linear`  | `models.dnn.commands.optimize.freq_transforms` |
 | `--max-y-condition FLOAT` | DNN fit | Rejects direct-Y targets when `cond(I+S)` exceeds the limit. Default: `1e10`. | `--max-y-condition 1e8`  | `models.dnn.commands.fit.max_y_condition` |
 | `--output-domain {s,y}` | DNN fit | Fits S directly or converts source S to direct admittance targets. Default: `s`. | `--output-domain y`  | `models.dnn.commands.fit.output_domain` |
+| `--passivity-collocation-candidate-multiplier INT` | DNN fit | Additional geometry-pool multiplier for hard-negative mining. Default: `4`. | `--passivity-collocation-candidate-multiplier 4` | `models.dnn.commands.fit.passivity_collocation_candidate_multiplier` |
+| `--passivity-collocation-frequencies INT` | DNN fit | RF constraint frequencies per collocation geometry. Default: `32`. | `--passivity-collocation-frequencies 32` | `models.dnn.commands.fit.passivity_collocation_frequencies` |
+| `--passivity-collocation-geometries INT` | DNN fit | Physics-only geometry count; `0` disables collocation. | `--passivity-collocation-geometries 64` | `models.dnn.commands.fit.passivity_collocation_geometries` |
+| `--passivity-collocation-geometry-json PATH` | DNN fit | Intended parameter domain from generated geometry metadata. | `--passivity-collocation-geometry-json geometries.json` | `models.dnn.commands.fit.passivity_collocation_geometry_json` |
+| `--passivity-collocation-refresh INT` | DNN fit | Hard-negative candidate rescore interval in epochs. Default: `25`. | `--passivity-collocation-refresh 25` | `models.dnn.commands.fit.passivity_collocation_refresh` |
 | `--passivity-penalty FLOAT` | DNN fit | Weight of the differentiable S-matrix passivity loss. Default: `10`. | `--passivity-penalty 20`  | `models.dnn.commands.fit.passivity_penalty` |
 | `--sparam-weights SPEC` | DNN fit | S-parameter loss and weighted-selection priorities; rules are applied left to right. | `--sparam-weights 'diag=1;offdiag=0.2'`  | `models.dnn.commands.fit.sparam_weights` |
 | `--target-z0 FLOAT` | DNN fit | Reference impedance used to build direct-Y targets. Default: `50`. | `--target-z0 50`  | `models.dnn.commands.fit.target_z0` |
@@ -7718,6 +7844,11 @@ The fine fit must receive exactly one reusable coarse source for `residual` or
 | `--include-coarse-inputs LIST` | KBNN optimize | Boolean candidate list; alias: `--include-coarse-input-options`. Default: `false,true`. | `--include-coarse-inputs false,true`  | `models.kbnn.commands.optimize.include_coarse_inputs` |
 | `--mode {plain,residual,prior-input,adaptive,grid,random}` | KBNN `train`/optimize | Fine formulation for the first three values; train accepts only those and defaults to `residual`. In optimize, `adaptive`, `grid`, and `random` are legacy search-mode values; prefer `--search-mode` for clarity. | `--mode residual`  | `models.kbnn.commands.fit.mode` |
 | `--modes LIST` | KBNN optimize | Comma-separated formulation candidates; alias: `--mode-options`. Default: `residual,prior-input`. | `--modes residual,prior-input`  | `models.kbnn.commands.optimize.modes` |
+| `--passivity-collocation-candidate-multiplier INT` | KBNN fit | Additional geometry-pool multiplier for integrated-coarse and fine hard-negative mining. Default: `4`. | `--passivity-collocation-candidate-multiplier 4` | `models.kbnn.commands.fit.passivity_collocation_candidate_multiplier` |
+| `--passivity-collocation-frequencies INT` | KBNN fit | RF constraint frequencies per collocation geometry. Default: `32`. | `--passivity-collocation-frequencies 32` | `models.kbnn.commands.fit.passivity_collocation_frequencies` |
+| `--passivity-collocation-geometries INT` | KBNN fit | Physics-only geometry count; `0` disables collocation. | `--passivity-collocation-geometries 64` | `models.kbnn.commands.fit.passivity_collocation_geometries` |
+| `--passivity-collocation-geometry-json PATH` | KBNN fit | Intended parameter domain from generated geometry metadata. | `--passivity-collocation-geometry-json geometries.json` | `models.kbnn.commands.fit.passivity_collocation_geometry_json` |
+| `--passivity-collocation-refresh INT` | KBNN fit | Hard-negative candidate rescore interval in epochs. Default: `25`. | `--passivity-collocation-refresh 25` | `models.kbnn.commands.fit.passivity_collocation_refresh` |
 | `--passivity-penalty FLOAT` | KBNN fit | Reconstructed fine-response passivity-loss weight. Default: `10`. | `--passivity-penalty 20`  | `models.kbnn.commands.fit.passivity_penalty` |
 | `--sparam-weights SPEC` | KBNN fit | Fine loss and weighted-selection priorities. | `--sparam-weights 'diag=1;offdiag=0.2'`  | `models.kbnn.commands.fit.sparam_weights` |
 

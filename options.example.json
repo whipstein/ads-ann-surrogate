@@ -43,6 +43,11 @@
       "commands": {
         "fit": {
           "output_domain": "s",
+          "passivity_collocation_candidate_multiplier": 4,
+          "passivity_collocation_frequencies": 32,
+          "passivity_collocation_geometries": 0,
+          "passivity_collocation_geometry_json": null,
+          "passivity_collocation_refresh": 25,
           "sparam_weights": "diag=1;offdiag=0.2"
         },
         "export-ads-ann": {
@@ -88,6 +93,11 @@
           "coarse_verification_mdif": null,
           "coarse_sparam_weights": "diag=1;offdiag=0.2",
           "mode": "residual",
+          "passivity_collocation_candidate_multiplier": 4,
+          "passivity_collocation_frequencies": 32,
+          "passivity_collocation_geometries": 0,
+          "passivity_collocation_geometry_json": null,
+          "passivity_collocation_refresh": 25,
           "sparam_weights": "diag=1;offdiag=0.2"
         },
         "export-ads-ann": {

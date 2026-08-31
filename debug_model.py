@@ -528,18 +528,23 @@ def build_command_suggestions(
             suggested_margin = max(current_margin, 5.0e-3)
         else:
             suggested_margin = current_margin
-        selection = (
-            metric_name
-            if metric_name
-            in {
-                "rmse_abs",
-                "max_abs",
-                "evm_pct",
-                "weighted_rmse_abs",
-                "weighted_evm_pct",
-            }
-            else "rmse_abs"
+        parameter_values = metadata.get("parameter_names")
+        dimension_count = (
+            len(parameter_values)
+            if isinstance(parameter_values, list) and parameter_values
+            else 4
         )
+        existing_collocation = metadata.get("passivity_collocation")
+        existing_collocation = (
+            existing_collocation if isinstance(existing_collocation, dict) else {}
+        )
+        current_collocation = int(existing_collocation.get("geometry_count") or 0)
+        suggested_collocation = max(32, 8 * dimension_count)
+        if current_collocation > 0:
+            suggested_collocation = max(
+                suggested_collocation,
+                min(256, int(math.ceil(current_collocation * 1.5))),
+            )
         output_dir = run_dir.parent / f"{run_dir.name}_passivity_search"
         command = [*base]
         if model == "dnn":
@@ -550,10 +555,18 @@ def build_command_suggestions(
                 "enforce",
                 "--passivity-margin",
                 numeric_text(suggested_margin),
+                "--passivity-collocation-geometries",
+                str(suggested_collocation),
+                "--passivity-collocation-frequencies",
+                "32",
+                "--passivity-collocation-candidate-multiplier",
+                "4",
+                "--passivity-collocation-refresh",
+                "25",
                 "--search-mode",
                 "adaptive",
                 "--selection-metric",
-                selection,
+                "passivity.max_singular_value",
                 "--require-passive",
                 "--max-passivity-sigma",
                 "1.000001",
@@ -581,6 +594,15 @@ def build_command_suggestions(
             ]
         )
         changes: list[dict[str, object]] = [
+            {
+                "option": "--passivity-collocation-geometries",
+                "observed": str(current_collocation),
+                "suggested": str(suggested_collocation),
+                "reason": (
+                    "Expose unlabeled geometry/frequency locations to the passivity "
+                    "gradient and final scaling safeguard."
+                ),
+            },
             {
                 "option": "--passivity-mode",
                 "observed": observed_setting(reference_row, metadata, "passivity_mode"),
@@ -628,7 +650,8 @@ def build_command_suggestions(
             )
         notes = [
             "Keep the original data, split, seed policy, weights, and parameter names unchanged so the comparison isolates these settings.",
-            "The adaptive objective already includes the requested passivity constraints; the response metric ranks trials once they become feasible.",
+            "This feasibility stage ranks maximum singular value directly; rerank passive trials by response error afterward.",
+            "Add --passivity-collocation-geometry-json when generated geometry metadata is available; otherwise fitted training bounds define the domain.",
         ]
         if "RAW_DATA_AUDIT_MISSING" in codes:
             notes.insert(0, "Run the suggested audit first and continue only if its RF rows pass.")
