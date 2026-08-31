@@ -3580,15 +3580,20 @@ def command_rerank_sweep(args: argparse.Namespace) -> int:
     summary_path = sweep_dir / "kbnn_reranked_sweep_summary.md"
     best_config_path = sweep_dir / "kbnn_reranked_best_config.json"
     write_csv(results_path, reranked)
+    diagnostic_paths, diagnostic_image_paths = plot_sweep_diagnostics(
+        reranked,
+        sweep_dir,
+        KBNN_SWEEP_RESULT_COLUMNS,
+        args.selection_metric,
+        prefix="kbnn_reranked",
+    )
     diagnostic_artifacts = [
         str(path.relative_to(sweep_dir))
-        for path in plot_sweep_diagnostics(
-            reranked,
-            sweep_dir,
-            KBNN_SWEEP_RESULT_COLUMNS,
-            args.selection_metric,
-            prefix="kbnn_reranked",
-        )
+        for path in diagnostic_paths
+    ]
+    diagnostic_images = [
+        str(path.relative_to(sweep_dir))
+        for path in diagnostic_image_paths
     ]
     write_sweep_markdown(
         summary_path,
@@ -3597,6 +3602,7 @@ def command_rerank_sweep(args: argparse.Namespace) -> int:
         best_config=best_config,
         best_metric=best_metric,
         diagnostic_artifacts=diagnostic_artifacts,
+        diagnostic_images=diagnostic_images,
     )
 
     promoted = False
@@ -3645,6 +3651,7 @@ def command_rerank_sweep(args: argparse.Namespace) -> int:
         "reranked_results": str(results_path),
         "reranked_summary": str(summary_path),
         "diagnostic_artifacts": diagnostic_artifacts,
+        "diagnostic_images": diagnostic_images,
         "promoted": promoted,
         "best_model_dir": str(best_model_dir) if best_model_dir is not None else None,
         "promotion_warning": promotion_warning,

@@ -4222,8 +4222,9 @@ python3 surrogate.py --model dnn rerank-sweep \
 
 This writes `dnn_reranked_sweep_results.csv`,
 `dnn_reranked_sweep_summary.md`, `dnn_reranked_best_config.json`, and refreshed
-diagnostic artifacts under `sweep_diagnostics/`. The reranker accepts both
-current `dnn_sweep_results.csv` folders and older `sweep_results.csv` folders.
+diagnostic artifacts and inset PNG trend plots under `sweep_diagnostics/`. The
+reranker accepts both current `dnn_sweep_results.csv` folders and older
+`sweep_results.csv` folders.
 
 If the original sweep used `--keep-trial-models`, the selected model can be
 copied without retraining:
@@ -4980,7 +4981,8 @@ python3 surrogate.py --model kbnn rerank-sweep \
 
 This writes `kbnn_reranked_sweep_results.csv`,
 `kbnn_reranked_sweep_summary.md`, `kbnn_reranked_best_config.json`, and
-refreshed diagnostic artifacts under `sweep_diagnostics/`. The reranker accepts
+refreshed diagnostic artifacts and inset PNG trend plots under
+`sweep_diagnostics/`. The reranker accepts
 both current `kbnn_sweep_results.csv` folders and older `sweep_results.csv`
 folders.
 

@@ -22,6 +22,85 @@ from surrogate_common import (
 
 
 class AdaptiveSweepTests(unittest.TestCase):
+    def test_dnn_and_kbnn_rerank_unpack_diagnostic_artifacts_and_images(self) -> None:
+        cases = [
+            (dnn, "dnn"),
+            (kbnn, "kbnn"),
+        ]
+        for module, prefix in cases:
+            with self.subTest(model=prefix), tempfile.TemporaryDirectory() as temp_dir:
+                sweep_dir = Path(temp_dir) / f"{prefix}_sweep"
+                sweep_dir.mkdir()
+                results_path = sweep_dir / f"{prefix}_sweep_results.csv"
+                with results_path.open("w", newline="") as stream:
+                    writer = csv.DictWriter(
+                        stream,
+                        fieldnames=[
+                            "trial",
+                            "rmse_abs",
+                            "passivity_max_singular_value",
+                            "passivity_violating_points",
+                        ],
+                    )
+                    writer.writeheader()
+                    writer.writerow(
+                        {
+                            "trial": 1,
+                            "rmse_abs": 0.2,
+                            "passivity_max_singular_value": 0.99,
+                            "passivity_violating_points": 0,
+                        }
+                    )
+
+                diagnostic_dir = sweep_dir / "sweep_diagnostics"
+                diagnostic_dir.mkdir()
+                pdf_path = diagnostic_dir / f"{prefix}_reranked_trends.pdf"
+                csv_path = diagnostic_dir / f"{prefix}_reranked_trends.csv"
+                png_path = diagnostic_dir / f"{prefix}_reranked_rmse_abs_trend.png"
+                for path in (pdf_path, csv_path, png_path):
+                    path.write_bytes(b"artifact")
+
+                args = argparse.Namespace(
+                    sweep_dir=str(sweep_dir),
+                    selection_metric="rmse_abs",
+                    require_passive=True,
+                    max_passivity_violations=None,
+                    max_passivity_sigma=1.000001,
+                    promote_best=False,
+                    replace_current_best=False,
+                    best_model_dir=None,
+                    overwrite=False,
+                )
+                with mock.patch.object(
+                    module,
+                    "plot_sweep_diagnostics",
+                    return_value=([pdf_path, csv_path], [png_path]),
+                ), mock.patch("builtins.print"):
+                    status = module.command_rerank_sweep(args)
+
+                self.assertEqual(status, 0)
+                payload = json.loads(
+                    (
+                        sweep_dir / f"{prefix}_reranked_best_config.json"
+                    ).read_text()
+                )
+                self.assertEqual(
+                    payload["diagnostic_artifacts"],
+                    [
+                        f"sweep_diagnostics/{pdf_path.name}",
+                        f"sweep_diagnostics/{csv_path.name}",
+                    ],
+                )
+                self.assertEqual(
+                    payload["diagnostic_images"],
+                    [f"sweep_diagnostics/{png_path.name}"],
+                )
+                report = (
+                    sweep_dir / f"{prefix}_reranked_sweep_summary.md"
+                ).read_text()
+                self.assertIn("## Sweep Trend Plots", report)
+                self.assertIn(f"](sweep_diagnostics/{png_path.name})", report)
+
     def test_trial_cleanup_always_retains_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             trial_dir = Path(temp_dir) / "trial_0001"
