@@ -287,6 +287,7 @@ def starter_options_payload() -> dict[str, object]:
                         "out_dir": None,
                     },
                     "predict": {"model_dir": None, "out_mdif": None},
+                    "rerank-sweep": {"sweep_dir": None},
                     "train": {"out_dir": None},
                 }
             },

@@ -24,6 +24,16 @@ from cli_options import (
 from surrogate_common import *  # noqa: F401,F403,E402
 
 VERSION = "0.2.0-rc4"
+NEUROTF_SWEEP_RESULT_COLUMNS = [
+    "order",
+    "pole_placement",
+    "pole_iterations",
+    "pole_damping",
+    "ridge",
+    "hidden_layers",
+    "activation",
+    "learning_rate",
+]
 
 def build_fixed_poles(
     blocks: Sequence[MDIFBlock],
@@ -1103,7 +1113,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         worker_func=neurotf_sweep_trial_worker,
         namespace_for_trial_func=namespace_for_trial,
         train_func=command_train,
-        result_columns=["order", "pole_placement", "pole_iterations", "pole_damping", "ridge", "hidden_layers", "activation", "learning_rate"],
+        result_columns=NEUROTF_SWEEP_RESULT_COLUMNS,
         results_filename="neurotf_sweep_results.csv",
         best_config_filename="neurotf_best_config.json",
         summary_filename="neurotf_sweep_summary.md",
@@ -1127,6 +1137,16 @@ def command_sweep(args: argparse.Namespace) -> int:
             neurotf_export_commands(best_dir, dc_mdif=args.mdif),
         )
     return status
+
+
+def command_rerank_sweep(args: argparse.Namespace) -> int:
+    return run_rerank_sweep_command(
+        args,
+        model_prefix="neurotf",
+        result_columns=NEUROTF_SWEEP_RESULT_COLUMNS,
+        export_commands_func=neurotf_export_commands,
+        plot_func=plot_sweep_diagnostics,
+    )
 
 
 def neurotf_export_commands(
@@ -2309,6 +2329,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument("--seed", type=int, default=1234)
     sweep.set_defaults(func=command_sweep)
+
+    rerank = sub.add_parser(
+        "rerank-sweep",
+        help=(
+            "Re-rank an existing Neuro-TF sweep using saved trial summaries "
+            "without rerunning all trials"
+        ),
+    )
+    add_rerank_sweep_arguments(rerank, model_label="Neuro-TF")
+    rerank.set_defaults(func=command_rerank_sweep)
 
     predict = sub.add_parser("predict", help="Predict S-parameters for MDIF parameter blocks")
     predict.add_argument("--model-dir", required=True)

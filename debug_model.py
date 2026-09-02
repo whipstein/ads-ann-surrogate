@@ -766,7 +766,11 @@ def build_command_suggestions(
             requires_editing=requires_editing,
         )
 
-    if "PASSIVE_TRIAL_AVAILABLE" in codes and model in {"dnn", "kbnn"}:
+    if "PASSIVE_TRIAL_AVAILABLE" in codes and model in {
+        "dnn",
+        "kbnn",
+        "neuro-tf",
+    }:
         selection = metric_name or "rmse_abs"
         command = [
             "python3",

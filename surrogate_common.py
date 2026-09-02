@@ -40,6 +40,25 @@ DEFAULT_DC_PASSIVITY_TOLERANCE = 1e-6
 DEFAULT_DC_EXPORT_S_MATCH_TOLERANCE = 1e-3
 ADS_EXPORT_TEMPLATE_FILENAME = "ads_export_template.mdif"
 
+RERANK_SELECTION_METRICS = [
+    "rmse_abs",
+    "max_abs",
+    "evm_rms",
+    "evm_pct",
+    "evm_db",
+    "weighted_rmse_abs",
+    "weighted_max_abs",
+    "weighted_evm_rms",
+    "weighted_evm_pct",
+    "weighted_evm_db",
+    "rmse_db",
+    "max_abs_db",
+    "weighted_rmse_db",
+    "weighted_max_abs_db",
+    "passivity.max_singular_value",
+    "passivity.violating_points",
+]
+
 
 FREQ_UNITS = {
     "hz": 1.0,
@@ -14549,6 +14568,74 @@ def add_adaptive_search_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_rerank_sweep_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    model_label: str,
+) -> None:
+    """Add the common post-optimization reranking interface."""
+
+    parser.add_argument(
+        "--sweep-dir",
+        required=True,
+        help=f"Existing {model_label} sweep/optimize output directory",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        default="rmse_abs",
+        choices=RERANK_SELECTION_METRICS,
+    )
+    parser.add_argument(
+        "--require-passive",
+        action="store_true",
+        help="Only consider trials with zero passivity-violating frequency points",
+    )
+    parser.add_argument(
+        "--max-passivity-violations",
+        type=int,
+        help=(
+            "Only consider trials at or below this number of "
+            "passivity-violating frequency points"
+        ),
+    )
+    parser.add_argument(
+        "--max-passivity-sigma",
+        type=float,
+        help=(
+            "Only consider trials whose worst S-matrix singular value is at or "
+            "below this value"
+        ),
+    )
+    parser.add_argument(
+        "--promote-best",
+        action="store_true",
+        help=(
+            "Copy the selected trial model to --best-model-dir if trial model "
+            "files were kept"
+        ),
+    )
+    parser.add_argument(
+        "--best-model-dir",
+        help=(
+            "Destination for --promote-best. Default: "
+            "<sweep-dir>/best_model_reranked"
+        ),
+    )
+    parser.add_argument(
+        "--replace-current-best",
+        action="store_true",
+        help=(
+            "Overwrite <sweep-dir>/best_model with the selected trial model if "
+            "available"
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow --best-model-dir replacement",
+    )
+
+
 def add_passivity_collocation_arguments(parser: argparse.ArgumentParser) -> None:
     """Add shared physics-only passivity coverage controls."""
 
@@ -15586,6 +15673,130 @@ def copy_trial_model(
         shutil.rmtree(best_model_dir)
     shutil.copytree(trial_dir, best_model_dir)
     return True, None
+
+
+def run_rerank_sweep_command(
+    args: argparse.Namespace,
+    *,
+    model_prefix: str,
+    result_columns: Sequence[str],
+    export_commands_func: Callable[[Path], Sequence[tuple[str, str]]],
+    plot_func: Callable[..., tuple[Sequence[Path], Sequence[Path]]] | None = None,
+    after_promote: Callable[[Path, Path], None] | None = None,
+) -> int:
+    """Re-rank and optionally promote a retained sweep for any model family."""
+
+    sweep_dir = Path(args.sweep_dir)
+    model_results_filename = f"{model_prefix}_sweep_results.csv"
+    results_filename = (
+        model_results_filename
+        if (sweep_dir / model_results_filename).exists()
+        else "sweep_results.csv"
+    )
+    rows = load_sweep_rows(sweep_dir, results_filename)
+    if not rows:
+        raise ValueError(f"No sweep rows found in {sweep_dir / results_filename}")
+
+    reranked, best_row, best_metric = rerank_sweep_rows(
+        rows,
+        selection_metric=args.selection_metric,
+        require_passive=args.require_passive,
+        max_passivity_violations=args.max_passivity_violations,
+        max_passivity_sigma=args.max_passivity_sigma,
+    )
+    if best_row is None or best_metric is None:
+        raise ValueError("No sweep trial satisfied the rerank criteria")
+
+    trial_value = csv_number(best_row.get("trial"))
+    if trial_value is None:
+        raise ValueError("Selected row does not have a numeric trial number")
+    best_trial = int(trial_value)
+    best_config = {
+        key: best_row[key]
+        for key in result_columns
+        if key in best_row and best_row[key] not in {None, ""}
+    }
+
+    results_path = sweep_dir / f"{model_prefix}_reranked_sweep_results.csv"
+    summary_path = sweep_dir / f"{model_prefix}_reranked_sweep_summary.md"
+    best_config_path = sweep_dir / f"{model_prefix}_reranked_best_config.json"
+    write_csv(results_path, reranked)
+    effective_plot_func = plot_sweep_diagnostics if plot_func is None else plot_func
+    diagnostic_paths, diagnostic_image_paths = effective_plot_func(
+        reranked,
+        sweep_dir,
+        result_columns,
+        args.selection_metric,
+        prefix=f"{model_prefix}_reranked",
+    )
+    diagnostic_artifacts = [
+        os.path.relpath(Path(path), sweep_dir) for path in diagnostic_paths
+    ]
+    diagnostic_images = [
+        os.path.relpath(Path(path), sweep_dir) for path in diagnostic_image_paths
+    ]
+    write_sweep_markdown(
+        summary_path,
+        reranked,
+        selection_metric=args.selection_metric,
+        best_config=best_config,
+        best_metric=best_metric,
+        diagnostic_artifacts=diagnostic_artifacts,
+        diagnostic_images=diagnostic_images,
+    )
+
+    promoted = False
+    promotion_warning = None
+    best_model_dir: Path | None = None
+    if args.promote_best or args.replace_current_best:
+        if args.replace_current_best:
+            best_model_dir = sweep_dir / "best_model"
+            overwrite = True
+        else:
+            best_model_dir = (
+                Path(args.best_model_dir)
+                if args.best_model_dir
+                else sweep_dir / "best_model_reranked"
+            )
+            overwrite = args.overwrite
+        promoted, promotion_warning = copy_trial_model(
+            sweep_dir,
+            best_trial,
+            best_model_dir,
+            overwrite=overwrite,
+        )
+        if promoted:
+            if after_promote is not None:
+                after_promote(sweep_dir, best_model_dir)
+            export_commands = list(export_commands_func(best_model_dir))
+            update_training_export_commands(
+                best_model_dir / "training_summary.md",
+                export_commands,
+            )
+            update_training_export_commands(summary_path, export_commands)
+
+    payload = {
+        "sweep_dir": str(sweep_dir),
+        "selection_metric": args.selection_metric,
+        "require_passive": bool(args.require_passive),
+        "max_passivity_violations": args.max_passivity_violations,
+        "max_passivity_sigma": args.max_passivity_sigma,
+        "best_trial": best_trial,
+        "best_metric": best_metric,
+        "best_config": best_config,
+        "reranked_results": str(results_path),
+        "reranked_summary": str(summary_path),
+        "diagnostic_artifacts": diagnostic_artifacts,
+        "diagnostic_images": diagnostic_images,
+        "promoted": promoted,
+        "best_model_dir": (
+            str(best_model_dir) if best_model_dir is not None else None
+        ),
+        "promotion_warning": promotion_warning,
+    }
+    best_config_path.write_text(json.dumps(payload, indent=2))
+    print(json.dumps(payload, indent=2))
+    return 0
 
 
 def configure_parallel_numeric_threads(jobs: int) -> int:

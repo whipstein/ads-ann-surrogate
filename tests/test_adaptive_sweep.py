@@ -22,10 +22,11 @@ from surrogate_common import (
 
 
 class AdaptiveSweepTests(unittest.TestCase):
-    def test_dnn_and_kbnn_rerank_unpack_diagnostic_artifacts_and_images(self) -> None:
+    def test_all_models_rerank_unpack_diagnostic_artifacts_and_images(self) -> None:
         cases = [
             (dnn, "dnn"),
             (kbnn, "kbnn"),
+            (neuro_tf, "neurotf"),
         ]
         for module, prefix in cases:
             with self.subTest(model=prefix), tempfile.TemporaryDirectory() as temp_dir:

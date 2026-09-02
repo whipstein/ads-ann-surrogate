@@ -45,6 +45,7 @@ from surrogate_common import (  # noqa: E402
     add_adaptive_search_arguments,
     add_debug_argument,
     add_passivity_collocation_arguments,
+    add_rerank_sweep_arguments,
     ads_ann_activation_enum,
     ads_ann_optimizer_enum,
     ads_ann_output_format_enum,
@@ -58,14 +59,11 @@ from surrogate_common import (  # noqa: E402
     cleanup_trial_dir,
     common_sparameter_labels,
     configure_parallel_numeric_threads,
-    copy_trial_model,
-    csv_number,
     extract_average_dc_resistance,
     frequency_feature_columns,
     frequency_weights_from_blocks,
     infer_complete_sparameter_ports,
     infer_parameter_names,
-    load_sweep_rows,
     load_or_write_trial_summary,
     make_training_progress_callback,
     metadata_csv,
@@ -97,7 +95,7 @@ from surrogate_common import (  # noqa: E402
     read_model_metadata,
     resolve_export_dc_conductance_model,
     resolve_ads_ann_layout,
-    rerank_sweep_rows,
+    run_rerank_sweep_command,
     run_sweep_command,
     sparam_sort_key,
     sparam_indices,
@@ -113,10 +111,8 @@ from surrogate_common import (  # noqa: E402
     write_ads_ann_package,
     write_ads_export_template,
     write_ads_export_package,
-    write_csv,
     write_history,
     write_mdif,
-    write_sweep_markdown,
     write_training_markdown,
     update_training_export_commands,
     write_ads_hb_mlp_package,
@@ -2436,116 +2432,13 @@ def command_sweep(args: argparse.Namespace) -> int:
 
 
 def command_rerank_sweep(args: argparse.Namespace) -> int:
-    sweep_dir = Path(args.sweep_dir)
-    results_filename = (
-        "dnn_sweep_results.csv"
-        if (sweep_dir / "dnn_sweep_results.csv").exists()
-        else "sweep_results.csv"
+    return run_rerank_sweep_command(
+        args,
+        model_prefix="dnn",
+        result_columns=DNN_SWEEP_RESULT_COLUMNS,
+        export_commands_func=dnn_export_commands,
+        plot_func=plot_sweep_diagnostics,
     )
-    rows = load_sweep_rows(sweep_dir, results_filename)
-    if not rows:
-        raise ValueError(f"No sweep rows found in {sweep_dir / results_filename}")
-
-    reranked, best_row, best_metric = rerank_sweep_rows(
-        rows,
-        selection_metric=args.selection_metric,
-        require_passive=args.require_passive,
-        max_passivity_violations=args.max_passivity_violations,
-        max_passivity_sigma=args.max_passivity_sigma,
-    )
-    if best_row is None or best_metric is None:
-        raise ValueError("No sweep trial satisfied the rerank criteria")
-
-    trial_value = csv_number(best_row.get("trial"))
-    if trial_value is None:
-        raise ValueError("Selected row does not have a numeric trial number")
-    best_trial = int(trial_value)
-    best_config = {
-        key: best_row[key]
-        for key in DNN_SWEEP_RESULT_COLUMNS
-        if key in best_row and best_row[key] not in {None, ""}
-    }
-
-    results_path = sweep_dir / "dnn_reranked_sweep_results.csv"
-    summary_path = sweep_dir / "dnn_reranked_sweep_summary.md"
-    best_config_path = sweep_dir / "dnn_reranked_best_config.json"
-    write_csv(results_path, reranked)
-    diagnostic_paths, diagnostic_image_paths = plot_sweep_diagnostics(
-        reranked,
-        sweep_dir,
-        DNN_SWEEP_RESULT_COLUMNS,
-        args.selection_metric,
-        prefix="dnn_reranked",
-    )
-    diagnostic_artifacts = [
-        str(path.relative_to(sweep_dir))
-        for path in diagnostic_paths
-    ]
-    diagnostic_images = [
-        str(path.relative_to(sweep_dir))
-        for path in diagnostic_image_paths
-    ]
-    write_sweep_markdown(
-        summary_path,
-        reranked,
-        selection_metric=args.selection_metric,
-        best_config=best_config,
-        best_metric=best_metric,
-        diagnostic_artifacts=diagnostic_artifacts,
-        diagnostic_images=diagnostic_images,
-    )
-
-    promoted = False
-    promotion_warning = None
-    best_model_dir = None
-    if args.promote_best or args.replace_current_best:
-        if args.replace_current_best:
-            best_model_dir = sweep_dir / "best_model"
-            overwrite = True
-        else:
-            best_model_dir = (
-                Path(args.best_model_dir)
-                if args.best_model_dir
-                else sweep_dir / "best_model_reranked"
-            )
-            overwrite = args.overwrite
-        promoted, promotion_warning = copy_trial_model(
-            sweep_dir,
-            best_trial,
-            best_model_dir,
-            overwrite=overwrite,
-        )
-        if promoted and best_model_dir is not None:
-            export_commands = dnn_export_commands(best_model_dir)
-            update_training_export_commands(
-                best_model_dir / "training_summary.md",
-                export_commands,
-            )
-            update_training_export_commands(
-                summary_path,
-                export_commands,
-            )
-
-    payload = {
-        "sweep_dir": str(sweep_dir),
-        "selection_metric": args.selection_metric,
-        "require_passive": bool(args.require_passive),
-        "max_passivity_violations": args.max_passivity_violations,
-        "max_passivity_sigma": args.max_passivity_sigma,
-        "best_trial": best_trial,
-        "best_metric": best_metric,
-        "best_config": best_config,
-        "reranked_results": str(results_path),
-        "reranked_summary": str(summary_path),
-        "diagnostic_artifacts": diagnostic_artifacts,
-        "diagnostic_images": diagnostic_images,
-        "promoted": promoted,
-        "best_model_dir": str(best_model_dir) if best_model_dir is not None else None,
-        "promotion_warning": promotion_warning,
-    }
-    best_config_path.write_text(json.dumps(payload, indent=2))
-    print(json.dumps(payload, indent=2))
-    return 0
 
 
 def command_inspect(args: argparse.Namespace) -> int:
@@ -2794,59 +2687,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "rerank-sweep",
         help="Re-rank an existing DNN sweep using saved trial summaries without rerunning all trials",
     )
-    rerank.add_argument("--sweep-dir", required=True, help="Existing DNN sweep/optimize output directory")
-    rerank.add_argument(
-        "--selection-metric",
-        default="rmse_abs",
-        choices=[
-            "rmse_abs",
-            "max_abs",
-            "evm_rms",
-            "evm_pct",
-            "evm_db",
-            "weighted_rmse_abs",
-            "weighted_max_abs",
-            "weighted_evm_rms",
-            "weighted_evm_pct",
-            "weighted_evm_db",
-            "rmse_db",
-            "max_abs_db",
-            "weighted_rmse_db",
-            "weighted_max_abs_db",
-            "passivity.max_singular_value",
-            "passivity.violating_points",
-        ],
-    )
-    rerank.add_argument(
-        "--require-passive",
-        action="store_true",
-        help="Only consider trials with zero passivity-violating frequency points",
-    )
-    rerank.add_argument(
-        "--max-passivity-violations",
-        type=int,
-        help="Only consider trials at or below this number of passivity-violating frequency points",
-    )
-    rerank.add_argument(
-        "--max-passivity-sigma",
-        type=float,
-        help="Only consider trials whose worst S-matrix singular value is at or below this value",
-    )
-    rerank.add_argument(
-        "--promote-best",
-        action="store_true",
-        help="Copy the selected trial model to --best-model-dir if trial model files were kept",
-    )
-    rerank.add_argument(
-        "--best-model-dir",
-        help="Destination for --promote-best. Default: <sweep-dir>/best_model_reranked",
-    )
-    rerank.add_argument(
-        "--replace-current-best",
-        action="store_true",
-        help="Overwrite <sweep-dir>/best_model with the selected trial model if available",
-    )
-    rerank.add_argument("--overwrite", action="store_true", help="Allow --best-model-dir replacement")
+    add_rerank_sweep_arguments(rerank, model_label="DNN")
     rerank.set_defaults(func=command_rerank_sweep)
 
     predict = sub.add_parser("predict", help="Predict S-parameters for MDIF parameter blocks")

@@ -355,6 +355,7 @@ class OptionsJSONTests(unittest.TestCase):
                 (
                     "train",
                     "optimize",
+                    "rerank-sweep",
                     "predict",
                     "export-ads-mdif",
                     "export-ads-hb",
@@ -470,6 +471,7 @@ class OptionsJSONTests(unittest.TestCase):
                         (
                             "train",
                             "optimize",
+                            "rerank-sweep",
                             "predict",
                             "export-ads-mdif",
                             "export-ads-hb",

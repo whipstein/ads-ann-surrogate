@@ -1852,9 +1852,9 @@ directory. At completion, each sweep prints a copyable standalone `train`
 command for the winning configuration; the same command is saved in the
 best-configuration JSON and Markdown summary. The sweep summary and the
 promoted model's `training_summary.md` also contain export commands resolved to
-`best_model/`. DNN and KBNN sweep results can be reranked after the fact to
-choose a different passive or weighted-error winner without repeating every
-trial.
+`best_model/`. DNN, KBNN, and Neuro-TF sweep results can be reranked after the
+fact to choose a different passive or weighted-error winner without repeating
+every trial.
 
 ## 4. Update or Extend the Sampling Points
 
@@ -5743,6 +5743,28 @@ Passivity-failing trials are shown in red on those plots. Passive-only grouped
 statistics remain available, while dashed all-trial means and `all_*` CSV
 columns preserve trends when every trial fails passivity.
 
+#### Rerank an Existing Sweep
+
+Neuro-TF uses the same post-sweep reranking interface as DNN and KBNN. This
+reuses the saved trial metrics and metadata; it does not train the candidates
+again:
+
+```bash
+python3 surrogate.py --model neuro-tf rerank-sweep \
+  --sweep-dir neuro_tf_adaptive \
+  --selection-metric weighted_evm_pct \
+  --require-passive
+```
+
+The command writes `neurotf_reranked_sweep_results.csv`,
+`neurotf_reranked_sweep_summary.md`,
+`neurotf_reranked_best_config.json`, and reranked trend plots. To make the
+selected retained trial available as a separate model, add
+`--promote-best --best-model-dir neuro_tf_adaptive/best_model_passive`. To
+replace the original winner, use `--replace-current-best`. Model promotion
+requires that the original optimize run used `--keep-trial-models`; reranking
+and report generation do not.
+
 #### Predict
 
 Predict new parameter blocks after training:
@@ -7766,7 +7788,7 @@ examples, although hyphenated keys are accepted too.
 | `--model MODEL inspect-mdif` | Summarize blocks, S-parameter labels, inferred variables, split values, and frequency span. | `python3 surrogate.py --model dnn inspect-mdif --mdif train_verify.mdif` |
 | `--model MODEL train` | Fit one DNN, KBNN, or Neuro-TF configuration and write its model and verification report. | `python3 surrogate.py --model dnn train --mdif train_verify.mdif --out-dir dnn_model` |
 | `--model MODEL optimize` | Run adaptive, grid, or random hyperparameter trials and promote the best completed model. `sweep` is an alias. | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --max-trials 24` |
-| `--model {dnn,kbnn} rerank-sweep` | Re-rank saved DNN/KBNN trial summaries without rerunning the trials. | `python3 surrogate.py --model dnn rerank-sweep --sweep-dir dnn_opt --selection-metric evm_pct --require-passive` |
+| `--model MODEL rerank-sweep` | Re-rank saved DNN, KBNN, or Neuro-TF trial summaries without rerunning the trials. | `python3 surrogate.py --model neuro-tf rerank-sweep --sweep-dir neuro_tf_opt --selection-metric evm_pct --require-passive` |
 | `--model MODEL predict` | Evaluate a frozen model on the geometry and frequency blocks in another MDIF. | `python3 surrogate.py --model dnn predict --model-dir dnn_model --mdif request.mdif --out-mdif predicted.mdif` |
 | `--model MODEL export-ads-mdif` | Sample a frozen model into a parameterized ADS-ready MDIF. `export-ads` is an alias. | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_model --out-dir ads_mdif --template-mdif dnn_model/ads_export_template.mdif` |
 | `--model {dnn,kbnn} export-ads-ann` | Create a package that retrains/extracts a native ADS ANN model on a licensed ADS installation. | `python3 surrogate.py --model dnn export-ads-ann --mdif train_verify.mdif --model-dir dnn_model --out-dir ads_ann` |
@@ -8013,22 +8035,22 @@ optimize unless the applicability column says otherwise.
 | `--adaptive-exploration FLOAT` | All-model optimize | GP lower-confidence-bound uncertainty multiplier. Default: `1.5`. | `--adaptive-exploration 2`  | `models.commands.optimize.adaptive_exploration` |
 | `--adaptive-hidden-width-step INT` | All-model optimize | Width quantization for structured hidden-layer ranges. Default: `8`. | `--adaptive-hidden-width-step 16`  | `models.commands.optimize.adaptive_hidden_width_step` |
 | `--adaptive-initial-trials INT` | All-model optimize | Category-balanced, maximin-separated trials before GP guidance. Marginal category counts differ by at most one when possible, and the count is raised to cover all levels once when needed. Default: `6`. | `--adaptive-initial-trials 8`  | `models.commands.optimize.adaptive_initial_trials` |
-| `--best-model-dir PATH` | DNN/KBNN `rerank-sweep` | Destination used by `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | `--best-model-dir dnn_opt/best_passive`  | `models.MODEL.commands.rerank-sweep.best_model_dir` |
+| `--best-model-dir PATH` | All-model `rerank-sweep` | Destination used by `--promote-best`. Default: `<sweep-dir>/best_model_reranked`. | `--best-model-dir dnn_opt/best_passive`  | `models.MODEL.commands.rerank-sweep.best_model_dir` |
 | `--jobs INT` | All-model optimize | Parallel workers for grid/random search; adaptive search is sequential. Default: `1`. | `--jobs 4`  | `models.commands.optimize.jobs` |
 | `--keep-trial-models` | All-model optimize | Retains every full trial model so a later rerank can promote it. Without the flag, every completed trial still retains `metadata.json`, but its model weights are removed. | `--keep-trial-models`  | `models.commands.optimize.keep_trial_models` |
 | `--learning-rates LIST` | All-model optimize | Comma-separated Adam learning-rate candidates. Default: `0.001,0.002,0.005`; single-value alias: `--learning-rate`. | `--learning-rates 0.0005,0.001,0.002`  | `models.commands.optimize.learning_rates` |
-| `--max-passivity-sigma FLOAT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for worst predicted S-matrix singular value. | `--max-passivity-sigma 1.000001`  | `models.commands.optimize.max_passivity_sigma`<br>`models.MODEL.commands.rerank-sweep.max_passivity_sigma` |
-| `--max-passivity-violations INT` | All-model optimize; DNN/KBNN rerank | Eligibility ceiling for violating sampled points. | `--max-passivity-violations 0`  | `models.commands.optimize.max_passivity_violations`<br>`models.MODEL.commands.rerank-sweep.max_passivity_violations` |
+| `--max-passivity-sigma FLOAT` | All-model optimize and rerank | Eligibility ceiling for worst predicted S-matrix singular value. | `--max-passivity-sigma 1.000001`  | `models.commands.optimize.max_passivity_sigma`<br>`models.MODEL.commands.rerank-sweep.max_passivity_sigma` |
+| `--max-passivity-violations INT` | All-model optimize and rerank | Eligibility ceiling for violating sampled points. | `--max-passivity-violations 0`  | `models.commands.optimize.max_passivity_violations`<br>`models.MODEL.commands.rerank-sweep.max_passivity_violations` |
 | `--max-trials INT` | All-model optimize | Trial budget or product truncation. Default: `24`. | `--max-trials 40`  | `models.commands.optimize.max_trials` |
 | `--optimize-parameter SPEC` | All-model optimize | Repeatable adaptive domain, such as numeric `name=low:high:log`, categories, explicit layouts, or structured hidden-layer ranges. | `--optimize-parameter learning_rate=1e-4:1e-2:log`  | `models.MODEL.commands.optimize.optimize_parameter` |
-| `--overwrite` | DNN/KBNN `rerank-sweep` | Allows replacement of an existing reranked destination. | `--overwrite`  | `models.MODEL.commands.rerank-sweep.overwrite` |
-| `--promote-best` | DNN/KBNN `rerank-sweep` | Copies the selected retained trial model to `--best-model-dir`. | `--promote-best`  | `models.MODEL.commands.rerank-sweep.promote_best` |
-| `--replace-current-best` | DNN/KBNN `rerank-sweep` | Replaces `<sweep-dir>/best_model` with the selected retained trial. | `--replace-current-best`  | `models.MODEL.commands.rerank-sweep.replace_current_best` |
-| `--require-passive` | All-model optimize; DNN/KBNN rerank | Restricts best-model selection to zero passivity violations; failed trials remain in reports. | `--require-passive`  | `models.commands.optimize.require_passive`<br>`models.MODEL.commands.rerank-sweep.require_passive` |
+| `--overwrite` | All-model `rerank-sweep` | Allows replacement of an existing reranked destination. | `--overwrite`  | `models.MODEL.commands.rerank-sweep.overwrite` |
+| `--promote-best` | All-model `rerank-sweep` | Copies the selected retained trial model to `--best-model-dir`. | `--promote-best`  | `models.MODEL.commands.rerank-sweep.promote_best` |
+| `--replace-current-best` | All-model `rerank-sweep` | Replaces `<sweep-dir>/best_model` with the selected retained trial. | `--replace-current-best`  | `models.MODEL.commands.rerank-sweep.replace_current_best` |
+| `--require-passive` | All-model optimize and rerank | Restricts best-model selection to zero passivity violations; failed trials remain in reports. | `--require-passive`  | `models.commands.optimize.require_passive`<br>`models.MODEL.commands.rerank-sweep.require_passive` |
 | `--retrain-best` | All-model optimize | Refits the winner after search instead of promoting its completed trial model. | `--retrain-best`  | `models.commands.optimize.retrain_best` |
 | `--search-mode {adaptive,grid,random}` | All-model optimize | Search strategy. Default: `random`. `--mode` remains a DNN/Neuro-TF legacy alias; KBNN reserves `--mode` primarily for its model formulation. | `--search-mode adaptive`  | `models.commands.optimize.search_mode` |
-| `--selection-metric NAME` | All-model optimize; DNN/KBNN rerank | Metric minimized for promotion: absolute, dB, EVM, weighted, or passivity metrics. Default: `rmse_abs`. | `--selection-metric weighted_evm_pct`  | `models.commands.optimize.selection_metric`<br>`models.MODEL.commands.rerank-sweep.selection_metric` |
-| `--sweep-dir PATH` | DNN/KBNN `rerank-sweep` | Required existing optimize output directory. | `--sweep-dir dnn_opt`  | `models.MODEL.commands.rerank-sweep.sweep_dir` |
+| `--selection-metric NAME` | All-model optimize and rerank | Metric minimized for promotion: absolute, dB, EVM, weighted, or passivity metrics. Default: `rmse_abs`. | `--selection-metric weighted_evm_pct`  | `models.commands.optimize.selection_metric`<br>`models.MODEL.commands.rerank-sweep.selection_metric` |
+| `--sweep-dir PATH` | All-model `rerank-sweep` | Required existing optimize output directory. | `--sweep-dir dnn_opt`  | `models.MODEL.commands.rerank-sweep.sweep_dir` |
 | `--trial-seed-mode {fixed,indexed}` | All-model optimize | `fixed` reuses `--seed`; `indexed` uses seed plus trial number. Default: `fixed`. | `--trial-seed-mode fixed`  | `models.commands.optimize.trial_seed_mode` |
 | `--trial-worst-plots INT` | All-model optimize | Worst-case plot pairs written per trial. Default: `1`; `0` speeds large searches. | `--trial-worst-plots 0`  | `models.commands.optimize.trial_worst_plots` |
 
@@ -8370,6 +8392,7 @@ on the primary entry point:
 | Generate | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 32 --verification-count 8 --out geometries.csv` |
 | Audit | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |
+| Rerank | `python3 surrogate.py --model neuro-tf rerank-sweep --sweep-dir neuro_tf_opt --selection-metric weighted_evm_pct --require-passive` |
 | Diagnose | `python3 surrogate.py debug-model --run-dir dnn_opt --audit audit --out-dir dnn_opt/model_debug` |
 | Add points | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --existing-mdif train_verify.mdif --count 8 --out additions.csv --combined-out additions_all_geometries.csv` |
 | Add response-aware points | `python3 surrogate.py points suggest-additional --fit-dir neuro_tf_opt --existing-points geometries.csv --existing-mdif train_verify.mdif --acquisition rational-hybrid --count auto --target-error 1.0 --out response_additions.csv --combined-out response_additions_all_geometries.csv` |
