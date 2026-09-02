@@ -138,7 +138,10 @@
     "neuro-tf": {
       "commands": {
         "fit": {
-          "order": 10
+          "order": 10,
+          "pole_damping": 0.18,
+          "pole_iterations": 6,
+          "pole_placement": "fixed"
         },
         "export-ads-hb": {
           "model_dir": null,
@@ -210,6 +213,7 @@
           "bare_values": "auto",
           "combined_out": null,
           "count": "auto",
+          "existing_mdif": null,
           "existing_points": null,
           "exploration_weight": "auto",
           "fit_dir": null,
@@ -219,6 +223,14 @@
           "out": null,
           "parameter_json": null,
           "previous_verification_metrics": null,
+          "rational_components": 8,
+          "rational_frequency_weights": null,
+          "rational_order": 12,
+          "rational_pole_damping": 0.18,
+          "rational_pole_iterations": 6,
+          "rational_pole_placement": "adaptive",
+          "rational_ridge": 1e-08,
+          "rational_variance": 0.995,
           "target_dataset": "train",
           "target_error": null,
           "verification_batch": null,

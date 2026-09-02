@@ -32,6 +32,7 @@ from cli_options import (
 RESULT_FILENAMES = (
     "dnn_sweep_results.csv",
     "kbnn_sweep_results.csv",
+    "neurotf_sweep_results.csv",
     "sweep_results.csv",
     "dnn_reranked_sweep_results.csv",
     "kbnn_reranked_sweep_results.csv",
@@ -101,6 +102,8 @@ def infer_model(run_dir: Path, results_path: Path | None) -> str:
     )
     if "kbnn" in text:
         return "kbnn"
+    if "neurotf" in text or "neuro_tf" in text or "neuro-tf" in text:
+        return "neuro-tf"
     if "dnn" in text:
         return "dnn"
     for metadata_path in (
@@ -112,6 +115,10 @@ def infer_model(run_dir: Path, results_path: Path | None) -> str:
             continue
         if metadata.get("mode") is not None or metadata.get("coarse_model") is not None:
             return "kbnn"
+        if metadata.get("rational_fit_train_summary") is not None or metadata.get(
+            "n_poles"
+        ) is not None:
+            return "neuro-tf"
         return "dnn"
     return "unknown"
 
@@ -264,6 +271,83 @@ def surviving_metadata(run_dir: Path) -> list[tuple[Path, dict[str, object]]]:
         if payload is not None:
             records.append((path, payload))
     return records
+
+
+def neurotf_stage_evidence(
+    metadata_records: Sequence[tuple[Path, Mapping[str, object]]],
+    preferred_metadata: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Extract comparable rational, neural, conditioning, and scaling evidence."""
+
+    candidates = [
+        (path, payload)
+        for path, payload in metadata_records
+        if payload.get("rational_fit_train_summary") is not None
+    ]
+    if not candidates:
+        return {}
+    has_promoted_model = any("best_model" in path.parts for path, _ in candidates)
+    candidates.sort(
+        key=lambda item: (
+            0 if "best_model" in item[0].parts else 1,
+            (
+                0
+                if not has_promoted_model
+                and preferred_metadata
+                and dict(item[1]) == dict(preferred_metadata)
+                else 1
+            ),
+            0 if "trials" not in item[0].parts else 1,
+            str(item[0]),
+        )
+    )
+    metadata_path, metadata = candidates[0]
+    summary = read_json(metadata_path.parent / "verification_summary.json") or {}
+    rational_train = nested_dict(metadata, "rational_fit_train_summary")
+    rational_verify = nested_dict(metadata, "rational_fit_verification_summary")
+    conditioning = nested_dict(metadata, "coefficient_conditioning")
+    pole_diagnostics = nested_dict(metadata, "pole_placement_diagnostics")
+    rational_train_rmse = number(rational_train.get("rmse_abs"))
+    rational_verify_rmse = number(rational_verify.get("rmse_abs"))
+    final_verify_rmse = number(summary.get("rmse_abs"))
+    rational_fraction = (
+        rational_verify_rmse / final_verify_rmse
+        if rational_verify_rmse is not None
+        and final_verify_rmse is not None
+        and final_verify_rmse > 0.0
+        else None
+    )
+    return {
+        "metadata_file": str(metadata_path),
+        "pole_placement": metadata.get("pole_placement", "fixed"),
+        "pole_count": metadata.get("n_poles"),
+        "pole_damping": metadata.get("pole_damping"),
+        "pole_iterations": metadata.get("pole_iterations"),
+        "rational_train_rmse_abs": rational_train_rmse,
+        "rational_verification_rmse_abs": rational_verify_rmse,
+        "final_verification_rmse_abs": final_verify_rmse,
+        "rational_to_final_verification_error_ratio": rational_fraction,
+        "rational_verification_to_train_ratio": (
+            rational_verify_rmse / rational_train_rmse
+            if rational_verify_rmse is not None
+            and rational_train_rmse is not None
+            and rational_train_rmse > 0.0
+            else None
+        ),
+        "basis_condition_number": number(
+            conditioning.get("basis_condition_number")
+        ),
+        "conditioning_matrix_condition_number": number(
+            conditioning.get("conditioning_matrix_condition_number")
+        ),
+        "rf_response_scale": number(metadata.get("rf_response_scale")),
+        "pole_placement_relative_rmse_improvement": number(
+            pole_diagnostics.get("relative_rmse_improvement")
+        ),
+        "adaptive_fixed_grid_retained": pole_diagnostics.get(
+            "fixed_grid_retained"
+        ),
+    }
 
 
 def ranked_trial_rows(
@@ -716,6 +800,200 @@ def build_command_suggestions(
             ),
         )
 
+    if model == "neuro-tf" and codes & {
+        "NEUROTF_RATIONAL_BASIS_BOTTLENECK",
+        "NEUROTF_RATIONAL_GENERALIZATION_GAP",
+        "NEUROTF_RATIONAL_BASIS_ILL_CONDITIONED",
+        "NEUROTF_MIXED_ERROR_SOURCES",
+    }:
+        base, requires_editing = model_optimize_command_base(args, model)
+        current_order = integer(metadata.get("n_poles")) or 10
+        order_low = max(4, current_order - 4)
+        order_high = max(order_low + 4, current_order + 8)
+        current_damping = number(metadata.get("pole_damping")) or 0.18
+        damping_low = max(0.03, current_damping / 3.0)
+        damping_high = max(damping_low * 2.0, current_damping * 2.0)
+        output_dir = run_dir.parent / f"{run_dir.name}_adaptive_poles"
+        command = [
+            *base,
+            "--search-mode",
+            "adaptive",
+            "--pole-iterations",
+            "8",
+            "--optimize-parameter",
+            "pole_placement=fixed,adaptive",
+            "--optimize-parameter",
+            f"order={order_low}:{order_high}",
+            "--optimize-parameter",
+            f"pole_damping={numeric_text(damping_low)}:{numeric_text(damping_high)}:log",
+            "--max-trials",
+            "24",
+            "--out-dir",
+            command_path(output_dir),
+        ]
+        add_command_suggestion(
+            suggestions,
+            identifier="neurotf-adaptive-pole-search",
+            title="Separate and optimize the Neuro-TF rational basis",
+            triggered_by=sorted(
+                codes
+                & {
+                    "NEUROTF_RATIONAL_BASIS_BOTTLENECK",
+                    "NEUROTF_RATIONAL_GENERALIZATION_GAP",
+                    "NEUROTF_RATIONAL_BASIS_ILL_CONDITIONED",
+                    "NEUROTF_MIXED_ERROR_SOURCES",
+                }
+            ),
+            rationale="Pole placement, pole count, and damping must make rational-only error comfortably smaller than the desired final model error before neural settings can close the remaining gap.",
+            command=command,
+            changes=[
+                {
+                    "option": "--pole-placement",
+                    "observed": metadata.get("pole_placement", "fixed"),
+                    "suggested": "adaptive comparison against fixed",
+                    "reason": "Relocate one common stable pole set from the dominant broadband training-response modes.",
+                },
+                {
+                    "option": "--order",
+                    "observed": str(current_order),
+                    "suggested": f"adaptive {order_low} to {order_high}",
+                    "reason": "Test whether the frequency basis is undercomplete without blindly making it ill-conditioned.",
+                },
+                {
+                    "option": "--pole-damping",
+                    "observed": numeric_text(current_damping),
+                    "suggested": f"adaptive {numeric_text(damping_low)} to {numeric_text(damping_high)} (log)",
+                    "reason": "Control the initial stable pole spread and the minimum decay used during relocation.",
+                },
+            ],
+            notes=(
+                "Compare rational_fit_verification_summary.rmse_abs before comparing final neural error.",
+                "Adaptive relocation retains the fixed grid automatically when none of its iterations improves representative rational RMSE.",
+            ),
+            requires_editing=requires_editing,
+        )
+
+    if model == "neuro-tf" and codes & {
+        "NEUROTF_COEFFICIENT_MAP_BOTTLENECK",
+        "NEUROTF_MIXED_ERROR_SOURCES",
+    }:
+        base, requires_editing = model_optimize_command_base(args, model)
+        output_dir = run_dir.parent / f"{run_dir.name}_coefficient_map"
+        command = [
+            *base,
+            "--search-mode",
+            "adaptive",
+            "--pole-placement",
+            str(metadata.get("pole_placement") or "fixed"),
+            "--optimize-parameter",
+            "hidden_layers=1:4x64:256:log",
+            "--optimize-parameter",
+            "activation=tanh,relu",
+            "--optimize-parameter",
+            "learning_rate=1e-4:2e-3:log",
+            "--max-trials",
+            "24",
+            "--out-dir",
+            command_path(output_dir),
+        ]
+        add_command_suggestion(
+            suggestions,
+            identifier="neurotf-coefficient-map-search",
+            title="Optimize the geometry-to-coefficient map",
+            triggered_by=sorted(
+                codes
+                & {
+                    "NEUROTF_COEFFICIENT_MAP_BOTTLENECK",
+                    "NEUROTF_MIXED_ERROR_SOURCES",
+                }
+            ),
+            rationale="The rational-only response is materially better than the final Neuro-TF, leaving coefficient interpolation and neural optimization as the reducible error source.",
+            command=command,
+            changes=[
+                {
+                    "option": "--hidden-layers",
+                    "observed": observed_setting(reference_row, metadata, "hidden_layers"),
+                    "suggested": "adaptive depth 1-4, width 64-256",
+                    "reason": "Increase coefficient-map capacity only after the rational basis is shown adequate.",
+                },
+                {
+                    "option": "--activation",
+                    "observed": observed_setting(reference_row, metadata, "activation"),
+                    "suggested": "balanced tanh,relu",
+                    "reason": "Smooth rational-coordinate maps often favor tanh, but the adaptive search should test both categories evenly.",
+                },
+                {
+                    "option": "--learning-rate",
+                    "observed": observed_setting(reference_row, metadata, "learning_rate"),
+                    "suggested": "1e-4 to 2e-3 (log)",
+                    "reason": "Reduce divergence and late-epoch instability in the conditioned coefficient loss.",
+                },
+            ],
+            notes=(
+                "Keep pole settings fixed for this run so the comparison isolates the coefficient MLP.",
+                "Inspect training_history.csv for a widening train/validation gap or late divergence.",
+            ),
+            requires_editing=requires_editing,
+        )
+
+    if model == "neuro-tf" and "NEUROTF_RATIONAL_GENERALIZATION_GAP" in codes:
+        command = ["python3", "surrogate.py"]
+        defaults: dict[str, object] = {}
+        if options_json:
+            command.extend(["--options-json", command_path(options_json)])
+            try:
+                defaults, _sources = load_options_json_resolution(
+                    options_json,
+                    workflow="points",
+                    command="suggest-additional",
+                )
+            except (OSError, OptionsJSONError):
+                defaults = {}
+        command.extend(
+            [
+                "points",
+                "suggest-additional",
+                "--acquisition",
+                "rational-hybrid",
+                "--fit-dir",
+                command_path(run_dir),
+            ]
+        )
+        requires_points_editing = False
+        if not defaults.get("existing_mdif"):
+            command.extend(["--existing-mdif", "PATH_TO_COMBINED_OR_TRAINING_MDIF"])
+            requires_points_editing = True
+        if not defaults.get("existing_points") and not defaults.get("parameter_json"):
+            command.extend(["--existing-points", "PATH_TO_ALL_GEOMETRIES_CSV"])
+            requires_points_editing = True
+        command.extend(
+            [
+                "--out",
+                command_path(run_dir.parent / f"{run_dir.name}_rational_points.csv"),
+            ]
+        )
+        add_command_suggestion(
+            suggestions,
+            identifier="neurotf-rational-hybrid-points",
+            title="Target broadband rational-response uncertainty",
+            triggered_by=["NEUROTF_RATIONAL_GENERALIZATION_GAP"],
+            rationale="A rational verification-to-training gap identifies geometry regions where the common frequency basis changes materially; the response-aware acquisition adds that evidence to measured-error exploitation and coverage.",
+            command=command,
+            changes=[
+                {
+                    "option": "--acquisition",
+                    "observed": "error-only or standard hybrid acquisition",
+                    "suggested": "rational-hybrid",
+                    "reason": "Use uncertainty in response-conditioned pole/residue coordinates, not only a scalar final-model error GP.",
+                }
+            ],
+            notes=(
+                "Only training-labeled responses from --existing-mdif enter the rational helper; verification responses remain excluded.",
+                "The existing verification metrics still drive the exploitation share of the batch.",
+            ),
+            requires_editing=requires_points_editing,
+        )
+
     if "MODEL_METADATA_MISSING" in codes and model in {"dnn", "kbnn"}:
         base, requires_editing = model_optimize_command_base(args, model)
         output_dir = run_dir.parent / f"{run_dir.name}_metadata_refresh"
@@ -958,6 +1236,86 @@ def build_findings(
             "Avoid solving verification passivity only by scaling; this directly adds RF loss.",
         )
 
+    if model == "neuro-tf":
+        stage = neurotf_stage_evidence(metadata_records)
+        if not stage:
+            add_finding(
+                findings,
+                "WARNING",
+                "NEUROTF_STAGE_EVIDENCE_MISSING",
+                "No retained Neuro-TF rational-stage metadata could be read.",
+                "Refit one representative configuration so rational-only and final verification errors can be separated.",
+            )
+        else:
+            rational_fraction = number(
+                stage.get("rational_to_final_verification_error_ratio")
+            )
+            response_scale = number(stage.get("rf_response_scale")) or 1.0
+            if response_scale < 0.98:
+                add_finding(
+                    findings,
+                    "WARNING",
+                    "NEUROTF_PASSIVITY_CONTRACTION_ERROR",
+                    f"The representative Neuro-TF uses rf_response_scale={response_scale:.6g}; its final verification error includes global contraction as well as rational/neural error.",
+                    "Inspect the pre-scale passivity excursion before attributing the accuracy loss to poles or network capacity.",
+                )
+            if rational_fraction is not None and response_scale >= 0.98:
+                if rational_fraction >= 0.65:
+                    add_finding(
+                        findings,
+                        "ERROR",
+                        "NEUROTF_RATIONAL_BASIS_BOTTLENECK",
+                        f"Rational-only verification RMSE is {rational_fraction:.3g}x the final Neuro-TF RMSE, so the frequency basis consumes most of the observed error budget.",
+                        "Try adaptive common-pole placement and optimize pole count/damping before adding more geometries or enlarging the MLP.",
+                    )
+                elif rational_fraction <= 0.35:
+                    add_finding(
+                        findings,
+                        "WARNING",
+                        "NEUROTF_COEFFICIENT_MAP_BOTTLENECK",
+                        f"Rational-only verification RMSE is only {rational_fraction:.3g}x the final Neuro-TF RMSE.",
+                        "The rational basis is adequate; focus on geometry-to-coefficient capacity, activation, learning rate, early stopping, and geometry coverage.",
+                    )
+                else:
+                    add_finding(
+                        findings,
+                        "INFO",
+                        "NEUROTF_MIXED_ERROR_SOURCES",
+                        f"Rational-only verification RMSE is {rational_fraction:.3g}x the final Neuro-TF RMSE.",
+                        "Optimize the pole basis and coefficient MLP together; neither stage is negligible.",
+                    )
+            generalization_ratio = number(
+                stage.get("rational_verification_to_train_ratio")
+            )
+            if generalization_ratio is not None and generalization_ratio > 2.0:
+                add_finding(
+                    findings,
+                    "WARNING",
+                    "NEUROTF_RATIONAL_GENERALIZATION_GAP",
+                    f"Rational-only verification RMSE is {generalization_ratio:.3g}x its training value even though verification coefficients are solved directly.",
+                    "The shared pole basis does not generalize uniformly across geometry; use adaptive poles, increase order cautiously, and target response-aware rational-hybrid points.",
+                )
+            basis_condition = number(stage.get("basis_condition_number"))
+            if basis_condition is not None and basis_condition > 1e8:
+                add_finding(
+                    findings,
+                    "WARNING",
+                    "NEUROTF_RATIONAL_BASIS_ILL_CONDITIONED",
+                    f"The raw rational basis condition number is {basis_condition:.6g}.",
+                    "Reduce pole count, increase ridge, or use adaptive placement; QR response conditioning protects the neural loss but cannot recover an overcomplete frequency basis.",
+                )
+            if (
+                str(stage.get("pole_placement") or "fixed") == "adaptive"
+                and stage.get("adaptive_fixed_grid_retained") is True
+            ):
+                add_finding(
+                    findings,
+                    "INFO",
+                    "NEUROTF_ADAPTIVE_POLES_NO_GAIN",
+                    "Adaptive relocation retained the original fixed pole grid because no tested relocation lowered representative-response RMSE.",
+                    "Change order or damping before increasing relocation iterations; the current pole count is the more likely limitation.",
+                )
+
     if model == "kbnn" and not any(
         "coarse" in str(path).lower() for path, _payload in metadata_records
     ):
@@ -1184,13 +1542,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=dispatcher_prog or None,
         description=(
-            "Diagnose DNN/KBNN fitting and passivity from retained train or "
+            "Diagnose DNN/KBNN/Neuro-TF fitting and passivity from retained train or "
             "optimization artifacts; per-trial metadata.json is optional."
         ),
     )
     parser.add_argument("--run-dir", required=True, help="Completed train, sweep, or optimize output directory.")
     parser.add_argument("--audit", help="dataset_audit.json or its containing audit directory.")
-    parser.add_argument("--model", choices=["auto", "dnn", "kbnn"], default="auto", help="Model family. Default: infer from artifacts.")
+    parser.add_argument(
+        "--model",
+        choices=["auto", "dnn", "kbnn", "neuro-tf", "neuro_tf", "neurotf"],
+        default="auto",
+        help="Model family. Default: infer from artifacts.",
+    )
     parser.add_argument("--out-dir", help="Diagnostic output directory. Default: <run-dir>/model_debug.")
     parser.add_argument("--top", type=int, default=12, help="Number of lowest-violation trials in the Markdown table. Default: 12.")
     add_options_json_argument(parser, recursive=False)
@@ -1213,10 +1576,31 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     else:
         rows, summaries_found = single_model_rows(run_dir)
         metric_name = selection_metric(rows)
-    model = infer_model(run_dir, results_path) if args.model == "auto" else args.model
+    requested_model = {
+        "neuro_tf": "neuro-tf",
+        "neurotf": "neuro-tf",
+    }.get(args.model, args.model)
+    model = (
+        infer_model(run_dir, results_path)
+        if requested_model == "auto"
+        else requested_model
+    )
     audit_path = resolve_audit_json(args.audit, run_dir)
     audit = read_json(audit_path) if audit_path else None
     metadata_records = surviving_metadata(run_dir)
+    stage_evidence = (
+        neurotf_stage_evidence(
+            metadata_records,
+            preferred_metadata=representative_metadata(
+                run_dir,
+                rows,
+                metric_name,
+                metadata_records,
+            ),
+        )
+        if model == "neuro-tf"
+        else {}
+    )
     findings = build_findings(rows, metric_name, audit, metadata_records, model)
     ordered = ranked_trial_rows(rows, metric_name)
     suggestions = build_command_suggestions(
@@ -1259,6 +1643,7 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             "late_vs_early_best_metric_improvement_fraction": improvement_fraction(metrics),
         },
         "findings": findings,
+        "neuro_tf_error_stages": stage_evidence or None,
         "suggested_commands": suggestions,
         "artifacts": {
             "report": report_md.name,
@@ -1288,6 +1673,30 @@ def command_debug(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         "",
     ]
     lines.extend(suggested_commands_markdown(suggestions))
+    if stage_evidence:
+        lines.extend(
+            [
+                "## Neuro-TF staged error evidence",
+                "",
+                "The rational-only values fit coefficients directly at each geometry; the final value also includes the learned geometry-to-coefficient map, reciprocity projection, and any RF passivity contraction.",
+                "",
+                markdown_table(
+                    ["Quantity", "Value", "Diagnostic use"],
+                    [
+                        ["Pole placement", stage_evidence.get("pole_placement", ""), "Frequency-basis construction"],
+                        ["Pole count", stage_evidence.get("pole_count", ""), "Frequency-basis capacity"],
+                        ["Rational train RMSE", stage_evidence.get("rational_train_rmse_abs", ""), "Irreducible fixed-basis error on training geometries"],
+                        ["Rational verification RMSE", stage_evidence.get("rational_verification_rmse_abs", ""), "Irreducible shared-basis error on held-out geometries"],
+                        ["Final verification RMSE", stage_evidence.get("final_verification_rmse_abs", ""), "Rational + coefficient-map + structural-control error"],
+                        ["Rational/final ratio", stage_evidence.get("rational_to_final_verification_error_ratio", ""), "Near one indicates a rational-basis bottleneck; a small value indicates the coefficient map"],
+                        ["Rational verify/train ratio", stage_evidence.get("rational_verification_to_train_ratio", ""), "Large values indicate geometry-dependent basis generalization"],
+                        ["Basis condition number", stage_evidence.get("basis_condition_number", ""), "Large values indicate redundant or poorly placed poles"],
+                        ["RF response scale", stage_evidence.get("rf_response_scale", ""), "Values below one quantify passivity-contraction loss"],
+                    ],
+                ),
+                "",
+            ]
+        )
     if plot_written:
         lines.extend(["## Error and passivity by trial", "", f"![Model passivity diagnostics]({plot_path.name})", ""])
     lines.extend(

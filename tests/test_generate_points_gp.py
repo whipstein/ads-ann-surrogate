@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 from PIL import Image
 
 import generate_points as POINTS
@@ -52,6 +53,153 @@ class GaussianAdaptivePointTests(unittest.TestCase):
         self.assertEqual(args.acquisition, "hybrid")
         self.assertEqual(args.verification_policy, "auto")
         self.assertEqual(args.target_dataset, "train")
+
+    def test_rational_hybrid_builds_response_gp_from_training_blocks_only(self) -> None:
+        sample = Path(__file__).resolve().parents[1] / (
+            "neuro_tf_sample_training_verification.mdif"
+        )
+        parameters = [
+            POINTS.parse_parameter_spec("W=0.40mm:0.55mm"),
+            POINTS.parse_parameter_spec("L=1.20mm:1.45mm"),
+        ]
+        surrogate = POINTS.build_rational_response_surrogate(
+            [str(sample)],
+            parameters,
+            split_var="dataset",
+            bare_values="auto",
+            order=2,
+            pole_placement="adaptive",
+            pole_damping=0.18,
+            pole_iterations=3,
+            ridge=1e-8,
+            variance_fraction=0.99,
+            max_components=3,
+            frequency_weight_spec=None,
+            noise_variance=1e-6,
+            ard_mode="off",
+        )
+        self.assertEqual(
+            surrogate.diagnostics["distinct_training_geometries"],
+            4,
+        )
+        self.assertTrue(surrogate.diagnostics["verification_responses_excluded"])
+        self.assertGreaterEqual(surrogate.diagnostics["retained_components"], 1)
+        uncertainty, change = POINTS.rational_response_scores(
+            surrogate,
+            [[0.0, 0.0], [0.5, 0.5]],
+        )
+        self.assertTrue(np.all(np.isfinite(uncertainty)))
+        self.assertTrue(np.all(np.isfinite(change)))
+        self.assertLess(uncertainty[0], uncertainty[1])
+
+        regions = [
+            POINTS.ErrorRegion("v1", [0.2, 0.2], 1.0, "S21", 1.0, 1),
+            POINTS.ErrorRegion("v2", [0.8, 0.8], 2.0, "S21", 2.0, 1),
+        ]
+        selected, _error_gp, diagnostics = POINTS.select_rational_hybrid_points(
+            [[0.1, 0.5], [0.5, 0.5], [0.9, 0.5], [0.5, 0.1], [0.5, 0.9]],
+            regions,
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+            surrogate,
+            count=3,
+            allocation=POINTS.HybridAllocation(1, 1, 1, "test"),
+            exploration_weight=2.0,
+            novelty_power=1.0,
+            min_distance=0.0,
+            length_scale=0.4,
+            noise_variance=1e-6,
+            error_floor=1e-12,
+            ard_mode="off",
+        )
+        self.assertEqual(len(selected), 3)
+        self.assertIn(
+            "rational-uncertainty",
+            {point.selection_component for point in selected},
+        )
+        self.assertEqual(
+            diagnostics["response_surrogate"]["training_response_blocks"],
+            4,
+        )
+
+    def test_rational_hybrid_cli_writes_response_diagnostics(self) -> None:
+        sample = Path(__file__).resolve().parents[1] / (
+            "neuro_tf_sample_training_verification.mdif"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metrics = root / "verification_metrics.csv"
+            with metrics.open("w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["source_index", "sparam", "evm_pct", "W", "L"],
+                )
+                writer.writeheader()
+                for index, (width, length, error) in enumerate(
+                    (
+                        ("0.425mm", "1.25mm", 2.0),
+                        ("0.525mm", "1.25mm", 4.0),
+                        ("0.425mm", "1.40mm", 3.0),
+                        ("0.525mm", "1.40mm", 6.0),
+                    ),
+                    start=1,
+                ):
+                    writer.writerow(
+                        {
+                            "source_index": index,
+                            "sparam": "S21",
+                            "evm_pct": error,
+                            "W": width,
+                            "L": length,
+                        }
+                    )
+            output = root / "rational_round.csv"
+            combined = root / "rational_round_all_geometries.csv"
+            command = [
+                "suggest-additional",
+                "--parameter",
+                "W=0.40mm:0.55mm",
+                "--parameter",
+                "L=1.20mm:1.45mm",
+                "--verification-metrics",
+                str(metrics),
+                "--existing-mdif",
+                str(sample),
+                "--acquisition",
+                "rational-hybrid",
+                "--count",
+                "3",
+                "--verification-policy",
+                "off",
+                "--candidate-count",
+                "48",
+                "--lhs-candidates",
+                "3",
+                "--rational-order",
+                "2",
+                "--rational-pole-placement",
+                "fixed",
+                "--rational-components",
+                "2",
+                "--out",
+                str(output),
+                "--combined-out",
+                str(combined),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(POINTS.main(command), 0)
+
+            with output.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 3)
+            self.assertIn("rational_response_uncertainty", rows[0])
+            self.assertIn("rational_response_change", rows[0])
+            metadata = json.loads(output.with_suffix(".json").read_text())
+            rational = metadata["rational_hybrid"]["response_surrogate"]
+            self.assertEqual(rational["method"], "common-pole-rational-pca-gp")
+            self.assertEqual(rational["distinct_training_geometries"], 4)
+            self.assertEqual(rational["pole_placement"], "fixed")
+            self.assertTrue(combined.is_file())
 
     def test_six_dimensional_verification_growth_policy_catches_up(self) -> None:
         before_trigger = POINTS.automatic_verification_plan(

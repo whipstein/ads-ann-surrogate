@@ -14,6 +14,39 @@ import surrogate
 
 
 class ModelDebugTests(unittest.TestCase):
+    def test_neurotf_model_aliases_are_accepted(self) -> None:
+        parser = DEBUG.build_parser()
+        self.assertEqual(
+            parser.parse_args(["--run-dir", "run", "--model", "neurotf"]).model,
+            "neurotf",
+        )
+        self.assertEqual(
+            parser.parse_args(["--run-dir", "run", "--model", "neuro_tf"]).model,
+            "neuro_tf",
+        )
+
+    def test_neurotf_stage_evidence_uses_preferred_failed_trial(self) -> None:
+        first = {
+            "rational_fit_train_summary": {"rmse_abs": 0.3},
+            "rational_fit_verification_summary": {"rmse_abs": 0.4},
+        }
+        preferred = {
+            "rational_fit_train_summary": {"rmse_abs": 0.03},
+            "rational_fit_verification_summary": {"rmse_abs": 0.04},
+        }
+        evidence = DEBUG.neurotf_stage_evidence(
+            [
+                (Path("run/trials/trial_0001/metadata.json"), first),
+                (Path("run/trials/trial_0002/metadata.json"), preferred),
+            ],
+            preferred_metadata=preferred,
+        )
+        self.assertEqual(
+            evidence["metadata_file"],
+            "run/trials/trial_0002/metadata.json",
+        )
+        self.assertEqual(evidence["rational_verification_rmse_abs"], 0.04)
+
     def test_nonpassive_source_suppresses_enforcement_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir) / "dnn_opt"
@@ -174,6 +207,91 @@ class ModelDebugTests(unittest.TestCase):
         self.assertEqual(surrogate.WORKFLOW_SCRIPTS["debug-model"], "debug_model.py")
         help_text = surrogate.build_arg_parser().format_help()
         self.assertIn("debug-model", help_text)
+
+    def test_neurotf_debug_separates_rational_basis_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "neurotf_model"
+            run_dir.mkdir()
+            (run_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "n_poles": 10,
+                        "pole_damping": 0.18,
+                        "pole_placement": "fixed",
+                        "pole_iterations": 6,
+                        "parameter_names": ["W", "L"],
+                        "rational_fit_train_summary": {"rmse_abs": 0.04},
+                        "rational_fit_verification_summary": {"rmse_abs": 0.08},
+                        "coefficient_conditioning": {
+                            "basis_condition_number": 2.5e6,
+                            "conditioning_matrix_condition_number": 4.0e4,
+                        },
+                        "rf_response_scale": 1.0,
+                    }
+                )
+            )
+            (run_dir / "verification_summary.json").write_text(
+                json.dumps(
+                    {
+                        "rmse_abs": 0.1,
+                        "passivity": {
+                            "violating_points": 0,
+                            "max_singular_value": 0.999,
+                        },
+                        "source_rf_passivity": {
+                            "violating_points": 0,
+                            "max_singular_value": 0.99,
+                        },
+                        "predicted_train_passivity_after_scale": {
+                            "violating_points": 0,
+                            "max_singular_value": 0.999,
+                        },
+                        "rf_response_scale": 1.0,
+                    }
+                )
+            )
+            audit_dir = root / "audit"
+            audit_dir.mkdir()
+            (audit_dir / "dataset_audit.json").write_text(
+                json.dumps({"passivity": {"violating_rf_rows": 0}})
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    DEBUG.main(
+                        [
+                            "--run-dir",
+                            str(run_dir),
+                            "--audit",
+                            str(audit_dir),
+                        ]
+                    ),
+                    0,
+                )
+            payload = json.loads(
+                (run_dir / "model_debug" / "model_debug.json").read_text()
+            )
+            self.assertEqual(payload["model"], "neuro-tf")
+            codes = {finding["code"] for finding in payload["findings"]}
+            self.assertIn("NEUROTF_RATIONAL_BASIS_BOTTLENECK", codes)
+            self.assertAlmostEqual(
+                payload["neuro_tf_error_stages"][
+                    "rational_to_final_verification_error_ratio"
+                ],
+                0.8,
+            )
+            suggestions = {
+                suggestion["id"]: suggestion
+                for suggestion in payload["suggested_commands"]
+            }
+            self.assertIn("neurotf-adaptive-pole-search", suggestions)
+            self.assertIn(
+                "pole_placement=fixed,adaptive",
+                suggestions["neurotf-adaptive-pole-search"]["command"],
+            )
+            report = (run_dir / "model_debug" / "model_debug.md").read_text()
+            self.assertIn("## Neuro-TF staged error evidence", report)
+            self.assertIn("Rational/final ratio", report)
 
     def test_options_json_can_supply_required_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -23,7 +23,7 @@ from cli_options import (
 )
 from surrogate_common import *  # noqa: F401,F403,E402
 
-VERSION = "0.2.0-rc3"
+VERSION = "0.2.0-rc4"
 
 def build_fixed_poles(
     blocks: Sequence[MDIFBlock],
@@ -95,6 +95,354 @@ def fit_rational_coeffs(
         rhs = weighted_values
     coeffs, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
     return coeffs
+
+
+def _representative_frequency_responses(
+    blocks: Sequence[MDIFBlock],
+    sparam_labels: Sequence[str],
+    frequency_weights: np.ndarray | None,
+    *,
+    max_modes: int = 8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    """Return a compact common-grid response set for pole relocation.
+
+    Pole relocation needs a common frequency grid but does not need to carry
+    every geometry/S-parameter trace through the denominator solve.  The
+    leading left singular vectors retain the broadband response subspace while
+    keeping the relocation least-squares problem small and well conditioned.
+    """
+
+    if not blocks:
+        raise ValueError("Adaptive pole placement requires RF training blocks")
+    flattened_weights = (
+        None
+        if frequency_weights is None
+        else np.asarray(frequency_weights, dtype=float).reshape(-1)
+    )
+    offset = 0
+    block_weights: list[np.ndarray] = []
+    for block in blocks:
+        count = len(block.freq_hz)
+        weights = (
+            np.ones(count, dtype=float)
+            if flattened_weights is None
+            else flattened_weights[offset : offset + count]
+        )
+        offset += count
+        block_weights.append(np.asarray(weights, dtype=float))
+    if flattened_weights is not None and offset != len(flattened_weights):
+        raise ValueError(
+            f"Expected {offset} adaptive-pole frequency weights, got "
+            f"{len(flattened_weights)}"
+        )
+
+    grid_groups: list[dict[str, object]] = []
+    for block_index, block in enumerate(blocks):
+        block_frequencies = np.asarray(block.freq_hz, dtype=float).reshape(-1)
+        matching_group: dict[str, object] | None = None
+        for group in grid_groups:
+            group_frequencies = np.asarray(group["frequencies"], dtype=float)
+            if (
+                block_frequencies.shape == group_frequencies.shape
+                and np.allclose(
+                    block_frequencies,
+                    group_frequencies,
+                    rtol=1e-10,
+                    atol=1e-6,
+                )
+            ):
+                matching_group = group
+                break
+        if matching_group is None:
+            matching_group = {
+                "frequencies": block_frequencies,
+                "indices": [],
+            }
+            grid_groups.append(matching_group)
+        indices = matching_group["indices"]
+        assert isinstance(indices, list)
+        indices.append(block_index)
+    selected_group = max(
+        grid_groups,
+        key=lambda group: (
+            len(group["indices"]),
+            len(np.asarray(group["frequencies"])),
+        ),
+    )
+    frequencies = np.asarray(selected_group["frequencies"], dtype=float)
+    matching_indices = list(selected_group["indices"])
+    matching = [blocks[index] for index in matching_indices]
+    per_block_weights = [block_weights[index] for index in matching_indices]
+
+    response_columns = [
+        np.asarray(block.sparams[label], dtype=complex).reshape(-1)
+        for block in matching
+        for label in sparam_labels
+    ]
+    response_matrix = np.column_stack(response_columns)
+    row_weights = np.mean(np.vstack(per_block_weights), axis=0)
+    root_weights = np.sqrt(np.maximum(row_weights, 0.0))
+    weighted_matrix = response_matrix * root_weights[:, None]
+    left, singular_values, _right_h = np.linalg.svd(
+        weighted_matrix,
+        full_matrices=False,
+    )
+    usable = int(min(max_modes, left.shape[1], np.count_nonzero(singular_values > EPS)))
+    if usable < 1:
+        raise ValueError("Adaptive pole placement found no non-zero RF response mode")
+    # Undo row weighting so the relocation routine can apply the weights once.
+    safe_roots = np.where(root_weights > EPS, root_weights, 1.0)
+    modes = (left[:, :usable] * singular_values[:usable]) / safe_roots[:, None]
+    total_energy = float(np.sum(singular_values**2))
+    retained_energy = float(np.sum(singular_values[:usable] ** 2))
+    diagnostics: dict[str, object] = {
+        "common_frequency_rows": int(len(frequencies)),
+        "matching_training_blocks": int(len(matching)),
+        "response_columns": int(response_matrix.shape[1]),
+        "representative_modes": usable,
+        "representative_energy_fraction": (
+            retained_energy / total_energy if total_energy > 0.0 else 1.0
+        ),
+    }
+    return frequencies, modes, row_weights, diagnostics
+
+
+def _representative_rational_rmse(
+    frequencies: np.ndarray,
+    responses: np.ndarray,
+    poles: np.ndarray,
+    f_scale: float,
+    ridge: float,
+    frequency_weights: np.ndarray,
+) -> float:
+    errors: list[np.ndarray] = []
+    for column in range(responses.shape[1]):
+        coeffs = fit_rational_coeffs(
+            frequencies,
+            responses[:, column],
+            poles,
+            f_scale,
+            ridge,
+            sample_weights=frequency_weights,
+        )
+        predicted = rational_basis(frequencies, poles, f_scale) @ coeffs
+        errors.append(
+            np.sqrt(np.maximum(frequency_weights, 0.0))
+            * (predicted - responses[:, column])
+        )
+    joined = np.concatenate(errors)
+    return float(np.sqrt(np.mean(np.abs(joined) ** 2)))
+
+
+def _conjugate_stable_poles(
+    relocated: np.ndarray,
+    previous: np.ndarray,
+    n_poles: int,
+    damping: float,
+) -> np.ndarray:
+    """Project relaxed relocation poles onto stable conjugate pairs."""
+
+    candidates = [complex(value) for value in np.asarray(relocated).reshape(-1)]
+    positive_previous = sorted(
+        (complex(value) for value in previous if complex(value).imag > 0.0),
+        key=lambda value: value.imag,
+    )
+    positive_candidates = [value for value in candidates if value.imag >= 0.0]
+    if len(positive_candidates) < n_poles // 2:
+        positive_candidates = candidates
+    unused = list(positive_candidates)
+    chosen: list[complex] = []
+    frequency_floor = max(
+        1e-8,
+        min((abs(value.imag) for value in positive_previous), default=1e-4) * 1e-3,
+    )
+    for reference in positive_previous[: n_poles // 2]:
+        if unused:
+            candidate_index = min(
+                range(len(unused)),
+                key=lambda index: abs(abs(unused[index].imag) - reference.imag)
+                + 0.2 * abs(abs(unused[index].real) - abs(reference.real)),
+            )
+            candidate = unused.pop(candidate_index)
+        else:
+            candidate = reference
+        center = max(abs(candidate.imag), frequency_floor)
+        minimum_decay = max(1e-10, 0.02 * max(damping, 1e-3) * center)
+        decay = max(abs(candidate.real), minimum_decay)
+        chosen.append(complex(-decay, center))
+
+    chosen.sort(key=lambda value: value.imag)
+    result: list[complex] = []
+    for pole in chosen:
+        result.extend([pole, pole.conjugate()])
+    if len(result) < n_poles:
+        real_candidates = sorted(candidates, key=lambda value: abs(value.imag))
+        source = real_candidates[0] if real_candidates else complex(-1.0, 0.0)
+        result.append(complex(-max(abs(source.real), frequency_floor), 0.0))
+    return np.asarray(result[:n_poles], dtype=complex)
+
+
+def build_adaptive_poles(
+    blocks: Sequence[MDIFBlock],
+    sparam_labels: Sequence[str],
+    n_poles: int,
+    damping: float,
+    *,
+    iterations: int = 6,
+    ridge: float = 1e-8,
+    frequency_weights: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, dict[str, object]]:
+    """Relocate a shared stable pole set from representative training responses.
+
+    This is a compact relaxed vector-fitting iteration.  Every update solves
+    for response-specific numerators and one shared denominator, finds the
+    denominator zeros, then projects them to stable conjugate pairs.  The best
+    representative-response basis seen during the iterations is returned, so
+    the original fixed grid remains selected when relocation does not help.
+    """
+
+    if iterations < 1:
+        raise ValueError("--pole-iterations must be at least 1")
+    initial, f_scale = build_fixed_poles(blocks, n_poles, damping)
+    frequencies, modes, row_weights, mode_diagnostics = (
+        _representative_frequency_responses(
+            blocks,
+            sparam_labels,
+            frequency_weights,
+        )
+    )
+    normalized_s = 1j * frequencies / f_scale
+    current = initial.copy()
+    initial_rmse = _representative_rational_rmse(
+        frequencies,
+        modes,
+        current,
+        f_scale,
+        ridge,
+        row_weights,
+    )
+    best = current.copy()
+    best_rmse = initial_rmse
+    history: list[dict[str, object]] = [
+        {"iteration": 0, "representative_rmse": initial_rmse, "selected": True}
+    ]
+    mode_count = modes.shape[1]
+    phi_rows = len(frequencies)
+    root_weights = np.sqrt(np.maximum(row_weights, 0.0))
+
+    for iteration in range(1, iterations + 1):
+        phi = 1.0 / (normalized_s[:, None] - current[None, :])
+        row_count = phi_rows * mode_count
+        column_count = mode_count * (n_poles + 1) + n_poles
+        lhs = np.zeros((row_count, column_count), dtype=complex)
+        rhs = np.zeros(row_count, dtype=complex)
+        for mode_index in range(mode_count):
+            start = mode_index * phi_rows
+            stop = start + phi_rows
+            local = mode_index * (n_poles + 1)
+            response = modes[:, mode_index]
+            lhs[start:stop, local : local + n_poles] = phi
+            lhs[start:stop, local + n_poles] = 1.0
+            lhs[start:stop, mode_count * (n_poles + 1) :] = -response[:, None] * phi
+            rhs[start:stop] = response
+            lhs[start:stop, :] *= root_weights[:, None]
+            rhs[start:stop] *= root_weights
+        column_norms = np.linalg.norm(lhs, axis=0)
+        column_norms = np.where(column_norms > EPS, column_norms, 1.0)
+        scaled_solution, *_ = np.linalg.lstsq(
+            lhs / column_norms[None, :],
+            rhs,
+            rcond=None,
+        )
+        solution = scaled_solution / column_norms
+        denominator_residues = solution[-n_poles:]
+        relocated = np.linalg.eigvals(
+            np.diag(current) - np.outer(np.ones(n_poles), denominator_residues)
+        )
+        candidate = _conjugate_stable_poles(
+            relocated,
+            current,
+            n_poles,
+            damping,
+        )
+        candidate_rmse = _representative_rational_rmse(
+            frequencies,
+            modes,
+            candidate,
+            f_scale,
+            ridge,
+            row_weights,
+        )
+        previous_sorted = np.asarray(sorted(current, key=lambda value: (value.imag, value.real)))
+        candidate_sorted = np.asarray(sorted(candidate, key=lambda value: (value.imag, value.real)))
+        relative_move = float(
+            np.max(
+                np.abs(candidate_sorted - previous_sorted)
+                / np.maximum(np.abs(previous_sorted), 1e-12)
+            )
+        )
+        selected = candidate_rmse < best_rmse
+        if selected:
+            best = candidate.copy()
+            best_rmse = candidate_rmse
+        history.append(
+            {
+                "iteration": iteration,
+                "representative_rmse": candidate_rmse,
+                "max_relative_pole_move": relative_move,
+                "selected": selected,
+            }
+        )
+        current = candidate
+        if relative_move < 1e-5:
+            break
+
+    diagnostics: dict[str, object] = {
+        "method": "adaptive-common-pole-relocation",
+        "requested_iterations": int(iterations),
+        "completed_iterations": len(history) - 1,
+        "initial_representative_rmse": initial_rmse,
+        "selected_representative_rmse": best_rmse,
+        "relative_rmse_improvement": (
+            (initial_rmse - best_rmse) / max(initial_rmse, EPS)
+        ),
+        "fixed_grid_retained": bool(np.array_equal(best, initial)),
+        "history": history,
+        **mode_diagnostics,
+    }
+    return best, f_scale, diagnostics
+
+
+def build_rational_poles(
+    blocks: Sequence[MDIFBlock],
+    sparam_labels: Sequence[str],
+    n_poles: int,
+    damping: float,
+    *,
+    placement: str = "fixed",
+    iterations: int = 6,
+    ridge: float = 1e-8,
+    frequency_weights: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, dict[str, object]]:
+    if placement == "adaptive":
+        return build_adaptive_poles(
+            blocks,
+            sparam_labels,
+            n_poles,
+            damping,
+            iterations=iterations,
+            ridge=ridge,
+            frequency_weights=frequency_weights,
+        )
+    if placement != "fixed":
+        raise ValueError(f"Unsupported pole placement method {placement!r}")
+    poles, f_scale = build_fixed_poles(blocks, n_poles, damping)
+    return poles, f_scale, {
+        "method": "fixed-logarithmic-grid",
+        "requested_iterations": 0,
+        "completed_iterations": 0,
+        "fixed_grid_retained": True,
+    }
 
 
 def fit_all_coefficients(
@@ -617,6 +965,8 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
     if args.mode == "adaptive":
         base_config = {
             "order": parse_int_options(args.orders)[0],
+            "pole_placement": parse_text_options(args.pole_placements)[0],
+            "pole_iterations": int(args.pole_iterations),
             "pole_damping": parse_float_options(args.pole_dampings)[0],
             "ridge": parse_float_options(args.ridge_values)[0],
             "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options)[0],
@@ -636,6 +986,8 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
                     "order": "int",
                     "patience": "int",
                     "pole_damping": "float",
+                    "pole_iterations": "int",
+                    "pole_placement": "str",
                     "ridge": "float",
                 },
                 max_trials=args.max_trials,
@@ -650,6 +1002,8 @@ def sweep_candidate_grid(args: argparse.Namespace) -> list[dict[str, object]]:
         return candidates
     axes = {
         "order": parse_int_options(args.orders),
+        "pole_placement": parse_text_options(args.pole_placements),
+        "pole_iterations": [int(args.pole_iterations)],
         "pole_damping": parse_float_options(args.pole_dampings),
         "ridge": parse_float_options(args.ridge_values),
         "hidden_layers": parse_hidden_layer_options(args.hidden_layer_options),
@@ -684,6 +1038,8 @@ def namespace_for_trial(args: argparse.Namespace, candidate: dict[str, object], 
         dc_open_threshold=args.dc_open_threshold,
         dc_open_resistance=args.dc_open_resistance,
         order=int(candidate["order"]),
+        pole_placement=str(candidate["pole_placement"]),
+        pole_iterations=int(candidate.get("pole_iterations", args.pole_iterations)),
         pole_damping=float(candidate["pole_damping"]),
         ridge=float(candidate["ridge"]),
         hidden_layers=str(candidate["hidden_layers"]),
@@ -747,7 +1103,7 @@ def command_sweep(args: argparse.Namespace) -> int:
         worker_func=neurotf_sweep_trial_worker,
         namespace_for_trial_func=namespace_for_trial,
         train_func=command_train,
-        result_columns=["order", "pole_damping", "ridge", "hidden_layers", "activation", "learning_rate"],
+        result_columns=["order", "pole_placement", "pole_iterations", "pole_damping", "ridge", "hidden_layers", "activation", "learning_rate"],
         results_filename="neurotf_sweep_results.csv",
         best_config_filename="neurotf_best_config.json",
         summary_filename="neurotf_sweep_summary.md",
@@ -897,7 +1253,16 @@ def command_train(args: argparse.Namespace) -> int:
         )
     else:
         normalized_verify_frequency_weights = None
-    poles, f_scale = build_fixed_poles(fit_train_blocks, args.order, args.pole_damping)
+    poles, f_scale, pole_placement_diagnostics = build_rational_poles(
+        fit_train_blocks,
+        sparam_labels,
+        args.order,
+        args.pole_damping,
+        placement=getattr(args, "pole_placement", "fixed"),
+        iterations=getattr(args, "pole_iterations", 6),
+        ridge=args.ridge,
+        frequency_weights=normalized_frequency_weights,
+    )
     x_train = parameter_matrix(fit_train_blocks, parameter_names)
     raw_y_train = fit_all_coefficients(
         fit_train_blocks,
@@ -1097,6 +1462,9 @@ def command_train(args: argparse.Namespace) -> int:
         "verification_blocks": len(verify_blocks),
         "ridge": args.ridge,
         "pole_damping": args.pole_damping,
+        "pole_placement": getattr(args, "pole_placement", "fixed"),
+        "pole_iterations": getattr(args, "pole_iterations", 6),
+        "pole_placement_diagnostics": pole_placement_diagnostics,
         "split_var": args.split_var,
         "train_values": sorted(parse_csv_set(args.train_values)),
         "verify_values": sorted(parse_csv_set(args.verify_values)),
@@ -1152,6 +1520,9 @@ def command_train(args: argparse.Namespace) -> int:
         "parameters": parameter_names,
         "sparameters": sparam_labels,
         "order": args.order,
+        "pole_placement": metadata["pole_placement"],
+        "pole_iterations": metadata["pole_iterations"],
+        "pole_placement_diagnostics": metadata["pole_placement_diagnostics"],
         "pole_damping": args.pole_damping,
         "ridge": args.ridge,
         "f_scale": f_scale,
@@ -1343,6 +1714,10 @@ def command_train(args: argparse.Namespace) -> int:
             "parameters": parameter_names,
             "sparameters": sparam_labels,
             "n_poles": args.order,
+            "pole_placement": metadata["pole_placement"],
+            "pole_placement_relative_improvement": pole_placement_diagnostics.get(
+                "relative_rmse_improvement"
+            ),
             "dc_equivalent_resistance_ohm": model.dc_equivalent_resistance_ohm,
             "dc_resistance_source_kind": metadata["dc_resistance_source_kind"],
             "dc_model_kind": metadata["dc_model_kind"],
@@ -1684,6 +2059,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train.add_argument("--holdout-fraction", type=float, default=0.2)
     add_dc_fitting_arguments(train)
     train.add_argument("--order", type=int, default=10, help="Number of fixed rational poles")
+    train.add_argument(
+        "--pole-placement",
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help=(
+            "Pole construction method. fixed uses the logarithmic stable grid; "
+            "adaptive relocates a common stable pole set from leading broadband "
+            "training-response modes. Default: fixed."
+        ),
+    )
+    train.add_argument(
+        "--pole-iterations",
+        type=int,
+        default=6,
+        help="Maximum common-pole relocation iterations for adaptive placement. Default: 6.",
+    )
     train.add_argument("--pole-damping", type=float, default=0.18)
     train.add_argument("--ridge", type=float, default=1e-8, help="Least-squares ridge for TF fitting")
     train.add_argument(
@@ -1760,6 +2151,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="orders",
         default="6,10,14",
         help="Comma-separated rational pole counts; --order accepts one value as in train.",
+    )
+    sweep.add_argument(
+        "--pole-placements",
+        "--pole-placement",
+        dest="pole_placements",
+        default="fixed",
+        help=(
+            "Comma-separated pole placement methods (fixed,adaptive); "
+            "--pole-placement accepts one train-compatible value. Default: fixed."
+        ),
+    )
+    sweep.add_argument(
+        "--pole-iterations",
+        type=int,
+        default=6,
+        help="Maximum relocation iterations used by adaptive pole-placement trials. Default: 6.",
     )
     sweep.add_argument(
         "--pole-dampings",

@@ -104,6 +104,79 @@ class NeuroTFConditioningTests(unittest.TestCase):
         neuro_tf.apply_rf_response_scale(mlp, 0.875)
         np.testing.assert_allclose(mlp.predict(x), 0.875 * before)
 
+    def test_adaptive_common_poles_recover_broadband_response_modes(self) -> None:
+        frequencies = np.logspace(7.0, 10.0, 101)
+        f_scale = float(np.sqrt(frequencies.min() * frequencies.max()))
+        normalized_s = 1j * frequencies / f_scale
+        true_poles = np.asarray(
+            [
+                -0.015 + 0.11j,
+                -0.015 - 0.11j,
+                -0.03 + 6.2j,
+                -0.03 - 6.2j,
+            ]
+        )
+        basis = np.column_stack(
+            [
+                np.ones_like(normalized_s),
+                *(1.0 / (normalized_s - pole) for pole in true_poles),
+            ]
+        )
+        rng = np.random.default_rng(2)
+        labels = ["S11", "S21"]
+        blocks = []
+        for index, x_value in enumerate(np.linspace(0.0, 1.0, 8)):
+            blocks.append(
+                MDIFBlock(
+                    params={"x": x_value},
+                    freq_hz=frequencies.copy(),
+                    sparams={
+                        label: basis
+                        @ (
+                            rng.normal(size=len(true_poles) + 1)
+                            + 1j * rng.normal(size=len(true_poles) + 1)
+                        )
+                        for label in labels
+                    },
+                    source_index=index,
+                )
+            )
+        poles, _scale, diagnostics = neuro_tf.build_adaptive_poles(
+            blocks,
+            labels,
+            n_poles=4,
+            damping=0.18,
+            iterations=8,
+            ridge=1e-10,
+        )
+        self.assertLess(
+            float(diagnostics["selected_representative_rmse"]),
+            1e-4 * float(diagnostics["initial_representative_rmse"]),
+        )
+        self.assertGreater(
+            float(diagnostics["relative_rmse_improvement"]),
+            0.99,
+        )
+        self.assertTrue(np.all(poles.real < 0.0))
+        np.testing.assert_allclose(poles[0::2], np.conjugate(poles[1::2]))
+
+    def test_neurotf_parser_exposes_adaptive_pole_options(self) -> None:
+        args = neuro_tf.build_arg_parser().parse_args(
+            [
+                "train",
+                "--mdif",
+                "input.mdif",
+                "--out-dir",
+                "model",
+                "--pole-placement",
+                "adaptive",
+                "--pole-iterations",
+                "9",
+            ]
+        )
+        self.assertEqual(args.pole_placement, "adaptive")
+        self.assertEqual(args.pole_iterations, 9)
+
     def test_lossless_distributed_line_trains_as_passive_reciprocal_model(self) -> None:
         frequencies = np.concatenate(
             [np.asarray([0.0]), np.linspace(1.0e8, 12.0e9, 61)]

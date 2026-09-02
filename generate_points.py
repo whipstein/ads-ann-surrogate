@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from cli_options import (
     add_options_json_argument,
     finalize_options_json_update,
@@ -100,6 +102,8 @@ class SuggestedPoint:
     predicted_error: float | None = None
     gp_log_uncertainty: float | None = None
     gp_upper_confidence_error: float | None = None
+    rational_response_uncertainty: float | None = None
+    rational_response_change: float | None = None
     selection_component: str = ""
 
 
@@ -126,6 +130,30 @@ class GaussianProcessModel:
             sum(math.log(max(value, 1e-300)) for value in self.length_scales)
             / len(self.length_scales)
         )
+
+
+@dataclass
+class RationalLatentGP:
+    """One geometry-space GP for a rational-response latent coordinate."""
+
+    target_mean: float
+    target_scale: float
+    length_scales: np.ndarray
+    noise_variance: float
+    cholesky: np.ndarray
+    alpha: np.ndarray
+    log_marginal_likelihood: float
+
+
+@dataclass
+class RationalResponseSurrogate:
+    """Response-conditioned rational/PCA surrogate used only for acquisition."""
+
+    observation_points: np.ndarray
+    observation_scores: np.ndarray
+    latent_models: list[RationalLatentGP]
+    score_energy: np.ndarray
+    diagnostics: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -3409,6 +3437,542 @@ def condition_gp_on_fantasy_mean(
     )
 
 
+def _matern52_numpy(
+    lhs: np.ndarray,
+    rhs: np.ndarray,
+    length_scales: np.ndarray,
+) -> np.ndarray:
+    scaled = (
+        lhs[:, None, :] - rhs[None, :, :]
+    ) / np.maximum(length_scales[None, None, :], 1e-12)
+    distance = np.sqrt(np.sum(scaled * scaled, axis=2))
+    root_five_distance = math.sqrt(5.0) * distance
+    return (
+        1.0 + root_five_distance + (5.0 / 3.0) * distance * distance
+    ) * np.exp(-root_five_distance)
+
+
+def _fit_numpy_gp_candidate(
+    points: np.ndarray,
+    targets: np.ndarray,
+    length_scales: np.ndarray,
+    noise_variance: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    covariance = _matern52_numpy(points, points, length_scales)
+    covariance.flat[:: len(points) + 1] += noise_variance
+    jitter = max(1e-12, noise_variance * 1e-6)
+    for _attempt in range(8):
+        try:
+            cholesky = np.linalg.cholesky(covariance)
+            break
+        except np.linalg.LinAlgError:
+            covariance.flat[:: len(points) + 1] += jitter
+            jitter *= 10.0
+    else:
+        raise ValueError(
+            "Could not stabilize a rational-response GP covariance; increase "
+            "--gp-noise-variance"
+        )
+    alpha = np.linalg.solve(cholesky.T, np.linalg.solve(cholesky, targets))
+    likelihood = float(
+        -0.5 * targets @ alpha
+        - np.sum(np.log(np.diag(cholesky)))
+        - 0.5 * len(points) * math.log(2.0 * math.pi)
+    )
+    return cholesky, alpha, likelihood
+
+
+def _fit_rational_latent_gp(
+    points: np.ndarray,
+    values: np.ndarray,
+    noise_variance: float,
+    ard_mode: str,
+) -> RationalLatentGP:
+    target_mean = float(np.mean(values))
+    target_scale = float(np.std(values, ddof=1)) if len(values) > 1 else 1.0
+    target_scale = max(target_scale, 1e-12)
+    targets = (values - target_mean) / target_scale
+    dimensions = points.shape[1]
+    scale_grid = np.asarray([0.08, 0.12, 0.18, 0.27, 0.4, 0.6, 0.9, 1.35])
+    best: tuple[np.ndarray, np.ndarray, float, np.ndarray] | None = None
+    for scale in scale_grid:
+        length_scales = np.full(dimensions, scale, dtype=float)
+        factor, alpha, likelihood = _fit_numpy_gp_candidate(
+            points,
+            targets,
+            length_scales,
+            noise_variance,
+        )
+        if best is None or likelihood > best[2]:
+            best = (factor, alpha, likelihood, length_scales)
+    assert best is not None
+    use_ard = ard_mode == "on" or (
+        ard_mode == "auto" and len(points) >= max(3 * dimensions, 12)
+    )
+    if use_ard:
+        scales = best[3].copy()
+        base_scale = float(np.exp(np.mean(np.log(scales))))
+        penalty_weight = 0.15
+
+        def penalized(likelihood: float, trial: np.ndarray) -> float:
+            return likelihood - penalty_weight * float(
+                np.sum(np.log(trial / base_scale) ** 2)
+            )
+
+        current_score = penalized(best[2], scales)
+        for dimension in range(dimensions):
+            dimension_best = best
+            dimension_score = current_score
+            for scale in scale_grid:
+                trial = scales.copy()
+                trial[dimension] = scale
+                factor, alpha, likelihood = _fit_numpy_gp_candidate(
+                    points,
+                    targets,
+                    trial,
+                    noise_variance,
+                )
+                score = penalized(likelihood, trial)
+                if score > dimension_score + 1e-12:
+                    dimension_best = (factor, alpha, likelihood, trial.copy())
+                    dimension_score = score
+            best = dimension_best
+            scales = best[3].copy()
+            current_score = dimension_score
+    return RationalLatentGP(
+        target_mean=target_mean,
+        target_scale=target_scale,
+        length_scales=best[3],
+        noise_variance=noise_variance,
+        cholesky=best[0],
+        alpha=best[1],
+        log_marginal_likelihood=best[2],
+    )
+
+
+def _predict_rational_latent_gp(
+    model: RationalLatentGP,
+    observation_points: np.ndarray,
+    candidate_points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    covariance = _matern52_numpy(
+        candidate_points,
+        observation_points,
+        model.length_scales,
+    )
+    normalized_mean = covariance @ model.alpha
+    projected = np.linalg.solve(model.cholesky, covariance.T)
+    normalized_variance = np.maximum(
+        0.0,
+        1.0 - np.sum(projected * projected, axis=0),
+    )
+    return (
+        model.target_mean + model.target_scale * normalized_mean,
+        model.target_scale**2 * normalized_variance,
+    )
+
+
+def _block_dataset_for_rational_acquisition(
+    block: object,
+    split_var: str,
+    default_dataset: str,
+) -> str:
+    params = getattr(block, "params", {})
+    try:
+        raw_value = lookup_row_value(params, split_var)
+    except KeyError:
+        raw_value = None
+    return canonical_dataset_label(raw_value, default=default_dataset)
+
+
+def build_rational_response_surrogate(
+    mdif_paths: Sequence[str],
+    parameters: Sequence[ParameterSpec],
+    *,
+    split_var: str,
+    bare_values: str,
+    order: int,
+    pole_placement: str,
+    pole_damping: float,
+    pole_iterations: int,
+    ridge: float,
+    variance_fraction: float,
+    max_components: int,
+    frequency_weight_spec: str | None,
+    noise_variance: float,
+    ard_mode: str,
+) -> RationalResponseSurrogate:
+    """Fit a common-pole rational/PCA/GP helper from simulated training MDIF."""
+
+    if not mdif_paths:
+        raise ValueError(
+            "--acquisition rational-hybrid requires at least one --existing-mdif "
+            "containing simulated training responses"
+        )
+    if order < 1:
+        raise ValueError("--rational-order must be positive")
+    if max_components < 1:
+        raise ValueError("--rational-components must be positive")
+    if not (0.0 < variance_fraction <= 1.0):
+        raise ValueError("--rational-variance must be in (0, 1]")
+    from neuro_tf import (
+        build_rational_poles,
+        build_response_conditioning_transform,
+        fit_all_coefficients,
+        transform_coefficient_rows,
+    )
+    from surrogate_common import (
+        common_sparameter_labels,
+        frequency_weights_from_blocks,
+        normalize_frequency_weights,
+        positive_frequency_blocks,
+        read_mdif,
+    )
+
+    training_blocks: list[object] = []
+    training_points: list[list[float]] = []
+    source_modes: dict[str, str] = {}
+    for raw_path in mdif_paths:
+        path = Path(raw_path)
+        blocks = read_mdif(path)
+        rows = [dict(block.params) for block in blocks]
+        source_mode = resolve_bare_values_for_rows(rows, parameters, bare_values)
+        source_modes[str(path)] = source_mode
+        try:
+            filename_role = geometry_file_split_group(path)
+        except ValueError:
+            filename_role = None
+        default_dataset = "verification" if filename_role == "verification" else "train"
+        for block in blocks:
+            if coverage_split_group(
+                _block_dataset_for_rational_acquisition(
+                    block,
+                    split_var,
+                    default_dataset,
+                )
+            ) != "training":
+                continue
+            point = row_unit_point(
+                block.params,
+                parameters,
+                bare_values=source_mode,
+            )
+            if point is None or not in_unit_cube(point):
+                continue
+            training_blocks.append(block)
+            training_points.append(clamp_unit_point(point))
+    if len(training_blocks) < 2:
+        raise ValueError(
+            "Rational-hybrid acquisition needs at least two in-range training "
+            "geometries with RF responses in --existing-mdif"
+        )
+    rf_blocks = positive_frequency_blocks(
+        training_blocks,
+        purpose="rational-hybrid acquisition",
+    )
+    if len(rf_blocks) != len(training_blocks):
+        raise ValueError(
+            "Rational-hybrid acquisition requires at least one positive-frequency "
+            "row in every selected training block; split or remove DC-only blocks "
+            "before requesting response-aware points"
+        )
+    labels = common_sparameter_labels(rf_blocks)
+    raw_weights = frequency_weights_from_blocks(
+        rf_blocks,
+        frequency_weight_spec,
+    )
+    normalized_weights, weight_mean = normalize_frequency_weights(raw_weights)
+    poles, f_scale, pole_diagnostics = build_rational_poles(
+        rf_blocks,
+        labels,
+        order,
+        pole_damping,
+        placement=pole_placement,
+        iterations=pole_iterations,
+        ridge=ridge,
+        frequency_weights=normalized_weights,
+    )
+    raw_coefficients = fit_all_coefficients(
+        rf_blocks,
+        labels,
+        poles,
+        f_scale,
+        ridge,
+        frequency_weights=normalized_weights,
+    )
+    encoder, _decoder, conditioning = build_response_conditioning_transform(
+        rf_blocks,
+        poles,
+        f_scale,
+        frequency_weights=normalized_weights,
+        ridge=ridge,
+    )
+    conditioned = transform_coefficient_rows(
+        raw_coefficients,
+        len(labels),
+        len(poles) + 1,
+        encoder,
+    )
+
+    grouped: dict[tuple[float, ...], tuple[list[float], list[np.ndarray]]] = {}
+    for point, row in zip(training_points, conditioned):
+        key = tuple(round(float(value), 12) for value in point)
+        if key not in grouped:
+            grouped[key] = (point, [])
+        grouped[key][1].append(np.asarray(row, dtype=float))
+    observation_points = np.asarray(
+        [value[0] for value in grouped.values()],
+        dtype=float,
+    )
+    response_rows = np.asarray(
+        [np.mean(np.vstack(value[1]), axis=0) for value in grouped.values()],
+        dtype=float,
+    )
+    if len(observation_points) < 2:
+        raise ValueError(
+            "Rational-hybrid acquisition found fewer than two distinct training geometries"
+        )
+    response_mean = np.mean(response_rows, axis=0)
+    centered = response_rows - response_mean
+    left, singular_values, right_h = np.linalg.svd(centered, full_matrices=False)
+    variance = singular_values**2
+    total_variance = float(np.sum(variance))
+    if total_variance <= 1e-15:
+        raise ValueError(
+            "Rational-hybrid acquisition found no response variation across training geometries"
+        )
+    cumulative = np.cumsum(variance) / total_variance
+    retained = int(np.searchsorted(cumulative, variance_fraction, side="left") + 1)
+    retained = min(retained, max_components, len(singular_values))
+    observation_scores = centered @ right_h[:retained, :].T
+    latent_models = [
+        _fit_rational_latent_gp(
+            observation_points,
+            observation_scores[:, component],
+            noise_variance,
+            ard_mode,
+        )
+        for component in range(retained)
+    ]
+    reconstructed = observation_scores @ right_h[:retained, :] + response_mean
+    compression_rmse = float(np.sqrt(np.mean((reconstructed - response_rows) ** 2)))
+    diagnostics: dict[str, object] = {
+        "method": "common-pole-rational-pca-gp",
+        "source_mdif_files": list(mdif_paths),
+        "source_bare_value_modes": source_modes,
+        "training_response_blocks": len(rf_blocks),
+        "distinct_training_geometries": len(observation_points),
+        "sparameter_count": len(labels),
+        "order": int(order),
+        "pole_placement": pole_placement,
+        "pole_damping": float(pole_damping),
+        "pole_iterations": int(pole_iterations),
+        "ridge": float(ridge),
+        "frequency_weights": frequency_weight_spec,
+        "frequency_weight_mean": float(weight_mean),
+        "conditioned_response_coordinates": int(response_rows.shape[1]),
+        "retained_components": retained,
+        "requested_variance_fraction": float(variance_fraction),
+        "retained_variance_fraction": float(cumulative[retained - 1]),
+        "compression_rmse": compression_rmse,
+        "latent_length_scales": [
+            model.length_scales.tolist() for model in latent_models
+        ],
+        "latent_log_marginal_likelihoods": [
+            model.log_marginal_likelihood for model in latent_models
+        ],
+        "pole_placement_diagnostics": pole_diagnostics,
+        "coefficient_conditioning": conditioning,
+        "dc_rows_excluded": True,
+        "verification_responses_excluded": True,
+    }
+    return RationalResponseSurrogate(
+        observation_points=observation_points,
+        observation_scores=observation_scores,
+        latent_models=latent_models,
+        score_energy=variance[:retained],
+        diagnostics=diagnostics,
+    )
+
+
+def rational_response_scores(
+    surrogate: RationalResponseSurrogate,
+    candidate_points: Sequence[Sequence[float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    candidates = np.asarray(candidate_points, dtype=float)
+    predicted_columns: list[np.ndarray] = []
+    variance_columns: list[np.ndarray] = []
+    for model in surrogate.latent_models:
+        mean, variance = _predict_rational_latent_gp(
+            model,
+            surrogate.observation_points,
+            candidates,
+        )
+        predicted_columns.append(mean)
+        variance_columns.append(variance)
+    predicted = np.column_stack(predicted_columns)
+    variances = np.column_stack(variance_columns)
+    response_scale = max(
+        float(np.sqrt(np.mean(np.sum(surrogate.observation_scores**2, axis=1)))),
+        1e-12,
+    )
+    uncertainty = np.sqrt(np.sum(variances, axis=1)) / response_scale
+    changes = np.zeros(len(candidates), dtype=float)
+    for index, (candidate, predicted_score) in enumerate(zip(candidates, predicted)):
+        nearest = int(
+            np.argmin(np.sum((surrogate.observation_points - candidate) ** 2, axis=1))
+        )
+        changes[index] = float(
+            np.linalg.norm(predicted_score - surrogate.observation_scores[nearest])
+            / response_scale
+        )
+    return uncertainty, changes
+
+
+def _robust_unit_scores(values: np.ndarray) -> np.ndarray:
+    finite = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(finite)):
+        raise ValueError("Rational-response acquisition produced non-finite scores")
+    low = float(np.quantile(finite, 0.1))
+    high = float(np.quantile(finite, 0.9))
+    if high <= low + 1e-15:
+        return np.zeros_like(finite)
+    return np.clip((finite - low) / (high - low), 0.0, 1.0)
+
+
+def select_rational_hybrid_points(
+    candidate_points: Sequence[Sequence[float]],
+    regions: Sequence[ErrorRegion],
+    existing_points: Sequence[Sequence[float]],
+    rational_surrogate: RationalResponseSurrogate,
+    count: int,
+    allocation: HybridAllocation,
+    exploration_weight: float,
+    novelty_power: float,
+    min_distance: float,
+    length_scale: float | Sequence[float] | None,
+    noise_variance: float,
+    error_floor: float,
+    ard_mode: str = "auto",
+) -> tuple[list[SuggestedPoint], GaussianProcessModel, dict[str, object]]:
+    """Mix measured-error exploitation with rational-response uncertainty."""
+
+    error_model = fit_error_gaussian_process(
+        regions,
+        length_scale=length_scale,
+        noise_variance=noise_variance,
+        error_floor=error_floor,
+        ard_mode=ard_mode,
+    )
+    working_error_model = error_model
+    all_candidates = [list(point) for point in candidate_points]
+    rational_uncertainty, rational_change = rational_response_scores(
+        rational_surrogate,
+        all_candidates,
+    )
+    normalized_uncertainty = _robust_unit_scores(rational_uncertainty)
+    normalized_change = _robust_unit_scores(rational_change)
+    rational_lookup = {
+        tuple(point): (
+            float(rational_uncertainty[index]),
+            float(rational_change[index]),
+            float(normalized_uncertainty[index]),
+            float(normalized_change[index]),
+        )
+        for index, point in enumerate(all_candidates)
+    }
+    occupied = [list(point) for point in existing_points]
+    unused = list(all_candidates)
+    selected: list[SuggestedPoint] = []
+    schedule = _hybrid_component_schedule(allocation)
+    diagonal = max(math.sqrt(len(all_candidates[0])), 1e-12)
+    for raw_component in schedule:
+        best_index: int | None = None
+        best_point: SuggestedPoint | None = None
+        for index, point in enumerate(unused):
+            distance = nearest_distance(point, occupied)
+            if distance < min_distance:
+                continue
+            novelty = min(1.0, distance / diagonal)
+            mean_log_error, std_log_error = predict_error_gaussian_process(
+                working_error_model,
+                point,
+            )
+            predicted_error = math.exp(min(700.0, mean_log_error))
+            upper_error = math.exp(
+                min(700.0, mean_log_error + exploration_weight * std_log_error)
+            )
+            raw_uncertainty, raw_change, unit_uncertainty, unit_change = (
+                rational_lookup[tuple(point)]
+            )
+            if raw_component == "exploitation":
+                score = predicted_error * max(novelty, 1e-12) ** min(
+                    novelty_power,
+                    0.5,
+                )
+                component = "exploitation"
+            elif raw_component == "uncertainty":
+                score = (unit_uncertainty + 0.35 * unit_change) * max(
+                    novelty,
+                    1e-12,
+                ) ** max(0.5, min(novelty_power, 1.5))
+                component = "rational-uncertainty"
+            else:
+                score = novelty
+                component = "coverage"
+            region, region_distance = _nearest_error_region(point, regions)
+            candidate = SuggestedPoint(
+                unit_point=point,
+                acquisition_score=score,
+                distance_to_existing=distance,
+                nearest_error_source_index=(region.source_index if region else ""),
+                nearest_error_score=(region.score if region else 0.0),
+                nearest_error_distance=region_distance,
+                predicted_error=predicted_error,
+                gp_log_uncertainty=std_log_error,
+                gp_upper_confidence_error=upper_error,
+                rational_response_uncertainty=raw_uncertainty,
+                rational_response_change=raw_change,
+                selection_component=component,
+            )
+            if best_point is None or score > best_point.acquisition_score:
+                best_index = index
+                best_point = candidate
+        if best_index is None or best_point is None:
+            break
+        selected.append(best_point)
+        occupied.append(best_point.unit_point)
+        unused.pop(best_index)
+        working_error_model = condition_gp_on_fantasy_mean(
+            working_error_model,
+            best_point.unit_point,
+        )
+    diagnostics = {
+        "allocation": {
+            "exploitation": allocation.exploitation,
+            "rational_uncertainty": allocation.uncertainty,
+            "coverage": allocation.coverage,
+            "regime": allocation.regime,
+        },
+        "selected_components": {
+            name: sum(item.selection_component == name for item in selected)
+            for name in ("exploitation", "rational-uncertainty", "coverage")
+        },
+        "candidate_rational_uncertainty": {
+            "median": float(np.median(rational_uncertainty)),
+            "p90": float(np.quantile(rational_uncertainty, 0.9)),
+            "max": float(np.max(rational_uncertainty)),
+        },
+        "candidate_rational_change": {
+            "median": float(np.median(rational_change)),
+            "p90": float(np.quantile(rational_change, 0.9)),
+            "max": float(np.max(rational_change)),
+        },
+        "response_surrogate": rational_surrogate.diagnostics,
+    }
+    return selected, error_model, diagnostics
+
+
 def _nearest_error_region(
     point: Sequence[float], regions: Sequence[ErrorRegion]
 ) -> tuple[ErrorRegion | None, float]:
@@ -3736,6 +4300,8 @@ def write_suggested_points_csv(
         "predicted_error",
         "gp_log_uncertainty",
         "gp_upper_confidence_error",
+        "rational_response_uncertainty",
+        "rational_response_change",
     ]
     if include_normalized:
         fields.extend(f"u_{parameter.name}" for parameter in parameters)
@@ -3781,6 +4347,16 @@ def write_suggested_points_csv(
                 ""
                 if suggestion.gp_upper_confidence_error is None
                 else f"{suggestion.gp_upper_confidence_error:.12g}"
+            ),
+            "rational_response_uncertainty": (
+                ""
+                if suggestion.rational_response_uncertainty is None
+                else f"{suggestion.rational_response_uncertainty:.12g}"
+            ),
+            "rational_response_change": (
+                ""
+                if suggestion.rational_response_change is None
+                else f"{suggestion.rational_response_change:.12g}"
             ),
         }
         rounded_values = [
@@ -4746,13 +5322,15 @@ def build_suggest_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--acquisition",
-        choices=["error-distance", "gp-ucb", "hybrid"],
+        choices=["error-distance", "gp-ucb", "hybrid", "rational-hybrid"],
         default="hybrid",
         help=(
             "Candidate scoring method. hybrid divides a dimension-scaled batch "
             "among exploitation, GP uncertainty, and maximin coverage and updates "
-            "posterior uncertainty after each selection. gp-ucb retains one-score "
-            "UCB acquisition; error-distance uses measured error hotspots. "
+            "posterior uncertainty after each selection. rational-hybrid replaces "
+            "the uncertainty component with a common-pole rational/PCA response "
+            "surrogate built from --existing-mdif. gp-ucb retains one-score UCB "
+            "acquisition; error-distance uses measured error hotspots. "
             "Default: hybrid."
         ),
     )
@@ -4796,6 +5374,61 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         type=float,
         default=1e-12,
         help="Positive error floor applied before the GP log transform. Default: 1e-12.",
+    )
+    parser.add_argument(
+        "--rational-components",
+        type=int,
+        default=8,
+        help=(
+            "Maximum response-conditioned PCA coordinates modeled by "
+            "rational-hybrid acquisition. Default: 8."
+        ),
+    )
+    parser.add_argument(
+        "--rational-frequency-weights",
+        help=(
+            "Optional frequency weights used only by the rational-hybrid helper. "
+            "Uses the same syntax as model --frequency-weights."
+        ),
+    )
+    parser.add_argument(
+        "--rational-order",
+        type=int,
+        default=12,
+        help="Common rational pole count for rational-hybrid acquisition. Default: 12.",
+    )
+    parser.add_argument(
+        "--rational-pole-damping",
+        type=float,
+        default=0.18,
+        help="Initial pole damping for rational-hybrid acquisition. Default: 0.18.",
+    )
+    parser.add_argument(
+        "--rational-pole-iterations",
+        type=int,
+        default=6,
+        help="Maximum adaptive common-pole relocation iterations. Default: 6.",
+    )
+    parser.add_argument(
+        "--rational-pole-placement",
+        choices=["fixed", "adaptive"],
+        default="adaptive",
+        help="Pole placement for rational-hybrid acquisition. Default: adaptive.",
+    )
+    parser.add_argument(
+        "--rational-ridge",
+        type=float,
+        default=1e-8,
+        help="Ridge used by rational-hybrid coefficient extraction. Default: 1e-8.",
+    )
+    parser.add_argument(
+        "--rational-variance",
+        type=float,
+        default=0.995,
+        help=(
+            "Minimum conditioned-response variance retained before the "
+            "--rational-components cap. Default: 0.995."
+        ),
     )
     parser.add_argument(
         "--candidate-count",
@@ -4861,7 +5494,7 @@ def build_suggest_parser() -> argparse.ArgumentParser:
         help=(
             "Automatically add acquisition-verification points as cumulative "
             "training count crosses dimension-based milestones. Applies to "
-            "hybrid and GP-UCB training batches. Default: auto."
+            "hybrid, rational-hybrid, and GP-UCB training batches. Default: auto."
         ),
     )
     parser.add_argument(
@@ -5786,6 +6419,18 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         parser.error("--gp-noise-variance must be non-negative")
     if args.gp_error_floor <= 0.0:
         parser.error("--gp-error-floor must be positive")
+    if args.rational_order <= 0:
+        parser.error("--rational-order must be positive")
+    if args.rational_components <= 0:
+        parser.error("--rational-components must be positive")
+    if args.rational_pole_iterations <= 0:
+        parser.error("--rational-pole-iterations must be positive")
+    if args.rational_pole_damping <= 0.0:
+        parser.error("--rational-pole-damping must be positive")
+    if args.rational_ridge < 0.0:
+        parser.error("--rational-ridge must be non-negative")
+    if not 0.0 < args.rational_variance <= 1.0:
+        parser.error("--rational-variance must be in (0, 1]")
     for option_name in (
         "verification_interval",
         "verification_batch",
@@ -5999,7 +6644,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         return 0
 
     automatic_verification_enabled = (
-        args.acquisition in {"gp-ucb", "hybrid"}
+        args.acquisition in {"gp-ucb", "hybrid", "rational-hybrid"}
         and args.verification_policy == "auto"
         and primary_is_training
     )
@@ -6130,9 +6775,9 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     target_datasets: list[str]
     automatic_verification_suggestions: list[SuggestedPoint] = []
     hybrid_diagnostics: dict[str, object] = {}
-    if args.acquisition in {"gp-ucb", "hybrid"}:
+    if args.acquisition in {"gp-ucb", "hybrid", "rational-hybrid"}:
         try:
-            if args.acquisition == "hybrid":
+            if args.acquisition in {"hybrid", "rational-hybrid"}:
                 hybrid_allocation = hybrid_component_allocation(
                     primary_count,
                     dimensions=len(parameters),
@@ -6142,20 +6787,55 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                         recommendation.latest_improvement_fraction
                     ),
                 )
-                suggestions, gp_model, hybrid_diagnostics = select_hybrid_points(
-                    candidates,
-                    regions,
-                    existing_points,
-                    count=primary_count,
-                    allocation=hybrid_allocation,
-                    exploration_weight=effective_exploration_weight,
-                    novelty_power=args.novelty_power,
-                    min_distance=args.min_distance,
-                    length_scale=args.gp_length_scale,
-                    noise_variance=args.gp_noise_variance,
-                    error_floor=args.gp_error_floor,
-                    ard_mode=args.gp_ard,
-                )
+                if args.acquisition == "rational-hybrid":
+                    rational_surrogate = build_rational_response_surrogate(
+                        args.existing_mdif,
+                        parameters,
+                        split_var=args.split_var,
+                        bare_values=args.bare_values,
+                        order=args.rational_order,
+                        pole_placement=args.rational_pole_placement,
+                        pole_damping=args.rational_pole_damping,
+                        pole_iterations=args.rational_pole_iterations,
+                        ridge=args.rational_ridge,
+                        variance_fraction=args.rational_variance,
+                        max_components=args.rational_components,
+                        frequency_weight_spec=args.rational_frequency_weights,
+                        noise_variance=args.gp_noise_variance,
+                        ard_mode=args.gp_ard,
+                    )
+                    suggestions, gp_model, hybrid_diagnostics = (
+                        select_rational_hybrid_points(
+                            candidates,
+                            regions,
+                            existing_points,
+                            rational_surrogate,
+                            count=primary_count,
+                            allocation=hybrid_allocation,
+                            exploration_weight=effective_exploration_weight,
+                            novelty_power=args.novelty_power,
+                            min_distance=args.min_distance,
+                            length_scale=args.gp_length_scale,
+                            noise_variance=args.gp_noise_variance,
+                            error_floor=args.gp_error_floor,
+                            ard_mode=args.gp_ard,
+                        )
+                    )
+                else:
+                    suggestions, gp_model, hybrid_diagnostics = select_hybrid_points(
+                        candidates,
+                        regions,
+                        existing_points,
+                        count=primary_count,
+                        allocation=hybrid_allocation,
+                        exploration_weight=effective_exploration_weight,
+                        novelty_power=args.novelty_power,
+                        min_distance=args.min_distance,
+                        length_scale=args.gp_length_scale,
+                        noise_variance=args.gp_noise_variance,
+                        error_floor=args.gp_error_floor,
+                        ard_mode=args.gp_ard,
+                    )
             else:
                 suggestions, gp_model = select_gp_ucb_points(
                     candidates,
@@ -6278,7 +6958,11 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             "batch_posterior_update": "kriging-believer-posterior-mean",
         }
         if hybrid_diagnostics:
-            acquisition_metadata["hybrid"] = hybrid_diagnostics
+            acquisition_metadata[
+                "rational_hybrid"
+                if args.acquisition == "rational-hybrid"
+                else "hybrid"
+            ] = hybrid_diagnostics
         if len(gp_model.observation_points) < max(3 * len(parameters), 12):
             print(
                 "warning: the adaptive GP has fewer distinct error observations "
@@ -6306,7 +6990,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         acquisition_metadata["automatic_verification"] = {
             **preliminary_verification_plan,
             "enabled": False,
-            "reason": "automatic verification applies only to hybrid or GP-UCB training batches",
+            "reason": "automatic verification applies only to hybrid, rational-hybrid, or GP-UCB training batches",
             "selected_additional_verification_count": 0,
         }
     primary_suggestion_count = len(suggestions) - len(
@@ -6594,7 +7278,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         )
     if getattr(args, "parameter_metadata_source", None):
         print(f"parameter domain: {args.parameter_metadata_source}")
-    if args.acquisition in {"gp-ucb", "hybrid"}:
+    if args.acquisition in {"gp-ucb", "hybrid", "rational-hybrid"}:
         scale_text = ", ".join(
             f"{parameter.name}={scale:.4g}"
             for parameter, scale in zip(parameters, gp_model.length_scales)
@@ -6605,15 +7289,41 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             f"Matérn-5/2 length scales: {scale_text}, "
             f"exploration weight: {effective_exploration_weight:.6g}"
         )
-        if args.acquisition == "hybrid":
+        if args.acquisition in {"hybrid", "rational-hybrid"}:
             allocation = hybrid_diagnostics.get("allocation", {})
             print(
-                "hybrid batch: "
+                (
+                    "rational-hybrid batch: "
+                    if args.acquisition == "rational-hybrid"
+                    else "hybrid batch: "
+                )
+                +
                 f"{allocation.get('exploitation', 0)} exploitation + "
-                f"{allocation.get('uncertainty', 0)} uncertainty + "
+                f"{allocation.get('rational_uncertainty', allocation.get('uncertainty', 0))} "
+                + (
+                    "rational-response uncertainty + "
+                    if args.acquisition == "rational-hybrid"
+                    else "uncertainty + "
+                )
+                +
                 f"{allocation.get('coverage', 0)} coverage "
                 f"({allocation.get('regime', 'unknown')})"
             )
+            if args.acquisition == "rational-hybrid":
+                response_diagnostics = hybrid_diagnostics.get(
+                    "response_surrogate",
+                    {},
+                )
+                if isinstance(response_diagnostics, dict):
+                    print(
+                        "rational response helper: "
+                        f"{response_diagnostics.get('distinct_training_geometries', 0)} "
+                        "training geometries, "
+                        f"{response_diagnostics.get('retained_components', 0)} PCA "
+                        "components, "
+                        f"{response_diagnostics.get('retained_variance_fraction', 0):.6g} "
+                        "retained variance"
+                    )
         verification_plan = acquisition_metadata["automatic_verification"]
         assert isinstance(verification_plan, dict)
         added_verification = int(

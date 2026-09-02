@@ -54,7 +54,7 @@ flowchart TD
     click CLI "README.md#unified-model-cli"
     click DNN "README.md#b3-dnn-direct-response-surrogate"
     click KBNN "README.md#b4-kbnn-fitted-coarse-knowledge-based-surrogate"
-    click NTF "README.md#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate"
+    click NTF "README.md#b5-neuro-tf-common-pole-rational-coefficient-surrogate"
     click FIT "README.md#shared-training-and-optimization-workflow"
     click VERIFY "README.md#fitting-output-artifacts"
     click ACCEPT "README.md#5-refit-and-iterate"
@@ -74,7 +74,7 @@ equivalent links: [options JSON](#configure-the-workflow-with-optionsjson),
 [model fitting](#shared-training-and-optimization-workflow),
 [DNN](#b3-dnn-direct-response-surrogate),
 [KBNN](#b4-kbnn-fitted-coarse-knowledge-based-surrogate),
-[Neuro-TF](#b5-neuro-tf-fixed-pole-rational-coefficient-surrogate), and
+[Neuro-TF](#b5-neuro-tf-common-pole-rational-coefficient-surrogate), and
 [ADS export](#choose-the-ads-handoff).
 
 The code uses a flat script-first layout. `surrogate.py` is the primary entry
@@ -1185,7 +1185,7 @@ fitting, optimization, prediction, and composite export options.
 
 ### Neuro-TF
 
-Use the fixed-pole rational formulation for smooth frequency responses:
+Use the common-pole rational formulation for smooth frequency responses:
 
 ```bash
 python3 surrogate.py --model neuro-tf train \
@@ -1194,6 +1194,27 @@ python3 surrogate.py --model neuro-tf train \
   --parameter-names W,L \
   --order 10
 ```
+
+To let the data relocate one common stable pole set before coefficient
+extraction, enable adaptive placement explicitly:
+
+```bash
+python3 surrogate.py --model neuro-tf train \
+  --mdif neuro_tf_sample_training_verification.mdif \
+  --out-dir outputs/neuro_tf_adaptive_poles \
+  --parameter-names W,L \
+  --order 10 \
+  --pole-placement adaptive \
+  --pole-iterations 6
+```
+
+`fixed` remains the default so existing commands reproduce the established
+model. Adaptive placement starts from that same grid, performs shared
+denominator relocation on the dominant broadband training-response modes, and
+retains the fixed grid if none of the relocation iterations lowers the
+representative rational-fit RMSE. Compare both methods during optimization
+with `--pole-placements fixed,adaptive` or
+`--optimize-parameter pole_placement=fixed,adaptive`.
 
 See the [Neuro-TF command reference](#neuro-tf-command-reference) for rational
 orders, pole controls, passivity/reciprocity handling, optimization, prediction,
@@ -1220,6 +1241,8 @@ Existing `*-options` spellings remain supported as compatibility aliases.
 | `--hidden-layers 64,64` | `--hidden-layers '32;64;64,64'` |
 | `--order 10` | `--orders 6,10,14` |
 | `--pole-damping 0.18` | `--pole-dampings 0.12,0.18,0.28` |
+| `--pole-iterations 6` | `--pole-iterations 6` |
+| `--pole-placement adaptive` | `--pole-placements fixed,adaptive` |
 | `--ridge 1e-8` | `--ridges 1e-10,1e-8,1e-6` |
 | KBNN `--mode residual` | KBNN `--modes residual,prior-input` |
 
@@ -1293,7 +1316,7 @@ Supported adaptive domains by model are:
 | --- | --- |
 | DNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `learning_rate`, `output_domain`, `passivity_penalty`, `patience`, `target_z0` |
 | KBNN | `activation`, `batch_size`, `epochs`, `freq_transform`, `hidden_layers`, `include_coarse_input`, `learning_rate`, `mode`, `passivity_penalty`, `patience` |
-| Neuro-TF | `activation`, `batch_size`, `epochs`, `hidden_layers`, `learning_rate`, `order`, `patience`, `pole_damping`, `ridge` |
+| Neuro-TF | `activation`, `batch_size`, `epochs`, `hidden_layers`, `learning_rate`, `order`, `patience`, `pole_damping`, `pole_iterations`, `pole_placement`, `ridge` |
 
 This example searches learning rate, activation, and neural architecture while
 requiring a passive result:
@@ -1421,8 +1444,9 @@ values are easy to edit before export.
 
 #### Generate a Model Debug Report
 
-Use the model debugger when fitting error improves but every DNN or KBNN trial
-still violates passivity. It reads the optimize ranking CSV and each retained
+Use the model debugger when fitting error improves but every DNN, KBNN, or
+Neuro-TF trial still violates passivity, or when Neuro-TF stops improving. It
+reads the optimize ranking CSV and each retained
 `verification_summary.json`, so it does not require the trial's
 `metadata.json` or `model.npz`:
 
@@ -1457,6 +1481,15 @@ New optimize runs retain `metadata.json` for every completed DNN, KBNN, and
 Neuro-TF trial. Use `--keep-trial-models` only when the actual network weights
 or complete KBNN coarse/fine packages must also remain available; it is not
 needed for this report.
+
+For Neuro-TF, the report adds a staged error table and diagnoses five distinct
+sources: rational-only training error, rational-only verification error,
+geometry-to-coefficient interpolation error, rational-basis conditioning, and
+global passivity contraction. It reports the rational-to-final verification
+RMSE ratio and emits separate copyable commands for an adaptive-pole search, a
+coefficient-network search, or response-aware additional points. This is the
+preferred way to decide whether more EM geometries can help before spending
+another simulation batch.
 
 The suggested-command section is conditional. It can produce:
 
@@ -1505,7 +1538,7 @@ before execution, run:
 python3 surrogate.py --options-json options.json debug-model --explain-options
 ```
 
-The `--run-dir` value must name the completed DNN/KBNN train or optimize output,
+The `--run-dir` value must name the completed DNN, KBNN, or Neuro-TF train or optimize output,
 not the future `model_debug` output directory. Disjoint duplicate object
 fragments are merged for compatibility, while conflicting duplicate settings
 now produce a specific duplicate-key error instead of being silently ignored.
@@ -1827,12 +1860,13 @@ trial.
 
 After the initial fit, use its geometry-level verification errors to select new
 EM points. Simulate the returned points before continuing to the refit stage.
-There are three supported adaptive selectors plus the separate range-extension
+There are four supported adaptive selectors plus the separate range-extension
 workflow:
 
 | Update method | Acquisition option | Use it when |
 | --- | --- | --- |
 | Hybrid adaptive GP | `--acquisition hybrid` | **Default.** Divides every dimension-scaled batch among predicted-error exploitation, posterior-uncertainty reduction, and maximin coverage. |
+| Rational-response hybrid | `--acquisition rational-hybrid` | Experimental response-aware alternative. Uses verification error for exploitation, a common-pole rational/PCA/GP helper for broadband-response uncertainty, and maximin coverage. Requires simulated training responses through `--existing-mdif`. |
 | Gaussian-process UCB | `--acquisition gp-ucb` | Compatibility method using a single upper-confidence score plus novelty. It now posterior-updates between batch selections. |
 | Non-GP error-distance | `--acquisition error-distance` | Use it for direct, local refinement around measured high-error verification points without fitting an error-surface model. |
 | One-sided range extension | `generate --extend-range` | A declared parameter bound must move outward and the new slab needs guaranteed coverage before error-directed refinement. |
@@ -2280,6 +2314,68 @@ python3 surrogate.py points suggest-additional \
 More GP examples—including six-parameter, range-extension, KBNN, Neuro-TF,
 and exploration-versus-exploitation commands—are provided under
 [Copyable Adaptive Point-Generation Examples](#copyable-adaptive-point-generation-examples).
+
+### Rational-Response Hybrid Additional Points
+
+Use `rational-hybrid` when the final-model verification error is improving
+slowly, narrowband resonances move with geometry, or Neuro-TF reports a large
+rational verification-to-training gap. This is an acquisition-only helper: it
+does not change the DNN, KBNN, or Neuro-TF that will eventually be exported.
+
+The method retains the standard hybrid allocation but changes its uncertainty
+source:
+
+- `exploitation` still uses the GP fitted to measured geometry-level
+  `verification_metrics.csv` error;
+- `rational-uncertainty` uses GPs fitted to low-rank,
+  response-conditioned common-pole coefficients from simulated training data;
+- `coverage` still uses maximin distance in normalized parameter space.
+
+Pass the cumulative geometry CSV for domain and duplicate handling, and pass
+the MDIF containing the corresponding simulated responses. A combined MDIF is
+valid: blocks labeled verification are excluded from the rational helper and
+never become helper training data; measured exploitation error comes from the
+separate `verification_metrics.csv` resolved by `--fit-dir` or
+`--verification-metrics`.
+
+If no optimize trial passed the promotion passivity filter, use the sweep root
+with `--allow-nonpassive`. That opt-in supplies the retained error metrics for
+acquisition only; it does not make that source model exportable. The rational
+response helper still uses only training-labeled blocks from `--existing-mdif`.
+
+```bash
+python3 surrogate.py points suggest-additional \
+  --fit-dir outputs/dnn_refit \
+  --existing-points outputs/round_3_all_geometries.csv \
+  --existing-mdif data/train_verify_round_3.mdif \
+  --acquisition rational-hybrid \
+  --count auto \
+  --target-error 1.0 \
+  --rational-order 12 \
+  --rational-pole-placement adaptive \
+  --rational-pole-iterations 6 \
+  --rational-components 8 \
+  --rational-variance 0.995 \
+  --rational-ridge 1e-8 \
+  --gp-ard auto \
+  --min-distance 0.05 \
+  --out outputs/round_4_points.csv \
+  --combined-out outputs/round_4_all_geometries.csv
+```
+
+`--rational-frequency-weights` optionally applies the same exact-frequency and
+band syntax as model `--frequency-weights`, but only to this acquisition
+helper. The new-points CSV adds `rational_response_uncertainty` and
+`rational_response_change`. Compare `acquisition_score` only within the same
+`selection_component`, because exploitation, rational uncertainty, and
+coverage intentionally have different score units.
+
+The companion JSON records the pole-relocation history, rational basis
+conditioning, retained PCA variance, latent GP length scales, and candidate
+uncertainty/change distributions. If relocation does not improve the compact
+broadband fitting criterion, the helper records `fixed_grid_retained=true` and
+uses the original stable logarithmic pole grid. Appendix C gives the complete
+mathematics and limitations.
 
 ### Extending an Existing Parameter Range
 
@@ -2838,7 +2934,7 @@ unambiguous.
 
 | Option | Subcommands | Description | Example |
 | --- | --- | --- | --- |
-| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: default <code>hybrid</code>, compatibility <code>gp-ucb</code>, or non-GP <code>error-distance</code>. Hybrid assigns explicit exploitation, uncertainty, and coverage roles. | <nobr><code>--acquisition hybrid</code></nobr> |
+| <nobr><code>--acquisition MODE</code></nobr> | <code>suggest-additional</code> | Candidate acquisition: default <code>hybrid</code>, response-aware <code>rational-hybrid</code>, compatibility <code>gp-ucb</code>, or non-GP <code>error-distance</code>. The two hybrid methods assign explicit exploitation, uncertainty, and coverage roles. | <nobr><code>--acquisition rational-hybrid</code></nobr> |
 | <nobr><code>--allow-nonpassive</code></nobr> | <code>suggest-additional</code> | Allows an all-passivity-ineligible optimize/sweep run's retained verification errors to drive point selection. This is an explicit acquisition-only opt-in and never makes the source model exportable. | <nobr><code>--fit-dir outputs/dnn_adaptive --allow-nonpassive</code></nobr> |
 | <nobr><code>--exploration-weight VALUE</code></nobr> | <code>suggest-additional</code> | Non-negative GP uncertainty multiplier or <code>auto</code>. Auto starts at <code>2.5</code> for sparse observations and reduces to <code>1.0</code> or <code>0.75</code> as the fit matures. Default: <code>auto</code>. | <nobr><code>--exploration-weight auto</code></nobr> |
 | <nobr><code>--gp-ard {auto,on,off}</code></nobr> | <code>suggest-additional</code> | Per-parameter length-scale fitting. Auto activates at <code>max(3*d,12)</code> error observations. Default: <code>auto</code>. | <nobr><code>--gp-ard auto</code></nobr> |
@@ -2846,11 +2942,19 @@ unambiguous.
 | <nobr><code>--gp-length-scale VALUE</code></nobr> | <code>suggest-additional</code> | Optional fixed normalized Matérn-5/2 scale: one value for isotropic behavior or one comma-separated value per parameter. Omit it for likelihood/ARD selection. | <nobr><code>--gp-length-scale 0.3,0.6,0.4</code></nobr> |
 | <nobr><code>--gp-noise-variance FLOAT</code></nobr> | <code>suggest-additional</code> | Non-negative normalized covariance nugget for GP stability and noisy error observations. Default: <code>1e-6</code>. | <nobr><code>--gp-noise-variance 1e-5</code></nobr> |
 | <nobr><code>--previous-verification-metrics PATH</code></nobr> | <code>suggest-additional</code> | Repeat prior metrics files in oldest-to-newest order to include latest RMS improvement in automatic count and allocation decisions. | <nobr><code>--previous-verification-metrics round_2/verification_metrics.csv</code></nobr> |
+| <nobr><code>--rational-components INT</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Maximum response PCA coordinates modeled by latent GPs. Default: <code>8</code>. | <nobr><code>--rational-components 8</code></nobr> |
+| <nobr><code>--rational-frequency-weights SPEC</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Optional acquisition-helper frequency weights, using the same exact-frequency/range syntax as model fitting. | <nobr><code>--rational-frequency-weights 'default=1;8GHz:12GHz=4'</code></nobr> |
+| <nobr><code>--rational-order INT</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Positive common-pole order. Default: <code>12</code>. | <nobr><code>--rational-order 16</code></nobr> |
+| <nobr><code>--rational-pole-damping FLOAT</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Positive damping for the initial stable pole grid. Default: <code>0.18</code>. | <nobr><code>--rational-pole-damping 0.12</code></nobr> |
+| <nobr><code>--rational-pole-iterations INT</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Maximum adaptive common-pole relocation iterations. Default: <code>6</code>. | <nobr><code>--rational-pole-iterations 8</code></nobr> |
+| <nobr><code>--rational-pole-placement {fixed,adaptive}</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Helper pole construction. Default: <code>adaptive</code>, with automatic fixed-grid fallback when relocation does not improve representative response RMSE. | <nobr><code>--rational-pole-placement adaptive</code></nobr> |
+| <nobr><code>--rational-ridge FLOAT</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | Non-negative rational coefficient regularization. Default: <code>1e-8</code>. | <nobr><code>--rational-ridge 1e-7</code></nobr> |
+| <nobr><code>--rational-variance FLOAT</code></nobr> | <code>suggest-additional</code> with <code>rational-hybrid</code> | PCA variance fraction in $(0,1]$, subject to the component cap. Default: <code>0.995</code>. | <nobr><code>--rational-variance 0.999</code></nobr> |
 | <nobr><code>--target-error FLOAT</code></nobr> | <code>suggest-additional</code> | Positive desired RMS geometry-level value of the selected metric. Enables target-relative automatic sizing and a zero-point target-met result. | <nobr><code>--target-error 1.0</code></nobr> |
 | <nobr><code>--verification-batch INT</code></nobr> | <code>suggest-additional</code> | Automatic acquisition-verification points per crossed training milestone. Default: <code>max(2,ceil(2*d/3))</code>. | <nobr><code>--verification-batch 4</code></nobr> |
 | <nobr><code>--verification-interval INT</code></nobr> | <code>suggest-additional</code> | Positive training-point growth between automatic verification milestones. Default: <code>2*d</code>. | <nobr><code>--verification-interval 12</code></nobr> |
 | <nobr><code>--verification-max-add INT</code></nobr> | <code>suggest-additional</code> | Positive cap on automatic verification points added by one command, including catch-up. Default: <code>max(d+2,6)</code>. | <nobr><code>--verification-max-add 8</code></nobr> |
-| <nobr><code>--verification-policy {auto,off}</code></nobr> | <code>suggest-additional</code> | Enables dimension-scaled acquisition-verification growth for hybrid and GP-UCB training batches. Default: <code>auto</code>. | <nobr><code>--verification-policy off</code></nobr> |
+| <nobr><code>--verification-policy {auto,off}</code></nobr> | <code>suggest-additional</code> | Enables dimension-scaled acquisition-verification growth for hybrid, rational-hybrid, and GP-UCB training batches. Default: <code>auto</code>. | <nobr><code>--verification-policy off</code></nobr> |
 
 ### Output and Dataset Splits
 
@@ -2875,7 +2979,7 @@ unambiguous.
 | <nobr><code>--bare-values MODE</code></nobr> | <code>generate</code>, <code>suggest-additional</code> | Interprets unitless values from existing input rows. Generate accepts <code>parameter-units</code> or <code>base-units</code> and defaults to parameter units. Suggest also accepts and defaults to <code>auto</code>, which tests both interpretations independently for the metrics file and each geometry/MDIF source against the saved domain. This supports generated values expressed in <code>um</code> even when ADS rewrites fitted metrics in unitless SI base units. | <nobr><code>--bare-values auto</code></nobr> |
 | <nobr><code>--candidate-count INT</code></nobr> | <code>suggest-additional</code> | Positive candidate-pool size. Default: the greater of 1000 and the planned primary-plus-automatic-verification count times <code>candidate-factor</code>. | <nobr><code>--candidate-count 5000</code></nobr> |
 | <nobr><code>--candidate-factor INT</code></nobr> | <code>suggest-additional</code> | Positive candidate multiplier used when <code>--candidate-count</code> is omitted. Default: <code>200</code>. | <nobr><code>--candidate-factor 300</code></nobr> |
-| <nobr><code>--existing-mdif PATH</code></nobr> | <code>suggest-additional</code> | Repeatable MDIF containing previously simulated parameter points to avoid. | <nobr><code>--existing-mdif training.mdif</code></nobr> |
+| <nobr><code>--existing-mdif PATH</code></nobr> | <code>suggest-additional</code> | Repeatable MDIF containing previously simulated parameter points to avoid. It is also the required positive-frequency training-response source for <code>rational-hybrid</code>; verification-labeled blocks remain excluded from its helper fit. | <nobr><code>--existing-mdif training.mdif</code></nobr> |
 | <nobr><code>--fit-dir PATH</code></nobr> | <code>suggest-additional</code> | Direct fit/model directory or optimize/sweep root. A sweep root resolves <code>best_model/verification_metrics.csv</code>, or its acquisition-only fallback when <code>--allow-nonpassive</code> is present. Ignored when <code>--verification-metrics</code> is given. | <nobr><code>--fit-dir outputs/dnn_adaptive</code></nobr> |
 | <nobr><code>--focus-power FLOAT</code></nobr> | <code>suggest-additional</code> | With <code>--acquisition error-distance</code>, non-negative exponent applied to verification-error scores. Default: <code>1.0</code>. | <nobr><code>--focus-power 1.5</code></nobr> |
 | <nobr><code>--focus-radius FLOAT</code></nobr> | <code>suggest-additional</code> | With <code>--acquisition error-distance</code>, positive unit-cube radius around high-error verification points. Default: <code>0.25</code>. | <nobr><code>--focus-radius 0.2</code></nobr> |
@@ -5418,12 +5522,13 @@ $$
 \mathbf p
 \xrightarrow{\mathrm{MLP}}
 \widehat{\mathbf C}(\mathbf p)
-\xrightarrow{\text{fixed-pole rational basis}}
+\xrightarrow{\text{common-pole rational basis}}
 \widehat{\mathbf S}(\mathbf p,f)
 $$
 
-The rational transfer functions use fixed stable poles, so coefficient
-extraction for each geometry is linear least squares. The neural network learns
+The rational transfer functions use one shared stable pole set, created by a
+fixed grid or by adaptive common-pole relocation, so coefficient extraction for
+each geometry remains linear least squares. The neural network learns
 a QR-conditioned coefficient map whose loss is proportional to weighted complex
 S-parameter error on the training frequency grid. The decoder is folded into
 the final neural layer after training, preserving the raw coefficient interface
@@ -5474,6 +5579,11 @@ python3 surrogate.py --model neuro-tf train \
   --passivity-mode auto \
   --reciprocity-mode auto
 ```
+
+Add `--pole-placement adaptive --pole-iterations 6` to relocate the shared pole
+set from dominant training-response modes. The initial fixed grid is retained
+automatically when none of the relocation iterations improves its
+representative rational-fit RMSE.
 
 With the default `auto` modes, reciprocal training data causes reciprocal
 coefficient rows to be tied exactly. If the positive-frequency training data is
@@ -5543,6 +5653,7 @@ python3 surrogate.py --model neuro-tf optimize \
   --out-dir neuro_tf_adaptive \
   --parameter-names W,L,H \
   --search-mode adaptive \
+  --optimize-parameter pole_placement=fixed,adaptive \
   --optimize-parameter order=6:20 \
   --optimize-parameter pole_damping=0.08:0.35:log \
   --optimize-parameter ridge=1e-10:1e-5:log \
@@ -5557,7 +5668,9 @@ python3 surrogate.py --model neuro-tf optimize \
   --require-passive
 ```
 
-`order` is sampled as an integer. The positive `pole_damping`, `ridge`, and
+`pole_placement` is categorical and receives the same balanced coverage as
+other categorical adaptive options. `order` is sampled as an integer. The
+positive `pole_damping`, `ridge`, and
 `learning_rate` ranges use logarithmic sampling so each decade is represented.
 To weight specific frequency bands during coefficient fitting and model
 selection, add a normal option such as
@@ -5608,7 +5721,8 @@ Useful selection metrics:
 
 Set `--search-mode grid` to exhaustively test all combinations, keep the
 default `--search-mode random --max-trials N` to sample a discrete product, or
-use `--search-mode adaptive` with ranges for `order`, `pole_damping`, `ridge`,
+use `--search-mode adaptive` with ranges for `order`, `pole_placement`,
+`pole_iterations`, `pole_damping`, `ridge`,
 `hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, or
 `patience`.
 
@@ -5642,7 +5756,7 @@ python3 surrogate.py --model neuro-tf predict \
 
 #### ADS Harmonic-Balance Passive Network Export
 
-Export the trained coefficient network and fixed-pole response as one linear
+Export the trained coefficient network and saved common-pole response as one linear
 ADS HB subnetwork:
 
 ```bash
@@ -5657,12 +5771,12 @@ python3 surrogate.py --model neuro-tf export-ads-hb \
 The generated equations evaluate the rational S-matrix at every HB spectral
 frequency, convert it to Y, and apply it through an explicit current stamp. A
 separate explicit branch stamps DC conductance only at zero frequency. The
-model remains linear and power independent; the fixed poles provide the
+model remains linear and power independent; the saved poles provide the
 frequency dependence, not signal-amplitude dependence.
 
 #### Direct Verilog-A Export
 
-Export the saved geometry-to-coefficient network and its fixed rational poles
+Export the saved geometry-to-coefficient network and its common rational poles
 as one self-contained Verilog-A n-port:
 
 ```bash
@@ -5693,7 +5807,7 @@ before using it in optimization.
 
 #### Export Sampled ADS MDIF
 
-Export the fitted fixed-pole Neuro-TF response on either the exact geometry and
+Export the fitted common-pole Neuro-TF response on either the exact geometry and
 frequency blocks of a template MDIF or an explicit parameter/frequency grid:
 
 ```bash
@@ -5715,7 +5829,7 @@ supply `--freqs`.
 Use `export-ads-mdif` for the lowest-risk interpolation-based handoff,
 `export-ads-hb` for an integrated harmonic-balance component, or
 `export-veriloga` for direct SP/AC evaluation of the trained coefficient
-network and fixed-pole response. Both direct packages are self-contained; the
+network and common-pole response. Both direct packages are self-contained; the
 sampled MDIF remains useful as a simulator-independent cross-check.
 
 #### Options Reference
@@ -5760,13 +5874,16 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--learning-rate FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Adam optimizer step size. Lower values are safer; higher values may converge faster but can overshoot. Default: `0.002`. | <nobr><code>--learning-rate 0.002</code></nobr> |
 | <nobr><code>--learning-rates LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated Adam learning rates. `--learning-rate` accepts one train-compatible value. Default: `0.001,0.002,0.005`. | <nobr><code>--learning-rates 0.001,0.002,0.005</code></nobr> |
 | <nobr><code>--loss-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Full train/verification loss check interval in epochs. Increasing this reduces full-dataset scoring overhead during long runs while early stopping still uses epoch-based patience. Default: `1`. | <nobr><code>--loss-interval 5</code></nobr> |
-| <nobr><code>--order INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of fixed stable rational poles used for each S-parameter transfer function. Higher values can fit sharper frequency behavior but increase coefficient count and NN output dimension. Default: `10`. | <nobr><code>--order 12</code></nobr> |
+| <nobr><code>--order INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Number of shared stable rational poles used for each S-parameter transfer function. Higher values can fit sharper frequency behavior but increase coefficient count and NN output dimension. Default: `10`. | <nobr><code>--order 12</code></nobr> |
 | <nobr><code>--orders LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated rational pole counts. `--order` accepts one train-compatible value. Default: `6,10,14`. | <nobr><code>--orders 8,10,12,16</code></nobr> |
 | <nobr><code>--passivity-margin FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Target margin below $\sigma_{\max}=1$ when passivity contraction is active. The saved RF coefficients are scaled toward zero by one common factor only when needed. Must be in $[0,1)$. Default: `0.001`. | <nobr><code>--passivity-margin 0.001</code></nobr> |
 | <nobr><code>--passivity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` contracts only when the positive-frequency training data is passive; `enforce` contracts any complete fitted S-matrix; `off` preserves the unconstrained response. Assessment and scaling use training blocks only, never verification blocks. Default: `auto`. | <nobr><code>--passivity-mode auto</code></nobr> |
 | <nobr><code>--patience INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Early-stopping patience measured in epochs without validation-loss improvement. Use `0` to disable early stopping. Default: `200`. | <nobr><code>--patience 200</code></nobr> |
 | <nobr><code>--pole-damping FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Real-part damping factor for the fixed pole grid. Larger values make poles more damped and smoother; smaller values can follow sharper resonances but may be more sensitive. Default: `0.18`. | <nobr><code>--pole-damping 0.18</code></nobr> |
 | <nobr><code>--pole-dampings LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated pole damping values. `--pole-damping` accepts one train-compatible value. Default: `0.12,0.18,0.28`. | <nobr><code>--pole-dampings 0.12,0.18,0.28</code></nobr> |
+| <nobr><code>--pole-iterations INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum common-pole relocation iterations when adaptive placement is selected. The fixed-grid candidate is also scored and retained when better. Default: `6`. | <nobr><code>--pole-iterations 8</code></nobr> |
+| <nobr><code>--pole-placement {fixed,adaptive}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Common-pole construction for one configuration. `fixed` preserves prior behavior; `adaptive` relocates from leading broadband training modes. Default: `fixed`. | <nobr><code>--pole-placement adaptive</code></nobr> |
+| <nobr><code>--pole-placements LIST</code></nobr> | <code>sweep</code>, <code>optimize</code> | Comma-separated placement candidates. `--pole-placement` accepts one train-compatible value. Default: `fixed`. | <nobr><code>--pole-placements fixed,adaptive</code></nobr> |
 | <nobr><code>--progress-interval INT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Console progress update interval in epochs. Updates redraw one terminal status line and include epoch count, elapsed time, and loss values when that epoch also matches `--loss-interval`. Use `0` to disable. Default: `25`. | <nobr><code>--progress-interval 10</code></nobr> |
 | <nobr><code>--reciprocity-mode {auto,enforce,off}</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | `auto` ties every fitted $S_{ij}$/$S_{ji}$ coefficient pair when the source training response is reciprocal; `enforce` always ties a complete S-matrix; `off` leaves ordered entries independent. Default: `auto`. | <nobr><code>--reciprocity-mode auto</code></nobr> |
 | <nobr><code>--reciprocity-tolerance FLOAT</code></nobr> | <code>train</code>, <code>sweep</code>, <code>optimize</code> | Maximum relative source $S_{ij}$/$S_{ji}$ disagreement accepted by reciprocity auto-detection. Must be finite and non-negative. Default: `1e-6`. | <nobr><code>--reciprocity-tolerance 1e-6</code></nobr> |
@@ -5789,7 +5906,7 @@ the **Subcommands** column includes accepted command aliases.
 | <nobr><code>--max-passivity-sigma FLOAT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials whose worst predicted S-matrix singular value is at or below this value when selecting `best_model/`. | <nobr><code>--max-passivity-sigma 1.000001</code></nobr> |
 | <nobr><code>--max-passivity-violations INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with this many or fewer passivity-violating frequency points when selecting `best_model/`. | <nobr><code>--max-passivity-violations 0</code></nobr> |
 | <nobr><code>--max-trials INT</code></nobr> | <code>sweep</code>, <code>optimize</code> | Maximum configurations evaluated. In `adaptive` mode this is the sequential trial budget; in `random` mode it limits the sample; in `grid` mode it truncates the product list. Default: `24`. | <nobr><code>--max-trials 40</code></nobr> |
-| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. Neuro-TF supports `order`, `pole_damping`, `ridge`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter order=6:20</code></nobr> |
+| <nobr><code>--optimize-parameter SPEC</code></nobr> | <code>sweep</code>, <code>optimize</code> | Repeatable adaptive domain. Neuro-TF supports `order`, `pole_placement`, `pole_iterations`, `pole_damping`, `ridge`, `hidden_layers`, `activation`, `learning_rate`, `batch_size`, `epochs`, and `patience`. | <nobr><code>--optimize-parameter pole_placement=fixed,adaptive</code></nobr> |
 | <nobr><code>--require-passive</code></nobr> | <code>sweep</code>, <code>optimize</code> | Only consider trials with zero passivity-violating frequency points when selecting `best_model/`. Equivalent to `--max-passivity-violations 0` unless a stricter value is supplied. | <nobr><code>--require-passive</code></nobr> |
 | <nobr><code>--retrain-best</code></nobr> | <code>sweep</code>, <code>optimize</code> | Retrain the selected best configuration at the end of the sweep instead of using the best completed trial model promoted during the sweep. Use this when you want `--worst-plots` to apply only to the final model. | <nobr><code>--retrain-best</code></nobr> |
 | <nobr><code>--search-mode {adaptive,grid,random}</code></nobr> | <code>sweep</code>, <code>optimize</code> | Search strategy. `adaptive` learns sequentially from completed trials. Legacy `--mode` remains an alias. Default: `random`. | <nobr><code>--search-mode adaptive</code></nobr> |
@@ -6587,14 +6704,15 @@ a fitted coarse S-parameter DNN is frozen and used as a residual baseline
 and/or prior input. It does not implement every internal knowledge neuron or
 input/output space-mapping topology described in the literature.
 
-### B.5 Neuro-TF: fixed-pole rational coefficient surrogate
+### B.5 Neuro-TF: common-pole rational coefficient surrogate
 
 #### Two-stage construction
 
 Neuro-TF separates frequency representation from geometry interpolation:
 
-1. fit one rational response at every training geometry using a common fixed
-   pole set;
+1. construct one common stable pole set using either the fixed logarithmic grid
+   or adaptive relocation, then fit one rational response at every training
+   geometry;
 2. train an MLP from geometry parameters to the real and imaginary rational
    coefficients.
 
@@ -6633,6 +6751,53 @@ $$
 Every pole has a negative real part for a positive damping value, giving a
 stable fixed basis. Poles are shared by all geometries and all S-parameters;
 the MLP predicts coefficients, not pole locations.
+
+#### Adaptive common-pole placement
+
+With `--pole-placement adaptive`, the fixed grid above becomes the initial
+condition for a compact common-denominator vector-fitting iteration. Let
+$\mathbf F\in\mathbb C^{N_f\times N_r}$ contain every training-geometry and
+S-parameter response on the most widely shared frequency grid. The
+implementation first applies the configured frequency weights and forms
+
+$$
+\mathbf W_f^{1/2}\mathbf F
+=\mathbf U\boldsymbol\Sigma\mathbf V^{\mathrm H}.
+$$
+
+At most eight leading weighted response modes are retained. If
+$\mathbf f_\ell$ is one of those modes and the current poles are
+$a_1,\ldots,a_K$, one relaxed relocation step solves the shared-denominator
+least-squares equations
+
+$$
+\sum_{k=1}^{K}\frac{c_{\ell k}}{s-a_k}
++d_\ell
+-f_\ell(s)\sum_{k=1}^{K}\frac{\widetilde c_k}{s-a_k}
+\approx f_\ell(s),
+$$
+
+where $c_{\ell k}$ and $d_\ell$ are mode-specific numerator terms while
+$\widetilde c_k$ is shared by every response mode. The denominator zeros are
+the eigenvalues of
+
+$$
+\operatorname{diag}(\mathbf a)
+-\mathbf 1\widetilde{\mathbf c}^{\mathsf T}.
+$$
+
+After every relocation, the implementation pairs conjugates and reflects the
+real parts into the stable half-plane. It then refits the representative
+responses with the candidate basis and records weighted RMSE. The selected
+basis is the lowest-RMSE basis seen across the initial grid and all requested
+iterations. Therefore adaptive mode retains the fixed grid when pole
+relocation is neutral or harmful.
+
+This is a reduced common-pole relocation stage inspired by vector fitting, not
+a claim of exact EM sensitivity or a continuous-domain passive macromodel. It
+uses only already simulated positive-frequency training responses. The fitted
+poles remain global; there is no geometry-dependent pole tracking at
+prediction or export time.
 
 #### Per-geometry coefficient extraction
 
@@ -6770,9 +6935,11 @@ continuous parameter and frequency values; validate the intended export grid.
 
 #### Important implementation boundaries
 
-- The pole set is generated once from the training band; this implementation
-  does not relocate poles with vector fitting.
-- Pole tracking across geometries is unnecessary because poles are fixed.
+- `fixed` generates poles once from the training band. `adaptive` relocates one
+  common pole set from representative training modes, but it does not fit
+  separate moving poles at each geometry.
+- Pole tracking across geometries remains unnecessary because either placement
+  method produces one shared pole set.
 - QR conditioning prevents ill-conditioned raw coefficients from defining the
   neural loss, but it cannot repair an inadequate rational pole basis.
 - Auto reciprocity is exact after its output projection. Auto passivity is
@@ -6784,7 +6951,7 @@ continuous parameter and frequency values; validate the intended export grid.
   size—is the current bottleneck.
 - Accuracy is determined jointly by rational order, pole damping, frequency
   weighting, ridge regularization, geometry coverage, and MLP capacity.
-- Direct export evaluates the fixed-pole equation; it does not sample and
+- Direct export evaluates the saved common-pole equation; it does not sample and
   interpolate a hidden lookup table.
 
 #### Persistence and export
@@ -6799,11 +6966,11 @@ Verilog-A and ADS HB exports evaluate the coefficient MLP, reconstruct the
 rational S-matrix at simulator frequency, convert it to Y, and stamp the same
 N-port relation used by the other families.
 
-This repository's method is best described as a **fixed-pole pole-residue
-Neuro-TF variant**. It is inspired by combined neural-network/transfer-function
-modeling, but it is not the pole-relocation, pole-tracking, hybrid
-pole-residue/rational, or sensitivity-assisted algorithm from any one cited
-paper.
+This repository's method is best described as a **common-pole pole-residue
+Neuro-TF variant** with fixed-grid and reduced adaptive-relocation alternatives.
+It is inspired by combined neural-network/transfer-function modeling and vector
+fitting, but it is not the pole-tracking, multivariate macromodel, or
+sensitivity-assisted algorithm from any one cited paper.
 
 ### B.6 Prediction, validation, and model selection
 
@@ -6877,7 +7044,7 @@ Thus scaling changes the ADS unit convention without changing the fitted model.
 | Neural target | Complex S or Y at each RF row | Fine complex S or fine-minus-fitted-coarse complex S | QR-conditioned rational response coordinates per geometry |
 | RF neural samples per geometry | Number of positive-frequency rows | Number of positive-frequency rows | One |
 | Frequency structure | Learned directly | Learned directly around coarse knowledge | Fixed stable pole basis |
-| Prior model | None | Frozen fitted S-domain DNN | Fixed rational basis |
+| Prior model | None | Frozen fitted S-domain DNN | Fixed or adaptively relocated common-pole rational basis |
 | Typical strength | Maximum response flexibility | Efficient correction when useful coarse data exists | Compact broadband frequency representation |
 | Main risk | Data demand and unconstrained frequency interpolation | Bias or error inherited from coarse model and mode choice | Insufficient pole order/basis placement or nonsmooth coefficient map |
 | RF passivity enforcement | S-domain singular-value loss, optional hard-negative collocation, feasibility-first checkpointing, and automatic sampled guard-domain contraction | Reconstructed-fine-S singular-value loss, optional coarse/fine collocation, feasibility-first checkpointing, and sampled guard-domain contraction | Automatic sampled training-domain contraction for passive source data; verification remains independent |
@@ -6918,8 +7085,9 @@ every algorithm in those publications.
    responses by vector fitting,” *IEEE Transactions on Power Delivery*, vol.
    14, no. 3, pp. 1052–1061, 1999.
    [doi:10.1109/61.772353](https://doi.org/10.1109/61.772353). General rational
-   frequency-response fitting background. This repository uses fixed poles and
-   linear ridge least squares rather than vector-fitting pole relocation.
+   frequency-response fitting background. This repository uses its relaxed
+   common-denominator relocation idea for adaptive poles, followed by stable
+   conjugate projection and linear ridge coefficient extraction.
 6. X. Glorot and Y. Bengio, “Understanding the difficulty of training deep
    feedforward neural networks,” *Proceedings of AISTATS*, PMLR 9, pp. 249–256,
    2010. [PMLR paper](https://proceedings.mlr.press/v9/glorot10a.html).
@@ -6956,16 +7124,17 @@ normative implementation:
 | Primary workflow and model-family command dispatch | [`surrogate.py`](surrogate.py) |
 | DNN features, S/Y targets, training, persistence, and commands | [`dnn.py`](dnn.py) |
 | KBNN coarse fitting, identity checks, modes, targets, and composite export | [`kbnn.py`](kbnn.py) |
-| Fixed-pole construction, rational coefficient extraction, and Neuro-TF evaluation | [`neuro_tf.py`](neuro_tf.py) |
+| Fixed/adaptive common-pole construction, rational coefficient extraction, and Neuro-TF evaluation | [`neuro_tf.py`](neuro_tf.py) |
 | MDIF parsing, splitting, weighting, MLP/Adam, metrics, exact DC, and simulator generators | [`surrogate_common.py`](surrogate_common.py) |
 | DC and export regression coverage | [`tests/test_dc_conductance_model.py`](tests/test_dc_conductance_model.py) and [`tests/test_ads_hb_export.py`](tests/test_ads_hb_export.py) |
 
 ## Appendix C: Gaussian-Process Adaptive Point Selection
 
 This appendix documents the exact GP-assisted point-selection implementation
-in `generate_points.py`. The GP is not the exported RF surrogate and does not
-predict S-parameters. It is a small auxiliary model of **geometry-level
-surrogate error** used only to choose the next expensive EM geometries.
+in `generate_points.py`. These GPs are never exported. The default methods use
+a small auxiliary model of **geometry-level surrogate error**; the optional
+`rational-hybrid` method also builds an acquisition-only broadband-response
+surrogate from simulated training MDIF.
 
 ### C.1 End-to-end data flow
 
@@ -6982,7 +7151,9 @@ One adaptive round follows this sequence:
 7. Recommend a primary batch size from dimension, current error, target error,
    observation density, and optional prior-round improvement.
 8. Allocate the default hybrid batch among exploitation, uncertainty, and
-   coverage; posterior-condition on each provisional selection.
+   coverage; posterior-condition on each provisional selection. With
+   `rational-hybrid`, build the training-response rational/PCA/latent-GP helper
+   first and use its response uncertainty for the uncertainty allocation.
 9. Write its physical parameter values to CSV and simulate
    that batch externally.
 10. Append the resulting MDIF blocks, refit the RF surrogate, and repeat.
@@ -7255,10 +7426,178 @@ counts, and the next-round CSV path. Consequently, round $k+1$ needs only the
 latest cumulative CSV as `--existing-points`, rather than a growing list of all
 earlier batch files.
 
-### C.8 Range extension behavior
+### C.8 Rational-response hybrid acquisition
 
-`generate --extend-range` and `suggest-additional --acquisition gp-ucb` serve
-different purposes:
+The `rational-hybrid` method supplements the scalar error GP with a parametric
+rational helper. It uses the same normalized geometry domain and candidate
+pool as the other selectors, but it learns broadband response structure from
+the positive-frequency **training** blocks in every `--existing-mdif`.
+Verification-labeled blocks and exact-zero-Hz rows are excluded.
+
+#### Relation to the adjoint-sensitivity sampling paper
+
+Na et al.'s published method begins with three coordinates per dimension,
+which partitions a $d$-dimensional box into $2^d$ axis-aligned subregions. For
+each subregion, let the $2^d$ corners be $mathbf x_q$, let
+$mathbf y(mathbf x_q)$ be the EM response, and let
+$\mathbf J_y(\mathbf x_q)$ be the EM response Jacobian supplied by the
+simulator. Its local response basis can be written compactly as
+
+$$
+\mathbf h(\mathbf x)=
+\left[
+\left\{\prod_{i=1}^{d}x_i^{k_i}:\mathbf k\in\{0,1\}^{d}\right\},
+x_1^2,\ldots,x_d^2
+\right]^{\mathsf T},
+\qquad N_h=2^d+d.
+$$
+
+The response and derivative constraints are stacked as
+
+$$
+\mathbf A=
+\begin{bmatrix}
+\mathbf h(\mathbf x_1)^{\mathsf T}\\
+\vdots\\
+\mathbf h(\mathbf x_{2^d})^{\mathsf T}\\
+\mathbf J_h(\mathbf x_1)\\
+\vdots\\
+\mathbf J_h(\mathbf x_{2^d})
+\end{bmatrix},
+\qquad
+\mathbf B=
+\begin{bmatrix}
+\mathbf y(\mathbf x_1)^{\mathsf T}\\
+\vdots\\
+\mathbf y(\mathbf x_{2^d})^{\mathsf T}\\
+\mathbf J_y(\mathbf x_1)^{\mathsf T}\\
+\vdots\\
+\mathbf J_y(\mathbf x_{2^d})^{\mathsf T}
+\end{bmatrix},
+$$
+
+and the local interpolant is obtained by least squares,
+
+$$
+\mathbf G^{\mathsf T}=\mathbf A^{+}\mathbf B,
+\qquad
+\mathbf F(\mathbf x)=\mathbf G\mathbf h(\mathbf x).
+$$
+
+The true response at each subregion center tests this interpolant. The method
+bisects the worst-error subregion and repeats until every local center error is
+below the requested threshold. Its data efficiency comes from the exact EM
+Jacobians: every corner solve supplies response and derivative constraints.
+Without simulator-produced sensitivities, finite-difference substitutes would
+require additional nearby geometry simulations and remove much of that
+advantage.
+
+`rational-hybrid` is the response-only alternative implemented here. It does
+not construct an initial $3^d$ grid, axis-aligned subregions, or finite-
+difference Jacobians. It starts from any existing design, compresses each full
+frequency response with a shared-pole rational basis, learns smooth latent
+response coordinates over geometry, and scores a finite maximin candidate
+pool. Thus it preserves the paper's useful principle—put more samples where
+the response changes nonlinearly—without claiming sensitivities unavailable
+from the supplied MDIF.
+
+#### Common-pole response coordinates
+
+For geometry $\mathbf u_g$, the helper represents each S-parameter as
+
+$$
+S_q(s,\mathbf u_g)
+=c_{q0}(\mathbf u_g)
++\sum_{k=1}^{K}\frac{c_{qk}(\mathbf u_g)}{s-p_k},
+$$
+
+where $q$ indexes the ordered S-parameters and one pole set $\{p_k\}$ is
+shared by every geometry and response. `--rational-pole-placement fixed` uses
+Appendix B's logarithmic grid; `adaptive` uses its reduced common-pole
+relocation and is the default for this acquisition method.
+
+At every geometry, weighted ridge least squares extracts the complex
+coefficients. The same QR response-conditioning transform used by Neuro-TF
+then maps raw pole/residue coordinates into real vectors $\mathbf y_g$ whose
+Euclidean error measures weighted complex response error. Duplicate geometries
+are collapsed by averaging their conditioned vectors, preventing repeated
+MDIF inputs from overweighting a location.
+
+#### PCA compression and latent GPs
+
+Let $\overline{\mathbf y}$ be the mean conditioned response and stack the
+centered geometry rows into $\mathbf Y$. The implementation computes
+
+$$
+\mathbf Y=\mathbf U\boldsymbol\Sigma\mathbf V^{\mathsf T}
+$$
+
+and retains the first $r$ coordinates that reach `--rational-variance`, subject
+to the `--rational-components` cap. The latent score of geometry $g$ is
+
+$$
+\mathbf z_g=(\mathbf y_g-\overline{\mathbf y})\mathbf V_r.
+$$
+
+One standardized Matérn-5/2 GP is fitted to each component $z_j(\mathbf u)$.
+Each component selects its own isotropic likelihood scale and, when permitted
+by `--gp-ard`, its own coordinate-refined ARD scales. If the posterior component
+variances at a candidate are $v_j(\mathbf u)$, normalized broadband-response
+uncertainty is
+
+$$
+U_R(\mathbf u)=
+\frac{\sqrt{\sum_{j=1}^{r}v_j(\mathbf u)}}
+{\sqrt{N_g^{-1}\sum_g\|\mathbf z_g\|_2^2}}.
+$$
+
+The helper also compares the predicted score vector with the closest simulated
+training response:
+
+$$
+C_R(\mathbf u)=
+\frac{\|\widehat{\mathbf z}(\mathbf u)-
+\mathbf z_{g^*(\mathbf u)}\|_2}
+{\sqrt{N_g^{-1}\sum_g\|\mathbf z_g\|_2^2}},
+$$
+
+where $g^*(\mathbf u)$ is the nearest training geometry. Both quantities are
+robustly normalized using their candidate-pool 10th and 90th percentiles.
+The rational-uncertainty component scores
+
+$$
+A_R(\mathbf u)=
+\left(\widetilde U_R(\mathbf u)+0.35\widetilde C_R(\mathbf u)\right)
+D(\mathbf u)^{\nu_R},
+$$
+
+with $\nu_R$ limited to the same stable diversity range used by standard
+hybrid uncertainty. Exploitation still uses the measured-error GP, and
+coverage still maximizes $D$. This division is intentional: vector fitting
+compresses the frequency response, while GP posterior variance supplies the
+geometry-space uncertainty that vector fitting alone does not provide.
+
+#### Interpretation and boundaries
+
+- The method estimates response sensitivities from the parametric helper; it
+  does not recover exact EM adjoint derivatives from S-parameter data.
+- Rational fits can reduce the frequency representation dramatically, but
+  fewer required **geometries** occur only when their conditioned coefficients
+  vary smoothly in the parameter domain.
+- Shared poles avoid pole permutation and mode-label discontinuities across
+  geometry. A range with appearing/disappearing modes may need larger order or
+  may remain better served by the standard hybrid method.
+- Stability is enforced on relocated poles. Passivity is assessed by the final
+  fitted model; the acquisition helper itself is not a bounded-real passive
+  realization and is never exported.
+- Dense latent GP fitting scales cubically with the number of distinct training
+  geometries and linearly with retained components. Keep the default component
+  cap unless retrospective validation demonstrates value from a larger one.
+
+### C.9 Range extension behavior
+
+`generate --extend-range` and the adaptive `suggest-additional` acquisitions
+serve different purposes:
 
 - `generate --extend-range` samples only the new one-sided slab and appends
   those points to the original geometry CSV. It provides guaranteed initial
@@ -7275,7 +7614,7 @@ batches from that identical expanded-domain fit. This also gives the GP actual
 error observations inside the new region instead of asking it to rely entirely
 on extrapolated uncertainty.
 
-### C.9 Diagnostics and tuning
+### C.10 Diagnostics and tuning
 
 The suggested-point CSV contains:
 
@@ -7288,6 +7627,8 @@ The suggested-point CSV contains:
 | `gp_log_uncertainty` | Posterior standard deviation in natural-log-error space. |
 | `gp_upper_confidence_error` | $\exp(\mu_{\log e}+\kappa\sigma_{\log e})$ before the diversity penalty. |
 | `predicted_error` | Posterior median-scale error, $\exp(\mu_{\log e})$. |
+| `rational_response_uncertainty` | Normalized posterior uncertainty across retained conditioned-response PCA coordinates; populated by `rational-hybrid`. |
+| `rational_response_change` | Normalized predicted latent-response change from the nearest simulated training geometry; populated by `rational-hybrid`. |
 
 The companion JSON records the kernel, target transform, observation count,
 chosen length scale, selection mode, nugget, exploration weight, and log
@@ -7325,10 +7666,11 @@ model family, architecture, frequency transform, output domain, loss weights,
 and random-seed policy fixed while comparing acquisition rounds. Reserve a
 final audit set that never enters GP acquisition.
 
-### C.10 Limitations and computational cost
+### C.11 Limitations and computational cost
 
-- The auxiliary GP models one scalar aggregate error, not individual
-  S-parameter errors or the underlying complex response.
+- The standard auxiliary GP models one scalar aggregate error. Rational-hybrid
+  adds a compressed complex-response model but still uses a finite common-pole
+  basis and retained PCA subspace.
 - ARD requires enough error observations to distinguish parameter
   sensitivities. Before $\max(3d,12)$ observations, `auto` deliberately retains
   an isotropic scale rather than overfitting six or more independent scales.
@@ -7346,7 +7688,7 @@ final audit set that never enters GP acquisition.
   or retrain a surrogate. Those remain explicit steps so
   each new expensive simulation batch can be inspected.
 
-### C.11 References and normative source map
+### C.12 References and normative source map
 
 1. C. E. Rasmussen and C. K. I. Williams, *Gaussian Processes for Machine
    Learning*, MIT Press, 2006, Chapters 2 and 4.
@@ -7364,10 +7706,33 @@ final audit set that never enters GP acquisition.
    no. 3, pp. 381–402, 1995.
    [doi:10.1016/0378-3758(94)00035-T](https://doi.org/10.1016/0378-3758(94)00035-T).
    Background for maximin distance designs within Latin hypercubes.
+4. B. Gustavsen and A. Semlyen, “Rational approximation of frequency domain
+   responses by vector fitting,” *IEEE Transactions on Power Delivery*, vol.
+   14, no. 3, pp. 1052–1061, 1999.
+   [Author-hosted paper](https://www.sintef.no/globalassets/project/vectfit/vf_paper.pdf),
+   [doi:10.1109/61.772353](https://doi.org/10.1109/61.772353). Source for
+   shared-pole rational fitting and iterative pole relocation; this repository
+   applies a reduced representative-response variant.
+5. D. Deschrijver, T. Dhaene, and D. De Zutter, “Robust parametric
+   macromodeling using multivariate orthonormal vector fitting,” *IEEE
+   Transactions on Microwave Theory and Techniques*, vol. 56, no. 7, 2008.
+   [doi:10.1109/TMTT.2008.924346](https://doi.org/10.1109/TMTT.2008.924346).
+   Background for combining rational frequency models with parameter-space
+   dependence. The repository instead uses response-conditioned PCA and
+   independent latent GPs.
+6. W. Na, W. Liu, K. Liu, J. Jin, D. Jin, H. Xie, W. Zhang, and Q.-J. Zhang,
+   “Automated model generation for microwave components using adjoint neural
+   network and EM sensitivity analysis,” *IEEE Microwave and Wireless
+   Technology Letters*, vol. 34, no. 7, pp. 867–870, 2024.
+   [doi:10.1109/LMWT.2024.3391656](https://doi.org/10.1109/LMWT.2024.3391656).
+   Source for the local response-plus-Jacobian interpolation and worst-
+   subregion refinement comparison; the implemented rational-hybrid method is
+   explicitly response-only.
 
 | Area | Source |
 | --- | --- |
-| Geometry parsing, normalization, Latin hypercubes, GP fitting, acquisition, CSV/JSON output, and CLI | [`generate_points.py`](generate_points.py) |
+| Geometry parsing, normalization, Latin hypercubes, scalar/latent GP fitting, rational-hybrid acquisition, CSV/JSON output, and CLI | [`generate_points.py`](generate_points.py) |
+| Fixed/adaptive common poles, rational coefficient extraction, and response conditioning reused by acquisition | [`neuro_tf.py`](neuro_tf.py) |
 | GP, alias, default-method, and legacy-compatibility regression tests | [`tests/test_generate_points_gp.py`](tests/test_generate_points_gp.py) |
 
 ## Appendix D: Complete CLI Command and Option Reference
@@ -7395,9 +7760,9 @@ examples, although hyphenated keys are accepted too.
 | `options init` | Write a ready-to-edit reusable options JSON. `options generate` is an alias; add `--overwrite` to replace an existing file. | `python3 surrogate.py options init --out options.json` |
 | `options discover` | Recursively recover a new options JSON from existing options, geometry, audit, model, optimize, report, log, and saved-command artifacts; also write a provenance report. | `python3 surrogate.py options discover existing_project --out options.json` |
 | `points generate` | Create an initial design, append a one-sided range extension, and write CSV/JSON/PNG coverage artifacts. | `python3 surrogate.py points generate --parameter W=0.4mm:0.8mm --parameter L=1mm:2mm --count 24 --out geometries.csv` |
-| `points suggest-additional` | Use saved verification metrics and existing geometry metadata to select a recommended hybrid batch or an explicit legacy/GP-UCB alternative. | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --target-error 1.0 --out additions.csv` |
+| `points suggest-additional` | Use saved verification metrics and existing geometry metadata to select a standard hybrid batch or the rational-response, legacy GP-UCB, or local error-distance alternative. | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --target-error 1.0 --out additions.csv` |
 | `audit` | Check raw MDIF passivity, reciprocity, coverage, grids, duplicates, and train/verification consistency. | `python3 surrogate.py audit --mdif train_verify.mdif --geometry-json geometries.json --out-dir audit` |
-| `debug-model` | Diagnose why a DNN/KBNN run improves in response error without reaching verification passivity; trial metadata is optional. | `python3 surrogate.py debug-model --run-dir dnn_opt --audit audit --out-dir dnn_opt/model_debug` |
+| `debug-model` | Diagnose DNN/KBNN passivity behavior or separate Neuro-TF rational-basis, coefficient-map, and contraction error sources; trial metadata is optional. | `python3 surrogate.py debug-model --run-dir neuro_tf_opt --audit audit --out-dir neuro_tf_opt/model_debug` |
 | `--model MODEL inspect-mdif` | Summarize blocks, S-parameter labels, inferred variables, split values, and frequency span. | `python3 surrogate.py --model dnn inspect-mdif --mdif train_verify.mdif` |
 | `--model MODEL train` | Fit one DNN, KBNN, or Neuro-TF configuration and write its model and verification report. | `python3 surrogate.py --model dnn train --mdif train_verify.mdif --out-dir dnn_model` |
 | `--model MODEL optimize` | Run adaptive, grid, or random hyperparameter trials and promote the best completed model. `sweep` is an alias. | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --max-trials 24` |
@@ -7513,14 +7878,14 @@ options in D.5 also apply where marked.
 
 | Option | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- |
-| `--acquisition {hybrid,gp-ucb,error-distance}` | Selection method. Default `hybrid` explicitly allocates exploitation, uncertainty, and coverage rows; `gp-ucb` is the one-score compatibility method; `error-distance` is non-GP. | `--acquisition hybrid`  | `workflows.points.commands.suggest-additional.acquisition` |
+| `--acquisition {hybrid,rational-hybrid,gp-ucb,error-distance}` | Selection method. Default `hybrid` uses scalar-error GP uncertainty; `rational-hybrid` substitutes broadband response uncertainty from a rational/PCA/latent-GP helper; `gp-ucb` is the one-score compatibility method; `error-distance` is non-GP. | `--acquisition rational-hybrid`  | `workflows.points.commands.suggest-additional.acquisition` |
 | `--allow-nonpassive` | Explicitly allows a sweep root with no passivity-eligible `best_model/` to supply its retained lowest-error trial observations for point selection only. The source remains ineligible for export. | `--fit-dir dnn_opt --allow-nonpassive`  | `workflows.points.commands.suggest-additional.allow_nonpassive` |
 | `--analysis-out PATH` | Ranked verification-error-region CSV. Its basename must contain `verification`. Default: `<out>_verification_error_regions.csv`. | `--analysis-out additions_verification_regions.csv`  | `workflows.points.commands.suggest-additional.analysis_out` |
 | `--candidate-count INT` | Explicit candidate-pool size. Default: `max(1000, planned total * candidate-factor)`, where planned total includes triggered automatic verification points. | `--candidate-count 4000`  | `workflows.points.commands.suggest-additional.candidate_count` |
 | `--candidate-factor INT` | Candidate multiplier when `--candidate-count` is omitted. Default: `200`. | `--candidate-factor 300`  | `workflows.points.commands.suggest-additional.candidate_factor` |
 | `--candidate-method NAME` | Candidate generator: `maximin-lhs`, `minimax-lhs`, `latin-hypercube`, `sobol`, or `halton`. Default: `maximin-lhs`. | `--candidate-method sobol`  | `workflows.points.commands.suggest-additional.candidate_method` |
 | `--combined-out PATH` | Combined cumulative existing-plus-new geometry CSV for the next GP round. Its basename cannot contain a training or verification role word; same-stem JSON, one all-point coverage PNG, and cumulative training/verification split CSVs are also written. Default: `<out>_all_geometries.csv`. | `--combined-out additions_all_geometries.csv`  | `workflows.points.commands.suggest-additional.combined_out` |
-| `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. | `--existing-mdif train_verify.mdif`  | `workflows.points.commands.suggest-additional.existing_mdif` |
+| `--existing-mdif PATH` | Repeatable MDIF containing already occupied geometry blocks. Required by `rational-hybrid` as its simulated positive-frequency training-response source; verification-labeled blocks and exact DC are excluded from that helper. | `--existing-mdif train_verify.mdif`  | `workflows.points.commands.suggest-additional.existing_mdif` |
 | `--existing-points PATH` | CSV containing already simulated points. Its companion JSON supplies the domain when no explicit domain is given. In later rounds, use the latest combined cumulative `*_all_geometries.csv`; repeat only for independent sources. | `--existing-points gp_round_1_all_geometries.csv`  | `workflows.points.commands.suggest-additional.existing_points` |
 | `--exploration-weight VALUE` | GP uncertainty multiplier or `auto`. Auto uses `2.5` for sparse observations and reduces to `1.0`/`0.75` as the error model matures. Default: `auto`. | `--exploration-weight auto`  | `workflows.points.commands.suggest-additional.exploration_weight` |
 | `--fit-dir PATH` | Fit/model directory or optimize/sweep root. A sweep root resolves `best_model/verification_metrics.csv`, or `point_generation_fallback/verification_metrics.csv` with `--allow-nonpassive`. | `--fit-dir dnn_opt`  | `workflows.points.commands.suggest-additional.fit_dir` |
@@ -7536,13 +7901,21 @@ options in D.5 also apply where marked.
 | `--out PATH` | New-points-only simulation CSV; a same-stem JSON and PNG are also written, in addition to the cumulative output. Default: `targeted_additional_points.csv`. | `--out additions.csv`  | `workflows.points.commands.suggest-additional.out` |
 | `--parameter-json PATH` | Explicit geometry metadata JSON. Normally inferred beside `--existing-points`. | `--parameter-json geometries.json`  | `workflows.points.commands.suggest-additional.parameter_json` |
 | `--previous-verification-metrics PATH` | Repeat prior metrics in oldest-to-newest order so automatic sizing can detect improvement, plateau, or regression. | `--previous-verification-metrics round_2/verification_metrics.csv` | `workflows.points.commands.suggest-additional.previous_verification_metrics` |
+| `--rational-components INT` | Maximum PCA response coordinates modeled by latent GPs. Positive; default `8`. | `--rational-components 8` | `workflows.points.commands.suggest-additional.rational_components` |
+| `--rational-frequency-weights SPEC` | Optional rational-helper exact-frequency/range weights, with model-fitting syntax. | `--rational-frequency-weights 'default=1;8GHz:12GHz=4'` | `workflows.points.commands.suggest-additional.rational_frequency_weights` |
+| `--rational-order INT` | Common-pole helper order. Positive; default `12`. | `--rational-order 16` | `workflows.points.commands.suggest-additional.rational_order` |
+| `--rational-pole-damping FLOAT` | Positive damping of the helper's initial stable pole grid. Default `0.18`. | `--rational-pole-damping 0.12` | `workflows.points.commands.suggest-additional.rational_pole_damping` |
+| `--rational-pole-iterations INT` | Maximum adaptive helper relocation iterations. Positive; default `6`. | `--rational-pole-iterations 8` | `workflows.points.commands.suggest-additional.rational_pole_iterations` |
+| `--rational-pole-placement {fixed,adaptive}` | Helper pole construction. Default `adaptive`; it falls back to the fixed grid if relocation does not lower representative rational RMSE. | `--rational-pole-placement adaptive` | `workflows.points.commands.suggest-additional.rational_pole_placement` |
+| `--rational-ridge FLOAT` | Non-negative helper rational-fit regularization. Default `1e-8`. | `--rational-ridge 1e-7` | `workflows.points.commands.suggest-additional.rational_ridge` |
+| `--rational-variance FLOAT` | PCA variance fraction in `(0,1]`, limited by `--rational-components`. Default `0.995`. | `--rational-variance 0.999` | `workflows.points.commands.suggest-additional.rational_variance` |
 | `--target-dataset {train,verification}` | Canonical dataset written on primary suggested points. Default: `train`; automatic verification additions remain `verification`. Legacy acquisition labels are migrated to `train`. | `--target-dataset train`  | `workflows.points.commands.suggest-additional.target_dataset` |
 | `--target-error FLOAT` | Desired RMS geometry-level value of the selected metric; drives target-relative automatic sizing. | `--target-error 1.0` | `workflows.points.commands.suggest-additional.target_error` |
 | `--verification-batch INT` | Automatic acquisition-verification points per crossed training milestone. Default: `max(2,ceil(2*d/3))`. | `--verification-batch 4`  | `workflows.points.commands.suggest-additional.verification_batch` |
 | `--verification-interval INT` | Positive training growth between automatic verification milestones. Default: `2*d`. | `--verification-interval 12`  | `workflows.points.commands.suggest-additional.verification_interval` |
 | `--verification-max-add INT` | Per-command cap on automatic verification catch-up. Default: `max(d+2,6)`. | `--verification-max-add 8`  | `workflows.points.commands.suggest-additional.verification_max_add` |
 | `--verification-metrics PATH` | Direct metrics CSV path; overrides `--fit-dir`. | `--verification-metrics dnn_model/verification_metrics.csv`  | `workflows.points.commands.suggest-additional.verification_metrics` |
-| `--verification-policy {auto,off}` | Enables dimension-scaled verification growth for hybrid/GP-UCB training batches. Default: `auto`. | `--verification-policy off`  | `workflows.points.commands.suggest-additional.verification_policy` |
+| `--verification-policy {auto,off}` | Enables dimension-scaled verification growth for hybrid, rational-hybrid, and GP-UCB training batches. Default: `auto`. | `--verification-policy off`  | `workflows.points.commands.suggest-additional.verification_policy` |
 
 Complete default hybrid example without re-entering parameter ranges:
 
@@ -7760,8 +8133,10 @@ ranges can produce fewer unique candidates than `--adaptive-candidate-pool`.
 
 | Name | Kind | Meaning and constraints | Representative domain |
 | --- | --- | --- | --- |
-| `order` | Positive integer | Number of fixed rational poles. Higher order increases coefficient count and needs enough RF frequency rows and rank for conditioning. | `order=6:20` |
-| `pole_damping` | Positive float | Real damping applied to complex pole pairs. Use positive values so the fixed poles remain in the stable half-plane. | `pole_damping=0.05:0.5:log` |
+| `order` | Positive integer | Number of shared rational poles. Higher order increases coefficient count and needs enough RF frequency rows and rank for conditioning. | `order=6:20` |
+| `pole_damping` | Positive float | Real damping applied to the initial complex pole pairs. Use positive values so the initial poles remain in the stable half-plane. | `pole_damping=0.05:0.5:log` |
+| `pole_iterations` | Positive integer | Maximum common-pole relocation iterations. This is relevant only when the candidate uses adaptive placement. | `pole_iterations=3:10` |
+| `pole_placement` | Categorical | `fixed` preserves the logarithmic grid; `adaptive` performs stable representative-mode relocation and retains the fixed candidate if better. | `pole_placement=fixed,adaptive` |
 | `ridge` | Non-negative float | Regularization for rational coefficient fitting and response conditioning. Use an explicit list to include zero because logarithmic ranges must be positive. | `ridge=1e-12:1e-5:log` |
 
 ##### Settings That Are Intentionally Fixed During Adaptive Search
@@ -7862,10 +8237,13 @@ all S-parameters.
 
 | Option | Applies to | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- | --- |
-| `--order INT` | Neuro-TF `train`; single-value optimize form | Number of fixed stable rational poles. Default: `10`. | `--order 12`  | `models.neuro-tf.commands.fit.order` |
+| `--order INT` | Neuro-TF `train`; single-value optimize form | Number of shared stable rational poles. Default: `10`. | `--order 12`  | `models.neuro-tf.commands.fit.order` |
 | `--orders LIST` | Neuro-TF optimize | Pole-count candidates. Default: `6,10,14`; single-value alias: `--order`. | `--orders 8,12,16`  | `models.neuro-tf.commands.optimize.orders` |
-| `--pole-damping FLOAT` | Neuro-TF `train`; single-value optimize form | Fixed-pole real-part damping factor. Default: `0.18`. | `--pole-damping 0.18`  | `models.neuro-tf.commands.fit.pole_damping` |
+| `--pole-damping FLOAT` | Neuro-TF `train`; single-value optimize form | Initial-grid real-part damping factor. Default: `0.18`. | `--pole-damping 0.18`  | `models.neuro-tf.commands.fit.pole_damping` |
 | `--pole-dampings LIST` | Neuro-TF optimize | Damping candidates. Default: `0.12,0.18,0.28`; single-value alias: `--pole-damping`. | `--pole-dampings 0.12,0.18,0.24`  | `models.neuro-tf.commands.optimize.pole_dampings` |
+| `--pole-iterations INT` | Neuro-TF fit | Maximum adaptive common-pole relocation iterations. It is also accepted as adaptive `--optimize-parameter pole_iterations=...`. Default: `6`. | `--pole-iterations 8` | `models.neuro-tf.commands.fit.pole_iterations` |
+| `--pole-placement {fixed,adaptive}` | Neuro-TF `train`; single-value optimize form | Pole construction for one fit. `adaptive` uses representative training-response relocation with fixed-grid fallback. Default: `fixed`. | `--pole-placement adaptive` | `models.neuro-tf.commands.fit.pole_placement` |
+| `--pole-placements LIST` | Neuro-TF optimize | Placement candidates; single-value alias: `--pole-placement`. Default: `fixed`. | `--pole-placements fixed,adaptive` | `models.neuro-tf.commands.optimize.pole_placements` |
 | `--ridge FLOAT` | Neuro-TF `train`; single-value optimize form | Ridge regularization for rational least squares. Default: `1e-8`. | `--ridge 1e-8`  | `models.neuro-tf.commands.fit.ridge` |
 | `--ridges LIST` | Neuro-TF optimize | Ridge candidates. Default: `1e-10,1e-8,1e-6`; aliases: `--ridge-values`, single-value `--ridge`. | `--ridges 1e-10,1e-8,1e-6`  | `models.neuro-tf.commands.optimize.ridges` |
 
@@ -7963,13 +8341,19 @@ the positional log list can be supplied by the options JSON.
 
 ### D.16 Model debug options
 
-The `debug-model` route analyzes a completed DNN or KBNN train/optimize output.
-It does not require retained trial model packages or per-trial metadata.
+The `debug-model` route analyzes a completed DNN, KBNN, or Neuro-TF
+train/optimize output. It does not require retained trial model packages or
+per-trial metadata. When Neuro-TF metadata is available, the report compares
+rational-only training/verification RMSE with final-model verification RMSE,
+checks rational basis/conditioning, and distinguishes a frequency-basis
+bottleneck from a geometry-to-coefficient bottleneck or excessive passivity
+contraction. Findings include copyable adaptive-pole, coefficient-map, or
+rational-hybrid point-generation commands as appropriate.
 
 | Option | Explanation | Example | Options JSON location |
 | --- | --- | --- | --- |
 | `--audit PATH` | Optional `dataset_audit.json` or its containing directory. If omitted, the command also checks `RUN_DIR/audit` and the adjacent `audit` directory. | `--audit outputs/audit` | `workflows.debug-model.commands.debug-model.audit` |
-| `--model {auto,dnn,kbnn}` | Model-family override. Default: `auto`, inferred from result filenames, directory names, or surviving metadata. | `--model kbnn` | `workflows.debug-model.commands.debug-model.model` |
+| `--model {auto,dnn,kbnn,neuro-tf}` | Model-family override. Default: `auto`, inferred from result filenames, directory names, or surviving metadata. Compatibility spellings `neuro_tf` and `neurotf` are accepted. | `--model neuro-tf` | `workflows.debug-model.commands.debug-model.model` |
 | `--out-dir PATH` | Diagnostic artifact directory. Default: `RUN_DIR/model_debug`. | `--out-dir dnn_opt/model_debug` | `workflows.debug-model.commands.debug-model.out_dir` |
 | `--run-dir PATH` | Required completed train, optimize, or sweep output directory. It can be supplied solely by options JSON. | `--run-dir dnn_opt` | `workflows.debug-model.commands.debug-model.run_dir` |
 | `--top INT` | Positive number of lowest-passivity-error trials shown in the Markdown report. Default: `12`. | `--top 20` | `workflows.debug-model.commands.debug-model.top` |
@@ -7988,7 +8372,9 @@ on the primary entry point:
 | Optimize | `python3 surrogate.py --model dnn optimize --mdif train_verify.mdif --out-dir dnn_opt --search-mode adaptive --optimize-parameter learning_rate=1e-4:1e-2:log --optimize-parameter 'hidden_layers=1:4x32:256:log' --max-trials 24 --require-passive` |
 | Diagnose | `python3 surrogate.py debug-model --run-dir dnn_opt --audit audit --out-dir dnn_opt/model_debug` |
 | Add points | `python3 surrogate.py points suggest-additional --fit-dir dnn_opt/best_model --existing-points geometries.csv --existing-mdif train_verify.mdif --count 8 --out additions.csv --combined-out additions_all_geometries.csv` |
+| Add response-aware points | `python3 surrogate.py points suggest-additional --fit-dir neuro_tf_opt --existing-points geometries.csv --existing-mdif train_verify.mdif --acquisition rational-hybrid --count auto --target-error 1.0 --out response_additions.csv --combined-out response_additions_all_geometries.csv` |
 | Next GP round | `python3 surrogate.py points suggest-additional --fit-dir dnn_refit --existing-points additions_all_geometries.csv --count 6 --out additions_round_2.csv` |
+| Optimize Neuro-TF poles | `python3 surrogate.py --model neuro-tf optimize --mdif train_verify.mdif --out-dir neuro_tf_opt --search-mode adaptive --optimize-parameter pole_placement=fixed,adaptive --optimize-parameter order=6:20 --optimize-parameter pole_damping=0.06:0.35:log --pole-iterations 8 --max-trials 24` |
 | Refit | `python3 surrogate.py --model dnn train --mdif updated_train_verify.mdif --out-dir dnn_final --hidden-layers 128,128,64 --activation tanh --learning-rate 0.001` |
 | Export sampled MDIF | `python3 surrogate.py --model dnn export-ads-mdif --model-dir dnn_final --out-dir exports/mdif --template-mdif dnn_final/ads_export_template.mdif` |
 | Export HB SDD | `python3 surrogate.py --model dnn export-ads-hb --model-dir dnn_final --out-dir exports/hb --module-name filter_hb --parameter-input-scales 1um` |
