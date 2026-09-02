@@ -13,6 +13,14 @@ from PIL import Image
 import generate_points as POINTS
 
 
+class TTYBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        raise OSError("in-memory terminal has no file descriptor")
+
+
 class GaussianAdaptivePointTests(unittest.TestCase):
     def assert_geometry_splits_are_disjoint(
         self,
@@ -185,8 +193,9 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 "--combined-out",
                 str(combined),
             ]
+            progress_output = TTYBuffer()
             with contextlib.redirect_stdout(io.StringIO()):
-                with contextlib.redirect_stderr(io.StringIO()):
+                with contextlib.redirect_stderr(progress_output):
                     self.assertEqual(POINTS.main(command), 0)
 
             with output.open(newline="") as stream:
@@ -200,6 +209,13 @@ class GaussianAdaptivePointTests(unittest.TestCase):
             self.assertEqual(rational["distinct_training_geometries"], 4)
             self.assertEqual(rational["pole_placement"], "fixed")
             self.assertTrue(combined.is_file())
+            progress_text = progress_output.getvalue()
+            self.assertIn(
+                "Additional-point selection: fitting common-pole rational response helper",
+                progress_text,
+            )
+            self.assertIn("selecting rational-uncertainty points", progress_text)
+            self.assertTrue(progress_text.endswith("\r\033[2K"))
 
     def test_six_dimensional_verification_growth_policy_catches_up(self) -> None:
         before_trigger = POINTS.automatic_verification_plan(
@@ -1865,7 +1881,10 @@ class GaussianAdaptivePointTests(unittest.TestCase):
     def test_initial_generation_still_defaults_to_maximin_lhs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "initial.csv"
-            with contextlib.redirect_stdout(io.StringIO()):
+            progress_output = TTYBuffer()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                progress_output
+            ):
                 self.assertEqual(
                     POINTS.main(
                         [
@@ -1890,6 +1909,16 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 )
             metadata = json.loads(output.with_suffix(".json").read_text())
             self.assertEqual(metadata["method"], "maximin-lhs")
+            progress_text = progress_output.getvalue()
+            self.assertIn(
+                "Point generation: maximin-lhs: testing maximin-LHS designs",
+                progress_text,
+            )
+            self.assertIn(
+                "Point generation: writing maximin-lhs CSV, metadata, and coverage plot",
+                progress_text,
+            )
+            self.assertTrue(progress_text.endswith("\r\033[2K"))
             coverage_path = Path(temp_dir) / "initial_parameter_coverage.png"
             self.assertTrue(coverage_path.is_file())
             self.assertEqual(

@@ -20,10 +20,11 @@ import random
 import re
 import shlex
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -60,6 +61,92 @@ UNIT_SCALES = {
     "ghz": 1e9,
     "thz": 1e12,
 }
+
+
+ProgressCallback = Callable[[int, int, str], None]
+
+
+class PointGenerationProgress:
+    """One-line terminal progress used by both point-generation workflows."""
+
+    def __init__(self, label: str, stream: object | None = None) -> None:
+        self.label = label
+        self.stream = stream if stream is not None else sys.stderr
+        isatty = getattr(self.stream, "isatty", None)
+        self.enabled = bool(isatty and isatty())
+        self.started_at = time.monotonic()
+        self.active = False
+
+    def _terminal_line(self, text: str) -> str:
+        fileno = getattr(self.stream, "fileno", None)
+        try:
+            columns = os.get_terminal_size(fileno()).columns if fileno else 120
+        except (OSError, TypeError, ValueError):
+            columns = 120
+        limit = max(1, int(columns) - 1)
+        if len(text) <= limit:
+            return text
+        if limit <= 3:
+            return "." * limit
+        return text[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def update(
+        self,
+        phase: str,
+        completed: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        parts = [f"{self.label}: {phase}"]
+        if completed is not None and total is not None and total > 0:
+            bounded = min(max(int(completed), 0), int(total))
+            parts.append(
+                f"{bounded}/{int(total)} ({100.0 * bounded / int(total):.1f}%)"
+            )
+        parts.append(f"elapsed {self._duration(time.monotonic() - self.started_at)}")
+        line = self._terminal_line(" ".join(parts))
+        self.stream.write("\r\033[2K" + line)
+        self.stream.flush()
+        self.active = True
+
+    def clear(self) -> None:
+        if not self.enabled or not self.active:
+            return
+        self.stream.write("\r\033[2K")
+        self.stream.flush()
+        self.active = False
+
+
+def point_progress(args: argparse.Namespace) -> PointGenerationProgress | None:
+    progress = getattr(args, "_point_generation_progress", None)
+    return progress if isinstance(progress, PointGenerationProgress) else None
+
+
+def update_point_progress(
+    args: argparse.Namespace,
+    phase: str,
+    completed: int | None = None,
+    total: int | None = None,
+) -> None:
+    progress = point_progress(args)
+    if progress is not None:
+        progress.update(phase, completed, total)
+
+
+def clear_point_progress(args: argparse.Namespace) -> None:
+    progress = point_progress(args)
+    if progress is not None:
+        progress.clear()
 
 
 @dataclass(frozen=True)
@@ -506,10 +593,13 @@ def maximin_lhs_points(
     dimensions: int,
     rng: random.Random,
     candidates: int,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[list[float]]:
     best_points: list[list[float]] | None = None
     best_score = -1.0
-    for _ in range(max(1, candidates)):
+    candidate_count = max(1, candidates)
+    update_interval = max(1, candidate_count // 20)
+    for candidate_index in range(1, candidate_count + 1):
         trial = latin_hypercube_points(count, dimensions, rng)
         score = min_pairwise_distance(
             trial,
@@ -518,6 +608,16 @@ def maximin_lhs_points(
         if score > best_score:
             best_score = score
             best_points = trial
+        if progress_callback is not None and (
+            candidate_index == 1
+            or candidate_index == candidate_count
+            or candidate_index % update_interval == 0
+        ):
+            progress_callback(
+                candidate_index,
+                candidate_count,
+                "testing maximin-LHS designs",
+            )
     assert best_points is not None
     return best_points
 
@@ -596,18 +696,34 @@ def generate_unit_points(
     lhs_candidates: int,
     scramble: bool,
     skip: int,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[list[float]]:
     if method == "minimax-lhs":
         method = "maximin-lhs"
     rng = random.Random(seed)
     if method == "latin-hypercube":
-        return latin_hypercube_points(count, dimensions, rng)
+        points = latin_hypercube_points(count, dimensions, rng)
+        if progress_callback is not None:
+            progress_callback(1, 1, "generating Latin-hypercube design")
+        return points
     if method == "maximin-lhs":
-        return maximin_lhs_points(count, dimensions, rng, lhs_candidates)
+        return maximin_lhs_points(
+            count,
+            dimensions,
+            rng,
+            lhs_candidates,
+            progress_callback=progress_callback,
+        )
     if method == "halton":
-        return halton_points(count, dimensions, skip)
+        points = halton_points(count, dimensions, skip)
+        if progress_callback is not None:
+            progress_callback(1, 1, "generating Halton design")
+        return points
     if method == "sobol":
-        return sobol_points(count, dimensions, seed, scramble, skip)
+        points = sobol_points(count, dimensions, seed, scramble, skip)
+        if progress_callback is not None:
+            progress_callback(1, 1, "generating Sobol design")
+        return points
     raise ValueError(f"Unsupported method {method!r}")
 
 
@@ -2110,6 +2226,7 @@ def generate_unique_output_points(
     scramble: bool,
     skip: int,
     excluded_keys: set[tuple[str, ...]] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[list[float]]:
     """Generate exactly ``count`` points unique at the requested output digits.
 
@@ -2148,6 +2265,7 @@ def generate_unique_output_points(
             lhs_candidates=lhs_candidates,
             scramble=scramble,
             skip=next_skip,
+            progress_callback=progress_callback,
         )
         next_skip += batch_count
         for point in batch:
@@ -3854,6 +3972,7 @@ def select_rational_hybrid_points(
     noise_variance: float,
     error_floor: float,
     ard_mode: str = "auto",
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[SuggestedPoint], GaussianProcessModel, dict[str, object]]:
     """Mix measured-error exploitation with rational-response uncertainty."""
 
@@ -3943,6 +4062,12 @@ def select_rational_hybrid_points(
         selected.append(best_point)
         occupied.append(best_point.unit_point)
         unused.pop(best_index)
+        if progress_callback is not None:
+            progress_callback(
+                len(selected),
+                count,
+                f"selecting {best_point.selection_component} points",
+            )
         working_error_model = condition_gp_on_fantasy_mean(
             working_error_model,
             best_point.unit_point,
@@ -3997,6 +4122,7 @@ def select_gp_ucb_points(
     noise_variance: float,
     error_floor: float,
     ard_mode: str = "auto",
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[SuggestedPoint], GaussianProcessModel]:
     model = fit_error_gaussian_process(
         regions,
@@ -4052,6 +4178,8 @@ def select_gp_ucb_points(
         selected.append(best_point)
         occupied.append(best_point.unit_point)
         unused.pop(best_idx)
+        if progress_callback is not None:
+            progress_callback(len(selected), count, "selecting GP-UCB points")
         working_model = condition_gp_on_fantasy_mean(
             working_model,
             best_point.unit_point,
@@ -4096,6 +4224,7 @@ def select_hybrid_points(
     noise_variance: float,
     error_floor: float,
     ard_mode: str = "auto",
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[SuggestedPoint], GaussianProcessModel, dict[str, object]]:
     """Select an adaptive mixture of error, uncertainty, and coverage points."""
 
@@ -4172,6 +4301,12 @@ def select_hybrid_points(
         selected.append(best_point)
         occupied.append(best_point.unit_point)
         unused.pop(best_idx)
+        if progress_callback is not None:
+            progress_callback(
+                len(selected),
+                count,
+                f"selecting {best_point.selection_component} points",
+            )
         working_model = condition_gp_on_fantasy_mean(
             working_model,
             best_point.unit_point,
@@ -4220,6 +4355,7 @@ def select_targeted_points(
     focus_power: float,
     novelty_power: float,
     min_distance: float,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[SuggestedPoint]:
     selected: list[SuggestedPoint] = []
     occupied = [list(point) for point in existing_points]
@@ -4260,6 +4396,12 @@ def select_targeted_points(
         selected.append(best_point)
         occupied.append(best_point.unit_point)
         unused.pop(best_idx)
+        if progress_callback is not None:
+            progress_callback(
+                len(selected),
+                count,
+                "selecting error-distance points",
+            )
     return selected
 
 
@@ -4717,6 +4859,7 @@ def write_accumulated_geometries(
     bare_values: str,
     method: str,
     metadata_extra: dict[str, object] | None = None,
+    status_progress: PointGenerationProgress | None = None,
 ) -> Path:
     """Write a deduplicated union suitable for the next GP acquisition round."""
 
@@ -4974,6 +5117,12 @@ def write_accumulated_geometries(
         decimal_places=decimal_places,
     )
     write_rows_csv(path, rows, fields)
+    if status_progress is not None and (
+        legacy_dataset_rows_normalized
+        or cross_split_duplicate_count
+        or filename_role_mismatch_count
+    ):
+        status_progress.clear()
     if legacy_dataset_rows_normalized:
         print(
             "warning: normalized "
@@ -4996,6 +5145,8 @@ def write_accumulated_geometries(
             "files whose names indicated a single split",
             file=sys.stderr,
         )
+    if status_progress is not None:
+        status_progress.update("rendering cumulative parameter coverage plot")
     return write_geometry_metadata(
         path,
         parameters,
@@ -5634,6 +5785,15 @@ def validate_parameter_decimal_places(
 
 
 def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    progress = PointGenerationProgress("Point generation")
+    args._point_generation_progress = progress
+    try:
+        return _command_generate(args, parser)
+    finally:
+        progress.clear()
+
+
+def _command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     validate_shared_sampling_args(parser, args)
     extending = args.extend_range is not None
     if extending != (args.existing_points is not None):
@@ -5804,6 +5964,28 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 excluded_output_keys.add(key)
     written_paths: list[Path] = []
     for offset, method in enumerate(methods):
+        method_number = offset + 1
+        update_point_progress(
+            args,
+            f"generating {method} points",
+            method_number,
+            len(methods),
+        )
+
+        def generation_progress(
+            completed: int,
+            total: int,
+            phase: str,
+            *,
+            method_name: str = method,
+        ) -> None:
+            update_point_progress(
+                args,
+                f"{method_name}: {phase}",
+                completed,
+                total,
+            )
+
         try:
             unit_points = generate_unique_output_points(
                 method,
@@ -5816,12 +5998,22 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 scramble=not args.no_scramble,
                 skip=args.skip,
                 excluded_keys=excluded_output_keys,
+                progress_callback=generation_progress,
             )
         except (RuntimeError, ValueError) as exc:
+            progress = point_progress(args)
+            if progress is not None:
+                progress.clear()
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
         out_path = output_path_for_method(base_out_path, method, multiple_methods)
+        update_point_progress(
+            args,
+            f"writing {method} CSV, metadata, and coverage plot",
+            method_number,
+            len(methods),
+        )
         if extension_plan is not None:
             written_paths.extend(
                 write_range_extension_csv(
@@ -5852,6 +6044,9 @@ def command_generate(args: argparse.Namespace, parser: argparse.ArgumentParser) 
                 decimal_places=args.decimal_places,
                 write_split_files=args.write_split_files,
             ))
+    progress = point_progress(args)
+    if progress is not None:
+        progress.clear()
     for path in written_paths:
         print(f"wrote {path}")
     return 0
@@ -6393,6 +6588,18 @@ def verification_metrics_path(args: argparse.Namespace, parser: argparse.Argumen
 
 
 def command_suggest_additional(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    progress = PointGenerationProgress("Additional-point selection")
+    args._point_generation_progress = progress
+    try:
+        return _command_suggest_additional(args, parser)
+    finally:
+        progress.clear()
+
+
+def _command_suggest_additional(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
     try:
         canonical_dataset_label(args.target_dataset)
     except ValueError as exc:
@@ -6684,6 +6891,18 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         if args.candidate_method == "minimax-lhs"
         else args.candidate_method
     )
+    update_point_progress(
+        args,
+        f"building {candidate_method} candidate pool ({candidate_count} points)",
+    )
+
+    def candidate_generation_progress(
+        completed: int,
+        total: int,
+        phase: str,
+    ) -> None:
+        update_point_progress(args, f"candidate pool: {phase}", completed, total)
+
     try:
         candidates = generate_unit_points(
             candidate_method,
@@ -6693,8 +6912,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             lhs_candidates=args.lhs_candidates,
             scramble=not args.no_scramble,
             skip=args.skip,
+            progress_callback=candidate_generation_progress,
         )
     except RuntimeError as exc:
+        clear_point_progress(args)
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -6707,6 +6928,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         for point in existing_points
     }
     raw_candidate_count = len(candidates)
+    update_point_progress(args, "removing occupied and rounded duplicate candidates")
     candidates = filter_unique_output_candidates(
         candidates,
         parameters,
@@ -6775,6 +6997,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
     target_datasets: list[str]
     automatic_verification_suggestions: list[SuggestedPoint] = []
     hybrid_diagnostics: dict[str, object] = {}
+
+    def acquisition_progress(
+        completed: int,
+        total: int,
+        phase: str,
+    ) -> None:
+        update_point_progress(args, phase, completed, total)
+
     if args.acquisition in {"gp-ucb", "hybrid", "rational-hybrid"}:
         try:
             if args.acquisition in {"hybrid", "rational-hybrid"}:
@@ -6788,6 +7018,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                     ),
                 )
                 if args.acquisition == "rational-hybrid":
+                    update_point_progress(
+                        args,
+                        "fitting common-pole rational response helper",
+                    )
                     rational_surrogate = build_rational_response_surrogate(
                         args.existing_mdif,
                         parameters,
@@ -6804,6 +7038,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                         noise_variance=args.gp_noise_variance,
                         ard_mode=args.gp_ard,
                     )
+                    update_point_progress(
+                        args,
+                        "scoring rational-response candidate uncertainty",
+                    )
                     suggestions, gp_model, hybrid_diagnostics = (
                         select_rational_hybrid_points(
                             candidates,
@@ -6819,9 +7057,14 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                             noise_variance=args.gp_noise_variance,
                             error_floor=args.gp_error_floor,
                             ard_mode=args.gp_ard,
+                            progress_callback=acquisition_progress,
                         )
                     )
                 else:
+                    update_point_progress(
+                        args,
+                        "fitting error GP and scoring hybrid candidates",
+                    )
                     suggestions, gp_model, hybrid_diagnostics = select_hybrid_points(
                         candidates,
                         regions,
@@ -6835,8 +7078,13 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                         noise_variance=args.gp_noise_variance,
                         error_floor=args.gp_error_floor,
                         ard_mode=args.gp_ard,
+                        progress_callback=acquisition_progress,
                     )
             else:
+                update_point_progress(
+                    args,
+                    "fitting error GP and scoring GP-UCB candidates",
+                )
                 suggestions, gp_model = select_gp_ucb_points(
                     candidates,
                     regions,
@@ -6849,8 +7097,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                     noise_variance=args.gp_noise_variance,
                     error_floor=args.gp_error_floor,
                     ard_mode=args.gp_ard,
+                    progress_callback=acquisition_progress,
                 )
         except ValueError as exc:
+            clear_point_progress(args)
             parser.error(str(exc))
         verification_plan = automatic_verification_plan(
             dimensions=len(parameters),
@@ -6892,6 +7142,25 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                 *existing_points,
                 *(suggestion.unit_point for suggestion in suggestions),
             ]
+            update_point_progress(
+                args,
+                "selecting automatic verification points",
+                0,
+                automatic_verification_count,
+            )
+
+            def verification_progress(
+                completed: int,
+                total: int,
+                _phase: str,
+            ) -> None:
+                update_point_progress(
+                    args,
+                    "selecting automatic verification points",
+                    completed,
+                    total,
+                )
+
             try:
                 automatic_verification_suggestions, _verification_gp_model = (
                     select_gp_ucb_points(
@@ -6906,13 +7175,16 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                         noise_variance=args.gp_noise_variance,
                         error_floor=args.gp_error_floor,
                         ard_mode=args.gp_ard,
+                        progress_callback=verification_progress,
                     )
                 )
                 for suggestion in automatic_verification_suggestions:
                     suggestion.selection_component = "verification-uncertainty"
             except ValueError as exc:
+                clear_point_progress(args)
                 parser.error(str(exc))
             if len(automatic_verification_suggestions) < automatic_verification_count:
+                clear_point_progress(args)
                 print(
                     "warning: selected "
                     f"{len(automatic_verification_suggestions)} of "
@@ -6964,6 +7236,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                 else "hybrid"
             ] = hybrid_diagnostics
         if len(gp_model.observation_points) < max(3 * len(parameters), 12):
+            clear_point_progress(args)
             print(
                 "warning: the adaptive GP has fewer distinct error observations "
                 "than the preferred max(3*d, 12); the hybrid allocation reserves "
@@ -6976,6 +7249,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             ["verification"] * len(automatic_verification_suggestions)
         )
     else:
+        update_point_progress(args, "scoring error-distance candidates")
         suggestions = select_targeted_points(
             candidates,
             regions,
@@ -6985,6 +7259,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             focus_power=args.focus_power,
             novelty_power=args.novelty_power,
             min_distance=args.min_distance,
+            progress_callback=acquisition_progress,
         )
         target_datasets = [args.target_dataset] * len(suggestions)
         acquisition_metadata["automatic_verification"] = {
@@ -6997,11 +7272,13 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         automatic_verification_suggestions
     )
     if primary_suggestion_count < primary_count:
+        clear_point_progress(args)
         print(
             f"warning: selected {primary_suggestion_count} of {primary_count} requested points; "
             "increase --candidate-count or lower --min-distance",
             file=sys.stderr,
         )
+    clear_point_progress(args)
 
     selected_output_keys: dict[tuple[str, ...], tuple[int, str]] = {}
     for suggestion_index, (suggestion, raw_dataset) in enumerate(
@@ -7179,6 +7456,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         },
         "coverage_plot_all_points": str(coverage_plot_path),
     }
+    update_point_progress(args, "writing new-point CSV and metadata")
     write_error_regions_csv(analysis_path, regions, parameters)
     metadata_path = write_suggested_points_csv(
         out_path,
@@ -7210,6 +7488,10 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         for region in regions
     ]
     observed_points.extend(mdif_observed_points)
+    update_point_progress(
+        args,
+        "building cumulative geometry inventory and coverage plot",
+    )
     try:
         combined_metadata_path = write_accumulated_geometries(
             combined_path,
@@ -7232,9 +7514,12 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
                 "new_point_count": len(suggestions),
                 **acquisition_metadata,
             },
+            status_progress=point_progress(args),
         )
     except ValueError as exc:
+        clear_point_progress(args)
         parser.error(str(exc))
+    update_point_progress(args, "writing training and verification split views")
     split_view_paths = write_dataset_split_geometry_views(
         out_path,
         parameters,
@@ -7249,6 +7534,7 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
         bare_values=args.bare_values,
         decimal_places=args.decimal_places,
     )
+    update_point_progress(args, "validating generated geometry outputs")
     try:
         output_integrity = validate_suggest_output_family(
             out_path,
@@ -7259,7 +7545,9 @@ def command_suggest_additional(args: argparse.Namespace, parser: argparse.Argume
             coverage_plot_path,
         )
     except ValueError as exc:
+        clear_point_progress(args)
         parser.error(f"Additional-point output integrity check failed: {exc}")
+    clear_point_progress(args)
     print(f"analyzed {len(regions)} verification error region(s) from {metrics_path}")
     print(
         f"considered {len(existing_points)} existing point(s) and "

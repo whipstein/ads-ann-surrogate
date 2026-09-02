@@ -680,6 +680,13 @@ python3 surrogate.py points generate \
   --out geometries.csv
 ```
 
+In an interactive terminal, point generation uses one live status line rather
+than printing a new line for every update. Maximin-LHS reports candidate-design
+progress, then the same line advances through CSV, metadata, and coverage-plot
+creation. The live line is erased before the final `wrote ...` artifact list.
+Progress is suppressed automatically when output is redirected to a file or a
+non-interactive process.
+
 ### How Many Points for the Default Hybrid GP Workflow
 
 The default adaptive workflow deliberately starts lean because the surrogate
@@ -1870,6 +1877,12 @@ workflow:
 | Gaussian-process UCB | `--acquisition gp-ucb` | Compatibility method using a single upper-confidence score plus novelty. It now posterior-updates between batch selections. |
 | Non-GP error-distance | `--acquisition error-distance` | Use it for direct, local refinement around measured high-error verification points without fitting an error-surface model. |
 | One-sided range extension | `generate --extend-range` | A declared parameter bound must move outward and the new slab needs guaranteed coverage before error-directed refinement. |
+
+In an interactive terminal, `suggest-additional` reports candidate-pool
+construction, GP or rational-helper fitting, point-by-point acquisition,
+automatic verification selection, cumulative inventory creation, coverage
+plotting, and output validation on one rewritten status line. The line is
+cleared before warnings and before the complete final artifact summary.
 
 Quick links: [hybrid sizing table](#how-many-points-for-the-default-hybrid-gp-workflow),
 [non-GP batch-size table](#non-gp-error-distance-batch-size-table), and
