@@ -2223,7 +2223,9 @@ Every `suggest-additional` invocation writes each nonempty split view for both
 the current batch and the cumulative all-geometries inventory; a training-only
 batch therefore has a `_training.csv` view but no empty `_verification.csv`.
 The single cumulative coverage PNG distinguishes existing/new and
-training/verification roles using four colors.
+training/verification roles using four colors. Added training and added
+verification points use twice the marker diameter of existing points, while
+the overlaid diagonal histograms retain their original presentation.
 
 The cumulative CSV preserves canonical dataset labels from existing CSV and
 MDIF rows and assigns primary new rows according to `--target-dataset`.

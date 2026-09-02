@@ -723,6 +723,49 @@ class GaussianAdaptivePointTests(unittest.TestCase):
                 "training",
             )
 
+    def test_added_coverage_markers_are_twice_normal_diameter(self) -> None:
+        parameters = [
+            POINTS.parse_parameter_spec("W=0:1"),
+            POINTS.parse_parameter_spec("L=0:1"),
+        ]
+        rows = [
+            {
+                "dataset": "train",
+                "point_origin": "existing",
+                "W": "0.25",
+                "L": "0.25",
+            },
+            {
+                "dataset": "train",
+                "point_origin": "additional",
+                "W": "0.75",
+                "L": "0.75",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plot_path = POINTS.write_parameter_coverage_png(
+                Path(temp_dir) / "all_geometries.csv",
+                parameters,
+                rows,
+                "dataset",
+            )
+            with Image.open(plot_path) as image:
+                color_counts = {
+                    color: count
+                    for count, color in image.convert("RGB").getcolors(
+                        maxcolors=image.width * image.height
+                    )
+                    or []
+                }
+
+        normal_radius = POINTS.COVERAGE_GROUP_MARKER_RADII["training"]
+        added_radius = POINTS.COVERAGE_GROUP_MARKER_RADII["additional_training"]
+        self.assertEqual(added_radius, 2.0 * normal_radius)
+        self.assertGreater(
+            color_counts[POINTS.COVERAGE_GROUP_COLORS["additional_training"]],
+            2.5 * color_counts[POINTS.COVERAGE_GROUP_COLORS["training"]],
+        )
+
     def test_combined_geometry_outputs_reject_split_role_words(self) -> None:
         with self.assertRaisesRegex(ValueError, "combined geometry output"):
             POINTS.require_combined_geometry_path(

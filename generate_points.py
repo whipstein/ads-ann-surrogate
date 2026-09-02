@@ -941,6 +941,12 @@ COVERAGE_GROUP_COLORS: dict[str, tuple[int, int, int]] = {
     "additional_training": (22, 163, 74),
     "additional_verification": (168, 85, 247),
 }
+COVERAGE_GROUP_MARKER_RADII: dict[str, float] = {
+    "training": 3.0,
+    "verification": 3.0,
+    "additional_training": 6.0,
+    "additional_verification": 6.0,
+}
 
 
 def write_parameter_coverage_png(
@@ -1115,8 +1121,17 @@ def write_parameter_coverage_png(
     )
     legend_x = left_margin
     for group_name in present_groups:
+        legend_radius = px(
+            8 if group_name.startswith("additional_") else 4
+        )
+        legend_center_y = px(72)
         draw.ellipse(
-            (legend_x - px(4), px(68), legend_x + px(4), px(76)),
+            (
+                legend_x - legend_radius,
+                legend_center_y - legend_radius,
+                legend_x + legend_radius,
+                legend_center_y + legend_radius,
+            ),
             fill=group_colors[group_name],
         )
         draw.text(
@@ -1226,15 +1241,18 @@ def write_parameter_coverage_png(
             else:
                 for group_name in present_groups:
                     color = group_colors[group_name]
+                    marker_radius = px(
+                        COVERAGE_GROUP_MARKER_RADII[group_name]
+                    )
                     for point in grouped_points[group_name]:
                         point_x = plot_left + point[column_index] * plot_width
                         point_y = plot_bottom - point[row_index] * plot_height
                         draw.ellipse(
                             (
-                                point_x - px(3),
-                                point_y - px(3),
-                                point_x + px(3),
-                                point_y + px(3),
+                                point_x - marker_radius,
+                                point_y - marker_radius,
+                                point_x + marker_radius,
+                                point_y + marker_radius,
                             ),
                             fill=color,
                             outline=(255, 255, 255, 255),
