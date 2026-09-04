@@ -2389,8 +2389,10 @@ The companion JSON records the pole-relocation history, rational basis
 conditioning, retained PCA variance, latent GP length scales, and candidate
 uncertainty/change distributions. If relocation does not improve the compact
 broadband fitting criterion, the helper records `fixed_grid_retained=true` and
-uses the original stable logarithmic pole grid. Appendix C gives the complete
-mathematics and limitations.
+uses the original stable logarithmic pole grid. See
+[Appendix E: Rational-Hybrid Point Generation](#appendix-e-rational-hybrid-point-generation)
+for the complete mathematics, algorithm, interpretation, limitations, and
+references.
 
 ### Extending an Existing Parameter Range
 
@@ -5967,6 +5969,12 @@ the **Subcommands** column includes accepted command aliases.
 
 # Technical Appendices
 
+- [Appendix A: Exact-DC Extraction and Export Method](#appendix-a-exact-dc-extraction-and-export-method)
+- [Appendix B: DNN, KBNN, and Neuro-TF Implementation](#appendix-b-dnn-kbnn-and-neuro-tf-implementation)
+- [Appendix C: Gaussian-Process Adaptive Point Selection](#appendix-c-gaussian-process-adaptive-point-selection)
+- [Appendix D: Complete CLI Command and Option Reference](#appendix-d-complete-cli-command-and-option-reference)
+- [Appendix E: Rational-Hybrid Point Generation](#appendix-e-rational-hybrid-point-generation)
+
 ## Appendix A: Exact-DC Extraction and Export Method
 
 This appendix describes the complete exact-DC data path shared by DNN, KBNN,
@@ -7171,7 +7179,9 @@ This appendix documents the exact GP-assisted point-selection implementation
 in `generate_points.py`. These GPs are never exported. The default methods use
 a small auxiliary model of **geometry-level surrogate error**; the optional
 `rational-hybrid` method also builds an acquisition-only broadband-response
-surrogate from simulated training MDIF.
+surrogate from simulated training MDIF. The shared GP mechanics are described
+here; the response-aware method has its own complete treatment in
+[Appendix E](#appendix-e-rational-hybrid-point-generation).
 
 ### C.1 End-to-end data flow
 
@@ -7465,6 +7475,11 @@ earlier batch files.
 
 ### C.8 Rational-response hybrid acquisition
 
+This section gives the shared-GP context for `rational-hybrid`. Its complete,
+self-contained derivation, inputs, algorithm, diagnostics, comparison with the
+adjoint-sensitivity method, and references are in
+[Appendix E: Rational-Hybrid Point Generation](#appendix-e-rational-hybrid-point-generation).
+
 The `rational-hybrid` method supplements the scalar error GP with a parametric
 rational helper. It uses the same normalized geometry domain and candidate
 pool as the other selectors, but it learns broadband response structure from
@@ -7475,8 +7490,8 @@ Verification-labeled blocks and exact-zero-Hz rows are excluded.
 
 Na et al.'s published method begins with three coordinates per dimension,
 which partitions a $d$-dimensional box into $2^d$ axis-aligned subregions. For
-each subregion, let the $2^d$ corners be $mathbf x_q$, let
-$mathbf y(mathbf x_q)$ be the EM response, and let
+each subregion, let the $2^d$ corners be $\mathbf x_q$, let
+$\mathbf y(\mathbf x_q)$ be the EM response, and let
 $\mathbf J_y(\mathbf x_q)$ be the EM response Jacobian supplied by the
 simulator. Its local response basis can be written compactly as
 
@@ -8423,3 +8438,566 @@ Use `python3 surrogate.py ROUTE --help` or
 `python3 surrogate.py --model MODEL COMMAND --help` to confirm the installed
 checkout; this appendix is organized to make those exact parser options easy to
 find and compare.
+
+## Appendix E: Rational-Hybrid Point Generation
+
+This appendix is the self-contained technical reference for
+`points suggest-additional --acquisition rational-hybrid`. The method is an
+**acquisition helper**: it recommends the next geometries to simulate, but it
+is not the DNN, KBNN, or Neuro-TF model that is trained, selected, or exported.
+
+### E.1 Purpose and required inputs
+
+Standard `hybrid` acquisition knows where the current fitted model has measured
+verification error and where its scalar error GP is uncertain. It does not use
+the frequency structure of the simulated S-parameters. `rational-hybrid` adds a
+second, response-aware helper so that moving resonances, rapid phase changes,
+and other broadband changes can attract points even when verification-error
+observations are sparse.
+
+One rational-hybrid round requires all of the following:
+
+1. A completed DNN, KBNN, or Neuro-TF fit/optimization result that supplies
+   geometry-level `verification_metrics.csv`. If every optimization trial was
+   rejected for passivity, the retained point-generation fallback is usable
+   only with `--allow-nonpassive`.
+2. The cumulative geometry CSV and its parameter bounds, supplied through
+   `--existing-points`, its companion JSON, `--parameter-json`, or explicit
+   `--parameter` overrides.
+3. One or more `--existing-mdif` files containing the already simulated
+   training responses. A combined training/verification MDIF is valid.
+4. At least two distinct, in-range training geometries with positive-frequency
+   RF data and a consistent ordered S-parameter set.
+
+A Neuro-TF model fit is **not** required. The helper reuses Neuro-TF's rational
+basis utilities, but it fits its own temporary common-pole representation
+directly to the supplied training MDIF. A fitted model is still required for
+the separate verification-error signal, batch-size recommendation, and
+exploitation part of acquisition.
+
+### E.2 Data separation and leakage controls
+
+The implementation deliberately uses two different information sources:
+
+| Source | Used for | Excluded data |
+| --- | --- | --- |
+| `verification_metrics.csv` resolved from `--fit-dir` or `--verification-metrics` | Scalar error GP, current-error summary, target comparison, and exploitation | Rows that do not contain the requested geometry parameters and a usable metric |
+| `--existing-mdif` | Common-pole response fit, response PCA, latent response GPs, and response uncertainty | Verification-labeled blocks, out-of-range blocks, DC-only blocks, and every exact-zero-Hz row |
+| Cumulative geometry CSV/MDIF inventory | Duplicate rejection, novelty distance, and coverage | Points outside the resolved domain |
+
+Verification **responses** never train the rational helper. They remain an
+independent measurement of final-model error. Exact DC is also excluded because
+the helper represents only the positive-frequency RF response. These rules are
+recorded in the companion JSON as `verification_responses_excluded=true` and
+`dc_rows_excluded=true`.
+
+### E.3 Geometry coordinates and scalar error GP
+
+For parameter $p_j$ with bounds $[a_j,b_j]$, the normalized coordinate is
+
+$$
+u_j=\frac{p_j-a_j}{b_j-a_j}
+$$
+
+for a linear parameter, or
+
+$$
+u_j=\frac{\log p_j-\log a_j}{\log b_j-\log a_j}
+$$
+
+for a log-scaled parameter. All candidate distances and GP length scales use
+$\mathbf u\in[0,1]^d$.
+
+Let $e_i>0$ be the selected aggregate model-error metric at verification
+geometry $\mathbf u_i$. The scalar GP target is
+
+$$
+t_i=\log\!\left(\max(e_i,e_{\min})\right),
+$$
+
+where $e_{\min}$ is `--error-floor`. Its Matérn-5/2 covariance is
+
+$$
+k(\mathbf u,\mathbf v)=
+\left(1+\sqrt{5}r+\frac{5r^2}{3}\right)e^{-\sqrt{5}r},
+\qquad
+r^2=\sum_{j=1}^{d}
+\frac{(u_j-v_j)^2}{\ell_j^2}.
+$$
+
+The length scales $\ell_j$ are fixed, likelihood-selected, or refined with ARD
+according to the GP options. If the posterior log-error mean and standard
+deviation are $\mu_t(\mathbf u)$ and $\sigma_t(\mathbf u)$, then
+
+$$
+\widehat e(\mathbf u)=e^{\mu_t(\mathbf u)},
+\qquad
+e_{\mathrm{UCB}}(\mathbf u)=
+e^{\mu_t(\mathbf u)+\kappa\sigma_t(\mathbf u)},
+$$
+
+where $\kappa$ is the effective exploration weight. Rational-hybrid uses
+$\widehat e$ for its exploitation component; it does not replace measured
+verification error with rational-fit residuals.
+
+### E.4 Common-pole rational response representation
+
+At training geometry $\mathbf u_g$, each ordered S-parameter $S_q$ is
+represented over positive frequency by
+
+$$
+S_q(f,\mathbf u_g)\approx
+c_{q0}(\mathbf u_g)+
+\sum_{k=1}^{K}
+\frac{c_{qk}(\mathbf u_g)}{s(f)-p_k},
+\qquad
+s(f)=j\frac{f}{f_{\mathrm{scale}}}.
+$$
+
+The scale is the geometric mean of the minimum and maximum positive fitting
+frequencies,
+
+$$
+f_{\mathrm{scale}}=\sqrt{f_{\min}f_{\max}}.
+$$
+
+The pole set $\{p_k\}_{k=1}^{K}$ is common to every geometry and every ordered
+S-parameter. Shared poles are important: independently fitted pole sets can
+swap order or appear and disappear as geometry changes, making a geometry-space
+regressor discontinuous even when the physical response is smooth.
+
+`--rational-pole-placement fixed` constructs stable conjugate pairs on a
+logarithmic frequency grid. The default, `adaptive`, relocates a reduced set of
+representative broadband response modes, projects the result back to stable
+conjugate pairs, and retains the relocated set only when it improves the
+representative response RMSE. Otherwise it records
+`fixed_grid_retained=true` and uses the stable initial grid.
+
+For basis matrix $\mathbf B_g$, complex response samples $\mathbf s_{qg}$,
+diagonal frequency-weight matrix $\mathbf W_g$, and ridge $\lambda$, the
+coefficient extraction solves
+
+$$
+\widehat{\mathbf c}_{qg}=
+\underset{\mathbf c}{\operatorname{argmin}}
+\left\|
+\mathbf W_g^{1/2}(\mathbf B_g\mathbf c-\mathbf s_{qg})
+\right\|_2^2+
+\lambda\|\mathbf c\|_2^2.
+$$
+
+`--rational-frequency-weights` changes $\mathbf W_g$ and therefore tells the
+acquisition helper which exact frequencies or bands matter most. It does not
+change the frequency weights used to fit the final model unless the equivalent
+model-fitting option is also supplied.
+
+### E.5 Response conditioning and PCA compression
+
+Raw residues can be poorly scaled: a small Euclidean coefficient error may
+produce a large response error when the rational basis is ill-conditioned.
+The helper forms the weighted, ridge-augmented basis and computes
+
+$$
+\mathbf B_{\mathrm{aug}}=\mathbf Q\mathbf R.
+$$
+
+For column-oriented coefficient vector $\mathbf c$, it uses the conditioned
+coordinate $\widetilde{\mathbf c}=\mathbf R\mathbf c$, so
+
+$$
+\|\Delta\widetilde{\mathbf c}\|_2
+=
+\|\mathbf B_{\mathrm{aug}}\Delta\mathbf c\|_2.
+$$
+
+The code applies the equivalent transposed transform to its row-oriented
+coefficient storage, then concatenates real and imaginary parts for every
+ordered S-parameter into one real response vector $\mathbf y_g$. Repeated MDIF
+blocks at the same geometry are collapsed by averaging $\mathbf y_g$, so a
+duplicate does not receive extra statistical weight.
+
+With response mean $\overline{\mathbf y}$, stack the centered rows into
+$\mathbf Y$ and compute
+
+$$
+\mathbf Y=\mathbf U\boldsymbol\Sigma\mathbf V^{\mathsf T}.
+$$
+
+The retained dimension $r$ is the smallest number of singular directions that
+reaches `--rational-variance`, capped by `--rational-components`. The latent
+coordinates are
+
+$$
+\mathbf z_g=
+(\mathbf y_g-\overline{\mathbf y})\mathbf V_r.
+$$
+
+This step replaces hundreds or thousands of complex frequency samples with a
+small set of response coordinates while preserving the requested fraction of
+conditioned response variation.
+
+### E.6 Latent response GPs
+
+One standardized Matérn-5/2 GP is fitted over geometry for each retained
+component $z_j(\mathbf u)$. Each latent GP selects its own likelihood scale and,
+when the data count and `--gp-ard` permit, its own coordinate-refined ARD
+length scales.
+
+If $v_j(\mathbf u)$ is the posterior variance of component $j$, define the
+broadband response uncertainty
+
+$$
+U_R(\mathbf u)=
+\frac{\sqrt{\sum_{j=1}^{r}v_j(\mathbf u)}}
+{\sqrt{N_g^{-1}\sum_{g=1}^{N_g}\|\mathbf z_g\|_2^2}}.
+$$
+
+The helper also measures predicted response movement relative to the nearest
+simulated training geometry $g^*(\mathbf u)$:
+
+$$
+C_R(\mathbf u)=
+\frac{
+\|\widehat{\mathbf z}(\mathbf u)-
+\mathbf z_{g^*(\mathbf u)}\|_2}
+{\sqrt{N_g^{-1}\sum_{g=1}^{N_g}\|\mathbf z_g\|_2^2}}.
+$$
+
+$U_R$ is large where the available response data do not constrain the latent
+GPs. $C_R$ is large where those GPs predict a material broadband change from
+the closest simulated response. Across the finite candidate pool, each is
+robustly mapped to $[0,1]$ using its 10th and 90th percentiles; values outside
+that interval are clipped. This prevents a single extreme candidate from
+compressing all other response scores.
+
+### E.7 Acquisition scores and batch allocation
+
+Let $d_{\min}(\mathbf u)$ be distance to the nearest occupied point in the
+normalized domain and let
+
+$$
+N(\mathbf u)=
+\min\!\left(1,\frac{d_{\min}(\mathbf u)}{\sqrt d}\right)
+$$
+
+be its novelty. Candidates closer than `--min-distance` are rejected. The three
+component scores are
+
+$$
+A_E(\mathbf u)=
+\widehat e(\mathbf u)
+N(\mathbf u)^{\min(\nu,0.5)},
+$$
+
+$$
+A_R(\mathbf u)=
+\left(\widetilde U_R(\mathbf u)
++0.35\widetilde C_R(\mathbf u)\right)
+N(\mathbf u)^{\max(0.5,\min(\nu,1.5))},
+$$
+
+and
+
+$$
+A_C(\mathbf u)=N(\mathbf u),
+$$
+
+where $\nu$ is `--novelty-power`. $A_E$ targets known model error,
+$A_R$ targets uncertain or rapidly changing broadband response, and $A_C$
+protects global coverage. Their units differ, so `acquisition_score` is
+comparable only among rows with the same `selection_component`.
+
+The requested or automatically recommended batch is divided as follows. Rules
+are evaluated from top to bottom, and integer rounding preserves at least one
+point per component when the batch contains at least three points.
+
+| Regime | Condition | Exploitation | Rational uncertainty | Coverage |
+| --- | --- | ---: | ---: | ---: |
+| Sparse error observations | Fewer than $\max(3d,12)$ verification-error observations | 35% | 35% | 30% |
+| Plateau | Latest recorded RMS improvement is below 5% | 40% | 25% | 35% |
+| Far from target | Current-to-target error ratio is at least 2 | 60% | 20% | 20% |
+| Near target | Current-to-target error ratio is below 1.5 | 45% | 25% | 30% |
+| Balanced | None of the conditions above | 50% | 25% | 25% |
+
+Selection is sequential. After every chosen point, novelty is recomputed and
+the scalar error GP is conditioned on its posterior mean (a kriging-believer
+update), reducing redundant error-GP uncertainty without inventing a new error
+observation. The rational latent scores remain fixed during that batch because
+the new EM response does not exist until simulation. The entire helper is
+rebuilt after the new MDIF data are available.
+
+### E.8 End-to-end algorithm
+
+The implemented procedure is:
+
+1. Resolve parameter bounds and normalize existing geometries.
+2. Load the selected geometry-level verification error from the fit result.
+3. Fit the scalar log-error Matérn-5/2 GP.
+4. Read every `--existing-mdif`, retain only in-range training blocks, and
+   remove exact DC from those blocks.
+5. Build a shared stable pole set and extract weighted rational coefficients
+   for every ordered S-parameter at every distinct training geometry.
+6. Response-condition the coefficients, average duplicate geometry rows, and
+   retain the requested PCA subspace.
+7. Fit one latent response GP per retained PCA coordinate.
+8. Generate the finite maximin-LHS candidate pool and remove occupied or
+   too-close candidates.
+9. Compute exploitation, rational-response, and coverage scores; select the
+   dimension- and accuracy-scaled batch sequentially.
+10. Write the new training/verification CSVs, cumulative CSVs, one coverage
+    plot, and companion JSON diagnostics.
+11. Simulate the new geometries, merge their MDIF responses, refit the final
+    model, and run the next acquisition round if required.
+
+The process does not continuously optimize in an unbounded parameter space.
+It scores `--candidate-count` maximin-LHS candidates, defaulting to
+$\max(1000,200n_{\mathrm{requested}})$, within the declared domain.
+
+### E.9 Copyable command and options JSON
+
+Command-line example:
+
+```bash
+python3 surrogate.py points suggest-additional \
+  --fit-dir outputs/dnn_refit \
+  --existing-points outputs/round_3_all_geometries.csv \
+  --existing-mdif data/train_verify_round_3.mdif \
+  --acquisition rational-hybrid \
+  --count auto \
+  --target-error 1.0 \
+  --rational-order 12 \
+  --rational-pole-placement adaptive \
+  --rational-pole-iterations 6 \
+  --rational-components 8 \
+  --rational-variance 0.995 \
+  --rational-ridge 1e-8 \
+  --gp-ard auto \
+  --min-distance 0.05 \
+  --out outputs/round_4_points.csv \
+  --combined-out outputs/round_4_all_geometries.csv
+```
+
+Equivalent settings belong under
+`workflows.points.commands.suggest-additional`:
+
+```json
+{
+  "workflows": {
+    "points": {
+      "commands": {
+        "suggest-additional": {
+          "fit_dir": "outputs/dnn_refit",
+          "existing_points": "outputs/round_3_all_geometries.csv",
+          "existing_mdif": ["data/train_verify_round_3.mdif"],
+          "acquisition": "rational-hybrid",
+          "count": "auto",
+          "target_error": 1.0,
+          "rational_order": 12,
+          "rational_pole_placement": "adaptive",
+          "rational_pole_iterations": 6,
+          "rational_components": 8,
+          "rational_variance": 0.995,
+          "rational_ridge": 1e-8,
+          "gp_ard": "auto",
+          "min_distance": 0.05,
+          "out": "outputs/round_4_points.csv",
+          "combined_out": "outputs/round_4_all_geometries.csv"
+        }
+      }
+    }
+  }
+}
+```
+
+Use `--explain-options` to inspect the fully resolved inputs before executing:
+
+```bash
+python3 surrogate.py --options-json options.json \
+  points suggest-additional --explain-options
+```
+
+The complete option list and JSON paths remain in
+[Appendix D.6](#d6-adaptive-additional-point-options).
+
+### E.10 Diagnostics and interpretation
+
+The selected-points CSV and companion JSON provide the evidence needed to
+decide whether the method is helping:
+
+| Output | Interpretation |
+| --- | --- |
+| `selection_component` | `exploitation`, `rational-uncertainty`, `coverage`, or an automatically added `verification-uncertainty` point |
+| `rational_response_uncertainty` | Raw normalized latent posterior uncertainty $U_R$; compare within one run |
+| `rational_response_change` | Raw predicted latent movement $C_R$ from the nearest simulated training response |
+| `predicted_error` | Median-scale error from the separate scalar error GP |
+| `distance_to_existing` | Nearest occupied normalized-domain distance at selection time |
+| `response_surrogate.distinct_training_geometries` | Number of unique training geometries available to the rational helper |
+| `response_surrogate.retained_components` | PCA coordinates actually modeled |
+| `response_surrogate.retained_variance_fraction` | Conditioned response variance retained after the component cap |
+| `response_surrogate.compression_rmse` | PCA reconstruction error in conditioned coordinates |
+| `response_surrogate.pole_placement_diagnostics` | Initial/adaptive rational RMSE history and whether the fixed grid was retained |
+| `response_surrogate.coefficient_conditioning` | Rational-basis rank and condition numbers |
+| `response_surrogate.latent_length_scales` | Geometry length scales fitted for each response coordinate |
+| `candidate_rational_uncertainty` and `candidate_rational_change` | Median, 90th percentile, and maximum score distributions over the candidate pool |
+
+Useful patterns are:
+
+| Observation | Likely cause or action |
+| --- | --- |
+| Low retained variance or high compression RMSE | Increase `--rational-components`; if already capped by sample count, add broader coverage first. |
+| Poor initial and adaptive rational RMSE | Increase `--rational-order`, adjust `--rational-pole-damping`, or emphasize the troublesome band with `--rational-frequency-weights`. |
+| `fixed_grid_retained=true` repeatedly | Pole relocation did not improve the representative modes; fixed poles are the safer basis for this dataset. |
+| Very small latent length scale in one parameter | The response varies rapidly with that parameter, or units/bounds/duplicates are inconsistent; audit before accepting the interpretation. |
+| High response uncertainty but low response change | The helper lacks nearby data but does not predict a strong local transition; the uncertainty allocation may still sample it. |
+| High response change but low uncertainty | A smooth, well-supported resonance or phase movement is predicted; the change term can still prioritize it. |
+| Rational points do not reduce final verification error | The bottleneck may be final-model capacity, loss weighting, passivity contraction, inconsistent data, or a rational basis that cannot represent appearing/disappearing modes. Use `debug-model` before adding another large batch. |
+
+### E.11 Relationship to the adjoint-sensitivity method
+
+Na et al. begin with three coordinates per input dimension, producing an
+initial tensor arrangement that partitions a $d$-dimensional box into $2^d$
+subregions. Each subregion uses response and response-Jacobian constraints at
+its $2^d$ corners to fit a local interpolation model. The simulated response at
+the center measures local interpolation error; the worst subregion is divided
+again until every center error meets the requested threshold.
+
+For local response $\mathbf y(\mathbf x)$, their basis contains all multilinear
+corner terms plus one squared term per dimension:
+
+$$
+\mathbf h(\mathbf x)=
+\left[
+\left\{
+\prod_{i=1}^{d}x_i^{k_i}:
+\mathbf k\in\{0,1\}^{d}
+\right\},
+x_1^2,\ldots,x_d^2
+\right]^{\mathsf T},
+\qquad
+N_h=2^d+d.
+$$
+
+The corner response and derivative constraints can be written as
+
+$$
+\mathbf A=
+\begin{bmatrix}
+\mathbf h(\mathbf x_1)^{\mathsf T}\\
+\vdots\\
+\mathbf h(\mathbf x_{2^d})^{\mathsf T}\\
+\mathbf J_h(\mathbf x_1)\\
+\vdots\\
+\mathbf J_h(\mathbf x_{2^d})
+\end{bmatrix},
+\qquad
+\mathbf B=
+\begin{bmatrix}
+\mathbf y(\mathbf x_1)^{\mathsf T}\\
+\vdots\\
+\mathbf y(\mathbf x_{2^d})^{\mathsf T}\\
+\mathbf J_y(\mathbf x_1)^{\mathsf T}\\
+\vdots\\
+\mathbf J_y(\mathbf x_{2^d})^{\mathsf T}
+\end{bmatrix},
+$$
+
+followed by the least-squares interpolant
+
+$$
+\mathbf G^{\mathsf T}=\mathbf A^{+}\mathbf B,
+\qquad
+\mathbf F(\mathbf x)=\mathbf G\mathbf h(\mathbf x).
+$$
+
+The paper assumes that the EM simulator produces $\mathbf y$ and its Jacobian
+$\mathbf J_y=\partial\mathbf y/\partial\mathbf x$ together. If the selected EM
+workflow does not expose those sensitivities, finite differences require
+additional nearby geometry solves and can remove much of the advertised sample
+advantage.
+
+The implemented method is deliberately different:
+
+| Aspect | Na et al. adjoint-sensitivity sampler | Repository rational hybrid |
+| --- | --- | --- |
+| Required response information | EM response and exact simulator-supplied geometry Jacobian | Previously simulated complex S-parameters only |
+| Initial design | Three coordinates per dimension and axis-aligned subregions | Any existing nonduplicated training design |
+| Local/global representation | Local polynomial interpolation in each subregion | Global shared-pole rational frequency basis plus latent geometry GPs |
+| Refinement signal | True response error at each subregion center | Measured final-model verification error, latent response uncertainty/change, and maximin coverage |
+| New-point search | Bisect the worst local subregion | Score a finite maximin-LHS candidate pool |
+| Neural-network dependency | Adjoint ANN uses response derivatives during training | Acquisition works with DNN, KBNN, or Neuro-TF; no derivative-trained ANN is required |
+| Passivity | Not the point-selection guarantee | Not guaranteed by the helper; evaluate the refitted final model |
+
+The common idea is to spend simulations where the response is most nonlinear
+or least understood. Rational hybrid is beneficial when exact EM sensitivities
+are unavailable and broadband response structure contains information that a
+sparse scalar-error surface cannot reveal. It is not a mathematical substitute
+for exact adjoint derivatives, and it should be treated as an experimental
+alternative to standard hybrid acquisition rather than an automatic upgrade
+for every dataset.
+
+### E.12 Limitations and computational cost
+
+- The helper does not recover exact geometry derivatives from existing EM
+  responses and does not synthesize finite-difference sensitivities.
+- A common pole basis can struggle when modes enter or leave the fitting band,
+  split, merge, or change damping abruptly. Higher order is not always a cure.
+- Neither stable poles nor a small rational residual guarantees a passive
+  multiport response. Passivity belongs to final-model validation and export.
+- Response uncertainty is conditional on the chosen rational basis, PCA cap,
+  and GP kernel. Model-form error outside that representation is not reflected
+  in posterior variance.
+- The final-model verification metrics must remain representative. A biased or
+  too-small verification set can still misdirect exploitation.
+- Dense GP fitting costs $O(N_g^3)$ per retained latent component and candidate
+  evaluation uses dense solves. The method targets expensive EM campaigns with
+  modest geometry counts, not massive datasets.
+- The routine selects points but does not run EM, merge new responses, retrain,
+  or certify convergence. Those stages remain explicit inspection boundaries.
+
+### E.13 References
+
+1. W. Na, W. Liu, K. Liu, J. Jin, D. Jin, H. Xie, W. Zhang, and Q.-J. Zhang,
+   “Automated model generation for microwave components using adjoint neural
+   network and EM sensitivity analysis,” *IEEE Microwave and Wireless
+   Technology Letters*, vol. 34, no. 7, pp. 867-870, 2024.
+   [doi:10.1109/LMWT.2024.3391656](https://doi.org/10.1109/LMWT.2024.3391656).
+   Source for the response-plus-Jacobian local interpolation and worst-subregion
+   refinement method used for comparison.
+2. B. Gustavsen and A. Semlyen, “Rational approximation of frequency domain
+   responses by vector fitting,” *IEEE Transactions on Power Delivery*, vol.
+   14, no. 3, pp. 1052-1061, 1999.
+   [doi:10.1109/61.772353](https://doi.org/10.1109/61.772353),
+   [author-hosted paper](https://www.sintef.no/globalassets/project/vectfit/vf_paper.pdf).
+   Source for common-pole rational fitting and iterative pole relocation.
+3. D. Deschrijver, T. Dhaene, and D. De Zutter, “Robust parametric
+   macromodeling using multivariate orthonormal vector fitting,” *IEEE
+   Transactions on Microwave Theory and Techniques*, vol. 56, no. 7, pp.
+   1661-1673, 2008.
+   [doi:10.1109/TMTT.2008.924346](https://doi.org/10.1109/TMTT.2008.924346).
+   Background for combining rational frequency representations with
+   parameter-space dependence.
+4. C. E. Rasmussen and C. K. I. Williams, *Gaussian Processes for Machine
+   Learning*, MIT Press, 2006, Chapters 2 and 4.
+   [Official open-access text](https://gaussianprocess.org/gpml/chapters/).
+   Source for GP regression, marginal likelihood, and Matérn covariance.
+5. N. Srinivas, A. Krause, S. M. Kakade, and M. Seeger, “Gaussian process
+   optimization in the bandit setting: No regret and experimental design,”
+   *Proceedings of ICML*, 2010.
+   [arXiv:0912.3995](https://arxiv.org/abs/0912.3995).
+   Source for the GP-UCB exploration/exploitation principle; the repository's
+   finite-candidate, diversity-penalized batch rule is an engineering
+   adaptation.
+6. M. D. Morris and T. J. Mitchell, “Exploratory designs for computational
+   experiments,” *Journal of Statistical Planning and Inference*, vol. 43,
+   no. 3, pp. 381-402, 1995.
+   [doi:10.1016/0378-3758(94)00035-T](https://doi.org/10.1016/0378-3758(94)00035-T).
+   Background for maximin distance designs within Latin hypercubes.
+
+### E.14 Implementation and test map
+
+| Area | Source |
+| --- | --- |
+| Geometry parsing, domain normalization, scalar/latent GP fitting, hybrid allocation, rational-response scoring, CSV/JSON output, and CLI | [`generate_points.py`](generate_points.py) |
+| Fixed/adaptive common poles, coefficient extraction, and response-conditioning transform reused by the helper | [`neuro_tf.py`](neuro_tf.py) |
+| MDIF parsing, dataset labels, RF/DC separation, and frequency weights | [`surrogate_common.py`](surrogate_common.py) |
+| Rational-hybrid, GP, options, split-integrity, and output regression tests | [`tests/test_generate_points_gp.py`](tests/test_generate_points_gp.py) |
